@@ -9,12 +9,20 @@ Next Round 3 CLEAN check required before production use.
 """
 
 import asyncio, json, os, sys, time, logging, urllib.request
-from logging.handlers import RotatingFileHandler
 
 UPSTREAM = ("127.0.0.1", 7890)
-LISTEN = ("0.0.0.0", 7891)
+LISTEN = ("127.0.0.1", 7891)
 CLASH_API = "http://127.0.0.1:9090"
-SECRET = open("/home/administrator/.singbox_secret").read().strip()
+
+# lazy-loaded to allow tests to import without the file
+_SINGBOX_SECRET: str | None = None
+
+def _get_secret() -> str:
+    global _SINGBOX_SECRET
+    if _SINGBOX_SECRET is None:
+        with open(os.path.expanduser("~/.singbox_secret")) as _f:
+            _SINGBOX_SECRET = _f.read().strip()
+    return _SINGBOX_SECRET
 
 MAX_HEADER_BYTES = 32 * 1024
 MAX_CONTENT_LENGTH = 64 * 1024 * 1024
@@ -30,12 +38,30 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def switch_clash_node():
+    """Pick a random live node via Clash API and switch to it."""
     try:
+        import random
+        secret = _get_secret()
         req = urllib.request.Request(
             f"{CLASH_API}/proxies/proxy",
-            headers={"Authorization": f"Bearer {SECRET}"},
-            method="PUT", data=b"{}")
+            headers={"Authorization": f"Bearer {secret}"},
+            method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        all_nodes = data.get("all", [])
+        current = data.get("now", "")
+        candidates = [n for n in all_nodes if n != current and n != "direct"]
+        if not candidates:
+            log("Clash switch: no other nodes available")
+            return
+        chosen = random.choice(candidates)
+        body = json.dumps({"name": chosen}).encode()
+        req = urllib.request.Request(
+            f"{CLASH_API}/proxies/proxy",
+            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+            method="PUT", data=body)
         urllib.request.urlopen(req, timeout=5)
+        log(f"Clash switch: {current} -> {chosen}")
     except Exception as e:
         log(f"Clash switch failed: {e}")
 
@@ -60,10 +86,13 @@ async def _cancel_pipe(t):
         except: pass
 
 def _has_te_chunked(headers_raw: bytes) -> bool:
-    """Check if headers contain Transfer-Encoding: chunked."""
+    """Check if headers contain Transfer-Encoding: chunked (handles multi-value)."""
     for line in headers_raw.split(b"\r\n"):
-        if line.lower().strip() == b"transfer-encoding: chunked":
-            return True
+        val = line.lower().strip()
+        if val.startswith(b"transfer-encoding:"):
+            te_value = val.split(b":", 1)[1].strip()
+            if b"chunked" in te_value.split(b","):
+                return True
     return False
 
 def _strip_header(headers_raw: bytes, name: bytes) -> bytes:
@@ -106,7 +135,7 @@ async def handle(reader, writer):
         line = await asyncio.wait_for(reader.readline(), timeout=30)
         if not line:
             writer.close(); return
-        parts = line.decode().strip().split(" ")
+        parts = line.decode(errors="replace").strip().split(" ")
         if len(parts) < 2:
             writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             await writer.drain(); writer.close(); return
@@ -114,9 +143,9 @@ async def handle(reader, writer):
 
         # Read headers with deadline + size cap
         headers = b""
-        deadline = asyncio.get_event_loop().time() + HEADER_READ_DEADLINE
+        deadline = asyncio.get_running_loop().time() + HEADER_READ_DEADLINE
         while True:
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 log(f"Header read timeout {peername}"); writer.close(); return
             h = await asyncio.wait_for(reader.readline(), timeout=max(remaining, 0.1))
@@ -205,7 +234,12 @@ async def handle(reader, writer):
                 log(f"Empty upstream response on {method} {target}")
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain(); break
-            status_code = int(status_line.split(b" ")[1])
+            try:
+                status_code = int(status_line.split(b" ")[1])
+            except (IndexError, ValueError):
+                log(f"Malformed status line: {status_line!r}")
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain(); break
 
             if status_code == 429 and attempt == 0:
                 log(f"429 {method} {target} → switching node, retrying...")
@@ -218,7 +252,7 @@ async def handle(reader, writer):
                         BrokenPipeError, OSError):
                     pass
                 u_w.close()
-                await asyncio.get_event_loop().run_in_executor(
+                await asyncio.get_running_loop().run_in_executor(
                     None, switch_clash_node)
                 await asyncio.sleep(1)
                 continue
