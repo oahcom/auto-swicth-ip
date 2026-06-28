@@ -8,23 +8,27 @@ Codex review Round 2: 1P1 chunked headers + 5P2 fixed
 Next Round 3 CLEAN check required before production use.
 """
 
-import asyncio, json, os, sys, time, logging, urllib.request
+import asyncio, json, os, random, sys, threading, time, logging, urllib.request
 
 UPSTREAM = ("127.0.0.1", 7890)
 LISTEN = ("127.0.0.1", 7891)
 CLASH_API = "http://127.0.0.1:9090"
+SELECTOR = "proxy"
 
-# lazy-loaded to allow tests to import without the file
 _SINGBOX_SECRET: str | None = None
+_SINGBOX_SECRET_LOCK = threading.Lock()
 
 def _get_secret() -> str:
     global _SINGBOX_SECRET
     if _SINGBOX_SECRET is None:
-        with open(os.path.expanduser("~/.singbox_secret")) as _f:
-            _SINGBOX_SECRET = _f.read().strip()
+        with _SINGBOX_SECRET_LOCK:
+            if _SINGBOX_SECRET is None:  # double-check
+                with open(os.path.expanduser("~/.singbox_secret")) as _f:
+                    _SINGBOX_SECRET = _f.read().strip()
     return _SINGBOX_SECRET
 
 MAX_HEADER_BYTES = 32 * 1024
+MAX_LINE_BYTES = 8 * 1024
 MAX_CONTENT_LENGTH = 64 * 1024 * 1024
 HEADER_READ_DEADLINE = 10
 BODY_READ_DEADLINE = 60
@@ -40,10 +44,9 @@ def log(msg):
 def switch_clash_node():
     """Pick a random live node via Clash API and switch to it."""
     try:
-        import random
         secret = _get_secret()
         req = urllib.request.Request(
-            f"{CLASH_API}/proxies/proxy",
+            f"{CLASH_API}/proxies/{SELECTOR}",
             headers={"Authorization": f"Bearer {secret}"},
             method="GET")
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -57,7 +60,7 @@ def switch_clash_node():
         chosen = random.choice(candidates)
         body = json.dumps({"name": chosen}).encode()
         req = urllib.request.Request(
-            f"{CLASH_API}/proxies/proxy",
+            f"{CLASH_API}/proxies/{SELECTOR}",
             headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
             method="PUT", data=body)
         urllib.request.urlopen(req, timeout=5)
@@ -76,14 +79,15 @@ async def pipe(r, w, timeout=600):
     except (asyncio.CancelledError, asyncio.TimeoutError,
             ConnectionResetError, BrokenPipeError, OSError):
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Pipe error: {e}")
 
 async def _cancel_pipe(t):
     if not t.done():
         t.cancel()
         try: await t
-        except: pass
+        except (asyncio.CancelledError, Exception):
+            pass
 
 def _has_te_chunked(headers_raw: bytes) -> bool:
     """Check if headers contain Transfer-Encoding: chunked (handles multi-value)."""
@@ -136,6 +140,10 @@ async def handle(reader, writer):
         line = await asyncio.wait_for(reader.readline(), timeout=30)
         if not line:
             writer.close(); return
+        if len(line) > MAX_LINE_BYTES:
+            log(f"Request line too long {peername} ({len(line)}B)")
+            writer.write(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n")
+            await writer.drain(); writer.close(); return
         parts = line.decode(errors="replace").strip().split(" ")
         if len(parts) < 2:
             writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
@@ -190,7 +198,13 @@ async def handle(reader, writer):
                 chunk_line_stripped = chunk_line.strip()
                 if not chunk_line_stripped or chunk_line_stripped == b"0":
                     if chunk_line_stripped == b"0":
-                        await reader.readline()  # trailing CRLF
+                        # consume trailing CRLF
+                        await reader.readline()
+                        # consume optional trailer headers until final CRLF
+                        while True:
+                            t = await asyncio.wait_for(reader.readline(), timeout=BODY_READ_DEADLINE)
+                            if t in (b"\r\n", b"\n", b""):
+                                break
                     break
                 # RFC 7230: chunk-size may have extensions after semicolon
                 # e.g., "5;ext=value" -> parse only hex part before ';'
@@ -269,11 +283,12 @@ async def handle(reader, writer):
     finally:
         if u_w and not u_w.is_closing():
             try: u_w.close()
-            except: pass
+            except OSError:
+                pass
         try:
             if not writer.is_closing():
                 writer.close()
-        except:
+        except OSError:
             pass
 
 async def main():

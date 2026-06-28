@@ -35,7 +35,14 @@ def bench(name, proxy_url, rounds=ROUNDS):
         # Run batch concurrently
         procs = [subprocess.Popen(c, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for c in cmds]
         for p in procs:
-            stdout, stderr = p.communicate(timeout=15)
+            try:
+                stdout, stderr = p.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.communicate()
+                errors += 1
+                times.append(10000)
+                continue
             if p.returncode == 0 and stdout.strip():
                 try:
                     times.append(float(stdout.strip()) * 1000)
