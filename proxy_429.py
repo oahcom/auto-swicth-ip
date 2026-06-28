@@ -162,7 +162,15 @@ async def handle(reader, writer):
                     if chunk_line_stripped == b"0":
                         await reader.readline()  # trailing CRLF
                     break
-                chunk_size = int(chunk_line_stripped, 16)
+                # RFC 7230: chunk-size may have extensions after semicolon
+                # e.g., "5;ext=value" -> parse only hex part before ';'
+                chunk_size_hex = chunk_line_stripped.split(b";")[0]
+                try:
+                    chunk_size = int(chunk_size_hex, 16)
+                except ValueError:
+                    log(f"Invalid chunk size from {peername}: {chunk_line_stripped}")
+                    writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                    await writer.drain(); writer.close(); return
                 if len(body) + chunk_size > MAX_CONTENT_LENGTH:
                     log(f"Chunked body too large from {peername}")
                     writer.write(b"HTTP/1.1 413 Payload Too Large\r\n\r\n")
