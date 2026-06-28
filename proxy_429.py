@@ -18,13 +18,27 @@ SELECTOR = "proxy"
 # Retry config
 MAX_RETRIES = 5
 RETRY_ON_STATUS = {429, 502, 503, 504}
-RETRY_ON_CONNECT_ERROR = True
-RETRY_ON_EMPTY_BODY = True
 RETRY_SLEEP_BASE = 1  # seconds, will multiply by attempt
 
+# Size / timeout limits
+REQUEST_LINE_TIMEOUT = 30
+UPSTREAM_CONNECT_TIMEOUT = 10
+UPSTREAM_READLINE_TIMEOUT = 30
+CLASH_API_TIMEOUT = 5
+CONNECT_RESP_TIMEOUT = 10
+MAX_LINE_BYTES = 8 * 1024
+MAX_HEADER_BYTES = 32 * 1024
+MAX_CONTENT_LENGTH = 64 * 1024 * 1024
+HEADER_READ_DEADLINE = 10
+BODY_READ_DEADLINE = 60
+PIPE_READ_TIMEOUT = 600  # max idle between chunks
+DRAIN_MAX_SEC = 10  # cap drain on retry
+PIPE_BUF_SIZE = 65536
+
+# Secret lazy-load
 _SINGBOX_SECRET: str | None = None
 _SINGBOX_SECRET_LOCK = threading.Lock()
-_SWITCH_LOCK = threading.Lock()  # prevent concurrent Clash node switches
+_SWITCH_LOCK = asyncio.Lock()  # async lock for concurrent node switch coordination
 
 def _get_secret() -> str:
     global _SINGBOX_SECRET
@@ -35,12 +49,6 @@ def _get_secret() -> str:
                     _SINGBOX_SECRET = _f.read().strip()
     return _SINGBOX_SECRET
 
-MAX_HEADER_BYTES = 32 * 1024
-MAX_LINE_BYTES = 8 * 1024
-MAX_CONTENT_LENGTH = 64 * 1024 * 1024
-HEADER_READ_DEADLINE = 10
-BODY_READ_DEADLINE = 60
-
 log_file = os.path.join(os.path.dirname(__file__), "proxy_429.log")
 logging.basicConfig(filename=log_file, level=logging.INFO,
     format="%(asctime)s %(message)s")
@@ -49,23 +57,9 @@ def log(msg):
     logging.info(msg)
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-async def _clash_api(method: str, path: str, body: bytes | None = None) -> dict | None:
-    """Call Clash API via thread (urllib blocks). Returns parsed JSON or None."""
-    secret = _get_secret()
-    url = f"{CLASH_API}{path}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {secret}"}, method=method, data=body)
-    if body:
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        log(f"Clash API {method} {path} failed: {e}")
-        return None
-
 async def switch_clash_node() -> None:
-    """Pick a random live node via Clash API and switch to it. Thread-safe via _SWITCH_LOCK."""
-    with _SWITCH_LOCK:
+    """Pick a random live node via Clash API and switch to it. Async-safe via asyncio.Lock."""
+    async with _SWITCH_LOCK:
         data = await asyncio.to_thread(_clash_api_sync, "GET", f"/proxies/{SELECTOR}")
         if not data:
             return
@@ -89,16 +83,16 @@ def _clash_api_sync(method: str, path: str, body: bytes | None = None) -> dict |
     if body:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=CLASH_API_TIMEOUT) as resp:
             return json.loads(resp.read())
-    except Exception as e:
+    except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as e:
         log(f"Clash API {method} {path} failed: {e}")
         return None
 
-async def pipe(r, w, timeout=600):
+async def pipe(r, w, timeout=PIPE_READ_TIMEOUT):
     try:
         while True:
-            chunk = await asyncio.wait_for(r.read(65536), timeout=timeout)
+            chunk = await asyncio.wait_for(r.read(PIPE_BUF_SIZE), timeout=timeout)
             if not chunk:
                 break
             w.write(chunk)
@@ -108,12 +102,24 @@ async def pipe(r, w, timeout=600):
         pass
     except Exception as e:
         log(f"Pipe error: {e}")
+        raise
 
-async def _cancel_pipe(t):
+async def _drain_reader(r) -> None:
+    """Drain reader with cap at DRAIN_MAX_SEC. Catches expected exceptions."""
+    drain_deadline = asyncio.get_running_loop().time() + DRAIN_MAX_SEC
+    try:
+        while asyncio.get_running_loop().time() < drain_deadline:
+            remaining = drain_deadline - asyncio.get_running_loop().time()
+            c = await asyncio.wait_for(r.read(PIPE_BUF_SIZE), timeout=max(remaining, 0.1))
+            if not c: break
+    except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
+        pass
+
+async def cancel_pipe(t):
     if not t.done():
         t.cancel()
         try: await t
-        except (asyncio.CancelledError, Exception):
+        except (asyncio.CancelledError, OSError):
             pass
 
 def _has_te_chunked(headers_raw: bytes) -> bool:
@@ -164,7 +170,7 @@ async def handle(reader, writer):
     peername = writer.get_extra_info('peername')
     u_w = None
     try:
-        line = await asyncio.wait_for(reader.readline(), timeout=30)
+        line = await asyncio.wait_for(reader.readline(), timeout=REQUEST_LINE_TIMEOUT)
         if not line:
             writer.close(); return
         if len(line) > MAX_LINE_BYTES:
@@ -195,7 +201,7 @@ async def handle(reader, writer):
             for attempt in range(MAX_RETRIES):
                 try:
                     u_r, u_w = await asyncio.wait_for(
-                        asyncio.open_connection(*UPSTREAM), timeout=10)
+                        asyncio.open_connection(*UPSTREAM), timeout=UPSTREAM_CONNECT_TIMEOUT)
                 except (asyncio.TimeoutError, OSError) as e:
                     log(f"CONNECT upstream connect fail: {e}")
                     if attempt == MAX_RETRIES - 1:
@@ -209,23 +215,27 @@ async def handle(reader, writer):
                     await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
                     continue
                 u_w.write(line + headers); await u_w.drain()
-                resp = await asyncio.wait_for(u_r.readuntil(b"\r\n\r\n"), timeout=10)
+                resp = await asyncio.wait_for(u_r.readuntil(b"\r\n\r\n"), timeout=CONNECT_RESP_TIMEOUT)
                 try:
                     status_code = int(resp.split(b" ")[1])
                 except (IndexError, ValueError):
                     status_code = 502
                 if status_code in RETRY_ON_STATUS and attempt < MAX_RETRIES - 1:
                     log(f"CONNECT {status_code} → switching node, retrying... (attempt {attempt + 1}/{MAX_RETRIES})")
+                    await _drain_reader(u_r)
                     u_w.close()
                     await switch_clash_node()
                     await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
                     continue
-                writer.write(resp); await writer.drain()
+                try:
+                    writer.write(resp); await writer.drain()
+                except OSError:
+                    u_w.close(); writer.close(); return
                 t1 = asyncio.create_task(pipe(reader, u_w))
                 t2 = asyncio.create_task(pipe(u_r, writer))
                 done, pending = await asyncio.wait(
                     [t1, t2], return_when=asyncio.FIRST_COMPLETED)
-                await _cancel_pipe(t1); await _cancel_pipe(t2)
+                await cancel_pipe(t1); await cancel_pipe(t2)
                 u_w.close(); writer.close(); return
             try:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -289,7 +299,7 @@ async def handle(reader, writer):
         for attempt in range(MAX_RETRIES):
             try:
                 u_r, u_w = await asyncio.wait_for(
-                    asyncio.open_connection(*UPSTREAM), timeout=10)
+                    asyncio.open_connection(*UPSTREAM), timeout=UPSTREAM_CONNECT_TIMEOUT)
             except (asyncio.TimeoutError, OSError) as e:
                 log(f"Upstream connect fail: {e}")
                 if attempt == MAX_RETRIES - 1:
@@ -312,7 +322,7 @@ async def handle(reader, writer):
                 await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
                 continue
 
-            status_line = await asyncio.wait_for(u_r.readline(), timeout=30)
+            status_line = await asyncio.wait_for(u_r.readline(), timeout=UPSTREAM_READLINE_TIMEOUT)
             if not status_line:
                 log(f"Empty upstream response on {method} {target}")
                 u_w.close()
@@ -337,16 +347,7 @@ async def handle(reader, writer):
             # Retry on bad status codes
             if status_code in RETRY_ON_STATUS and attempt < MAX_RETRIES - 1:
                 log(f"{status_code} {method} {target} → switching node, retrying... (attempt {attempt + 1}/{MAX_RETRIES})")
-                # Drain remaining response (cap at 10s total)
-                drain_deadline = asyncio.get_running_loop().time() + 10
-                try:
-                    while asyncio.get_running_loop().time() < drain_deadline:
-                        remaining = drain_deadline - asyncio.get_running_loop().time()
-                        c = await asyncio.wait_for(u_r.read(4096), timeout=max(remaining, 0.1))
-                        if not c: break
-                except (asyncio.TimeoutError, ConnectionResetError,
-                        BrokenPipeError, OSError):
-                    pass
+                await _drain_reader(u_r)
                 u_w.close()
                 await switch_clash_node()
                 await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
