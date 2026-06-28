@@ -306,7 +306,8 @@ def test_12_multiple_switches_ip_changes():
             tag, delay = f.result()
             if delay and delay < 3000:
                 candidates.append(tag)
-        candidates.sort(key=lambda x: candidates.index(x))
+        seen = set()
+        candidates = [x for x in candidates if not (x in seen or seen.add(x))]
 
     candidates = candidates[:3]
     if len(candidates) < 3:
