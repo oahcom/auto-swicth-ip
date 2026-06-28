@@ -7,16 +7,16 @@ import json
 import urllib.parse
 import sys
 import os
+import subprocess
 from pathlib import Path
 
-SUBSCRIPTION_URL = os.environ.get("OKZ_SUB_URL")
-if not SUBSCRIPTION_URL:
-    raise RuntimeError("OKZ_SUB_URL env var not set — required for subscription fetch")
+from config import CFG, SINGBOX_SECRET
+
+_OKZ_SUB_URL = os.environ.get("OKZ_SUB_URL")
 
 # ============= 解析订阅 =============
 def fetch_and_decode_sub(url: str) -> list[str]:
     """拉订阅，base64 解码，返回原始 URL 列表"""
-    import subprocess
     r = subprocess.run(['curl', '-sf', url], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise RuntimeError(f"failed to fetch: {r.stderr}")
@@ -51,7 +51,7 @@ def parse_hysteria2(url: str) -> dict:
             "insecure": insecure,
             "utls": {"enabled": True, "fingerprint": "chrome"},
         },
-        "obfs": ({"type": p["obfs"][0], "password": urllib.parse.unquote(p["obfs-password"][0])}
+        "obfs": ({"type": p["obfs"][0], "password": urllib.parse.unquote(p.get("obfs-password", [""])[0])}
                  if "obfs" in p else None),
     }
 
@@ -105,17 +105,22 @@ def parse_url(url: str) -> dict | None:
     try:
         return parser(url)
     except Exception as e:
-        print(f"failed parse: {url[:80]}... err={e}", file=sys.stderr)
+        safe = url.split("@")[-1] if "@" in url else url[:80]
+        print(f"failed parse: {safe[:80]}... err={e}", file=sys.stderr)
         return None
 
 # ============= 生成 sing-box config =============
-def make_config(nodes: list[dict], listen_port: int = 7890,
-                clash_port: int = 9090, clash_secret: str = "auto-switch-2026",
+def make_config(nodes: list[dict], listen_port: int = 0,
+                clash_port: int = 0, clash_secret: str = "",
                 include_h2: bool = False) -> dict:
     """生成 sing-box 配置：mixed port + selector + clash API
 
     include_h2: 是否包含 hysteria2 节点（WSL2 下 utls 不兼容，默认排除）
     """
+    if not listen_port:
+        listen_port = CFG["singbox"]["mixed_port"]
+    if not clash_port:
+        clash_port = int(CFG["singbox"]["clash_api"].rsplit(":", 1)[-1])
     if not include_h2:
         nodes = [n for n in nodes if n.get("type") != "hysteria2"]
     outbounds = nodes[:]
@@ -127,7 +132,7 @@ def make_config(nodes: list[dict], listen_port: int = 7890,
             {
                 "type": "mixed",
                 "tag": "mixed-in",
-                "listen": "0.0.0.0",
+                "listen": "127.0.0.1",
                 "listen_port": listen_port,
             },
         ],
@@ -161,16 +166,20 @@ def make_config(nodes: list[dict], listen_port: int = 7890,
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default=SUBSCRIPTION_URL)
-    ap.add_argument("--out", default="/home/administrator/dkk-projects/auto-switch-ip/singbox-config.json")
-    ap.add_argument("--port", type=int, default=7890)
+    if not _OKZ_SUB_URL:
+        print("ERROR: OKZ_SUB_URL env var not set — required for subscription fetch", file=sys.stderr)
+        sys.exit(1)
+    ap.add_argument("--url", default=_OKZ_SUB_URL)
+    ap.add_argument("--out", default=CFG["singbox"]["config_file"])
+    ap.add_argument("--port", type=int, default=CFG["singbox"]["mixed_port"])
     ap.add_argument("--clash-port", type=int, default=9090)
-    ap.add_argument("--secret", default=os.environ.get("SINGBOX_SECRET", "auto-switch-2026"))
+    ap.add_argument("--secret", default=SINGBOX_SECRET)
     ap.add_argument("--include-h2", action="store_true", help="include hysteria2 (default: skip, WSL2 utls incompatible)")
     ap.add_argument("--filter", default="", help="substring filter node name (case-insensitive)")
     args = ap.parse_args()
 
-    print(f"fetching subscription from {args.url[:60]}...")
+    safe_url = args.url.split("@")[-1] if "@" in args.url else args.url[:60]
+    print(f"fetching subscription from {safe_url}...")
     urls = fetch_and_decode_sub(args.url)
     print(f"got {len(urls)} raw URLs")
 
@@ -190,12 +199,13 @@ if __name__ == "__main__":
     cfg = make_config(nodes, args.port, args.clash_port, args.secret, include_h2=args.include_h2)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     out_path = Path(args.out)
-    out_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
-    os.chmod(out_path, 0o600)  # 0600: 防本地其他用户读节点密码
+    fd = os.open(str(out_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
     print(f"wrote config to {args.out}")
     print(f"first 3 nodes:")
     for n in nodes[:3]:
         print(f"  - {n['tag']:50s} {n['type']:10s} {n['server']}:{n['server_port']}")
     print(f"total usable nodes: {len(nodes)}")
-    print(f"clash API: 127.0.0.1:{args.clash_port} secret={args.secret}")
+    print(f"clash API: 127.0.0.1:{args.clash_port}")
     print(f"mixed port: 0.0.0.0:{args.port}")

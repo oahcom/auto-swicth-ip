@@ -14,8 +14,9 @@ def _read_secret():
         # 检查权限：必须是 0o600 或更严格
         st = os.stat(SECRET_FILE)
         if st.st_mode & 0o077:
-            log_msg = f"⚠ 密钥文件 {SECRET_FILE} 权限过宽 ({oct(st.st_mode & 0o777)})，建议 chmod 600"
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {log_msg}")
+            raise PermissionError(
+                f"密钥文件 {SECRET_FILE} 权限过宽 ({oct(st.st_mode & 0o777)})，"
+                f"请执行 chmod 600 {SECRET_FILE}")
         with open(SECRET_FILE) as f:
             return f.read().strip()
     except Exception as e:
@@ -23,8 +24,8 @@ def _read_secret():
         return None
 
 SINGBOX_SECRET = _read_secret()
-if SINGBOX_SECRET is None:
-    raise RuntimeError(f"SINGBOX_SECRET not set: create {SECRET_FILE} with a base64 secret")
+if SINGBOX_SECRET is None or SINGBOX_SECRET == "":
+    raise RuntimeError(f"SINGBOX_SECRET not set or empty: create {SECRET_FILE} with a base64 secret")
 
 CFG = {
     "9router": {
@@ -39,6 +40,13 @@ CFG = {
         "config_file": "/home/administrator/dkk-projects/auto-switch-ip/singbox-config.json",
         "startup_grace_sec": 5,
         "max_restart_attempts": 3,
+        "mixed_port": 7890,
+    },
+    "proxy_429": {
+        "proxy_url": "http://127.0.0.1:7891",
+        "enabled": False,  # daemon 自动检测 proxy_429 进程后置 True
+        "listen_port": 7891,
+        "upstream_port": 7890,
     },
     "okz": {
         "proxy_url": "http://127.0.0.1:6696",
@@ -59,7 +67,11 @@ CFG = {
         "node_test_timeout_ms": 10000,
         "node_test_url": "https://www.gstatic.com/generate_204",
     },
+    "bad_nodes": {
+        "ttl_sec": 300,  # 5 minutes - shared by proxy_429 and daemon
+    },
     "log_file": "/home/administrator/dkk-projects/auto-switch-ip/daemon.log",
+    "log_format": "%Y-%m-%d %H:%M:%S",  # unified log timestamp format
 }
 
 # ============= 便捷常量 =============
@@ -67,6 +79,11 @@ NODE_INFO_DB = CFG["9router"]["db_path"]
 SINGBOX_API = CFG["singbox"]["clash_api"]
 SINGBOX_SECRET = CFG["singbox"]["secret"]
 SELECTOR = CFG["singbox"]["selector"]
+MIXED_PORT = CFG["singbox"]["mixed_port"]
+UPSTREAM_PORT = CFG["proxy_429"]["upstream_port"]
+LISTEN_PORT = CFG["proxy_429"]["listen_port"]
+BAD_NODES_TTL = CFG["bad_nodes"]["ttl_sec"]
+LOG_FORMAT = CFG["log_format"]
 STALE_THRESHOLD_SEC = 300
 
 # ============= FREE_PROVIDERS 常量 =============

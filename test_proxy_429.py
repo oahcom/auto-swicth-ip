@@ -157,9 +157,9 @@ async def test_429_retry():
     proxy_port = proxy_server.sockets[0].getsockname()[1]
 
     old_upstream = p.UPSTREAM
-    old_clash = p.CLASH_API
+    old_clash = p.SINGBOX_API
     p.UPSTREAM = ("127.0.0.1", upstream_port)
-    p.CLASH_API = f"http://127.0.0.1:{clash_port}"
+    p.SINGBOX_API = f"http://127.0.0.1:{clash_port}"
 
     async with clash_server, upstream_server, proxy_server:
         try:
@@ -184,7 +184,7 @@ async def test_429_retry():
             _check_bool(f"429 测试异常: {e}", False)
 
     p.UPSTREAM = old_upstream
-    p.CLASH_API = old_clash
+    p.SINGBOX_API = old_clash
 
 
 # ================================================================

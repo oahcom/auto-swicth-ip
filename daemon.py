@@ -35,11 +35,19 @@ from logging.handlers import RotatingFileHandler
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
-from config import CFG, NODE_INFO_DB, FREE_PROVIDERS, STALE_THRESHOLD_SEC
+from config import CFG, NODE_INFO_DB, FREE_PROVIDERS, STALE_THRESHOLD_SEC, BAD_NODES_TTL, MIXED_PORT, LOG_FORMAT
 
 # 全局复用连接 - 避免每次操作开/关 SQLite 连接
 _db_conn: sqlite3.Connection | None = None
 _db_lock = threading.RLock()  # RLock: init_node_info_db 里 _get_db 需重入
+_proxy_429_detected: bool = False  # proxy_429 进程检测缓存
+_proxy_429_check_ts: float = 0  # 上次检测时间
+_BAD_NODES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bad_nodes.json")
+# bad_nodes cache (mtime-based, avoid repeated I/O)
+_p429_bad_cache: dict[str, float] = {}
+_p429_bad_mtime: float = 0
+_p429_bad_check_ts: float = 0
+_p429_bad_loaded: bool = False
 
 def _get_db() -> sqlite3.Connection:
     """获取模块级 SQLite 连接（惰性初始化，WAL 模式）"""
@@ -132,8 +140,9 @@ _NODE_DELAYS: dict[str, int] = {}  # 节点延迟缓存 (ms)
 _NODE_CALL_COUNTS: dict[str, int] = {}  # 节点调用计数，用于宏观调控
 _NODE_CALL_RESET_TS: float = 0  # 上次重置时间
 _state_lock = threading.RLock()  # 保护所有全局共享状态
-_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10)  # 模块级复用
-atexit.register(lambda: _thread_pool.shutdown(wait=False))
+_health_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="health")
+_io_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="io")
+atexit.register(lambda: (_health_pool.shutdown(wait=False), _io_pool.shutdown(wait=False)))
 
 # ============= 日志 =============
 _logger = None
@@ -150,12 +159,12 @@ def _init_logger():
     # 文件 handler（轮转）
     fh = RotatingFileHandler(CFG["log_file"], maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUP_COUNT)
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    fh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt=LOG_FORMAT))
     _logger.addHandler(fh)
     # stdout handler
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(logging.DEBUG)
-    sh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    sh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt=LOG_FORMAT))
     _logger.addHandler(sh)
 
 def log(msg: str):
@@ -181,40 +190,89 @@ _STALE_THRESHOLD_SEC = STALE_THRESHOLD_SEC  # from config.py
 def get_9router_error_rate() -> tuple[int, int, list]:
     """从 SQLite 读最近请求，返回 (total, errors, details_list)
 
+    使用聚合查询统计 _STALE_THRESHOLD_SEC 窗口内免费 provider 总请求数和错误数。
     如果最新记录时间戳超过 _STALE_THRESHOLD_SEC 秒没更新，视为无活跃流量，
     返回 (0, 0, []) 防止用过期数据误触发切换。
     """
     try:
         with _db_lock:
             c = _get_db()
-            # 只取过去 _STALE_THRESHOLD_SEC 内的记录，按时间倒序
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_STALE_THRESHOLD_SEC)).isoformat().replace("+00:00", "Z")
+            # 聚合查询：统计窗口内总数和错误数，LIMIT 看最近的详情
+            row = c.execute("""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) as errors
+                FROM requestDetails
+                WHERE timestamp > ? AND provider IN ('opencode', 'kiro', 'nvidia', 'ollama')
+            """, (cutoff,)).fetchone()
+            total = row["total"] if row else 0
+            errors = row["errors"] if row else 0
+
+            # 取最近的 20 条详情用于外部参考
             rows = c.execute("""
                 SELECT provider, model, status, timestamp
                 FROM requestDetails
                 WHERE timestamp > ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-            """, (cutoff, CFG["thresholds"]["recent_window"])).fetchall()
+                ORDER BY timestamp DESC LIMIT 20
+            """, (cutoff,)).fetchall()
         recent = [dict(r) for r in rows]
 
-        # 无最近记录，跳过错误率判断（避免用旧数据误触发切换）
+        # 无最近记录，跳过错误率判断
         if not recent:
             return 0, 0, []
 
-        oc = [r for r in recent if r.get("provider") in FREE_PROVIDERS]
-        total = len(oc)
-        errors = sum(1 for r in oc if r.get("status") != "success")
         return total, errors, recent
     except Exception as e:
         log(f"✗ 读 SQLite 失败: {e}")
         return 0, 0, []
 
+def _load_proxy_429_bad_nodes() -> dict[str, float]:
+    """Read bad nodes from proxy_429's file. Returns {node: expire_ts}, expired filtered out.
+    ponytail: cached per-mtime to avoid repeated I/O (checked every 5s at most)."""
+    global _p429_bad_cache, _p429_bad_mtime, _p429_bad_check_ts, _p429_bad_loaded
+    now = time.time()
+    if now - _p429_bad_check_ts < 5:
+        return _p429_bad_cache
+    _p429_bad_check_ts = now
+    try:
+        if os.path.exists(_BAD_NODES_FILE):
+            mtime = os.path.getmtime(_BAD_NODES_FILE)
+            if mtime == _p429_bad_mtime and _p429_bad_loaded:
+                return _p429_bad_cache
+            with open(_BAD_NODES_FILE) as f:
+                nodes = json.load(f)
+            filtered = {n: exp for n, exp in nodes.items() if exp > now}
+            _p429_bad_cache = filtered
+            _p429_bad_mtime = mtime
+            _p429_bad_loaded = True
+            return filtered
+    except Exception:
+        pass
+    _p429_bad_loaded = True
+    return _p429_bad_cache
+
+def _detect_proxy_429() -> bool:
+    """检测 proxy_429 是否在运行。缓存 30s。"""
+    global _proxy_429_detected, _proxy_429_check_ts
+    now = time.time()
+    if now - _proxy_429_check_ts < 30:
+        return _proxy_429_detected
+    _proxy_429_check_ts = now
+    try:
+        r = subprocess.run(["pgrep", "-f", "python.*proxy_429"], capture_output=True, timeout=3)
+        _proxy_429_detected = bool(r.stdout.strip())
+    except Exception:
+        _proxy_429_detected = False
+    return _proxy_429_detected
+
 def check_9router_outbound_proxy() -> bool:
-    """确认 opencode 的 proxyPool 指向 sing-box:7890，不是就修。fallback 期间跳过。"""
+    """确认 opencode 的 proxyPool 指向正确的代理。fallback 期间跳过。
+
+    proxy_429 运行时接受 :7891，否则接受 :7890。
+    """
     if _ALL_DEAD_FALLBACK:
         return True  # 已降级到 okz，不覆盖
-    SINGBOX_PROXY = "http://127.0.0.1:7890"
+    EXPECTED_URL = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
     try:
         with _db_lock:
             c = _get_db()
@@ -237,14 +295,14 @@ def check_9router_outbound_proxy() -> bool:
 
             pool = json.loads(pool_row[0])
             url = pool.get("proxyUrl", "")
-            if url == SINGBOX_PROXY:
+            if url == EXPECTED_URL:
                 return True
 
-            log(f"⚠ opencode proxyPool 异常 (url={url})，修复为 {SINGBOX_PROXY}...")
-            pool["proxyUrl"] = SINGBOX_PROXY
+            log(f"⚠ opencode proxyPool 异常 (url={url})，修复为 {EXPECTED_URL}...")
+            pool["proxyUrl"] = EXPECTED_URL
             c.execute('UPDATE proxyPools SET data = ? WHERE id = ?', (json.dumps(pool), pool_id))
             c.commit()
-        log("✓ opencode proxyPool 已修复 -> 7890")
+        log(f"✓ opencode proxyPool 已修复 -> {EXPECTED_URL}")
         return True
     except Exception as e:
         log(f"✗ 检查 opencode proxyPool 失败: {e}")
@@ -336,7 +394,7 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
 
     alive = set()
     dead = set()
-    futures = {_thread_pool.submit(test_node_delay, n): n for n in to_test}
+    futures = {_health_pool.submit(test_node_delay, n): n for n in to_test}
     for f in concurrent.futures.as_completed(futures):
         node = futures[f]
         delay = f.result()
@@ -360,15 +418,27 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
     return dead, alive
 
 def cleanup_dead_ttl():
-    """清理过期的死节点 TTL"""
+    """清理过期的死节点 TTL，重置连续失败计数（给节点公平重试机会）
+
+    同时从 proxy_429 的 bad_nodes 文件导入坏节点标记。
+    """
     with _state_lock:
         now = time.time()
         expired = [n for n, ts in _DEAD_NODES_RELEASE_TS.items() if ts < now]
         for n in expired:
             _DEAD_NODES.discard(n)
             _DEAD_NODES_RELEASE_TS.pop(n, None)
+            _dead_fail_count.pop(n, None)  # 重置 fail count，TTL 到了就给新机会
         if expired:
-            log(f"  释放 {len(expired)} 个黑名单节点 (TTL 到)")
+            log(f"  释放 {len(expired)} 个黑名单节点 (TTL 到，fail_count 已重置)")
+
+        # 导入 proxy_429 标记的坏节点（如果有），保留原始 expiry
+        p429_bad = _load_proxy_429_bad_nodes()
+        if p429_bad:
+            for n, exp in p429_bad.items():
+                if n not in _DEAD_NODES:
+                    _DEAD_NODES.add(n)
+                    _DEAD_NODES_RELEASE_TS[n] = exp  # 保留 proxy_429 的原始 TTL
 
 
 
@@ -415,15 +485,10 @@ def _precompute_delay_stats(all_delays: list[int]) -> tuple[int, int, int]:
     return median, min_d, max_d
 
 
-def pick_next_node(current: str, all_nodes: list, fail_set: set) -> str | None:
-    """P2C + 自适应分数：每次随机抽两个候选，选分数高的。
+def _filter_candidates(current: str, all_nodes: list, fail_set: set) -> list[str]:
+    """Filter usable candidates, apply anti-sticky, fallback if < 5."""
+    cleanup_dead_ttl()
 
-    _score = (-call_count, delay_score) 字典序比较
-    - 主序：调用次数越少越好（流量分散为核心目标）
-    - 次序：调用次数相同时，延迟分高的优先（同次数时选快节点）
-    延迟分散→陡峭优先，延迟趋同→分散到其他节点。
-    最近使用过的 5 个节点不参与选择（anti-sticky）。
-    """
     def usable(n):
         if n == "direct" or n == current:
             return False
@@ -433,27 +498,24 @@ def pick_next_node(current: str, all_nodes: list, fail_set: set) -> str | None:
 
     with _state_lock:
         candidates = [n for n in all_nodes if usable(n)]
-        # 如果 recent 阻塞太严重，部分放行（删掉最老的 2 个）
+        # ponytail: 候选不足时临时放行最近节点，不弹出 deque（保持防粘记忆）
         if len(candidates) < 5:
-            for _ in range(min(2, len(_recent_nodes))):
-                released = _recent_nodes[0]  # peek first
-                if released not in fail_set and released not in _DEAD_NODES and released != current:
-                    _recent_nodes.popleft()  # only pop if usable
-                    candidates.append(released)
-                else:
-                    _recent_nodes.popleft()  # still pop to avoid infinite loop
+            for n in _recent_nodes:
+                if len(candidates) >= 5:
+                    break
+                if n not in fail_set and n not in _DEAD_NODES and n != current and n not in candidates:
+                    candidates.append(n)
             if len(candidates) < 5:
                 candidates = [n for n in all_nodes
                               if n != "direct" and n != current
                               and n not in fail_set and n not in _DEAD_NODES]
+    return candidates
 
-    if not candidates:
-        log(f"⚠ 无可用节点 (dead={len(_DEAD_NODES)} fail={len(fail_set)} current={current or 'none'} total={len(all_nodes)})")
-        return None
 
-    # 加载国家 + 调用计数 + IP去重数据
+def _load_candidate_stats(candidates: list[str]) -> tuple[dict[str, int], dict[str, str]]:
+    """Load call_count and IP from DB for candidates. Returns (call_map, ip_map)."""
     call_map: dict[str, int] = {}
-    ip_map: dict[str, str] = {}  # node -> ip
+    ip_map: dict[str, str] = {}
     with _db_lock:
         c = _get_db()
         placeholders = ",".join("?" for _ in candidates)
@@ -466,38 +528,65 @@ def pick_next_node(current: str, all_nodes: list, fail_set: set) -> str | None:
             ip = row["ip"] or ""
             if ip:
                 ip_map[row["node"]] = ip
+    return call_map, ip_map
 
-    # IP去重：同出口IP保留调用次数最低的节点
+
+def _dedup_by_ip(candidates: list[str], call_map: dict[str, int], ip_map: dict[str, str]) -> set[str]:
+    """Return set of nodes to skip (duplicates by IP, keep lowest call_count)."""
     ip_groups: dict[str, list[str]] = {}
     for n in candidates:
         ip = ip_map.get(n, "")
         if ip:
             ip_groups.setdefault(ip, []).append(n)
         else:
-            ip_groups.setdefault(n, []).append(n)  # 无IP的节点各自独立
+            ip_groups.setdefault(n, []).append(n)
     dedup_skip: set[str] = set()
     for ip, group in ip_groups.items():
         if len(group) > 1:
-            # 同IP多节点：保留 call_count 最小的，其余跳过
             sorted_group = sorted(group, key=lambda n: call_map.get(n, 0))
             for n in sorted_group[1:]:
                 dedup_skip.add(n)
+    return dedup_skip
 
+
+def _p2c_select(candidates: list[str], dedup_skip: set[str], call_map: dict[str, int]) -> str:
+    """Pick from candidates using P2C + score (-call_count, delay_score)."""
+    pool = [n for n in candidates if n not in dedup_skip] or candidates
     with _state_lock:
         usage_counts = {n: call_map.get(n, 0) + _NODE_CALL_COUNTS.get(n, 0) for n in candidates}
-        delays = dict(_NODE_DELAYS)  # snapshot
+        delays = dict(_NODE_DELAYS)
     all_delays = [d for d in delays.values() if d is not None]
     median, dmin, dmax = _precompute_delay_stats(all_delays)
 
-    # P2C: 抽两个（不足 2 个时单抽），选分数高的
     def _score(n):
         calls = usage_counts.get(n, 0)
         ds = _delay_score(n, delays, median, dmin, dmax)
-        return (-calls, ds)  # 调用次数越少越好；次数相同时延迟分高的优先
+        return (-calls, ds)
 
-    pool = [n for n in candidates if n not in dedup_skip] or candidates  # fallback：全部去重后就用原始列表
     k = min(2, len(pool))
     chosen = _random.sample(pool, k)[0] if k < 2 else max(_random.sample(pool, k), key=_score)
+    return chosen
+
+
+def pick_next_node(current: str, all_nodes: list, fail_set: set) -> str | None:
+    """P2C + 自适应分数：每次随机抽两个候选，选分数高的。
+
+    _score = (-call_count, delay_score) 字典序比较
+    - 主序：调用次数越少越好（流量分散为核心目标）
+    - 次序：调用次数相同时，延迟分高的优先（同次数时选快节点）
+    延迟分散→陡峭优先，延迟趋同→分散到其他节点。
+    最近使用过的 5 个节点不参与选择（anti-sticky）。
+    """
+    candidates = _filter_candidates(current, all_nodes, fail_set)
+
+    if not candidates:
+        log(f"⚠ 无可用节点 (dead={len(_DEAD_NODES)} fail={len(fail_set)} current={current or 'none'} total={len(all_nodes)})")
+        return None
+
+    call_map, ip_map = _load_candidate_stats(candidates)
+    dedup_skip = _dedup_by_ip(candidates, call_map, ip_map)
+    chosen = _p2c_select(candidates, dedup_skip, call_map)
+
     with _state_lock:
         _recent_nodes.append(chosen)
         _NODE_CALL_COUNTS[chosen] = _NODE_CALL_COUNTS.get(chosen, 0) + 1
@@ -527,12 +616,12 @@ def is_singbox_alive() -> bool:
             log(f"⚠ Clash API 不通但进程还在 (PID={pids})，触发 watchdog 重启")
         return False
 
-    # 2. 代理端口 7890 必须通（快速连接测试）
+    # 2. 代理端口 MIXED_PORT 必须通（快速连接测试）
     try:
-        sock = socket.create_connection(("127.0.0.1", 7890), timeout=2)
+        sock = socket.create_connection(("127.0.0.1", MIXED_PORT), timeout=2)
         sock.close()
     except (ConnectionRefusedError, OSError, TimeoutError):
-        log(f"⚠ Clash API 正常但代理端口 7890 不通，触发 watchdog 重启")
+        log(f"⚠ Clash API 正常但代理端口 {MIXED_PORT} 不通，触发 watchdog 重启")
         return False
 
     return True
@@ -553,11 +642,10 @@ def restart_singbox() -> bool:
         time.sleep(2)
 
         subprocess.run(
-            ["fuser", "-k", "7890/tcp"],
+            ["fuser", "-k", f"{MIXED_PORT}/tcp"],
             capture_output=True, timeout=5)
         time.sleep(1)
 
-        singbox_bin = CFG["singbox"]["binary"]
         config_file = CFG["singbox"]["config_file"]
         log_dir = os.path.dirname(CFG["log_file"])
 
@@ -596,12 +684,10 @@ def refresh_subscription() -> bool:
     try:
         parse_script = os.path.join(os.path.dirname(__file__), "parse_subscription.py")
         config_file = CFG["singbox"]["config_file"]
-        env = os.environ.copy()
-        env["SINGBOX_SECRET"] = CFG["singbox"]["secret"]
         subprocess.run(
             [sys.executable, parse_script,
              "--out", config_file],
-            capture_output=True, text=True, timeout=60, env=env)
+            capture_output=True, text=True, timeout=60)
         log("✓ 订阅刷新完毕，重启 sing-box 加载新配置...")
         return restart_singbox()
     except Exception as e:
@@ -616,15 +702,34 @@ def check_and_handle_fallback(all_nodes: list, current: str) -> bool:
     """
     global _ALL_DEAD_FALLBACK
 
+    def _update_settings_proxy(url: str, enabled: bool = True) -> None:
+        """Update 9router settings.outboundProxyUrl/enabled."""
+        with _db_lock:
+            c = _get_db()
+            row = c.execute('SELECT data FROM settings WHERE id=1').fetchone()
+            if row:
+                s = json.loads(row[0])
+                s["outboundProxyUrl"] = url
+                s["outboundProxyEnabled"] = enabled
+                c.execute('UPDATE settings SET data=? WHERE id=1', (json.dumps(s),))
+                c.commit()
+
     with _state_lock:
         dead_snapshot = set(_DEAD_NODES)
     alive = [n for n in all_nodes
-             if n != "direct" and n != current and n not in dead_snapshot]
+             if n != "direct" and n not in dead_snapshot]
     if alive:
         # 有可用节点，如果之前降级了，恢复到 sing-box
         if _ALL_DEAD_FALLBACK:
             _ALL_DEAD_FALLBACK = False
-            log("🔁 节点恢复，切回 sing-box")
+            try:
+                proxy_429_up = _detect_proxy_429()
+                _update_settings_proxy(
+                    CFG["proxy_429"]["proxy_url"] if proxy_429_up else f"http://127.0.0.1:{MIXED_PORT}"
+                )
+                log("🔁 节点恢复，outboundProxyUrl 已从 okz 恢复为 sing-box")
+            except Exception as e:
+                log(f"✗ 恢复 outboundProxyUrl 失败: {e}")
         return False
 
     # 全部死了
@@ -635,17 +740,7 @@ def check_and_handle_fallback(all_nodes: list, current: str) -> bool:
     _ALL_DEAD_FALLBACK = True
     # 通过 SQLite 把 9router 切到 okz
     try:
-        with _db_lock:
-            c = _get_db()
-            row = c.execute('SELECT data FROM settings WHERE id=1').fetchone()
-            if not row:
-                log("⚠ settings 表无数据，无法降级")
-                return True
-            s = json.loads(row[0])
-            s["outboundProxyUrl"] = "http://127.0.0.1:6696"
-            s["outboundProxyEnabled"] = True
-            c.execute('UPDATE settings SET data = ? WHERE id = 1', (json.dumps(s),))
-            c.commit()
+        _update_settings_proxy(CFG["okz"]["proxy_url"])
         log("✓ 已降级到 okz:6696")
     except Exception as e:
         log(f"✗ 降级失败: {e}")
@@ -660,7 +755,7 @@ def fetch_node_ip_region(node: str) -> tuple[str, str, str, str] | None:
     try:
         # 1. 拿出口 IP（通过 sing-box 代理）
         r = requests.get("https://api.ipify.org",
-                         proxies={"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"},
+                         proxies={"http": f"http://127.0.0.1:{MIXED_PORT}", "https": f"http://127.0.0.1:{MIXED_PORT}"},
                          timeout=10)
         ip = r.text.strip()
         if not ip:
@@ -698,7 +793,7 @@ def update_node_info_async(node: str):
         except Exception as e:
             log(f"  ✗ 更新 {node} 信息失败: {e}")
 
-    _thread_pool.submit(_worker)
+    _io_pool.submit(_worker)
 
 # ============= 主循环 =============
 def main():
@@ -823,7 +918,7 @@ def main():
                 if nodes:
                     if current:
                         fail_set.add(current)
-                        _fail_set_release_ts[current] = now + 300  # TTL 5 分钟
+                        _fail_set_release_ts[current] = now + BAD_NODES_TTL  # TTL 5 分钟
 
                     check_and_handle_fallback(nodes, current or "")
 
@@ -858,7 +953,7 @@ def main():
 
             # ---- 6. 订阅刷新 (每 1h，后台执行避免阻塞主循环) ----
             if now - last_sub_refresh > CFG["intervals"]["subscription_refresh_sec"]:
-                _thread_pool.submit(refresh_subscription)
+                _io_pool.submit(refresh_subscription)
                 last_sub_refresh = now
 
             # ---- 7. Sing-box watchdog ----
@@ -887,6 +982,15 @@ def main():
                     _get_db().commit()
                 _NODE_CALL_RESET_TS = now
                 log("  ♻ 节点调用计数已重置")
+
+            # ---- 8b. WAL checkpoint (每 5min) ---
+            if now - getattr(main, "_last_wal_checkpoint", 0) > 300:
+                try:
+                    with _db_lock:
+                        _get_db().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    main._last_wal_checkpoint = now
+                except Exception:
+                    pass
 
             # ---- 9. 健康摘要（每 10s 最多一条） ----
             with _state_lock:
