@@ -1,0 +1,983 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "0.0.0.0",
+      "listen_port": 7890
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55059-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55059,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-gc-59.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55061-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55061,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-gc-61.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55063-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55063,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-gc-63.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55065-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55065,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-gc-65.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55041-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55041,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "impression.biligame.com",
+        "insecure": true,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55043-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55043,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "impression.biligame.com",
+        "insecure": true,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55045-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55045,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "jp-aws-45.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50013-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50013,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-ak-any-13.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50015-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50015,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-ak-any-15.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50017-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50017,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-ak-any-17.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50019-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50019,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-ak-any-19.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50021-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50021,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-gc-21.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50023-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50023,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-gc-23.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50025-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50025,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-qiu-25.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50027-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50027,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-qiu-27.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50029-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50029,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-qiu-29.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50031-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50031,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hk-qiu-31.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50033-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50033,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "jp-gc-33.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50035-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50035,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "jp-gc-35.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50037-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50037,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "jp-gc-37.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50039-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50039,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "jp-gc-39.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50041-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50041,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "jp-gc-41.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50001-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50001,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "sg-hd-any-1.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50003-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50003,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "sg-hd-any-3.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50005-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50005,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "sg-hd-any-5.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50007-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50007,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "sg-hd-any-7.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55033-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55033,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "sg-hd-33.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55035-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55035,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "sg-hd-35.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55037-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55037,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "sg-hd-37.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55039-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55039,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "sg-hd-39.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55025-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55025,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "tw-ln-25.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55027-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55027,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "tw-pl-27.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55029-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55029,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "tw-pl-29.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55067-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55067,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "kr-gc-67.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55069-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55069,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "kr-ora-69.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55071-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55071,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "usa-bv-71.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55073-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55073,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "usa-bv-73.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55075-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55075,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "usa-bv-75.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55077-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55077,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "usa-bv-77.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50009-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50009,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "us-cc-any-9.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:50011-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 50011,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "us-cc-any-11.hi2026.net",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55079-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55079,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "eu-gc-79.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55081-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55081,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "eu-gc-81.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55083-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55083,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "adl-nc-83.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55085-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55085,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "db-ora-85.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55089-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55089,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "yn-89.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55091-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55091,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "hl-nc-91.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55093-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55093,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "ml-ln-93.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55095-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55095,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "yn-ln-95.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55097-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55097,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "tur-ln-97.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55099-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55099,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "agt-ln-99.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55101-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55101,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "tg-ln-101.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55103-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55103,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "flb-ln-103.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "bilibili-image-cdn.juhazf.cn:55105-any",
+      "server": "bilibili-image-cdn.juhazf.cn",
+      "server_port": 55105,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "rus-105.okzdns.com",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "ru0195.lv1.zero1890.com:60194-tr",
+      "server": "ru0195.lv1.zero1890.com",
+      "server_port": 60194,
+      "password": "af302c7d-16bf-42bf-8b40-7e48463577e5",
+      "tls": {
+        "enabled": true,
+        "server_name": "russia.okzdns.com",
+        "insecure": true,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": [
+        "bilibili-image-cdn.juhazf.cn:55059-any",
+        "bilibili-image-cdn.juhazf.cn:55061-any",
+        "bilibili-image-cdn.juhazf.cn:55063-any",
+        "bilibili-image-cdn.juhazf.cn:55065-any",
+        "bilibili-image-cdn.juhazf.cn:55041-any",
+        "bilibili-image-cdn.juhazf.cn:55043-any",
+        "bilibili-image-cdn.juhazf.cn:55045-any",
+        "bilibili-image-cdn.juhazf.cn:50013-any",
+        "bilibili-image-cdn.juhazf.cn:50015-any",
+        "bilibili-image-cdn.juhazf.cn:50017-any",
+        "bilibili-image-cdn.juhazf.cn:50019-any",
+        "bilibili-image-cdn.juhazf.cn:50021-any",
+        "bilibili-image-cdn.juhazf.cn:50023-any",
+        "bilibili-image-cdn.juhazf.cn:50025-any",
+        "bilibili-image-cdn.juhazf.cn:50027-any",
+        "bilibili-image-cdn.juhazf.cn:50029-any",
+        "bilibili-image-cdn.juhazf.cn:50031-any",
+        "bilibili-image-cdn.juhazf.cn:50033-any",
+        "bilibili-image-cdn.juhazf.cn:50035-any",
+        "bilibili-image-cdn.juhazf.cn:50037-any",
+        "bilibili-image-cdn.juhazf.cn:50039-any",
+        "bilibili-image-cdn.juhazf.cn:50041-any",
+        "bilibili-image-cdn.juhazf.cn:50001-any",
+        "bilibili-image-cdn.juhazf.cn:50003-any",
+        "bilibili-image-cdn.juhazf.cn:50005-any",
+        "bilibili-image-cdn.juhazf.cn:50007-any",
+        "bilibili-image-cdn.juhazf.cn:55033-any",
+        "bilibili-image-cdn.juhazf.cn:55035-any",
+        "bilibili-image-cdn.juhazf.cn:55037-any",
+        "bilibili-image-cdn.juhazf.cn:55039-any",
+        "bilibili-image-cdn.juhazf.cn:55025-any",
+        "bilibili-image-cdn.juhazf.cn:55027-any",
+        "bilibili-image-cdn.juhazf.cn:55029-any",
+        "bilibili-image-cdn.juhazf.cn:55067-any",
+        "bilibili-image-cdn.juhazf.cn:55069-any",
+        "bilibili-image-cdn.juhazf.cn:55071-any",
+        "bilibili-image-cdn.juhazf.cn:55073-any",
+        "bilibili-image-cdn.juhazf.cn:55075-any",
+        "bilibili-image-cdn.juhazf.cn:55077-any",
+        "bilibili-image-cdn.juhazf.cn:50009-any",
+        "bilibili-image-cdn.juhazf.cn:50011-any",
+        "bilibili-image-cdn.juhazf.cn:55079-any",
+        "bilibili-image-cdn.juhazf.cn:55081-any",
+        "bilibili-image-cdn.juhazf.cn:55083-any",
+        "bilibili-image-cdn.juhazf.cn:55085-any",
+        "bilibili-image-cdn.juhazf.cn:55089-any",
+        "bilibili-image-cdn.juhazf.cn:55091-any",
+        "bilibili-image-cdn.juhazf.cn:55093-any",
+        "bilibili-image-cdn.juhazf.cn:55095-any",
+        "bilibili-image-cdn.juhazf.cn:55097-any",
+        "bilibili-image-cdn.juhazf.cn:55099-any",
+        "bilibili-image-cdn.juhazf.cn:55101-any",
+        "bilibili-image-cdn.juhazf.cn:55103-any",
+        "bilibili-image-cdn.juhazf.cn:55105-any",
+        "ru0195.lv1.zero1890.com:60194-tr",
+        "direct"
+      ],
+      "default": "bilibili-image-cdn.juhazf.cn:55059-any",
+      "interrupt_exist_connections": false
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true
+  },
+  "experimental": {
+    "clash_api": {
+      "default_mode": "rule",
+      "external_controller": "127.0.0.1:9090",
+      "secret": "H1bNYb6nRAqrEctlxbFk0rcCIv5viz7TEA5Zbjk39so="
+    },
+    "cache_file": {
+      "enabled": false
+    }
+  }
+}
