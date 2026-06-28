@@ -49,33 +49,51 @@ def log(msg):
     logging.info(msg)
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
+async def _clash_api(method: str, path: str, body: bytes | None = None) -> dict | None:
+    """Call Clash API via thread (urllib blocks). Returns parsed JSON or None."""
+    secret = _get_secret()
+    url = f"{CLASH_API}{path}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {secret}"}, method=method, data=body)
+    if body:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        log(f"Clash API {method} {path} failed: {e}")
+        return None
+
 async def switch_clash_node() -> None:
     """Pick a random live node via Clash API and switch to it. Thread-safe via _SWITCH_LOCK."""
     with _SWITCH_LOCK:
-        try:
-            secret = _get_secret()
-            req = urllib.request.Request(
-                f"{CLASH_API}/proxies/{SELECTOR}",
-                headers={"Authorization": f"Bearer {secret}"},
-                method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
-            all_nodes = data.get("all", [])
-            current = data.get("now", "")
-            candidates = [n for n in all_nodes if n != current and n != "direct"]
-            if not candidates:
-                log("Clash switch: no other nodes available")
-                return
-            chosen = random.choice(candidates)
-            body = json.dumps({"name": chosen}).encode()
-            req = urllib.request.Request(
-                f"{CLASH_API}/proxies/{SELECTOR}",
-                headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
-                method="PUT", data=body)
-            urllib.request.urlopen(req, timeout=5)
+        data = await asyncio.to_thread(_clash_api_sync, "GET", f"/proxies/{SELECTOR}")
+        if not data:
+            return
+        all_nodes = data.get("all", [])
+        current = data.get("now", "")
+        candidates = [n for n in all_nodes if n != current and n != "direct"]
+        if not candidates:
+            log("Clash switch: no other nodes available")
+            return
+        chosen = random.choice(candidates)
+        body = json.dumps({"name": chosen}).encode()
+        ok = await asyncio.to_thread(_clash_api_sync, "PUT", f"/proxies/{SELECTOR}", body)
+        if ok is not None:
             log(f"Clash switch: {current} -> {chosen}")
-        except Exception as e:
-            log(f"Clash switch failed: {e}")
+
+def _clash_api_sync(method: str, path: str, body: bytes | None = None) -> dict | None:
+    """Synchronous Clash API call (runs in thread pool)."""
+    secret = _get_secret()
+    url = f"{CLASH_API}{path}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {secret}"}, method=method, data=body)
+    if body:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        log(f"Clash API {method} {path} failed: {e}")
+        return None
 
 async def pipe(r, w, timeout=600):
     try:
@@ -181,12 +199,27 @@ async def handle(reader, writer):
                 except (asyncio.TimeoutError, OSError) as e:
                     log(f"CONNECT upstream connect fail: {e}")
                     if attempt == MAX_RETRIES - 1:
+                        try:
+                            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            await writer.drain()
+                        except OSError:
+                            pass
                         writer.close(); return
                     await switch_clash_node()
                     await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
                     continue
                 u_w.write(line + headers); await u_w.drain()
                 resp = await asyncio.wait_for(u_r.readuntil(b"\r\n\r\n"), timeout=10)
+                try:
+                    status_code = int(resp.split(b" ")[1])
+                except (IndexError, ValueError):
+                    status_code = 502
+                if status_code in RETRY_ON_STATUS and attempt < MAX_RETRIES - 1:
+                    log(f"CONNECT {status_code} → switching node, retrying... (attempt {attempt + 1}/{MAX_RETRIES})")
+                    u_w.close()
+                    await switch_clash_node()
+                    await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
+                    continue
                 writer.write(resp); await writer.drain()
                 t1 = asyncio.create_task(pipe(reader, u_w))
                 t2 = asyncio.create_task(pipe(u_r, writer))
@@ -194,7 +227,12 @@ async def handle(reader, writer):
                     [t1, t2], return_when=asyncio.FIRST_COMPLETED)
                 await _cancel_pipe(t1); await _cancel_pipe(t2)
                 u_w.close(); writer.close(); return
-            return
+            try:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                await writer.drain()
+            except OSError:
+                pass
+            writer.close(); return
 
         # HTTP request body parsing
         cl = _get_content_length(headers)
@@ -261,13 +299,22 @@ async def handle(reader, writer):
                 await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
                 continue
 
-            u_w.write(line + headers + body)
-            await u_w.drain()
+            try:
+                u_w.write(line + headers + body)
+                await u_w.drain()
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                log(f"Upstream write fail: {e}")
+                u_w.close()
+                if attempt == MAX_RETRIES - 1:
+                    writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    await writer.drain(); break
+                await switch_clash_node()
+                await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
+                continue
 
             status_line = await asyncio.wait_for(u_r.readline(), timeout=30)
             if not status_line:
-                err = f"Empty upstream response on {method} {target}"
-                log(err)
+                log(f"Empty upstream response on {method} {target}")
                 u_w.close()
                 if attempt == MAX_RETRIES - 1:
                     writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -290,10 +337,12 @@ async def handle(reader, writer):
             # Retry on bad status codes
             if status_code in RETRY_ON_STATUS and attempt < MAX_RETRIES - 1:
                 log(f"{status_code} {method} {target} → switching node, retrying... (attempt {attempt + 1}/{MAX_RETRIES})")
-                # Drain remaining response
+                # Drain remaining response (cap at 10s total)
+                drain_deadline = asyncio.get_running_loop().time() + 10
                 try:
-                    while True:
-                        c = await asyncio.wait_for(u_r.read(4096), timeout=5)
+                    while asyncio.get_running_loop().time() < drain_deadline:
+                        remaining = drain_deadline - asyncio.get_running_loop().time()
+                        c = await asyncio.wait_for(u_r.read(4096), timeout=max(remaining, 0.1))
                         if not c: break
                 except (asyncio.TimeoutError, ConnectionResetError,
                         BrokenPipeError, OSError):
@@ -304,7 +353,10 @@ async def handle(reader, writer):
                 continue
 
             # Success - forward response
-            writer.write(status_line); await writer.drain()
+            try:
+                writer.write(status_line); await writer.drain()
+            except OSError:
+                u_w.close(); break
             await pipe(u_r, writer)
             u_w.close(); break
 
