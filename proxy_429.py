@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
 429-intercepting HTTP forward proxy.
-Listens :7891 → sing-box:7890. On 429 → switch node → retry once.
-
-Codex review Round 1: 3P1 4P2 fixed
-Codex review Round 2: 1P1 chunked headers + 5P2 fixed
-Next Round 3 CLEAN check required before production use.
+Listens :7891 → sing-box:7890. Retries on 429/502/503/504/errors up to 5 times
+with Clash node switching.
 """
 
 import asyncio, json, os, random, sys, threading, time, logging, urllib.request
@@ -108,9 +105,11 @@ async def _drain_reader(r) -> None:
     """Drain reader with cap at DRAIN_MAX_SEC. Catches expected exceptions."""
     drain_deadline = asyncio.get_running_loop().time() + DRAIN_MAX_SEC
     try:
-        while asyncio.get_running_loop().time() < drain_deadline:
+        while True:
             remaining = drain_deadline - asyncio.get_running_loop().time()
-            c = await asyncio.wait_for(r.read(PIPE_BUF_SIZE), timeout=max(remaining, 0.1))
+            if remaining <= 0:
+                break
+            c = await asyncio.wait_for(r.read(PIPE_BUF_SIZE), timeout=remaining)
             if not c: break
     except (asyncio.TimeoutError, ConnectionResetError, BrokenPipeError, OSError):
         pass
@@ -214,8 +213,24 @@ async def handle(reader, writer):
                     await switch_clash_node()
                     await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
                     continue
-                u_w.write(line + headers); await u_w.drain()
-                resp = await asyncio.wait_for(u_r.readuntil(b"\r\n\r\n"), timeout=CONNECT_RESP_TIMEOUT)
+                try:
+                    u_w.write(line + headers)
+                    await u_w.drain()
+                    resp = await asyncio.wait_for(
+                        u_r.readuntil(b"\r\n\r\n"), timeout=CONNECT_RESP_TIMEOUT)
+                except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
+                    log(f"CONNECT upstream write/read fail: {e}")
+                    if attempt == MAX_RETRIES - 1:
+                        try:
+                            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            await writer.drain()
+                        except OSError:
+                            pass
+                        writer.close(); return
+                    u_w.close()
+                    await switch_clash_node()
+                    await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
+                    continue
                 try:
                     status_code = int(resp.split(b" ")[1])
                 except (IndexError, ValueError):
@@ -237,6 +252,8 @@ async def handle(reader, writer):
                     [t1, t2], return_when=asyncio.FIRST_COMPLETED)
                 await cancel_pipe(t1); await cancel_pipe(t2)
                 u_w.close(); writer.close(); return
+            # Unreachable: last attempt with retryable status always returns in success branch above
+            # Kept for structural symmetry with HTTP path
             try:
                 writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                 await writer.drain()
