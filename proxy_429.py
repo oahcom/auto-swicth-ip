@@ -91,8 +91,9 @@ def _has_te_chunked(headers_raw: bytes) -> bool:
         val = line.lower().strip()
         if val.startswith(b"transfer-encoding:"):
             te_value = val.split(b":", 1)[1].strip()
-            if b"chunked" in te_value.split(b","):
-                return True
+            for part in te_value.split(b","):
+                if part.strip() == b"chunked":
+                    return True
     return False
 
 def _strip_header(headers_raw: bytes, name: bytes) -> bytes:
