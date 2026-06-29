@@ -422,19 +422,24 @@ async def _read_body(reader, headers, peername) -> tuple[bytes, bytes]:
 
 async def _handle_connect(reader, writer, line, headers):
     """CONNECT 方法处理，带重试+节点切换。
-    重试耗尽时启用 bypass + 直连目标服务器，保证当前请求不报错。"""
+    重试耗尽时启用 bypass + 直连目标服务器，保证当前请求不报错。
+    快速失败：连续 2 次 upstream 连接失败 → 直接 bypass（sing-box 重启时不浪费 15s）"""
     target = None
     try:
         target = line.decode(errors="replace").strip().split(" ")[1]
     except Exception:
         pass
+    upstream_fail_count = 0  # 连续 upstream 连接失败计数
     for attempt in range(MAX_RETRIES):
         try:
             u_r, u_w = await asyncio.wait_for(
                 asyncio.open_connection(*UPSTREAM), timeout=UPSTREAM_CONNECT_TIMEOUT)
         except (asyncio.TimeoutError, OSError) as e:
-            log(f"CONNECT upstream connect fail: {e}")
-            if attempt == MAX_RETRIES - 1:
+            upstream_fail_count += 1
+            log(f"CONNECT upstream connect fail: {e} (连续 {upstream_fail_count})")
+            # 快速失败：连续 2 次 upstream 不可达 → 直接 bypass，不浪费重试
+            if upstream_fail_count >= 2:
+                log("  upstream 连续不可达，立即 bypass 直连")
                 await _enable_bypass()
                 if target:
                     return await _direct_connect_connect(reader, writer, line, headers, target)
@@ -446,6 +451,7 @@ async def _handle_connect(reader, writer, line, headers):
                 return
             await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
             continue
+        upstream_fail_count = 0  # 连接成功，重置计数
         try:
             u_w.write(line + headers)
             await u_w.drain()
@@ -582,13 +588,21 @@ async def _direct_connect_http(writer, method: str, target: str, headers: bytes,
 
 
 async def _handle_http(reader, writer, line, method, target, headers, body):
-    """HTTP 转发，带重试+节点切换。将 line+headers+body 作为请求发送。"""
+    """HTTP 转发，带重试+节点切换。将 line+headers+body 作为请求发送。
+    快速失败：连续 2 次 upstream 连接失败 → 直接 bypass（sing-box 重启/坏节点时不浪费 15s）"""
+    upstream_fail_count = 0  # 连续 upstream 连接失败计数
     for attempt in range(MAX_RETRIES):
         try:
             u_r, u_w = await asyncio.wait_for(
                 asyncio.open_connection(*UPSTREAM), timeout=UPSTREAM_CONNECT_TIMEOUT)
         except (asyncio.TimeoutError, OSError) as e:
-            log(f"Upstream connect fail: {e}")
+            upstream_fail_count += 1
+            log(f"Upstream connect fail: {e} (连续 {upstream_fail_count})")
+            # 快速失败：连续 2 次 upstream 不可达 → 直接 bypass
+            if upstream_fail_count >= 2:
+                log("  upstream 连续不可达，立即 bypass 直连")
+                await _enable_bypass()
+                return await _direct_connect_http(writer, method, target, headers, body)
             if attempt == MAX_RETRIES - 1:
                 await _enable_bypass()
                 return await _direct_connect_http(writer, method, target, headers, body)
@@ -597,6 +611,7 @@ async def _handle_http(reader, writer, line, method, target, headers, body):
                 return await _direct_connect_http(writer, method, target, headers, body)
             await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
             continue
+        upstream_fail_count = 0  # 连接成功，重置计数
 
         try:
             u_w.write(line + headers + body)
