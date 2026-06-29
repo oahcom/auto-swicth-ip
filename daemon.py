@@ -441,9 +441,9 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
                 else:
                     ttl = _DEAD_TTL_STAGES[stage_idx]
                     ttl_desc = f"{ttl}s"
-                # 保底：活跃节点不足 50% 时不拉黑
+                # 保底：活跃节点不足一半时不拉黑（严格小于才停）
                 alive_count = len(nodes) - len(_DEAD_NODES)
-                if alive_count <= len(nodes) * _POOL_MIN_RATIO:
+                if alive_count < len(nodes) * _POOL_MIN_RATIO:
                     log(f"  ⚠ {node} 跳过拉黑（保底: {alive_count}/{len(nodes)} <= {_POOL_MIN_RATIO*100:.0f}%）")
                     _dead_fail_count.pop(node, None)
                 else:
