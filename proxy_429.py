@@ -67,7 +67,8 @@ _bad_nodes_file_mtime: float = 0  # 追踪文件修改时间，用于检测 daem
 
 async def _load_bad_nodes() -> dict:
     """从文件加载坏节点，mtime 变化时重新读取。
-    daemon 会向同一文件写入新条目；通过 mtime 检测来拾取。"""
+    daemon 会向同一文件写入新条目；通过 mtime 检测来拾取。
+    读取时过滤过期条目，防止文件膨胀。"""
     global _bad_nodes_cache, _bad_nodes_file_mtime
     try:
         cur_mtime = os.path.getmtime(BAD_NODES_FILE) if os.path.exists(BAD_NODES_FILE) else 0
@@ -75,10 +76,13 @@ async def _load_bad_nodes() -> dict:
         cur_mtime = 0
     async with _bad_nodes_lock:
         if cur_mtime != _bad_nodes_file_mtime:
+            now = time.time()
             if os.path.exists(BAD_NODES_FILE):
                 def _sync_load():
                     with open(BAD_NODES_FILE) as f:
-                        return json.load(f)
+                        data = json.load(f)
+                    # 过滤过期条目，保留未过期的
+                    return {n: exp for n, exp in data.items() if exp > now}
                 _bad_nodes_cache = await asyncio.to_thread(_sync_load)
             else:
                 _bad_nodes_cache = {}
@@ -708,7 +712,7 @@ async def handle(reader, writer):
     except (asyncio.CancelledError, asyncio.IncompleteReadError):
         pass
     except Exception as e:
-        log(f"Error: {e}")
+        log(f"Error: {type(e).__name__}: {e}")
         await _enable_bypass()
         await _close_gracefully(writer)
     finally:
