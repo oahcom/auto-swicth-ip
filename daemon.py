@@ -131,9 +131,10 @@ def format_node_display(node: str | None) -> str:
 # ============= 全局状态 =============
 _DEAD_NODES: set[str] = set()
 _DEAD_NODES_RELEASE_TS: dict[str, float] = {}
-# 死节点指数退避参数
-_DEAD_TTL_BASE = 60      # 基础 TTL 60s
-_DEAD_TTL_MAX = 600      # 最大 TTL 600s (10min)
+# 死节点指数退避参数（60s → 6min → 1h → 10h → 永久）
+_DEAD_TTL_STAGES = [60, 360, 3600, 36000]  # 各阶段 TTL（秒）
+_DEAD_TTL_PERMANENT = float('inf')         # 永久拉黑标记
+_POOL_MIN_RATIO = 0.5                      # 最少保留 50% 节点可用
 _dead_fail_count: dict[str, int] = {}  # 节点连续失败计数
 
 _RESTART_COUNT = 0          # sing-box 连续重启计数
@@ -432,10 +433,23 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
                 _NODE_DELAYS.pop(node, None)
                 _dead_fail_count[node] = _dead_fail_count.get(node, 0) + 1
                 fail_count = _dead_fail_count[node]
-                ttl = min(_DEAD_TTL_BASE * (2 ** (fail_count - 1)), _DEAD_TTL_MAX)
-                _DEAD_NODES.add(node)
-                _DEAD_NODES_RELEASE_TS[node] = now + ttl
-            log(f"  ✗ {node} 死 (连续失败 {fail_count} 次, TTL {ttl}s)")
+                # 指数退避：60s → 6min → 1h → 10h → 永久
+                stage_idx = fail_count - 1
+                if stage_idx >= len(_DEAD_TTL_STAGES):
+                    ttl = _DEAD_TTL_PERMANENT
+                    ttl_desc = "永久"
+                else:
+                    ttl = _DEAD_TTL_STAGES[stage_idx]
+                    ttl_desc = f"{ttl}s"
+                # 保底：活跃节点不足 50% 时不拉黑
+                alive_count = len(nodes) - len(_DEAD_NODES)
+                if alive_count <= len(nodes) * _POOL_MIN_RATIO:
+                    log(f"  ⚠ {node} 跳过拉黑（保底: {alive_count}/{len(nodes)} <= {_POOL_MIN_RATIO*100:.0f}%）")
+                    _dead_fail_count.pop(node, None)
+                else:
+                    _DEAD_NODES.add(node)
+                    _DEAD_NODES_RELEASE_TS[node] = now + ttl
+                    log(f"  ✗ {node} 死 (连续失败 {fail_count} 次, TTL {ttl_desc})")
 
     log(f"  节点测试: {len(alive)}✓/{len(dead)}✗")
     return dead, alive
