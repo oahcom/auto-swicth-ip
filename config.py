@@ -25,7 +25,8 @@ def _read_secret():
 
 SINGBOX_SECRET = _read_secret()
 if SINGBOX_SECRET is None or SINGBOX_SECRET == "":
-    raise RuntimeError(f"SINGBOX_SECRET not set or empty: create {SECRET_FILE} with a base64 secret")
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WARNING: SINGBOX_SECRET not set — create {SECRET_FILE} (chmod 600) with a base64 secret", file=sys.stderr)
+    SINGBOX_SECRET = ""
 
 CFG = {
     "9router": {
@@ -54,15 +55,15 @@ CFG = {
     },
     "intervals": {
         "monitor_sec": 2,
-        "proactive_rotate_sec": 30,
-        "cooldown_after_switch_sec": 4,
+        "proactive_rotate_sec": 60,
+        "cooldown_after_switch_sec": 10,
         "singbox_watchdog_sec": 30,
         "node_health_sec": 300,
         "subscription_refresh_sec": 3600,
         "proxy_check_sec": 60,
     },
     "thresholds": {
-        "recent_window": 5,
+        "recent_window": 10,
         "opencode_min_success_rate": 0.9,
         "node_test_timeout_ms": 10000,
         "node_test_url": "https://www.gstatic.com/generate_204",
@@ -77,7 +78,7 @@ CFG = {
 # ============= 便捷常量 =============
 NODE_INFO_DB = CFG["9router"]["db_path"]
 SINGBOX_API = CFG["singbox"]["clash_api"]
-SINGBOX_SECRET = CFG["singbox"]["secret"]
+SINGBOX_SECRET = CFG["singbox"]["secret"]  # same value as above, via CFG
 SELECTOR = CFG["singbox"]["selector"]
 MIXED_PORT = CFG["singbox"]["mixed_port"]
 UPSTREAM_PORT = CFG["proxy_429"]["upstream_port"]

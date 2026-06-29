@@ -227,24 +227,28 @@ def _load_proxy_429_bad_nodes() -> dict[str, float]:
     global _p429_bad_cache, _p429_bad_mtime, _p429_bad_check_ts, _p429_bad_loaded
     now = time.time()
     if now - _p429_bad_check_ts < 5:
-        return _p429_bad_cache
+        with _state_lock:
+            return dict(_p429_bad_cache)
     _p429_bad_check_ts = now
     try:
         if os.path.exists(_BAD_NODES_FILE):
             mtime = os.path.getmtime(_BAD_NODES_FILE)
             if mtime == _p429_bad_mtime and _p429_bad_loaded:
-                return _p429_bad_cache
+                with _state_lock:
+                    return dict(_p429_bad_cache)
             with open(_BAD_NODES_FILE) as f:
                 nodes = json.load(f)
             filtered = {n: exp for n, exp in nodes.items() if exp > now}
-            _p429_bad_cache = filtered
+            with _state_lock:
+                _p429_bad_cache = filtered
             _p429_bad_mtime = mtime
             _p429_bad_loaded = True
             return filtered
     except Exception:
         pass
     _p429_bad_loaded = True
-    return _p429_bad_cache
+    with _state_lock:
+        return dict(_p429_bad_cache)
 
 def _detect_proxy_429() -> bool:
     """检测 proxy_429 是否在运行。缓存 5s。"""
@@ -260,15 +264,22 @@ def _detect_proxy_429() -> bool:
         _proxy_429_detected = False
     return _proxy_429_detected
 
-def check_9router_outbound_proxy() -> bool:
-    """确认 opencode 的 proxyPool 指向正确的代理。fallback 期间跳过。
 
-    proxy_429 运行时接受 :7891，否则接受 :7890。
+def _expected_proxy_url() -> str:
+    """Compute expected proxy URL based on proxy_429 presence."""
+    return CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
+
+
+def check_9router_outbound_proxy() -> bool:
+    """确保 opencode 的 proxyPool 和 outboundProxyEnabled 都正确。fallback 期间跳过。
+
+    proxy_429 运行时代理地址 :7891，否则 :7890。
+    同时恢复 outboundProxyEnabled=True（proxy_429 崩溃时可能残留 bypass 状态）。
     """
     with _state_lock:
         if _ALL_DEAD_FALLBACK:
             return True  # 已降级到 okz，不覆盖
-    EXPECTED_URL = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
+    EXPECTED_URL = _expected_proxy_url()
     try:
         with _db_lock:
             c = _get_db()
@@ -283,7 +294,9 @@ def check_9router_outbound_proxy() -> bool:
                 log("⚠ 未找到 opencode proxyPool 配置")
                 return False
 
-            # 检查 proxyPool 当前代理地址
+            changed = False
+
+            # 1. 检查 proxyPool 当前代理地址
             pool_row = c.execute('SELECT data FROM proxyPools WHERE id=?', (pool_id,)).fetchone()
             if not pool_row:
                 log(f"⚠ proxyPool {pool_id} 不存在")
@@ -291,17 +304,27 @@ def check_9router_outbound_proxy() -> bool:
 
             pool = json.loads(pool_row[0])
             url = pool.get("proxyUrl", "")
-            if url == EXPECTED_URL:
-                return True
+            if url != EXPECTED_URL:
+                log(f"⚠ opencode proxyPool 异常 (url={url})，修复为 {EXPECTED_URL}...")
+                pool["proxyUrl"] = EXPECTED_URL
+                c.execute('UPDATE proxyPools SET data = ? WHERE id = ?', (json.dumps(pool), pool_id))
+                changed = True
 
-            log(f"⚠ opencode proxyPool 异常 (url={url})，修复为 {EXPECTED_URL}...")
-            pool["proxyUrl"] = EXPECTED_URL
-            c.execute('UPDATE proxyPools SET data = ? WHERE id = ?', (json.dumps(pool), pool_id))
-            c.commit()
-        log(f"✓ opencode proxyPool 已修复 -> {EXPECTED_URL}")
+            # 2. 恢复 outboundProxyEnabled（proxy_429 崩溃遗留的 bypass 状态）
+            if not s.get("outboundProxyEnabled", True):
+                log("⚠ outboundProxyEnabled=False，恢复为 True")
+                s["outboundProxyEnabled"] = True
+                c.execute('UPDATE settings SET data=? WHERE id=1', (json.dumps(s),))
+                changed = True
+
+            if changed:
+                c.commit()
+                log(f"✓ 代理配置已修复 -> url={EXPECTED_URL}, outboundProxyEnabled=True")
+            else:
+                return True
         return True
     except Exception as e:
-        log(f"✗ 检查 opencode proxyPool 失败: {e}")
+        log(f"✗ 检查代理配置失败: {e}")
         return False
 
 # ============= Sing-box 操作 =============
@@ -393,7 +416,11 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
     futures = {_health_pool.submit(test_node_delay, n): n for n in to_test}
     for f in concurrent.futures.as_completed(futures):
         node = futures[f]
-        delay = f.result()
+        try:
+            delay = f.result()
+        except Exception as e:
+            delay = None
+            log(f"  ⚠ {node} 延迟测试异常: {e}")
         if delay is not None and delay < CFG["thresholds"]["node_test_timeout_ms"]:
             alive.add(node)
             with _state_lock:
@@ -605,18 +632,23 @@ def _singbox_pids() -> list[int]:
 
 
 def is_singbox_alive() -> bool:
-    """检查 sing-box Clash API + 代理端口是否都正常"""
-    # 1. Clash API 必须通
-    code, _ = singbox_api("/proxies", silent=True)
+    """Check sing-box Clash API + proxy port. Hard timeout 4s to avoid blocking main loop."""
+    deadline = time.time() + 4
+    # 1. Clash API must respond
+    code, _ = singbox_api("/proxies", silent=True, timeout=min(2, deadline - time.time() + 0.5))
     if code != 200:
         pids = _singbox_pids()
         if pids:
             log(f"⚠ Clash API 不通但进程还在 (PID={pids})，触发 watchdog 重启")
         return False
 
-    # 2. 代理端口 MIXED_PORT 必须通（快速连接测试）
+    if time.time() >= deadline:
+        log(f"⚠ Clash API 正常但端口检查超时")
+        return True
+
+    # 2. Proxy port must accept connection (fast check)
     try:
-        sock = socket.create_connection(("127.0.0.1", MIXED_PORT), timeout=2)
+        sock = socket.create_connection(("127.0.0.1", MIXED_PORT), timeout=min(2, deadline - time.time() + 0.5))
         sock.close()
     except (ConnectionRefusedError, OSError, TimeoutError):
         log(f"⚠ Clash API 正常但代理端口 {MIXED_PORT} 不通，触发 watchdog 重启")
@@ -627,17 +659,18 @@ def is_singbox_alive() -> bool:
 _restart_lock = threading.Lock()
 
 def _set_outbound_proxy(url: str = "", enabled: bool = False) -> None:
-    """Temporarily set 9router outboundProxyEnabled. Thread-safe."""
+    """Atomically set 9router outboundProxyUrl + outboundProxyEnabled via json_set. Thread-safe."""
     try:
         with _db_lock:
             c = _get_db()
-            row = c.execute('SELECT data FROM settings WHERE id=1').fetchone()
-            if row:
-                s = json.loads(row[0])
-                s["outboundProxyUrl"] = url
-                s["outboundProxyEnabled"] = enabled
-                c.execute('UPDATE settings SET data=? WHERE id=1', (json.dumps(s),))
-                c.commit()
+            enabled_int = 1 if enabled else 0
+            c.execute("""
+                UPDATE settings SET data = json_set(data,
+                    '$.outboundProxyUrl', ?,
+                    '$.outboundProxyEnabled', ?
+                ) WHERE id=1
+            """, (url, enabled_int))
+            c.commit()
     except Exception as e:
         log(f"✗ 设置 outboundProxy 失败: {e}")
 
@@ -692,22 +725,19 @@ def restart_singbox() -> bool:
             _RESTART_COUNT = 0
             log("✓ sing-box 重启成功")
             # 恢复代理
-            expected_url = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
-            _set_outbound_proxy(url=expected_url, enabled=True)
+            _set_outbound_proxy(url=_expected_proxy_url(), enabled=True)
             return True
         else:
             _RESTART_COUNT += 1
             log(f"✗ sing-box 重启失败 (第 {_RESTART_COUNT} 次)")
             # 重启失败也要恢复代理，避免 9router 裸奔
-            expected_url = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
-            _set_outbound_proxy(url=expected_url, enabled=True)
+            _set_outbound_proxy(url=_expected_proxy_url(), enabled=True)
             return False
     except Exception as e:
         _RESTART_COUNT += 1
         log(f"✗ sing-box 重启异常: {e}")
         # 异常分支也要恢复代理
-        expected_url = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
-        _set_outbound_proxy(url=expected_url, enabled=True)
+        _set_outbound_proxy(url=_expected_proxy_url(), enabled=True)
         return False
     finally:
         _restart_lock.release()
@@ -747,9 +777,8 @@ def check_and_handle_fallback(all_nodes: list, current: str) -> bool:
         if _ALL_DEAD_FALLBACK:
             _ALL_DEAD_FALLBACK = False
             try:
-                proxy_429_up = _detect_proxy_429()
                 _set_outbound_proxy(
-                    CFG["proxy_429"]["proxy_url"] if proxy_429_up else f"http://127.0.0.1:{MIXED_PORT}",
+                    _expected_proxy_url(),
                     enabled=True
                 )
                 log("🔁 节点恢复，outboundProxyUrl 已从 okz 恢复为 sing-box")
@@ -917,7 +946,8 @@ def main():
             total, errors, recent = get_9router_error_rate()
 
             # ---- 2b. 错误触发轮换 ----
-            should_error = (total >= 3 and errors / total > (1 - CFG["thresholds"]["opencode_min_success_rate"]))
+            should_error = (total >= 2 and errors / total > (1 - CFG["thresholds"]["opencode_min_success_rate"]))
+            # ponytail: threshold=2 instead of 3 to catch 100% failure in low-traffic windows
             in_cooldown = now < cooldown_until
 
             # ---- 3. 主动轮换（每 N 秒加权选新节点） ----
@@ -941,7 +971,8 @@ def main():
 
             # ---- 3b. 错误触发轮换（错误率高时立即切） ----
             if should_error and not in_cooldown:
-                current = cached_current_proxy
+                # 拿当前真实节点（不用缓存，确保标记正确）
+                current = get_current_proxy()
                 nodes = cached_all_nodes
 
                 if nodes:

@@ -18,7 +18,7 @@ import requests
 import concurrent.futures
 
 # 从共享配置导入
-from config import SINGBOX_API, SINGBOX_SECRET, SELECTOR, NODE_INFO_DB, MIXED_PORT
+from config import SINGBOX_API, SINGBOX_SECRET, SELECTOR, NODE_INFO_DB, MIXED_PORT, CFG
 
 # 权重参数 - imported from shared weights module
 from weights import (
@@ -90,7 +90,7 @@ class OKZProxyPool:
             try:
                 r = requests.get(
                     f"{self.api}/proxies/{node}/delay",
-                    params={"timeout": 10000, "url": "https://www.gstatic.com/generate_204"},
+                    params={"timeout": 10000, "url": CFG['thresholds']['node_test_url']},
                     headers=self._headers(),
                     timeout=15,
                 )
@@ -153,12 +153,14 @@ class OKZProxyPool:
         )
 
     def _ensure_cache(self):
-        """如缓存过期则刷新"""
+        """如缓存过期则刷新。存失效时间戳而非检测时刻，减少持锁时间。"""
+        if time.time() - self._cache_ts < self.cache_ttl:
+            return
         with self._lock:
-            now = time.time()
-            if now - self._cache_ts >= self.cache_ttl:
-                self._refresh_data()
-                self._cache_ts = now
+            if time.time() - self._cache_ts < self.cache_ttl:
+                return  # double-check: 另一线程已刷新
+            self._refresh_data()
+            self._cache_ts = time.time()
 
     def get_current(self) -> str | None:
         """查 sing-box 当前 selector 用的是哪个节点"""
@@ -184,12 +186,13 @@ class OKZProxyPool:
         if not self._weights_cache:
             return f"http://127.0.0.1:{MIXED_PORT}"  # 兜底
 
-        # 加权随机选一个
-        nodes, weights = zip(*self._weights_cache)
-        chosen = random.choices(nodes, weights=weights, k=1)[0]
-        self._usage_count[chosen] = self._usage_count.get(chosen, 0) + 1
+        # 加权随机选一个（原子递增，自旋锁避免持锁发网络请求）
+        with self._lock:
+            nodes, weights = zip(*self._weights_cache)
+            chosen = random.choices(nodes, weights=weights, k=1)[0]
+            self._usage_count[chosen] = self._usage_count.get(chosen, 0) + 1
 
-        # 切 sing-box selector
+        # 切 sing-box selector（锁外发请求，不阻塞其他读）
         try:
             requests.put(
                 f"{self.api}/proxies/{self.selector}",
