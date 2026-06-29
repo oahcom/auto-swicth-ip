@@ -5,7 +5,7 @@ OKZProxyPool - Per-request proxy rotation for sing-box
 每个 HTTP 请求都换一个出口 IP，按「IP 质量/延迟」加权概率选择节点。
 用法:
     pool = OKZProxyPool()
-    proxy_url = pool.rotate()  # 每次请求前调用，返回 http://127.0.0.1:7890
+    proxy_url = pool.rotate()  # 每次请求前调用，返回 http://127.0.0.1:{MIXED_PORT}
     httpx.post(url, json=data, proxy=proxy_url, timeout=30)
 """
 import json
@@ -15,9 +15,10 @@ import sqlite3
 import threading
 import time
 import requests
+import concurrent.futures
 
 # 从共享配置导入
-from config import SINGBOX_API, SINGBOX_SECRET, SELECTOR, NODE_INFO_DB
+from config import SINGBOX_API, SINGBOX_SECRET, SELECTOR, NODE_INFO_DB, MIXED_PORT
 
 # 权重参数 - imported from shared weights module
 from weights import (
@@ -99,7 +100,6 @@ class OKZProxyPool:
                 pass
             return node, None
 
-        import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
             futures = {pool.submit(test_one, n): n for n in to_test}
             for f in concurrent.futures.as_completed(futures):
@@ -182,7 +182,7 @@ class OKZProxyPool:
         self._ensure_cache()
 
         if not self._weights_cache:
-            return "http://127.0.0.1:7890"  # 兜底
+            return f"http://127.0.0.1:{MIXED_PORT}"  # 兜底
 
         # 加权随机选一个
         nodes, weights = zip(*self._weights_cache)
@@ -200,7 +200,7 @@ class OKZProxyPool:
         except Exception as e:
             print(f"  ⚠ proxy_pool 切换 {chosen} 失败: {e}")
 
-        return "http://127.0.0.1:7890"
+        return f"http://127.0.0.1:{MIXED_PORT}"
 
     def get_stats(self) -> dict:
         """调试用：看当前权重分布"""

@@ -18,28 +18,22 @@ import time
 import requests
 
 # ============= 配置 =============
-CLASH_API = "http://127.0.0.1:9090"
-ROUTER_API = "http://127.0.0.1:20128"
-SELECTOR = "proxy"
-SECRET_FILE = os.path.expanduser("~/.singbox_secret")
+from config import CFG, SINGBOX_SECRET
+
+CLASH_API = CFG["singbox"]["clash_api"]
+SELECTOR = CFG["singbox"]["selector"]
 TIMEOUT = 3
 
 
-def _load_secret():
-    # Raw secret file (no KEY=VALUE format, just the secret string)
-    with open(SECRET_FILE) as f:
-        return f.read().strip()
+def _headers():
+    return {"Authorization": "Bearer " + SINGBOX_SECRET, "Content-Type": "application/json"}
 
 
-def _headers(secret):
-    return {"Authorization": "Bearer " + secret, "Content-Type": "application/json"}
-
-
-def get_nodes(secret):
+def get_nodes():
     try:
         r = requests.get(
             CLASH_API + "/proxies/" + SELECTOR,
-            headers={"Authorization": "Bearer " + secret},
+            headers={"Authorization": "Bearer " + SINGBOX_SECRET},
             timeout=TIMEOUT,
         )
         if r.status_code == 200:
@@ -52,7 +46,7 @@ def get_nodes(secret):
 
 def get_9router_proxy():
     try:
-        r = requests.get(ROUTER_API + "/api/settings", timeout=3)
+        r = requests.get(CFG["9router"]["base"] + "/api/settings", timeout=3)
         if r.status_code == 200:
             d = r.json()
             return d.get("outboundProxyEnabled", False), d.get("outboundProxyUrl", "N/A")
@@ -63,8 +57,7 @@ def get_9router_proxy():
 
 # ============= 子命令 =============
 def cmd_status():
-    secret = _load_secret()
-    current, nodes = get_nodes(secret)
+    current, nodes = get_nodes()
     if current is None:
         print("sing-box 连接失败")
         return 1
@@ -78,8 +71,7 @@ def cmd_status():
 
 
 def cmd_list():
-    secret = _load_secret()
-    current, nodes = get_nodes(secret)
+    current, nodes = get_nodes()
     if current is None:
         print("sing-box 连接失败")
         return 1
@@ -92,13 +84,12 @@ def cmd_list():
 
 
 def cmd_next(count=1):
-    secret = _load_secret()
     for i in range(count):
-        current, nodes = get_nodes(secret)
+        current, nodes = get_nodes()
         if current is None:
             print("第" + str(i + 1) + "次切换失败")
             return 1
-        candidates = [n for n in nodes if n != current and n.endswith("-any")]
+        candidates = [n for n in nodes if n != current and n != "direct"]
         if not candidates:
             print("没有其他可用节点")
             return 1
@@ -106,7 +97,7 @@ def cmd_next(count=1):
         try:
             r = requests.put(
                 CLASH_API + "/proxies/" + SELECTOR,
-                headers=_headers(secret),
+                headers=_headers(),
                 json={"name": new_node},
                 timeout=TIMEOUT,
             )
@@ -127,8 +118,7 @@ def cmd_next(count=1):
 
 
 def cmd_goto(name):
-    secret = _load_secret()
-    current, nodes = get_nodes(secret)
+    current, nodes = get_nodes()
     if current is None:
         print("sing-box 连接失败")
         return 1
@@ -147,7 +137,7 @@ def cmd_goto(name):
     try:
         r = requests.put(
             CLASH_API + "/proxies/" + SELECTOR,
-            headers=_headers(secret),
+            headers=_headers(),
             json={"name": name},
             timeout=TIMEOUT,
         )

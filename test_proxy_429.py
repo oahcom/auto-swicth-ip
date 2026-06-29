@@ -104,6 +104,20 @@ async def _read_request(reader):
     return first_line, body
 
 
+async def test_chunked_extension():
+    """Mock _read_body: chunked 0;ext=1 must not hang."""
+    from proxy_429 import _read_body
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"5\r\nHello\r\n0;ext=1\r\n\r\n")
+    reader.feed_eof()
+
+    headers = b"Transfer-Encoding: chunked\r\n\r\n"
+    body, new_headers = await _read_body(reader, headers, ("127.0.0.1", 0))
+    _check("chunked extension body", body, b"Hello")
+    _check_bool("Content-Length present", b"Content-Length: 5" in new_headers)
+
+
 async def test_429_retry():
     """Mock upstream 返回 429，验证 proxy_429 重试一次后得 200。"""
     import proxy_429 as p
@@ -129,7 +143,7 @@ async def test_429_retry():
                 h = await asyncio.wait_for(reader.readline(), timeout=5)
                 if h in (b"\r\n", b"\n", b""):
                     break
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            writer.write(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
         await writer.drain()
         clash_called.set()
         writer.close()
@@ -182,9 +196,9 @@ async def test_429_retry():
             _check_bool("Clash API 被调用", clash_called.is_set())
         except Exception as e:
             _check_bool(f"429 测试异常: {e}", False)
-
-    p.UPSTREAM = old_upstream
-    p.SINGBOX_API = old_clash
+        finally:
+            p.UPSTREAM = old_upstream
+            p.SINGBOX_API = old_clash
 
 
 # ================================================================
@@ -197,6 +211,7 @@ def main():
         ("_get_content_length", test_get_content_length),
     ]
     integration_tests = [
+        ("chunked extension", test_chunked_extension),
         ("429 retry", test_429_retry),
     ]
 

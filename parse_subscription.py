@@ -7,7 +7,6 @@ import json
 import urllib.parse
 import sys
 import os
-import subprocess
 from pathlib import Path
 
 from config import CFG, SINGBOX_SECRET
@@ -17,13 +16,14 @@ _OKZ_SUB_URL = os.environ.get("OKZ_SUB_URL")
 # ============= 解析订阅 =============
 def fetch_and_decode_sub(url: str) -> list[str]:
     """拉订阅，base64 解码，返回原始 URL 列表"""
-    r = subprocess.run(['curl', '-sf', url], capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        raise RuntimeError(f"failed to fetch: {r.stderr}")
-    raw = r.stdout
-    # 尝试 base64 解码（去掉空白）
+    import requests
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    raw = r.text
+    # 尝试 base64 解码：先去已有填充和空白，再统一加标准 padding
     try:
-        decoded = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode('utf-8', errors='replace')
+        stripped = raw.strip().replace(" ", "").rstrip("=")
+        decoded = base64.b64decode(stripped + "=" * (-len(stripped) % 4)).decode('utf-8', errors='replace')
         return [l.strip() for l in decoded.splitlines() if l.strip()]
     except Exception:
         # 已经是明文
@@ -185,9 +185,12 @@ if __name__ == "__main__":
 
     nodes = []
     seen_tags: set[str] = set()
+    filter_sub = args.filter.lower() if args.filter else None
     for u in urls:
         n = parse_url(u)
         if n and n["tag"] not in seen_tags:
+            if filter_sub and filter_sub not in n["tag"].lower():
+                continue
             seen_tags.add(n["tag"])
             nodes.append(n)
 

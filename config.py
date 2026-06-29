@@ -84,7 +84,7 @@ UPSTREAM_PORT = CFG["proxy_429"]["upstream_port"]
 LISTEN_PORT = CFG["proxy_429"]["listen_port"]
 BAD_NODES_TTL = CFG["bad_nodes"]["ttl_sec"]
 LOG_FORMAT = CFG["log_format"]
-STALE_THRESHOLD_SEC = 300
+RECENT_WINDOW = CFG["thresholds"]["recent_window"]
 
 # ============= FREE_PROVIDERS 常量 =============
 FREE_PROVIDERS = {"opencode", "kiro", "nvidia", "ollama"}

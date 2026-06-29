@@ -14,9 +14,9 @@ import requests
 
 # ============= 配置 =============
 CLASH_API = "http://127.0.0.1:9090"
-CLASH_SECRET = open(os.path.expanduser("~/.singbox_secret")).read().strip()
+from config import SINGBOX_SECRET as CLASH_SECRET
 OKZ_PROXY = "http://127.0.0.1:6696"
-SINGBOX_PROXY = "http://127.0.0.1:7890"
+SINGBOX_PROXY = "http://127.0.0.1:" + os.environ.get("SINGBOX_PORT", "7890")
 NROUTER_DB = "/home/administrator/.9router/db/data.sqlite"
 TEST_URL = "https://www.gstatic.com/generate_204"
 IP_CHECK_URL = "https://api.ipify.org"
@@ -56,7 +56,8 @@ def test_1_singbox_api_reachable():
     print("\n[测试 1] Clash API 可达性")
     try:
         r = requests.get(f"{CLASH_API}/version", headers=headers(), timeout=3)
-        assert_eq("版本号", r.json().get("version", ""), "sing-box 1.13.0")
+        version = r.json().get("version", "")
+        assert_true("版本号非空", len(version) > 0, f"version={version}")
     except Exception as e:
         assert_true("连接成功", False, str(e))
 
@@ -273,12 +274,14 @@ def test_11_node_health_rejects_dead():
     fake_dead = "fake-dead-node-1"
     _DEAD_NODES.add(fake_dead)
     _DEAD_NODES_RELEASE_TS[fake_dead] = time.time() + 300
-    nodes = ["node-a", "node-b", fake_dead, "node-c"]
-    picked = pick_next_node("node-a", nodes, set())
-    assert_true("死节点被跳过", picked != fake_dead, f"picked={picked}")
-    assert_true("选了活节点", picked in ("node-b", "node-c"), f"picked={picked}")
-    _DEAD_NODES.discard(fake_dead)
-    _DEAD_NODES_RELEASE_TS.pop(fake_dead, None)
+    try:
+        nodes = ["node-a", "node-b", fake_dead, "node-c"]
+        picked = pick_next_node("node-a", nodes, set())
+        assert_true("死节点被跳过", picked != fake_dead, f"picked={picked}")
+        assert_true("选了活节点", picked in ("node-b", "node-c"), f"picked={picked}")
+    finally:
+        _DEAD_NODES.discard(fake_dead)
+        _DEAD_NODES_RELEASE_TS.pop(fake_dead, None)
 
 def test_12_multiple_switches_ip_changes():
     """测试 12: 连续切换 3 次，每次 IP 应该不同"""

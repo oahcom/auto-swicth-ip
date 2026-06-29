@@ -6,7 +6,7 @@
 
 9router 通过 `outboundProxyUrl` 配置上游代理（默认指向 okz:6696）。okz 提供多个 hysteria2/anytls/trojan 节点，每次手动切代理可换出口 IP，但 opencode free 等 provider 看到 IP 不变就会限流（402 MONTHLY_REQUEST_COUNT）。
 
-本项目**完全接管 9router 的 outbound 代理**：拉 okz 订阅、用 sing-box 当代理池、daemon 主动轮换节点，每 5 分钟切一次 IP，opencode 永远看到不同 IP → 永远不限流。
+本项目**完全接管 9router 的 outbound 代理**：拉 okz 订阅、用 sing-box 当代理池、daemon 主动轮换节点，每 30 秒切一次 IP，opencode 永远看到不同 IP → 永远不限流。
 
 ## 架构
 
@@ -59,13 +59,13 @@ curl -x http://127.0.0.1:7890 https://api.ipify.org  # 应返回非本地 IP
 ## 配置
 
 `daemon.py` 顶部 CFG dict:
-- `proactive_rotate_sec`: 主动轮换间隔（默认 300s = 5 分钟）
-- `recent_window`: 错误检测看最近 N 条
-- `opencode_min_success_rate`: 低于这个成功率触发切代理
+- `proactive_rotate_sec`: 主动轮换间隔（默认 30s = 30 秒）
+- `recent_window`: 错误检测看最近 N 条（默认 5 条）
+- `opencode_min_success_rate`: 低于这个成功率触发切代理（默认 0.9 = 90%）
 
 ## 工作原理
 
-**主动轮换**（每 5 分钟）：
+**主动轮换**（每 30 秒）：
 - daemon 调 sing-box clash API `PUT /proxies/proxy` 切换到下一个 anytls 节点
 - 9router 下次出站请求自动走新节点（无需重启 9router）
 

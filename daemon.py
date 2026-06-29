@@ -30,12 +30,13 @@ from datetime import datetime, timezone, timedelta
 import re as _re
 import logging
 import atexit
+import shutil
 from logging.handlers import RotatingFileHandler
 # daemon uses its own _delay_score; proxy_pool.py imports weights directly
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
-from config import CFG, NODE_INFO_DB, FREE_PROVIDERS, STALE_THRESHOLD_SEC, BAD_NODES_TTL, MIXED_PORT, LOG_FORMAT
+from config import CFG, NODE_INFO_DB, FREE_PROVIDERS, RECENT_WINDOW, BAD_NODES_TTL, MIXED_PORT, LOG_FORMAT
 
 # 全局复用连接 - 避免每次操作开/关 SQLite 连接
 _db_conn: sqlite3.Connection | None = None
@@ -111,8 +112,10 @@ def set_node_info(node: str, ip: str, country: str = "", city: str = "", isp: st
 
 
 
-def format_node_display(node: str) -> str:
+def format_node_display(node: str | None) -> str:
     """格式化 node 显示：node | IP | country/city"""
+    if node is None:
+        return "unknown"
     info = get_node_info(node)
     if info and info.get("ip"):
         parts = [info["ip"]]
@@ -140,6 +143,7 @@ _NODE_DELAYS: dict[str, int] = {}  # 节点延迟缓存 (ms)
 _NODE_CALL_COUNTS: dict[str, int] = {}  # 节点调用计数，用于宏观调控
 _NODE_CALL_RESET_TS: float = 0  # 上次重置时间
 _state_lock = threading.RLock()  # 保护所有全局共享状态
+_last_wal_checkpoint: float = 0  # WAL checkpoint 时间戳
 _health_pool = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="health")
 _io_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="io")
 atexit.register(lambda: (_health_pool.shutdown(wait=False), _io_pool.shutdown(wait=False)))
@@ -185,41 +189,32 @@ def log_health(msg: str):
     log(msg)
 
 # ============= 9router 监控 =============
-_STALE_THRESHOLD_SEC = STALE_THRESHOLD_SEC  # from config.py
 
 def get_9router_error_rate() -> tuple[int, int, list]:
-    """从 SQLite 读最近请求，返回 (total, errors, details_list)
+    """从 SQLite 读最近 N 个请求，返回 (total, errors, details_list)
 
-    使用聚合查询统计 _STALE_THRESHOLD_SEC 窗口内免费 provider 总请求数和错误数。
-    如果最新记录时间戳超过 _STALE_THRESHOLD_SEC 秒没更新，视为无活跃流量，
-    返回 (0, 0, []) 防止用过期数据误触发切换。
+    基于请求数量窗口：取最近 RECENT_REQUESTS 个免费 provider 请求，
+    统计其中错误数。若错误数 >= ERROR_COUNT_THRESHOLD，触发切换。
     """
     try:
         with _db_lock:
             c = _get_db()
-            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_STALE_THRESHOLD_SEC)).isoformat().replace("+00:00", "Z")
-            # 聚合查询：统计窗口内总数和错误数，LIMIT 看最近的详情
-            row = c.execute("""
-                SELECT COUNT(*) as total,
-                       SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) as errors
-                FROM requestDetails
-                WHERE timestamp > ? AND provider IN ('opencode', 'kiro', 'nvidia', 'ollama')
-            """, (cutoff,)).fetchone()
-            total = row["total"] if row else 0
-            errors = row["errors"] if row else 0
-
-            # 取最近的 20 条详情用于外部参考
-            rows = c.execute("""
+            # 取最近 N 个免费 provider 请求
+            placeholders = ",".join("?" for _ in FREE_PROVIDERS)
+            params = list(FREE_PROVIDERS) + [RECENT_WINDOW]
+            rows = c.execute(f"""
                 SELECT provider, model, status, timestamp
                 FROM requestDetails
-                WHERE timestamp > ?
-                ORDER BY timestamp DESC LIMIT 20
-            """, (cutoff,)).fetchall()
-        recent = [dict(r) for r in rows]
+                WHERE provider IN ({placeholders})
+                ORDER BY timestamp DESC LIMIT ?
+            """, params).fetchall()
 
-        # 无最近记录，跳过错误率判断
-        if not recent:
+        if not rows:
             return 0, 0, []
+
+        recent = [dict(r) for r in rows]
+        total = len(recent)
+        errors = sum(1 for r in recent if r.get("status") != "success")
 
         return total, errors, recent
     except Exception as e:
@@ -252,10 +247,10 @@ def _load_proxy_429_bad_nodes() -> dict[str, float]:
     return _p429_bad_cache
 
 def _detect_proxy_429() -> bool:
-    """检测 proxy_429 是否在运行。缓存 30s。"""
+    """检测 proxy_429 是否在运行。缓存 5s。"""
     global _proxy_429_detected, _proxy_429_check_ts
     now = time.time()
-    if now - _proxy_429_check_ts < 30:
+    if now - _proxy_429_check_ts < 5:
         return _proxy_429_detected
     _proxy_429_check_ts = now
     try:
@@ -270,8 +265,9 @@ def check_9router_outbound_proxy() -> bool:
 
     proxy_429 运行时接受 :7891，否则接受 :7890。
     """
-    if _ALL_DEAD_FALLBACK:
-        return True  # 已降级到 okz，不覆盖
+    with _state_lock:
+        if _ALL_DEAD_FALLBACK:
+            return True  # 已降级到 okz，不覆盖
     EXPECTED_URL = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
     try:
         with _db_lock:
@@ -390,7 +386,7 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
                     log(f"  复活重测: {n}")
 
     if not to_test:
-        return _DEAD_NODES, set()
+        return set(_DEAD_NODES), set()
 
     alive = set()
     dead = set()
@@ -422,6 +418,9 @@ def cleanup_dead_ttl():
 
     同时从 proxy_429 的 bad_nodes 文件导入坏节点标记。
     """
+    # 先读 proxy_429 文件（无锁）
+    p429_bad = _load_proxy_429_bad_nodes()
+
     with _state_lock:
         now = time.time()
         expired = [n for n, ts in _DEAD_NODES_RELEASE_TS.items() if ts < now]
@@ -433,7 +432,6 @@ def cleanup_dead_ttl():
             log(f"  释放 {len(expired)} 个黑名单节点 (TTL 到，fail_count 已重置)")
 
         # 导入 proxy_429 标记的坏节点（如果有），保留原始 expiry
-        p429_bad = _load_proxy_429_bad_nodes()
         if p429_bad:
             for n, exp in p429_bad.items():
                 if n not in _DEAD_NODES:
@@ -627,14 +625,33 @@ def is_singbox_alive() -> bool:
     return True
 
 _restart_lock = threading.Lock()
+
+def _set_outbound_proxy(url: str = "", enabled: bool = False) -> None:
+    """Temporarily set 9router outboundProxyEnabled. Thread-safe."""
+    try:
+        with _db_lock:
+            c = _get_db()
+            row = c.execute('SELECT data FROM settings WHERE id=1').fetchone()
+            if row:
+                s = json.loads(row[0])
+                s["outboundProxyUrl"] = url
+                s["outboundProxyEnabled"] = enabled
+                c.execute('UPDATE settings SET data=? WHERE id=1', (json.dumps(s),))
+                c.commit()
+    except Exception as e:
+        log(f"✗ 设置 outboundProxy 失败: {e}")
+
 def restart_singbox() -> bool:
-    """重启 sing-box，互斥锁防止并发调用"""
+    """重启 sing-box，互斥锁防止并发调用。停服前绕过代理，启动后恢复。"""
     global _RESTART_COUNT
     if not _restart_lock.acquire(blocking=False):
         log("  ⚠ restart_singbox 已在运行，跳过并发调用")
         return False
     try:
         log(f"⚠ 重启 sing-box (连续失败 {_RESTART_COUNT}/{CFG['singbox']['max_restart_attempts']})...")
+
+        # 停服前绕过代理，避免重启窗口请求报错
+        _set_outbound_proxy(enabled=False)
         singbox_bin = CFG["singbox"]["binary"]
         subprocess.run(
             ["pkill", "-f", f"^{_re.escape(singbox_bin)} run"],
@@ -651,6 +668,16 @@ def restart_singbox() -> bool:
 
         # ponytail: 显式保存文件句柄，避免 fd 泄漏
         log_path = os.path.join(log_dir, "singbox.log")
+        # 单文件轮转：>10MB 时备份为 .1 并截断
+        try:
+            if os.path.getsize(log_path) > 10 * 1024 * 1024:
+                bak = log_path + ".1"
+                if os.path.exists(bak):
+                    os.remove(bak)
+                shutil.move(log_path, bak)
+                log(f"  singbox.log 轮转 (>{10}MB)")
+        except Exception:
+            pass
         log_file = open(log_path, "a")
         try:
             subprocess.Popen(
@@ -664,14 +691,23 @@ def restart_singbox() -> bool:
         if is_singbox_alive():
             _RESTART_COUNT = 0
             log("✓ sing-box 重启成功")
+            # 恢复代理
+            expected_url = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
+            _set_outbound_proxy(url=expected_url, enabled=True)
             return True
         else:
             _RESTART_COUNT += 1
             log(f"✗ sing-box 重启失败 (第 {_RESTART_COUNT} 次)")
+            # 重启失败也要恢复代理，避免 9router 裸奔
+            expected_url = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
+            _set_outbound_proxy(url=expected_url, enabled=True)
             return False
     except Exception as e:
         _RESTART_COUNT += 1
         log(f"✗ sing-box 重启异常: {e}")
+        # 异常分支也要恢复代理
+        expected_url = CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
+        _set_outbound_proxy(url=expected_url, enabled=True)
         return False
     finally:
         _restart_lock.release()
@@ -702,18 +738,6 @@ def check_and_handle_fallback(all_nodes: list, current: str) -> bool:
     """
     global _ALL_DEAD_FALLBACK
 
-    def _update_settings_proxy(url: str, enabled: bool = True) -> None:
-        """Update 9router settings.outboundProxyUrl/enabled."""
-        with _db_lock:
-            c = _get_db()
-            row = c.execute('SELECT data FROM settings WHERE id=1').fetchone()
-            if row:
-                s = json.loads(row[0])
-                s["outboundProxyUrl"] = url
-                s["outboundProxyEnabled"] = enabled
-                c.execute('UPDATE settings SET data=? WHERE id=1', (json.dumps(s),))
-                c.commit()
-
     with _state_lock:
         dead_snapshot = set(_DEAD_NODES)
     alive = [n for n in all_nodes
@@ -724,8 +748,9 @@ def check_and_handle_fallback(all_nodes: list, current: str) -> bool:
             _ALL_DEAD_FALLBACK = False
             try:
                 proxy_429_up = _detect_proxy_429()
-                _update_settings_proxy(
-                    CFG["proxy_429"]["proxy_url"] if proxy_429_up else f"http://127.0.0.1:{MIXED_PORT}"
+                _set_outbound_proxy(
+                    CFG["proxy_429"]["proxy_url"] if proxy_429_up else f"http://127.0.0.1:{MIXED_PORT}",
+                    enabled=True
                 )
                 log("🔁 节点恢复，outboundProxyUrl 已从 okz 恢复为 sing-box")
             except Exception as e:
@@ -740,7 +765,7 @@ def check_and_handle_fallback(all_nodes: list, current: str) -> bool:
     _ALL_DEAD_FALLBACK = True
     # 通过 SQLite 把 9router 切到 okz
     try:
-        _update_settings_proxy(CFG["okz"]["proxy_url"])
+        _set_outbound_proxy(CFG["okz"]["proxy_url"], enabled=True)
         log("✓ 已降级到 okz:6696")
     except Exception as e:
         log(f"✗ 降级失败: {e}")
@@ -760,8 +785,9 @@ def fetch_node_ip_region(node: str) -> tuple[str, str, str, str] | None:
         ip = r.text.strip()
         if not ip:
             return None
-        # 2. 查地区（直连 ip-api.com，不过代理）
-        r2 = requests.get(f"http://ip-api.com/json/{ip}?fields=country,city,isp", timeout=5)
+        # 2. 查地区（直连 ip-api.com，绕过系统代理 6696）
+        r2 = requests.get(f"http://ip-api.com/json/{ip}?fields=country,city,isp",
+                          proxies={"http": None, "https": None}, timeout=5)
         if r2.status_code == 200:
             d = r2.json()
             country = d.get("country", "")
@@ -811,7 +837,7 @@ def main():
     # log(f"  慢性排除: 连续 {_CHRONIC_FAIL_THRESHOLD}+ 批次死亡永久排除")
     log(f"  IP去重: 同出口IP保留调用次数最低的节点")
     log(f"  interrupt_exist_connections: false (不杀现有连接)")
-    log(f"  错误触发: 连续 {CFG['thresholds']['recent_window']} 请求中成功率 <{CFG['thresholds']['opencode_min_success_rate']*100:.0f}%")
+    log(f"  错误触发: 连续 {RECENT_WINDOW} 请求中成功率 <{CFG['thresholds']['opencode_min_success_rate']*100:.0f}%")
     log("=" * 50)
 
     # 初始化 node_info 表
@@ -829,7 +855,7 @@ def main():
     last_summary_ts = 0
     last_proactive_rotate = 0
 
-    global _RESTART_COUNT, _NODE_CALL_RESET_TS
+    global _RESTART_COUNT, _NODE_CALL_RESET_TS, _last_wal_checkpoint
     _RESTART_COUNT = 0  # 确保在 main() 作用域内也是 global
     _NODE_CALL_RESET_TS = time.time()
 
@@ -851,19 +877,22 @@ def main():
         log(f"✓ sing-box OK，节点数={len(all_nodes)}")
 
     # 首次节点健康测试（异步后台跑，不阻塞主循环）
+    _initial_health_done = threading.Event()
     if all_nodes:
         current = get_current_proxy()
         log("🔍 首次节点健康测试（后台）...")
         def _initial_health_check():
-            nonlocal last_health_check
             try:
                 dead, alive = batch_test_nodes(all_nodes, current or "")
                 # ponytail: batch_test_nodes 已更新 _DEAD_NODES 和 TTL（含指数退避），无需重复操作
-                last_health_check = time.time()
                 log(f"🔍 首轮健康测试完成: dead={len(dead)} alive={len(alive)}")
             except Exception as e:
                 log(f"✗ 首轮健康测试异常: {e}")
+            finally:
+                _initial_health_done.set()
         threading.Thread(target=_initial_health_check, daemon=True).start()
+    else:
+        _initial_health_done.set()
 
     while True:
         now = time.time()
@@ -888,7 +917,7 @@ def main():
             total, errors, recent = get_9router_error_rate()
 
             # ---- 2b. 错误触发轮换 ----
-            should_error = (total != 0 and errors / total > (1 - CFG["thresholds"]["opencode_min_success_rate"]))
+            should_error = (total >= 3 and errors / total > (1 - CFG["thresholds"]["opencode_min_success_rate"]))
             in_cooldown = now < cooldown_until
 
             # ---- 3. 主动轮换（每 N 秒加权选新节点） ----
@@ -935,20 +964,21 @@ def main():
 
             # ---- 5. 节点健康检查 (每 300s) ----
             if now - last_health_check > CFG["intervals"]["node_health_sec"]:
-                nodes = cached_all_nodes
-                current = cached_current_proxy
-                if nodes and current:
-                    dead, alive = batch_test_nodes(nodes, current)
-                    # ponytail: batch_test_nodes 已更新 _DEAD_NODES 和 TTL（含指数退避），无需重复操作
-                    # 清理活过来的节点
-                    with _state_lock:
-                        for n in list(_DEAD_NODES):
-                            if n in alive:
-                                _DEAD_NODES.discard(n)
-                                _DEAD_NODES_RELEASE_TS.pop(n, None)
+                if _initial_health_done.is_set():
+                    nodes = cached_all_nodes
+                    current = cached_current_proxy
+                    if nodes and current:
+                        dead, alive = batch_test_nodes(nodes, current)
+                        # ponytail: batch_test_nodes 已更新 _DEAD_NODES 和 TTL（含指数退避），无需重复操作
+                        # 清理活过来的节点
+                        with _state_lock:
+                            for n in list(_DEAD_NODES):
+                                if n in alive:
+                                    _DEAD_NODES.discard(n)
+                                    _DEAD_NODES_RELEASE_TS.pop(n, None)
 
-                    # 降级检查
-                    check_and_handle_fallback(nodes, current)
+                        # 降级检查
+                        check_and_handle_fallback(nodes, current)
                 last_health_check = now
 
             # ---- 6. 订阅刷新 (每 1h，后台执行避免阻塞主循环) ----
@@ -984,13 +1014,13 @@ def main():
                 log("  ♻ 节点调用计数已重置")
 
             # ---- 8b. WAL checkpoint (每 5min) ---
-            if now - getattr(main, "_last_wal_checkpoint", 0) > 300:
+            if now - _last_wal_checkpoint > 300:
                 try:
                     with _db_lock:
-                        _get_db().execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    main._last_wal_checkpoint = now
-                except Exception:
-                    pass
+                        _get_db().execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    _last_wal_checkpoint = now
+                except Exception as e:
+                    log(f"  ⚠ WAL checkpoint 失败: {e}")
 
             # ---- 9. 健康摘要（每 10s 最多一条） ----
             with _state_lock:
