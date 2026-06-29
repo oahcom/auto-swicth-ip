@@ -133,6 +133,7 @@ async def _mark_bad_node(node: str) -> None:
             return
         _bad_nodes_cache[node] = now + BAD_NODES_TTL
         _bad_nodes_dirty = True
+        _bad_nodes_flush_event.set()
     log(f"  🚫 Bad node: {node} (TTL {BAD_NODES_TTL}s)")
 
 
@@ -143,12 +144,16 @@ async def _get_current_bad_nodes() -> set:
     return {n for n, exp in nodes.items() if exp > now}
 
 
+_bad_nodes_flush_event = asyncio.Event()  # 有脏数据时 set，_periodic_flush_bad_nodes 等待
+
+
 async def _periodic_flush_bad_nodes():
-    """每 3 秒将脏缓存写入磁盘。"""
+    """脏数据写入磁盘，由 Event 触发（去轮询）。"""
     global _bad_nodes_flush_task
     try:
         while True:
-            await asyncio.sleep(3)
+            await _bad_nodes_flush_event.wait()
+            _bad_nodes_flush_event.clear()
             await _flush_bad_nodes()
     except asyncio.CancelledError:
         await _flush_bad_nodes()
@@ -284,7 +289,9 @@ def _clash_api_sync(method: str, path: str, body: bytes | None = None) -> dict |
                 return {}
             return json.loads(resp.read())
     except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as e:
-        log(f"Clash API {method} {path} failed: {e}")
+        # 脱敏：异常信息中可能泄露 Authorization Bearer token
+        safe_msg = str(e).replace(SINGBOX_SECRET, "***") if SINGBOX_SECRET else str(e)
+        log(f"Clash API {method} {path} failed: {type(e).__name__}: {safe_msg}")
         return None
 
 
@@ -711,14 +718,15 @@ async def handle(reader, writer):
 
     except (asyncio.CancelledError, asyncio.IncompleteReadError):
         pass
-    except Exception as e:
-        log(f"Error: {type(e).__name__}: {e}")
+    except Exception:
+        log(f"Handler error from {peername}", exc_info=True)
         await _enable_bypass()
         await _close_gracefully(writer)
     finally:
         try:
             if not writer.is_closing():
                 writer.close()
+                await writer.wait_closed()
         except OSError:
             pass
 
