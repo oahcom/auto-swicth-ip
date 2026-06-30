@@ -137,6 +137,19 @@ async def _mark_bad_node(node: str) -> None:
     log(f"  🚫 Bad node: {node} (TTL {BAD_NODES_TTL}s)")
 
 
+async def _mark_current_node_bad() -> None:
+    """查询 Clash API 当前节点并标记为坏节点（重试耗尽时调用）。
+    静默处理：查询失败时跳过标记，不阻塞 bypass。"""
+    try:
+        data = await asyncio.to_thread(_clash_api_sync, "GET", f"/proxies/{SELECTOR}")
+        if data:
+            current = data.get("now", "")
+            if current and current != "direct":
+                await _mark_bad_node(current)
+    except Exception:
+        pass  # 查询失败不影响 bypass
+
+
 async def _get_current_bad_nodes() -> set:
     """获取当前坏节点集合（从文件支持的缓存中读取）。"""
     now = time.time()
@@ -459,6 +472,7 @@ async def _handle_connect(reader, writer, line, headers):
         except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
             log(f"CONNECT upstream write/read fail: {e}")
             if attempt == MAX_RETRIES - 1:
+                await _mark_current_node_bad()
                 await _enable_bypass()
                 if target:
                     return await _direct_connect_connect(reader, writer, line, headers, target)
@@ -487,6 +501,7 @@ async def _handle_connect(reader, writer, line, headers):
                 await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
                 continue
             await _drain_reader(u_r); u_w.close()
+            await _mark_current_node_bad()
             await _enable_bypass()
             if target:
                 return await _direct_connect_connect(reader, writer, line, headers, target)
@@ -545,13 +560,15 @@ async def _direct_connect_connect(reader, writer, line, headers, target: str) ->
 
 
 async def _direct_connect_http(writer, method: str, target: str, headers: bytes, body: bytes) -> bool:
-    """上游全部不可用时，直接连接目标服务器（HTTP 转发）。
-    从 target 中提取 host，建立直连 TCP，发送完整请求。"""
+    """上游全部不可用时，直接连接目标服务器（HTTP/HTTPS 转发）。
+    从 target 中提取 host，建立直连 TCP，HTTPS 自动升级 TLS。"""
+    import ssl as _ssl
     from urllib.parse import urlparse
     try:
         parsed = urlparse(target)
         host = parsed.hostname
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        is_https = parsed.scheme == "https"
         path = parsed.path or "/"
         if parsed.query:
             path += "?" + parsed.query
@@ -562,8 +579,16 @@ async def _direct_connect_http(writer, method: str, target: str, headers: bytes,
         writer.close()
         return False
     try:
-        u_r, u_w = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=UPSTREAM_CONNECT_TIMEOUT)
+        if is_https:
+            # HTTPS 直连：SSL 包装 TCP socket（明文发送到 443 服务器会拒绝）
+            ctx = _ssl.create_default_context()
+            u_r, u_w = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=ctx),
+                timeout=UPSTREAM_CONNECT_TIMEOUT)
+        else:
+            u_r, u_w = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=UPSTREAM_CONNECT_TIMEOUT)
     except (OSError, asyncio.TimeoutError):
         writer.close()
         return False
@@ -604,6 +629,7 @@ async def _handle_http(reader, writer, line, method, target, headers, body):
                 await _enable_bypass()
                 return await _direct_connect_http(writer, method, target, headers, body)
             if attempt == MAX_RETRIES - 1:
+                await _mark_current_node_bad()
                 await _enable_bypass()
                 return await _direct_connect_http(writer, method, target, headers, body)
             if not await switch_clash_node():
@@ -620,6 +646,7 @@ async def _handle_http(reader, writer, line, method, target, headers, body):
             log(f"Upstream write fail: {e}")
             u_w.close()
             if attempt == MAX_RETRIES - 1:
+                await _mark_current_node_bad()
                 await _enable_bypass()
                 return await _direct_connect_http(writer, method, target, headers, body)
             if not await switch_clash_node():
@@ -633,6 +660,7 @@ async def _handle_http(reader, writer, line, method, target, headers, body):
             log(f"Empty upstream response on {method} {target}")
             u_w.close()
             if attempt == MAX_RETRIES - 1:
+                await _mark_current_node_bad()
                 await _enable_bypass()
                 return await _direct_connect_http(writer, method, target, headers, body)
             if not await switch_clash_node():
@@ -646,6 +674,7 @@ async def _handle_http(reader, writer, line, method, target, headers, body):
             log(f"Malformed status line: {status_line!r}")
             u_w.close()
             if attempt == MAX_RETRIES - 1:
+                await _mark_current_node_bad()
                 await _enable_bypass()
                 return await _direct_connect_http(writer, method, target, headers, body)
             if not await switch_clash_node():
@@ -664,6 +693,7 @@ async def _handle_http(reader, writer, line, method, target, headers, body):
                 await asyncio.sleep(RETRY_SLEEP_BASE * (attempt + 1))
                 continue
             await _drain_reader(u_r); u_w.close()
+            await _mark_current_node_bad()
             await _enable_bypass()
             return await _direct_connect_http(writer, method, target, headers, body)
 
@@ -675,7 +705,8 @@ async def _handle_http(reader, writer, line, method, target, headers, body):
         await pipe(u_r, writer)
         u_w.close(); return
 
-    # for 循环耗尽或 switch_clash_node() 所有重试失败，bypass 直连
+    # for 循环耗尽或 switch_clash_node() 所有重试失败，标记当前节点后 bypass 直连
+    await _mark_current_node_bad()
     await _enable_bypass()
     return await _direct_connect_http(writer, method, target, headers, body)
 
