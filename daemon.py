@@ -41,14 +41,12 @@ from config import CFG, NODE_INFO_DB, FREE_PROVIDERS, RECENT_WINDOW, BAD_NODES_T
 # 全局复用连接 - 避免每次操作开/关 SQLite 连接
 _db_conn: sqlite3.Connection | None = None
 _db_lock = threading.RLock()  # RLock: init_node_info_db 里 _get_db 需重入
-_proxy_429_detected: bool = False  # proxy_429 进程检测缓存
-_proxy_429_check_ts: float = 0  # 上次检测时间
 _BAD_NODES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bad_nodes.json")
 # bad_nodes cache (mtime-based, avoid repeated I/O)
-_p429_bad_cache: dict[str, float] = {}
-_p429_bad_mtime: float = 0
-_p429_bad_check_ts: float = 0
-_p429_bad_loaded: bool = False
+_shared_bad_cache: dict[str, float] = {}
+_shared_bad_mtime: float = 0
+_shared_bad_check_ts: float = 0
+_shared_bad_loaded: bool = False
 
 def _get_db() -> sqlite3.Connection:
     """获取模块级 SQLite 连接（惰性初始化，WAL 模式）"""
@@ -156,7 +154,7 @@ class _BoundedPool:
     def submit(self, fn, /, *args, **kwargs):
         # 非阻塞获取：队列满时返回 None 而非阻塞事件循环
         if not self._sem.acquire(blocking=False):
-            log(f"⚠ {_name} 线程池队列已满，丢弃任务 {fn.__name__}")
+            log(f"⚠ {self._name} 线程池队列已满，丢弃任务 {fn.__name__}")
             return None
         f = self._executor.submit(fn, *args, **kwargs)
         f.add_done_callback(lambda _: self._sem.release())
@@ -241,61 +239,42 @@ def get_9router_error_rate() -> tuple[int, int, list]:
         log(f"✗ 读 SQLite 失败: {e}")
         return 0, 0, []
 
-def _load_proxy_429_bad_nodes() -> dict[str, float]:
-    """Read bad nodes from proxy_429's file. Returns {node: expire_ts}, expired filtered out.
+def _load_shared_bad_nodes() -> dict[str, float]:
+    """Read bad nodes from shared .bad_nodes.json. Returns {node: expire_ts}, expired filtered out.
     ponytail: cached per-mtime to avoid repeated I/O (checked every 5s at most)."""
-    global _p429_bad_cache, _p429_bad_mtime, _p429_bad_check_ts, _p429_bad_loaded
+    global _shared_bad_cache, _shared_bad_mtime, _shared_bad_check_ts, _shared_bad_loaded
     now = time.time()
-    if now - _p429_bad_check_ts < 5:
+    if now - _shared_bad_check_ts < 5:
         with _state_lock:
-            return dict(_p429_bad_cache)
-    _p429_bad_check_ts = now
+            return dict(_shared_bad_cache)
+    _shared_bad_check_ts = now
     try:
         if os.path.exists(_BAD_NODES_FILE):
             mtime = os.path.getmtime(_BAD_NODES_FILE)
-            if mtime == _p429_bad_mtime and _p429_bad_loaded:
+            if mtime == _shared_bad_mtime and _shared_bad_loaded:
                 with _state_lock:
-                    return dict(_p429_bad_cache)
+                    return dict(_shared_bad_cache)
             with open(_BAD_NODES_FILE) as f:
                 nodes = json.load(f)
             filtered = {n: exp for n, exp in nodes.items() if exp > now}
             with _state_lock:
-                _p429_bad_cache = filtered
-            _p429_bad_mtime = mtime
-            _p429_bad_loaded = True
+                _shared_bad_cache = filtered
+            _shared_bad_mtime = mtime
+            _shared_bad_loaded = True
             return filtered
     except Exception:
         pass
-    _p429_bad_loaded = True
+    _shared_bad_loaded = True
     with _state_lock:
-        return dict(_p429_bad_cache)
-
-def _detect_proxy_429() -> bool:
-    """检测 proxy_429 是否在运行。缓存 5s。"""
-    global _proxy_429_detected, _proxy_429_check_ts
-    now = time.time()
-    if now - _proxy_429_check_ts < 5:
-        return _proxy_429_detected
-    _proxy_429_check_ts = now
-    try:
-        r = subprocess.run(["pgrep", "-f", "python.*proxy_429"], capture_output=True, timeout=3)
-        _proxy_429_detected = bool(r.stdout.strip())
-    except Exception:
-        _proxy_429_detected = False
-    return _proxy_429_detected
-
+        return dict(_shared_bad_cache)
 
 def _expected_proxy_url() -> str:
-    """Compute expected proxy URL based on proxy_429 presence."""
-    return CFG["proxy_429"]["proxy_url"] if _detect_proxy_429() else f"http://127.0.0.1:{MIXED_PORT}"
+    """Expected proxy URL: always sing-box mixed port."""
+    return f"http://127.0.0.1:{MIXED_PORT}"
 
 
 def check_9router_outbound_proxy() -> bool:
-    """确保 opencode 的 proxyPool 和 outboundProxyEnabled 都正确。fallback 期间跳过。
-
-    proxy_429 运行时代理地址 :7891，否则 :7890。
-    同时恢复 outboundProxyEnabled=True（proxy_429 崩溃时可能残留 bypass 状态）。
-    """
+    """Ensure opencode proxyPool + outboundProxyEnabled correct. Skip during fallback."""
     with _state_lock:
         if _ALL_DEAD_FALLBACK:
             return True  # 已降级到 okz，不覆盖
@@ -330,7 +309,7 @@ def check_9router_outbound_proxy() -> bool:
                 c.execute('UPDATE proxyPools SET data = ? WHERE id = ?', (json.dumps(pool), pool_id))
                 changed = True
 
-            # 2. 恢复 outboundProxyEnabled（proxy_429 崩溃遗留的 bypass 状态）
+            # 2. 恢复 outboundProxyEnabled（before proxy-global.js: bypass left outboundProxyEnabled=False）
             if not s.get("outboundProxyEnabled", True):
                 log("⚠ outboundProxyEnabled=False，恢复为 True")
                 s["outboundProxyEnabled"] = True
@@ -480,10 +459,10 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
 def cleanup_dead_ttl():
     """清理过期的死节点 TTL，重置连续失败计数（给节点公平重试机会）
 
-    同时从 proxy_429 的 bad_nodes 文件导入坏节点标记。
+    Shared bad_nodes from proxy-global.js + daemon。
     """
-    # 先读 proxy_429 文件（无锁）
-    p429_bad = _load_proxy_429_bad_nodes()
+    # 先读共享 bad_nodes 文件（无锁）
+    p429_bad = _load_shared_bad_nodes()
 
     with _state_lock:
         now = time.time()
@@ -495,12 +474,12 @@ def cleanup_dead_ttl():
         if expired:
             log(f"  释放 {len(expired)} 个黑名单节点 (TTL 到，fail_count 已重置)")
 
-        # 导入 proxy_429 标记的坏节点（如果有），保留原始 expiry
+        # 导入坏节点（proxy-global.js + daemon 共享写入），保留原始 expiry
         if p429_bad:
             for n, exp in p429_bad.items():
                 if n not in _DEAD_NODES:
                     _DEAD_NODES.add(n)
-                    _DEAD_NODES_RELEASE_TS[n] = exp  # 保留 proxy_429 的原始 TTL
+                    _DEAD_NODES_RELEASE_TS[n] = exp  # 保留原始 TTL
 
 
 

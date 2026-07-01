@@ -15,7 +15,6 @@ PROXIES = {
     "直接": "",
     "6696-okz": "http://127.0.0.1:6696",
     "7890-singbox": "http://127.0.0.1:7890",
-    "7891-proxy429": "http://127.0.0.1:7891",
 }
 
 def bench(name, proxy_url, rounds=ROUNDS):

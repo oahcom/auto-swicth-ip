@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""
+DEPRECATED since 2026-07-02
+Replaced by proxy-global.js (9router NODE_OPTIONS injection).
+
+proxy-global.js handles:
+  - 429/5xx retry with exponential backoff
+  - Response body inspection (resource_exhausted, rate_limit, etc.)
+  - Bad node tracking (.bad_nodes.json shared with daemon)
+  - BYPASS mode (sing-box unreachable → direct connections)
+  - CONNECT proxy routing through sing-box:7890
+
+This file kept for reference only. Not started by start-auto-switch-ip.sh.
+To restore: uncomment the proxy_429 lines in start.sh and remove this banner.
+"""

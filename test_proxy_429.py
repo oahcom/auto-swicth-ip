@@ -1,3 +1,6 @@
+# DEPRECATED: proxy_429.py has been replaced by proxy-global.js (9router process).
+# This test file is kept for reference only. Will fail if proxy_429.py is not importable.
+
 #!/usr/bin/env python3
 """Tests for proxy_429.py — unit tests for helper functions + integration mock test.
 

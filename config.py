@@ -5,13 +5,13 @@ Both daemon.py and proxy_pool.py import from this module.
 """
 
 import os
+import sys
 import time
 
 # ============= 配置常量 =============
 SECRET_FILE = "/home/administrator/.singbox_secret"
 def _read_secret():
     try:
-        # 检查权限：必须是 0o600 或更严格
         st = os.stat(SECRET_FILE)
         if st.st_mode & 0o077:
             raise PermissionError(
@@ -43,12 +43,6 @@ CFG = {
         "max_restart_attempts": 3,
         "mixed_port": 7890,
     },
-    "proxy_429": {
-        "proxy_url": "http://127.0.0.1:7891",
-        "enabled": False,  # daemon 自动检测 proxy_429 进程后置 True
-        "listen_port": 7891,
-        "upstream_port": 7890,
-    },
     "okz": {
         "proxy_url": "http://127.0.0.1:6696",
         "name": "okz",
@@ -69,20 +63,18 @@ CFG = {
         "node_test_url": "https://www.gstatic.com/generate_204",
     },
     "bad_nodes": {
-        "ttl_sec": 300,  # 5 minutes - shared by proxy_429 and daemon
+        "ttl_sec": 300,  # 5 minutes - shared by proxy-global.js and daemon
     },
     "log_file": "/home/administrator/dkk-projects/auto-switch-ip/daemon.log",
-    "log_format": "%Y-%m-%d %H:%M:%S",  # unified log timestamp format
+    "log_format": "%Y-%m-%d %H:%M:%S",
 }
 
 # ============= 便捷常量 =============
 NODE_INFO_DB = CFG["9router"]["db_path"]
 SINGBOX_API = CFG["singbox"]["clash_api"]
-SINGBOX_SECRET = CFG["singbox"]["secret"]  # same value as above, via CFG
+SINGBOX_SECRET = CFG["singbox"]["secret"]
 SELECTOR = CFG["singbox"]["selector"]
 MIXED_PORT = CFG["singbox"]["mixed_port"]
-UPSTREAM_PORT = CFG["proxy_429"]["upstream_port"]
-LISTEN_PORT = CFG["proxy_429"]["listen_port"]
 BAD_NODES_TTL = CFG["bad_nodes"]["ttl_sec"]
 LOG_FORMAT = CFG["log_format"]
 RECENT_WINDOW = CFG["thresholds"]["recent_window"]

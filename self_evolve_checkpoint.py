@@ -20,7 +20,7 @@ STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 
 # Default check suite - evolves over time
 DEFAULT_CHECKS = [
-    {"name": "7891_connectivity", "enabled": True, "interval": 1},
+    {"name": "7890_connectivity", "enabled": true, "interval": 1},
     {"name": "7890_connectivity", "enabled": True, "interval": 1},
     {"name": "dead_nodes", "enabled": True, "interval": 1},
     {"name": "bypass_events", "enabled": True, "interval": 1},
@@ -51,7 +51,7 @@ def load_state():
         "checks": DEFAULT_CHECKS.copy(),
         "anomalies": [],
         "history": [],
-        "enabled_checks": ["7891_connectivity", "7890_connectivity", "dead_nodes", "bypass_events", "bounded_pool_pressure", "node_switch_distribution", "response_latency_p95", "upstream_failure_rate", "repeat_failure_nodes"],
+        "enabled_checks": ["7890_connectivity", "dead_nodes", "bypass_events", "bounded_pool_pressure", "node_switch_distribution", "response_latency_p95", "upstream_failure_rate", "repeat_failure_nodes"],
     }
 
 
@@ -65,18 +65,7 @@ def save_state(state):
 def run_check(name, context, state=None):
     """Run a specific check and return (status, metric_value, details)."""
     try:
-        if name == "7891_connectivity":
-            out = subprocess.run(
-                ["curl", "-m", "10", "-s", "-x", "http://127.0.0.1:7891",
-                 "https://www.gstatic.com/generate_204", "-o", "/dev/null",
-                 "-w", "%{http_code} %{time_total}"],
-                capture_output=True, text=True, timeout=15
-            )
-            ok = out.stdout.strip().startswith("204")
-            latency = float(out.stdout.split()[1]) if out.stdout else 999
-            return ok, latency, out.stdout.strip()
-
-        elif name == "7890_connectivity":
+        if name == "7890_connectivity":
             out = subprocess.run(
                 ["curl", "-m", "5", "-s", "-o", "/dev/null",
                  "-w", "%{http_code} %{time_total}", "http://127.0.0.1:7890"],
@@ -84,7 +73,6 @@ def run_check(name, context, state=None):
             )
             ok = out.stdout.strip() in ("400", "204")
             return ok, float(out.stdout.split()[1]) if out.stdout else 999, out.stdout.strip()
-
         elif name == "dead_nodes":
             out = subprocess.run(
                 ["grep", "-a", "dead=", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
@@ -129,7 +117,7 @@ def run_check(name, context, state=None):
         elif name == "response_latency_p95":
             # Quick latency check + trend detection
             out = subprocess.run(
-                ["curl", "-m", "10", "-s", "-x", "http://127.0.0.1:7891",
+                ["curl", "-m", "10", "-s", "-x", "http://127.0.0.1:7890",
                  "https://www.gstatic.com/generate_204", "-o", "/dev/null",
                  "-w", "%{time_total}"],
                 capture_output=True, text=True, timeout=15
@@ -147,7 +135,7 @@ def run_check(name, context, state=None):
             return ok, lat, f"latency={lat:.2f}s trend={trend_lat}"
 
         elif name == "upstream_failure_rate":
-            # Check recent upstream connect failures in proxy_429
+            # Check recent upstream connect failures in upstream
             out = subprocess.run(
                 ["grep", "-a", "upstream connect fail", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
                 capture_output=True, text=True, timeout=5

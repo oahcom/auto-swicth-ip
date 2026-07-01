@@ -1,10 +1,10 @@
 {
-  "round": 76,
+  "round": 95,
   "checks": [
     {
       "name": "7891_connectivity",
       "enabled": true,
-      "interval": 1
+      "interval": 2
     },
     {
       "name": "7890_connectivity",
@@ -2508,6 +2508,549 @@
           "metric": 7
         },
         "bypass_events": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 77,
+      "timestamp": "2026-06-30 18:13:53",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 3.189216
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.00029
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 78,
+      "timestamp": "2026-06-30 18:14:22",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 2.431259
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000532
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 79,
+      "timestamp": "2026-06-30 18:23:46",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000402
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 80,
+      "timestamp": "2026-06-30 18:25:19",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 1.482552
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000326
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        },
+        "bounded_pool_pressure": {
+          "ok": true,
+          "metric": 0
+        },
+        "node_switch_distribution": {
+          "ok": true,
+          "metric": 0.1
+        },
+        "response_latency_p95": {
+          "ok": false,
+          "metric": null
+        },
+        "upstream_failure_rate": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 81,
+      "timestamp": "2026-06-30 18:25:45",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000462
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 82,
+      "timestamp": "2026-06-30 18:34:08",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 1.239755
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.00035
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 83,
+      "timestamp": "2026-06-30 18:34:20",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000566
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 84,
+      "timestamp": "2026-06-30 18:34:30",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 1.541076
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000255
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 85,
+      "timestamp": "2026-06-30 18:43:46",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000318
+        },
+        "bounded_pool_pressure": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 86,
+      "timestamp": "2026-06-30 18:44:55",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 0.488728
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000245
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 87,
+      "timestamp": "2026-06-30 18:53:42",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000454
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 88,
+      "timestamp": "2026-06-30 18:55:34",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 1.233089
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000268
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 89,
+      "timestamp": "2026-06-30 19:03:44",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000353
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 90,
+      "timestamp": "2026-06-30 19:03:54",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 0.664788
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.00031
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        },
+        "bounded_pool_pressure": {
+          "ok": true,
+          "metric": 0
+        },
+        "node_switch_distribution": {
+          "ok": true,
+          "metric": 0.13043478260869565
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 91,
+      "timestamp": "2026-06-30 19:13:43",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000297
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 92,
+      "timestamp": "2026-06-30 19:13:53",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 1.207975
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000347
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 93,
+      "timestamp": "2026-06-30 19:24:02",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000373
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 94,
+      "timestamp": "2026-06-30 19:25:03",
+      "results": {
+        "7891_connectivity": {
+          "ok": true,
+          "metric": 0.2547
+        },
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000277
+        },
+        "dead_nodes": {
+          "ok": true,
+          "metric": 5
+        },
+        "bypass_events": {
+          "ok": true,
+          "metric": 0
+        }
+      },
+      "enabled": [
+        "7891_connectivity",
+        "7890_connectivity",
+        "dead_nodes",
+        "bypass_events",
+        "bounded_pool_pressure",
+        "node_switch_distribution",
+        "response_latency_p95",
+        "upstream_failure_rate",
+        "repeat_failure_nodes"
+      ]
+    },
+    {
+      "round": 95,
+      "timestamp": "2026-06-30 19:33:59",
+      "results": {
+        "7890_connectivity": {
+          "ok": false,
+          "metric": 0.000295
+        },
+        "bounded_pool_pressure": {
           "ok": true,
           "metric": 0
         }
