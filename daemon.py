@@ -162,7 +162,7 @@ class _BoundedPool:
     def shutdown(self, wait=True):
         self._executor.shutdown(wait=wait)
 
-_health_pool = _BoundedPool(max_workers=20, name_prefix="health")
+_health_pool = _BoundedPool(max_workers=30, name_prefix="health")
 _io_pool = _BoundedPool(max_workers=8, name_prefix="io")
 atexit.register(lambda: (_health_pool.shutdown(wait=False), _io_pool.shutdown(wait=False)))
 
