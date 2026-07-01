@@ -868,10 +868,12 @@ def update_node_info_async(node: str):
 
 # ============= 主循环 =============
 def main():
-    all_nodes = get_all_proxy_nodes()
-
+    # Log first, then fetch (avoid hanging before any output)
     log("=" * 50)
     log("auto-switch-ip daemon v2 启动 (加固版)")
+    log(f"  sing-box: {CFG['singbox']['clash_api']}")
+
+    all_nodes = get_all_proxy_nodes()
     log(f"  sing-box: {CFG['singbox']['clash_api']}")
 
     log(f"  节点数: {len(all_nodes)}")
@@ -905,21 +907,20 @@ def main():
     _NODE_CALL_RESET_TS = time.time()
 
     # 启动检查：如果首次查询失败，等待几秒再重试（可能正在重启）
-    # 启动检查
     if not all_nodes:
         log("⚠ sing-box 首次查询超时，等待5s重试...")
         time.sleep(5)
         all_nodes = get_all_proxy_nodes()
-    if not all_nodes:
-        log("⚠ sing-box 不通，尝试启动...")
-        _set_outbound_proxy(enabled=False)  # 先 bypass
-        if not restart_singbox():
-            log("✗ sing-box 启动失败，等 30s 重试")
-            time.sleep(30)
+        if not all_nodes:
+            log("⚠ sing-box 不通，尝试启动...")
+            _set_outbound_proxy(enabled=False)  # 先 bypass
             if not restart_singbox():
-                log("✗ 无法启动 sing-box，降级到 okz:6696")
-                check_and_handle_fallback([], "")
-                time.sleep(60)
+                log("✗ sing-box 启动失败，等 30s 重试")
+                time.sleep(30)
+                if not restart_singbox():
+                    log("✗ 无法启动 sing-box，降级到 okz:6696")
+                    check_and_handle_fallback([], "")
+                    time.sleep(60)
 
         all_nodes = get_all_proxy_nodes()
         if all_nodes:
@@ -927,3 +928,172 @@ def main():
     else:
         log(f"✓ sing-box OK，节点数={len(all_nodes)}")
 
+    # 首次节点健康测试（异步后台跑，不阻塞主循环）
+    _initial_health_done = threading.Event()
+    if all_nodes:
+        current = get_current_proxy()
+        log("🔍 首次节点健康测试（后台）...")
+        def _initial_health_check():
+            try:
+                dead, alive = batch_test_nodes(all_nodes, current or "")
+                # ponytail: batch_test_nodes 已更新 _DEAD_NODES 和 TTL（含指数退避），无需重复操作
+                log(f"🔍 首轮健康测试完成: dead={len(dead)} alive={len(alive)}")
+            except Exception as e:
+                log(f"✗ 首轮健康测试异常: {e}")
+            finally:
+                _initial_health_done.set()
+        threading.Thread(target=_initial_health_check, daemon=True).start()
+    else:
+        _initial_health_done.set()
+
+    while True:
+        now = time.time()
+        # ---- 缓存 Clash API 结果：每循环只请求一次 ----
+        # 合并 /proxies/proxy 一次调用得 now+all（减少 Clash API 请求次数）
+        _r, _data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}')
+        cached_all_nodes = _data.get("all", []) if _data else []
+        cached_current_proxy = _data.get("now") if _data else None
+        try:
+            # ---- 清理过期 fail_set（每轮循环） ----
+            expired_fail = [n for n, ts in _fail_set_release_ts.items() if ts < now]
+            for n in expired_fail:
+                fail_set.discard(n)
+                _fail_set_release_ts.pop(n, None)
+
+            # ---- 0. 9router 代理配置检查 (每 60s) ----
+            if now - last_proxy_check > CFG["intervals"]["proxy_check_sec"]:
+                check_9router_outbound_proxy()
+                last_proxy_check = now
+
+            # ---- 1. 读取错误率 ----
+            total, errors, recent = get_9router_error_rate()
+
+            # ---- 2b. 错误触发轮换 ----
+            should_error = (total >= 2 and errors / total > (1 - CFG["thresholds"]["opencode_min_success_rate"]))
+            # ponytail: threshold=2 instead of 3 to catch 100% failure in low-traffic windows
+            in_cooldown = now < cooldown_until
+
+            # ---- 3. 主动轮换（每 N 秒加权选新节点） ----
+            if now - last_proactive_rotate > CFG["intervals"]["proactive_rotate_sec"]:
+                current = cached_current_proxy
+                nodes = cached_all_nodes
+
+                if nodes:
+                    next_node = pick_next_node(current or "", nodes, fail_set)
+                    if next_node and next_node != current:
+                        reason = "主动轮换"
+                        delay_info = f" ({_NODE_DELAYS[next_node]}ms)" if next_node in _NODE_DELAYS else ""
+                        log(f"→ 切代理 ({reason}): {format_node_display(current)} -> {format_node_display(next_node)}{delay_info}")
+                        if switch_proxy(next_node):
+                            last_switch_ts = now
+                            update_node_info_async(next_node)
+                    elif not next_node:
+                        log(f"⚠ 主动轮换: 无可用节点 (dead={len(_DEAD_NODES)} fail={len(fail_set)})")
+
+                last_proactive_rotate = now
+
+            # ---- 3b. 错误触发轮换（错误率高时立即切） ----
+            if should_error and not in_cooldown:
+                # 拿当前真实节点（不用缓存，确保标记正确）
+                current = get_current_proxy()
+                nodes = cached_all_nodes
+
+                if nodes:
+                    if current:
+                        fail_set.add(current)
+                        _fail_set_release_ts[current] = now + BAD_NODES_TTL  # TTL 5 分钟
+
+                    check_and_handle_fallback(nodes, current or "")
+
+                    next_node = pick_next_node(current or "", nodes, fail_set)
+                    if next_node:
+                        reason = f"err={errors}/{total}"
+                        delay_info = f" ({_NODE_DELAYS[next_node]}ms)" if next_node in _NODE_DELAYS else ""
+                        log(f"→ 切代理 ({reason}): {format_node_display(current)} -> {format_node_display(next_node)}{delay_info}")
+                        if switch_proxy(next_node):
+                            cooldown_until = now + CFG["intervals"]["cooldown_after_switch_sec"]
+                            update_node_info_async(next_node)
+                    else:
+                        log(f"⚠ 无可用节点 (dead={len(_DEAD_NODES)} fail={len(fail_set)})")
+
+            # ---- 5. 节点健康检查 (每 300s) ----
+            if now - last_health_check > CFG["intervals"]["node_health_sec"]:
+                if _initial_health_done.is_set():
+                    nodes = cached_all_nodes
+                    current = cached_current_proxy
+                    if nodes and current:
+                        dead, alive = batch_test_nodes(nodes, current)
+                        # ponytail: batch_test_nodes 已更新 _DEAD_NODES 和 TTL（含指数退避），无需重复操作
+                        # 清理活过来的节点
+                        with _state_lock:
+                            for n in list(_DEAD_NODES):
+                                if n in alive:
+                                    _DEAD_NODES.discard(n)
+                                    _DEAD_NODES_RELEASE_TS.pop(n, None)
+
+                        # 降级检查
+                        check_and_handle_fallback(nodes, current)
+                last_health_check = now
+
+            # ---- 6. 订阅刷新 (每 1h，后台执行避免阻塞主循环) ----
+            if now - last_sub_refresh > CFG["intervals"]["subscription_refresh_sec"]:
+                _io_pool.submit(refresh_subscription)
+                last_sub_refresh = now
+
+            # ---- 7. Sing-box watchdog ----
+            if now - last_singbox_check > CFG["intervals"]["singbox_watchdog_sec"]:
+                if not is_singbox_alive():
+                    if _RESTART_COUNT < CFG["singbox"]["max_restart_attempts"]:
+                        restart_singbox()
+                        cooldown_until = now + 30  # 重启后冷却
+                    else:
+                        log(f"🚨 sing-box 连续重启 {_RESTART_COUNT} 次失败，降级")
+                        check_and_handle_fallback([], "")
+                else:
+                    # 恢复后清除重启计数
+                    if _RESTART_COUNT > 0:
+                        _RESTART_COUNT = 0
+                        log("✓ sing-box watchdog 恢复")
+
+                last_singbox_check = now
+
+            # ---- 8. 节点调用计数重置 (每 20min) ----
+            if now - _NODE_CALL_RESET_TS > 1200:
+                with _state_lock:
+                    _NODE_CALL_COUNTS.clear()
+                with _db_lock:
+                    _get_db().execute("UPDATE node_info SET call_count=0")
+                    _get_db().commit()
+                _NODE_CALL_RESET_TS = now
+                log("  ♻ 节点调用计数已重置")
+
+            # ---- 8b. WAL checkpoint (每 5min) ---
+            if now - _last_wal_checkpoint > 300:
+                try:
+                    with _db_lock:
+                        _get_db().execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    _last_wal_checkpoint = now
+                except Exception as e:
+                    log(f"  ⚠ WAL checkpoint 失败: {e}")
+
+            # ---- 9. 健康摘要（每 10s 最多一条） ----
+            with _state_lock:
+                dead_count = len(_DEAD_NODES)
+                err_threshold = 1 - CFG["thresholds"]["opencode_min_success_rate"]
+            log_health(f"节点={len(cached_all_nodes)} 错误={errors}/{total} "
+                       f"err>{(err_threshold*100):.0f}%→切"
+                       f"冷却至={time.strftime('%H:%M:%S', time.localtime(cooldown_until)) if cooldown_until>0 else '-'}"
+                       f" dead={dead_count} singbox={'🟢' if _RESTART_COUNT==0 else '🔴'}")
+
+            time.sleep(CFG["intervals"]["monitor_sec"])
+
+        except KeyboardInterrupt:
+            log("=== 退出 ===")
+            break
+        except Exception as e:
+            log(f"✗ 主循环异常: {e}")
+            log(traceback.format_exc())
+            time.sleep(10)
+
+if __name__ == "__main__":
+    main()
