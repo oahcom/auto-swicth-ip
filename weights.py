@@ -6,14 +6,13 @@ Single source of truth for weight calculation used by both:
 - proxy_pool.py (OKZProxyPool)
 - daemon.py (daemon main loop)
 
-Weight formula:
-    weight = ip_score * delay_score * freq_score
+Adaptive strategy:
+    mode="normal":    delay优先, 同延迟按调用次数 → 快节点优先用完
+    mode="pressure":  调用次数优先, 同次数按延迟 → 均匀分散
 
-Where:
-    ip_score: 1.0 (has country), 0.5 (has city only), 0.1 (no geo data)
-    delay_score: exp(-delay_ms / DELAY_TAU)  if delay > 0, else DEAD_DELAY_SCORE
-    freq_score: 1.0 / sqrt(usage_count + 1)  -- gentler penalty than linear
-    MIN_WEIGHT floor: 0.0001
+Weight formula (rank-based):
+    sorted_nodes = sort by (mode key)
+    weight[i] = 1 / (rank + 1)  → rank 0 gets highest probability
 """
 
 import math
@@ -27,31 +26,21 @@ DEAD_DELAY_SCORE = 0.001  # 无延迟数据（死节点）的延迟分
 DELAY_TAU = 300  # ms, 控制延迟衰减速度: 300ms→0.37, 600ms→0.14, 1000ms→0.036
 
 
+def compute_delay_score(delay_ms: int | None) -> float:
+    """延迟评分：exp 衰减，100ms→0.72, 300ms→0.37, 1000ms→0.036"""
+    if delay_ms is not None and delay_ms > 0:
+        return math.exp(-delay_ms / DELAY_TAU)
+    return DEAD_DELAY_SCORE
+
+
 def compute_node_weight(
     ip_score: float,
     delay_ms: int | None,
     usage_count: int,
 ) -> float:
-    """Compute weight for a single node.
-
-    Args:
-        ip_score: 0.1 to 1.0 (from node_info table: country=1.0, city=0.5, none=0.1)
-        delay_ms: delay in milliseconds from sing-box delay test, or None if unknown
-        usage_count: number of times this node has been selected
-
-    Returns:
-        Weight >= MIN_WEIGHT
-    """
-    # Delay score: exp decay — 100ms→0.72, 300ms→0.37, 1000ms→0.036
-    if delay_ms is not None and delay_ms > 0:
-        delay_score = math.exp(-delay_ms / DELAY_TAU)
-    else:
-        delay_score = DEAD_DELAY_SCORE
-
-    # Usage frequency penalty: more calls = lower weight
-    # Use sqrt for gentler penalty: calls=0 -> 1.0, calls=10 -> 0.3, calls=100 -> 0.1
+    """Compute weight for a single node (legacy multiplicative formula)."""
+    delay_score = compute_delay_score(delay_ms)
     freq_score = 1.0 / math.sqrt(usage_count + 1)
-
     weight = ip_score * delay_score * freq_score
     return max(weight, MIN_WEIGHT)
 
@@ -61,18 +50,38 @@ def compute_all_weights(
     ip_scores: dict[str, float],
     delays: dict[str, int],
     usage_counts: dict[str, int],
+    mode: str = "normal",
 ) -> list[tuple[str, float]]:
-    """Compute weights for all nodes, returning list of (node, weight) tuples sorted by weight desc."""
-    weights = []
+    """Compute weights for all nodes using rank-based adaptive strategy.
+
+    mode="normal":    延迟优先 (delay_score desc, calls asc)
+    mode="pressure":  调用次数优先 (calls asc, delay_score desc)
+
+    Returns list of (node, weight) sorted by weight desc.
+    """
+    # Build sortable list with scores
+    scored = []
     for node in nodes:
         ip_score = ip_scores.get(node, IP_SCORE_NONE)
         delay = delays.get(node)
         calls = usage_counts.get(node, 0)
-        w = compute_node_weight(ip_score, delay, calls)
-        weights.append((node, w))
+        ds = compute_delay_score(delay)
+        scored.append((node, ds, calls, ip_score))
 
-    # Sort by weight descending for debugging/logging
-    weights.sort(key=lambda x: -x[1])
+    # Sort by adaptive key
+    if mode == "pressure":
+        # 均匀分散: 调用次数少的优先, 同次数延迟低的优先
+        scored.sort(key=lambda x: (-x[1], x[2], x[3]))
+    else:
+        # 正常: 延迟低的优先, 同延迟调用次数少的优先
+        scored.sort(key=lambda x: (x[1], -x[2], -x[3]))
+
+    # Rank-based weights: rank 0 gets highest weight
+    weights = []
+    for rank, (node, ds, calls, ip_score) in enumerate(scored):
+        w = 1.0 / (rank + 1)
+        weights.append((node, max(w, MIN_WEIGHT)))
+
     return weights
 
 

@@ -39,7 +39,7 @@ CFG = {
         "selector": "proxy",
         "binary": "/home/administrator/dkk-projects/auto-switch-ip/sing-box",
         "config_file": "/home/administrator/dkk-projects/auto-switch-ip/singbox-config.json",
-        "startup_grace_sec": 5,
+        "startup_grace_sec": 10,  # 增加到 10s，给 sing-box 更多初始化时间
         "max_restart_attempts": 3,
         "mixed_port": 7890,
     },
@@ -59,8 +59,10 @@ CFG = {
     "thresholds": {
         "recent_window": 10,
         "opencode_min_success_rate": 0.9,
-        "node_test_timeout_ms": 10000,
+        "node_test_timeout_ms": 15000,  # 放宽到 15s，避免慢节点误判
         "node_test_url": "https://www.gstatic.com/generate_204",
+        "pressure_error_rate": 0.3,   # 429 率超过此阈值 → 切均匀分散
+        "normal_error_rate": 0.1,     # 429 率低于此阈值 → 切回延迟优先
     },
     "bad_nodes": {
         "ttl_sec": 300,  # 5 minutes - shared by proxy-global.js and daemon
@@ -80,4 +82,8 @@ LOG_FORMAT = CFG["log_format"]
 RECENT_WINDOW = CFG["thresholds"]["recent_window"]
 
 # ============= FREE_PROVIDERS 常量 =============
-FREE_PROVIDERS = {"opencode", "kiro", "nvidia", "ollama"}
+# OPENCODE_FREE_PROVIDER: 9router providerStrategies 中的 key = "opencode"
+# provider 值在 requestDetails 表中也是 "opencode"
+OPENCODE_FREE_PROVIDER = "opencode"
+# 辅助检查用的 provider 集合（仅用于 query 请求历史）
+FREE_PROVIDERS = {OPENCODE_FREE_PROVIDER, "kiro", "nvidia", "ollama", "xiaomi-tokenplan"}

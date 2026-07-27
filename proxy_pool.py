@@ -2,7 +2,9 @@
 """
 OKZProxyPool - Per-request proxy rotation for sing-box
 
-每个 HTTP 请求都换一个出口 IP，按「IP 质量/延迟」加权概率选择节点。
+每个 HTTP 请求都换一个出口 IP，按自适应策略选择节点：
+- normal:   延迟优先，快节点优先用完
+- pressure: 调用次数优先，均匀分散
 用法:
     pool = OKZProxyPool()
     proxy_url = pool.rotate()  # 每次请求前调用，返回 http://127.0.0.1:{MIXED_PORT}
@@ -30,7 +32,7 @@ from weights import (
 
 
 class OKZProxyPool:
-    """sing-box 代理池：每次 rotate() 返回代理 URL，内部按概率选节点"""
+    """sing-box 代理池：每次 rotate() 返回代理 URL，内部按自适应概率选节点"""
 
     def __init__(
         self,
@@ -52,9 +54,10 @@ class OKZProxyPool:
         self._delays_cache: dict[str, int] = {}   # node -> delay ms
         self._ip_scores_cache: dict[str, float] = {}  # node -> 0.5~1.0
         self._weights_cache: list[tuple[str, float]] = []  # [(node, weight), ...]
-        self._usage_count: dict[str, int] = {}  # node -> 调用次数
+        self._usage_count: dict[str, int] = {}  # node -> 调用次数（仅成功调用）
         self._cache_ts = 0
         self._lock = threading.Lock()
+        self._strategy_mode: str = "normal"  # "normal" or "pressure"
 
         if not skip_init:
             self._refresh_data()
@@ -144,12 +147,13 @@ class OKZProxyPool:
         self._cache_ts = time.time()
 
     def _compute_weights(self) -> list[tuple[str, float]]:
-        """权重 = IP分 × 延迟分 / (调用次数+1)。调用越多越不受待见。"""
+        """权重 = 自适应排序: normal=延迟优先, pressure=调用次数优先"""
         return compute_all_weights(
             nodes=self._nodes_cache,
             ip_scores=self._ip_scores_cache,
             delays=self._delays_cache,
             usage_counts=self._usage_count,
+            mode=self._strategy_mode,
         )
 
     def _ensure_cache(self):
@@ -176,10 +180,10 @@ class OKZProxyPool:
             pass
         return None
 
-    def rotate(self) -> str:
+    def rotate(self, count_call: bool = True) -> str:
         """
-        选一个节点（按权重概率），切 sing-box selector，返回代理 URL。
-        供 HTTP 客户端每次请求前调用。
+        选一个节点（按自适应权重），切 sing-box selector，返回代理 URL。
+        count_call=False 时不计入调用次数（用于 429 错误触发的轮换）。
         """
         self._ensure_cache()
 
@@ -190,7 +194,8 @@ class OKZProxyPool:
         with self._lock:
             nodes, weights = zip(*self._weights_cache)
             chosen = random.choices(nodes, weights=weights, k=1)[0]
-            self._usage_count[chosen] = self._usage_count.get(chosen, 0) + 1
+            if count_call:
+                self._usage_count[chosen] = self._usage_count.get(chosen, 0) + 1
 
         # 切 sing-box selector（锁外发请求，不阻塞其他读）
         try:
@@ -204,6 +209,13 @@ class OKZProxyPool:
             print(f"  ⚠ proxy_pool 切换 {chosen} 失败: {e}")
 
         return f"http://127.0.0.1:{MIXED_PORT}"
+
+    def set_strategy_mode(self, mode: str):
+        """设置策略模式: "normal"=延迟优先, "pressure"=均匀分散"""
+        if mode != self._strategy_mode:
+            print(f"  🔄 proxy_pool 策略切换: {self._strategy_mode} → {mode}")
+            self._strategy_mode = mode
+            self._cache_ts = 0  # 强制刷新权重
 
     def get_stats(self) -> dict:
         """调试用：看当前权重分布"""
