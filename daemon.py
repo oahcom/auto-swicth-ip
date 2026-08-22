@@ -36,7 +36,7 @@ from logging.handlers import RotatingFileHandler
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
-from config import CFG, NODE_INFO_DB, FREE_PROVIDERS, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, BAD_NODES_TTL, MIXED_PORT, LOG_FORMAT
+from config import CFG, NODE_INFO_DB, FREE_PROVIDERS, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret
 
 # 全局复用连接 - 避免每次操作开/关 SQLite 连接
 _db_conn: sqlite3.Connection | None = None
@@ -133,9 +133,38 @@ def format_node_display(node: str | None) -> str:
 # ============= 全局状态 =============
 _DEAD_NODES: set[str] = set()
 _DEAD_NODES_RELEASE_TS: dict[str, float] = {}
-# 死节点指数退避参数（60s → 6min → 1h → 10h → 永久）
-_DEAD_TTL_STAGES = [60, 120, 300, 600]  # 缩短退避：1min → 2min → 5min → 10min
-_DEAD_TTL_PERMANENT = float('inf')         # 永久拉黑标记
+# 死节点指数退避参数
+_DEAD_TTL_MAX = BAD_NODES_MAX_TTL          # 最大 TTL（替代 float('inf）永久拉黑）
+
+def _generate_ttl_stages() -> list[int]:
+    """算法生成 TTL 阶梯：
+    - 第 1-10 次：平滑渐进 30s → 120s (指数平滑)
+    - 第 11-15 次：线性增长到 1h
+    - 16+ 次：指数增长到 7 天
+    """
+    stages = []
+
+    # 第 1-10 次：平滑指数渐进 30s → 120s
+    # 使用指数插值：start * (end/start)^(i/(n-1))
+    start, end = 30, 120
+    for i in range(10):
+        ratio = i / 9  # 0 到 1
+        ttl = int(start * (end / start) ** ratio)
+        stages.append(ttl)
+
+    # 第 11-15 次：线性增长到 1h (3600s)
+    for i in range(5):
+        stages.append(300 + i * 600)  # 5m, 10m, 15m, 20m, 25m
+
+    # 16+ 次：指数增长到 7 天
+    base = 3600  # 1h
+    for i in range(12):  # 足够到达 7 天
+        stages.append(min(base * (2 ** i), _DEAD_TTL_MAX))
+
+    return stages
+
+# 模块加载时生成，避免懒加载竞态
+_DEAD_TTL_STAGES: list[int] = _generate_ttl_stages()
 _POOL_MIN_RATIO = 0.3                      # 降低保底：允许 70% 节点被拉黑
 _dead_fail_count: dict[str, int] = {}  # 节点连续失败计数
 
@@ -149,6 +178,10 @@ _NODE_CALL_RESET_TS: float = 0  # 上次重置时间
 _strategy_mode: str = "normal"  # "normal"=延迟优先, "pressure"=均匀分散
 _state_lock = threading.RLock()  # 保护所有全局共享状态
 _last_wal_checkpoint: float = 0  # WAL checkpoint 时间戳
+# 健康检查后台任务状态
+_health_check_future = None
+_health_check_nodes = None
+_health_check_current = None
 class _BoundedPool:
     """有界线程池：队列深度 ≤ max_workers*2，防止 Clash API 挂起队列暴涨 OOM。
     非阻塞：队列满时丢弃任务并记录警告，不阻塞 asyncio 事件循环。"""
@@ -168,7 +201,8 @@ class _BoundedPool:
     def shutdown(self, wait=True):
         self._executor.shutdown(wait=wait)
 
-_health_pool = _BoundedPool(max_workers=30, name_prefix="health")
+# 增加 worker 数和队列深度：支持并发测试 90+ 节点不丢任务
+_health_pool = _BoundedPool(max_workers=60, name_prefix="health")
 _io_pool = _BoundedPool(max_workers=8, name_prefix="io")
 def _cleanup_atexit():
     _health_pool.shutdown(wait=True)
@@ -271,12 +305,18 @@ def _load_shared_bad_nodes() -> dict[str, float]:
     ponytail: cached per-mtime to avoid repeated I/O (checked every 5s at most).
     与 proxy-global.js 的 mtime 缓存不对称：proxy-global 在每次 HTTP 请求时检测，
     daemon 每5秒检查一次。快速连续写入场景下 proxy-global 可能先于 daemon 感知。
-    修复路径：统一为 mtime 检测或事件通知（当前延迟影响 ≤5s）。"""
+    修复路径：统一为 mtime 检测或事件通知（当前延迟影响 ≤5s）。
+    Validation: skip expired, skip > MAX_TTL, skip non-dict entries, accept both legacy "-any" and canonical "host:port-scheme" formats, cap at MAX_TTL."""
     global _shared_bad_cache, _shared_bad_mtime, _shared_bad_check_ts, _shared_bad_loaded
     now = _now_ts()
-    if now - _shared_bad_check_ts < 5:
-        with _state_lock:
+    max_allowed = now + _DEAD_TTL_MAX
+    import_max_allowed = now + 3600  # 导入时上限 1h
+    
+    # 先检查是否需要刷新 cache（不更新 check_ts，避免加载失败时标记为已检查）
+    with _state_lock:
+        if now - _shared_bad_check_ts < 5:
             return dict(_shared_bad_cache)
+    
     try:
         if os.path.exists(_BAD_NODES_FILE):
             mtime = os.path.getmtime(_BAD_NODES_FILE)
@@ -285,17 +325,26 @@ def _load_shared_bad_nodes() -> dict[str, float]:
                     return dict(_shared_bad_cache)
             with open(_BAD_NODES_FILE) as f:
                 nodes = json.load(f)
-            filtered = {n: (v.get("expire", 0) if isinstance(v, dict) else v)
-                        for n, v in nodes.items()
-                        if (v.get("expire", 0) if isinstance(v, dict) else v) > now}
+            filtered = {}
+            for n, v in nodes.items():
+                if isinstance(v, dict) and "expire" in v:
+                    expire_ts = v.get("expire", 0)
+                    if expire_ts > now and expire_ts <= max_allowed:
+                        filtered[n] = expire_ts
+                    continue
+                if isinstance(v, (int, float)) and v > now and v <= max_allowed:
+                    filtered[n] = v
+                    continue
+            # 只有加载成功后才更新 check_ts 和 cache
             with _state_lock:
                 _shared_bad_cache = filtered
                 _shared_bad_mtime = mtime
-                _shared_bad_check_ts = now
+                _shared_bad_check_ts = now  # 只有成功加载后才更新检查时间
                 _shared_bad_loaded = True
             return filtered
     except Exception:
         log("⚠ _load_shared_bad_nodes 异常: " + traceback.format_exc())
+    
     with _state_lock:
         _shared_bad_loaded = True
     with _state_lock:
@@ -364,7 +413,7 @@ def singbox_api(path: str, method: str = "GET", body: dict | None = None,
                 timeout: int = 3, silent: bool = False) -> tuple[int, dict | None]:
     """通用 sing-box Clash API 调用"""
     try:
-        headers = {"Authorization": f"Bearer {CFG['singbox']['secret']}"}
+        headers = {"Authorization": f"Bearer {get_singbox_secret()}"}
         if body:
             headers["Content-Type"] = "application/json"
         r = requests.request(
@@ -395,15 +444,23 @@ def get_all_proxy_nodes() -> list[str]:
     return data.get("all", []) if data else []
 
 def switch_proxy(new_node: str) -> bool:
-    """切换代理节点。不 ban 旧节点——ban 只在错误触发路径处理。"""
+    """切换代理节点并验证切换生效。不 ban 旧节点——ban 只在错误触发路径处理。"""
     r, _ = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}',
                        method="PUT", body={"name": new_node})
-    ok = r == 200 or r == 204
-    if ok:
-        log(f"✓ 切到: {new_node}")
-    else:
+    if r != 200 and r != 204:
         log(f"✗ 切代理失败 ({new_node}): status={r}")
-    return ok
+        return False
+
+    # PUT 成功后，延迟 0.2s 等待变更生效，再通过 GET 验证 now == new_node
+    time.sleep(0.2)
+    _, verify_data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}')
+    actual = verify_data.get("now") if verify_data else None
+    if actual == new_node:
+        log(f"✓ 切到: {new_node} (已验证)")
+        return True
+    else:
+        log(f"✗ 切代理验证失败 ({new_node}): PUT 返回 {r} 但实际 now={actual}")
+        return False
 
 
 # ponytail: _ban_node 暂未被调用，预留给未来错误触发路径显式 ban。
@@ -438,49 +495,82 @@ def _ban_node(node: str, ttl: int = 300, reason: str = "unknown") -> None:
     except Exception as e:
         log(f"  ⚠ ban 节点失败: {e}")
 
-def test_node_delay(node: str) -> int | None:
-    """测试单个节点延迟，超时返回 None"""
+def _probe_node(node: str, timeout_ms: int, strict: bool = False) -> int | None:
+    """统一节点探测核心函数
+
+    Args:
+        node: 节点名
+        timeout_ms: 探测超时毫秒数
+        strict: True=严格模式(连接错误/超时/SSL/DNS=明确失败), False=宽松模式(仅记录日志,给机会)
+
+    Returns:
+        延迟(ms) 如果成功, None 如果失败
+    """
     try:
         r = requests.get(
             f'{CFG["singbox"]["clash_api"]}/proxies/{node}/delay',
-            params={"timeout": CFG["thresholds"]["node_test_timeout_ms"],
+            params={"timeout": timeout_ms,
                     "url": CFG["thresholds"]["node_test_url"]},
-            headers={"Authorization": f"Bearer {CFG['singbox']['secret']}"},
-            timeout=15,
+            headers={"Authorization": f"Bearer {get_singbox_secret()}"},
+            timeout=timeout_ms / 1000 + 2,
         )
         if r.status_code == 200:
             data = r.json()
-            return data.get("delay")
+            delay = data.get("delay")
+            if delay is not None:
+                return delay
+    except requests.exceptions.ConnectionError:
+        if strict:
+            return None
+    except requests.exceptions.Timeout:
+        if strict:
+            return None
+    except requests.exceptions.SSLError:
+        if strict:
+            return None
     except Exception as e:
-        log(f"  ⚠ test_node_delay 测试 {node} 失败: {e}")
+        err_str = str(e).lower()
+        if strict and ("dns" in err_str or "name" in err_str or "resolve" in err_str):
+            return None
+        # 宽松模式：记录日志但给机会
+        if not strict:
+            log(f"  ⚠ _probe_node {node} 异常: {e}")
     return None
 
-# ============= 节点健康检查 =============
-def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]]:
-    """并发批量测节点延迟，返回 (dead, alive)"""
-    now = time.time()
-    # 先清理过期 TTL，给 dead 节点复活机会
+
+def test_node_delay(node: str) -> int | None:
+    """测试单个节点延迟（健康检查用），返回延迟ms或None"""
+    return _probe_node(node, CFG["thresholds"]["node_test_timeout_ms"], strict=False)
+
+
+def test_node_quick(node: str, timeout_ms: int = 3000) -> bool:
+    """快速可用性探测（切换前验证用），返回True/False"""
+    delay = _probe_node(node, timeout_ms, strict=True)
+    return delay is not None
+
+
+def _collect_test_nodes(nodes: list[str], current: str) -> list[str]:
+    """收集待测节点（需在锁内调用）"""
     cleanup_dead_ttl()
 
-    with _state_lock:
-        to_test = [n for n in nodes
-                   if n != "direct" and n != current and n not in _DEAD_NODES]
-        # 如果可测节点太少，尝试重测已过期但还在 blacklist 的节点
-        if len(to_test) < 3:
-            for n in list(_DEAD_NODES):
-                if n != "direct" and n != current and _DEAD_NODES_RELEASE_TS.get(n, 0) <= now:
-                    to_test.append(n)
-                    _DEAD_NODES.discard(n)
-                    _DEAD_NODES_RELEASE_TS.pop(n, None)
-                    log(f"  复活重测: {n}")
+    to_test = [n for n in nodes
+               if n != "direct" and n != current and n not in _DEAD_NODES]
+    # 仅测试 TTL 已到的死节点（允许恢复），保持指数退避语义
+    now = time.time()
+    for n in list(_DEAD_NODES):
+        if n != "direct" and n != current and _DEAD_NODES_RELEASE_TS.get(n, 0) <= now:
+            to_test.append(n)
+            _DEAD_NODES.discard(n)
+            _DEAD_NODES_RELEASE_TS.pop(n, None)
+            log(f"  复活重测: {n}")
+    return to_test
 
-    if not to_test:
-        return set(_DEAD_NODES), set()
 
-    alive = set()
-    dead = set()
+def _concurrent_test_delays(nodes: list[str]) -> dict[str, int | None]:
+    """并发测试节点延迟，返回 {node: delay或None}"""
+    results = {}
     futures = {}
-    for n in to_test:
+    for n in nodes:
         f = _health_pool.submit(test_node_delay, n)
         if f is not None:
             futures[f] = n
@@ -491,96 +581,179 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
         except Exception as e:
             delay = None
             log(f"  ⚠ {node} 延迟测试异常: {e}")
+        results[node] = delay
+    return results
+
+
+def _apply_test_results(nodes: list[str], results: dict[str, int | None], now: float) -> tuple[set[str], set[str]]:
+    """应用测试结果到全局状态（需在锁内调用）"""
+    alive = set()
+    dead = set()
+    for node, delay in results.items():
         if delay is not None and delay < CFG["thresholds"]["node_test_timeout_ms"]:
             alive.add(node)
-            with _state_lock:
-                _NODE_DELAYS[node] = delay
-                _dead_fail_count.pop(node, None)
+            _NODE_DELAYS[node] = delay
+            _dead_fail_count.pop(node, None)
         else:
             dead.add(node)
-            with _state_lock:
-                _NODE_DELAYS.pop(node, None)
-                _dead_fail_count[node] = _dead_fail_count.get(node, 0) + 1
-                fail_count = _dead_fail_count[node]
-                # 指数退避：60s → 6min → 1h → 10h → 永久
-                stage_idx = fail_count - 1
-                if stage_idx >= len(_DEAD_TTL_STAGES):
-                    ttl = _DEAD_TTL_PERMANENT
-                    ttl_desc = "永久"
-                else:
-                    ttl = _DEAD_TTL_STAGES[stage_idx]
-                    ttl_desc = f"{ttl}s"
-                # 保底：活跃节点不足一半时不拉黑（严格小于才停）
-                alive_count = len(nodes) - len(_DEAD_NODES)
-                if alive_count < len(nodes) * _POOL_MIN_RATIO:
-                    log(f"  ⚠ {node} 跳过拉黑（保底: {alive_count}/{len(nodes)} < {_POOL_MIN_RATIO*100:.0f}%）")
-                    _dead_fail_count.pop(node, None)
-                else:
-                    _DEAD_NODES.add(node)
-                    _DEAD_NODES_RELEASE_TS[node] = now + ttl
-                    log(f"  ✗ {node} 死 (连续失败 {fail_count} 次, TTL {ttl_desc})")
+            _NODE_DELAYS.pop(node, None)
+            _dead_fail_count[node] = _dead_fail_count.get(node, 0) + 1
+            fail_count = _dead_fail_count[node]
+            if fail_count > len(_DEAD_TTL_STAGES):
+                ttl = _DEAD_TTL_MAX
+                ttl_desc = "永久"
+            else:
+                ttl = _DEAD_TTL_STAGES[fail_count - 1]
+                ttl_desc = f"{ttl}s"
+            alive_count = len(nodes) - len(_DEAD_NODES)
+            if alive_count < len(nodes) * _POOL_MIN_RATIO:
+                log(f"  ⚠ {node} 跳过拉黑（保底: {alive_count}/{len(nodes)} < {_POOL_MIN_RATIO*100:.0f}%）")
+                _dead_fail_count.pop(node, None)
+            else:
+                _DEAD_NODES.add(node)
+                _DEAD_NODES_RELEASE_TS[node] = now + ttl
+                log(f"  ✗ {node} 死 (连续失败 {fail_count} 次, TTL {ttl_desc})")
+    return dead, alive
+
+
+# ============= 节点健康检查 =============
+def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]]:
+    """并发批量测节点延迟，返回 (dead, alive)"""
+    now = time.time()
+    with _state_lock:
+        to_test = _collect_test_nodes(nodes, current)
+
+    if not to_test:
+        return set(_DEAD_NODES), set()
+
+    # 无锁并发测试
+    results = _concurrent_test_delays(to_test)
+
+    # 锁内应用结果
+    with _state_lock:
+        dead, alive = _apply_test_results(nodes, results, now)
 
     log(f"  节点测试: {len(alive)}✓/{len(dead)}✗")
     return dead, alive
+
+def _run_health_check_async(nodes: list[str], current: str) -> tuple[set[str], set[str]]:
+    """后台异步运行健康检查，供主循环非阻塞调用"""
+    return batch_test_nodes(nodes, current)
 
 def cleanup_dead_ttl():
     """清理过期的死节点 TTL，重置连续失败计数（给节点公平重试机会）
 
     Shared bad_nodes from proxy-global.js + daemon。
+    三阶段设计：1) 锁内收集快照 2) 无锁网络探测 3) 锁内应用结果
     """
-    # 先读共享 bad_nodes 文件（无锁）
-    p429_bad = _load_shared_bad_nodes()
+    # 阶段 1：锁内收集快照
+    p429_bad = _load_shared_bad_nodes()  # 无锁读取
 
     with _state_lock:
         now = time.time()
-        expired = [n for n, ts in _DEAD_NODES_RELEASE_TS.items() if ts < now]
-        for n in expired:
-            _DEAD_NODES.discard(n)
-            _DEAD_NODES_RELEASE_TS.pop(n, None)
-            _dead_fail_count.pop(n, None)  # 重置 fail count，TTL 到了就给新机会
-        if expired:
-            log(f"  释放 {len(expired)} 个黑名单节点 (TTL 到，fail_count 已重置)")
+        max_allowed = now + _DEAD_TTL_MAX
+        import_max_allowed = now + 3600  # 导入时上限 1h
 
-        # 导入坏节点（proxy-global.js + daemon 共享写入），保留原始 expiry
+        # 收集过期节点快照
+        expired = [n for n, ts in _DEAD_NODES_RELEASE_TS.items() if ts < now]
+
+        # 收集导入所需数据快照
+        p429_import = {}
         if p429_bad:
             for n, exp in p429_bad.items():
-                if n not in _DEAD_NODES:
-                    _DEAD_NODES.add(n)
-                    _DEAD_NODES_RELEASE_TS[n] = exp  # 保留原始 TTL
+                if n not in _DEAD_NODES and exp > now and exp <= max_allowed:
+                    p429_import[n] = min(exp, import_max_allowed)
 
-        # 导出 daemon 死节点到共享文件，让 proxy-global.js 看到 daemon 发现的死节点
-        if _DEAD_NODES:
-            try:
-                total_count = 0
-                try:
-                    _, _data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}', timeout=2)
-                    total_count = len(_data.get("all", [])) if _data else 0
-                except Exception:
-                    total_count = 0
-                # 安全阀：Clash API 不通或节点数为 0 → Clash 自身有问题，不导出
-                if total_count == 0:
-                    _DEAD_NODES.clear()
-                    _DEAD_NODES_RELEASE_TS.clear()
-                    log("  ⚠ Clash API 不通或节点数为 0，清空 _DEAD_NODES 并跳过 bad_nodes 导出")
-                    return
-                # 防全误判：死节点超过总节点 60% 时跳过导出
-                if len(_DEAD_NODES) > total_count * 0.6:
-                    log(f"  ⚠ 跳过 bad_nodes 导出: {len(_DEAD_NODES)}/{total_count} 死节点 >60%")
-                    return
-                shared = {}
-                if os.path.exists(_BAD_NODES_FILE):
-                    with open(_BAD_NODES_FILE) as f:
-                        shared = json.load(f)
-                # 只追加 daemon 发现的死节点，不覆盖 proxy-global 已有的条目
-                for n in _DEAD_NODES:
-                    if n not in shared:
-                        shared[n] = {"expire": _DEAD_NODES_RELEASE_TS.get(n, _now_ts() + BAD_NODES_TTL), "reason": "daemon_dead"}
-                tmp = _BAD_NODES_FILE + ".tmp"
-                with open(tmp, "w") as f:
-                    json.dump(shared, f)
-                os.replace(tmp, _BAD_NODES_FILE)
-            except Exception:
-                pass  # 写失败不影响主逻辑
+        # 收集导出所需数据快照
+        dead_snapshot = set(_DEAD_NODES)
+        release_ts_snapshot = dict(_DEAD_NODES_RELEASE_TS)
+
+    # 阶段 2：无锁网络探测（探测过期节点）
+    revived = []
+    for n in expired:
+        probe_ok = test_node_quick(n, timeout_ms=3000)
+        if probe_ok:
+            revived.append(n)
+        else:
+            # 探测失败：记录但不修改状态，下阶段统一处理
+            log(f"  ⚠ {n} TTL 到但探测失败，延长 TTL 5 分钟")
+
+    # 预取 total_count 避免在锁内做网络请求（减少 _state_lock 持有时间）
+    total_count = 0
+    try:
+        _, _data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}', timeout=2)
+        total_count = len(_data.get("all", [])) if _data else 0
+    except Exception:
+        pass
+
+    # 阶段 3：锁内应用结果
+    with _state_lock:
+        now = time.time()
+        max_allowed = now + _DEAD_TTL_MAX
+        import_max_allowed = now + 3600
+
+        # 应用复活结果
+        for n in revived:
+            _DEAD_NODES.discard(n)
+            _DEAD_NODES_RELEASE_TS.pop(n, None)
+            _dead_fail_count.pop(n, None)
+        if revived:
+            log(f"  释放 {len(revived)} 个黑名单节点 (TTL 到且探测通过，fail_count 已重置): {revived}")
+
+        # 处理探测失败的过期节点：延长 TTL + fail_count+1
+        failed_expired = [n for n in expired if n not in revived]
+        for n in failed_expired:
+            if n in _DEAD_NODES_RELEASE_TS:  # 可能已被并发移除
+                _DEAD_NODES_RELEASE_TS[n] = time.time() + 300  # 额外 5 分钟
+                _dead_fail_count[n] = _dead_fail_count.get(n, 0) + 1
+
+        # 导入 proxy-global 的坏节点
+        for n, capped_exp in p429_import.items():
+            if n not in _DEAD_NODES:
+                # 再次验证（双重检查模式）
+                if capped_exp <= now or capped_exp > max_allowed:
+                    continue
+                _DEAD_NODES.add(n)
+                _DEAD_NODES_RELEASE_TS[n] = capped_exp
+
+        # 导出到共享文件（total_count 已预取）
+        _export_dead_nodes_locked(total_count)
+
+
+def _export_dead_nodes_locked(total_count: int = 0):
+    """导出死节点到共享文件（需在 _state_lock 内调用）。total_count 应在锁外预取。"""
+    if not _DEAD_NODES:
+        return
+
+    try:
+        # 安全阀：Clash API 不通或节点数为 0 → Clash 自身有问题，不导出
+        if total_count == 0:
+            _DEAD_NODES.clear()
+            _DEAD_NODES_RELEASE_TS.clear()
+            log("  ⚠ Clash API 不通或节点数为 0，清空 _DEAD_NODES 并跳过 bad_nodes 导出")
+            return
+
+        # 防全误判：死节点超过总节点 60% 时跳过导出
+        if len(_DEAD_NODES) > total_count * (1 - _POOL_MIN_RATIO):
+            log(f"  ⚠ 跳过 bad_nodes 导出: {len(_DEAD_NODES)}/{total_count} 死节点 >60%")
+            return
+
+        shared = {}
+        if os.path.exists(_BAD_NODES_FILE):
+            with open(_BAD_NODES_FILE) as f:
+                shared = json.load(f)
+
+        # 只追加 daemon 发现的死节点，不覆盖 proxy-global 已有的条目
+        for n in _DEAD_NODES:
+            if n not in shared:
+                shared[n] = {"expire": _DEAD_NODES_RELEASE_TS.get(n, _now_ts() + BAD_NODES_TTL), "reason": "daemon_dead"}
+
+        tmp = _BAD_NODES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(shared, f)
+        os.replace(tmp, _BAD_NODES_FILE)
+    except Exception:
+        pass  # 写失败不影响主逻辑
 
 
 
@@ -690,16 +863,18 @@ def _dedup_by_ip(candidates: list[str], call_map: dict[str, int], ip_map: dict[s
     return dedup_skip
 
 
-def _p2c_select(candidates: list[str], dedup_skip: set[str], call_map: dict[str, int], mode: str = "normal") -> str:
+def _p2c_select(candidates: list[str], dedup_skip: set[str], call_map: dict[str, int]) -> str:
     """Pick from candidates using P2C + adaptive score.
 
-    mode="normal":    delay优先, 同延迟按调用次数 (ds, -calls)
-    mode="pressure":  调用次数优先, 同次数按延迟 (-calls, ds)
+    Mode is read from _strategy_mode under _state_lock to avoid race.
+    normal:   delay优先, 同延迟按调用次数 (ds, -calls)
+    pressure: 调用次数优先, 同次数按延迟 (-calls, ds)
     """
     pool = [n for n in candidates if n not in dedup_skip] or candidates
     with _state_lock:
         usage_counts = {n: call_map.get(n, 0) + _NODE_CALL_COUNTS.get(n, 0) for n in candidates}
         delays = dict(_NODE_DELAYS)
+        mode = _strategy_mode
     all_delays = [d for d in delays.values() if d is not None]
     median, dmin, dmax = _precompute_delay_stats(all_delays)
 
@@ -722,6 +897,8 @@ def pick_next_node(current: str, all_nodes: list, fail_set: set, count_call: boo
     - normal 模式:   延迟优先 (ds, -calls) — 快节点优先用
     - pressure 模式: 调用次数优先 (-calls, ds) — 均匀分散
     count_call=False 时, 选中节点不计入调用次数（用于 429 错误触发的轮换）
+
+    增加: 选中后快速探测可用性，失败则标记为死节点并重选（最多 3 次）。
     """
     global _strategy_mode
     candidates = _filter_candidates(current, all_nodes, fail_set)
@@ -732,13 +909,47 @@ def pick_next_node(current: str, all_nodes: list, fail_set: set, count_call: boo
 
     call_map, ip_map = _load_candidate_stats(candidates)
     dedup_skip = _dedup_by_ip(candidates, call_map, ip_map)
-    chosen = _p2c_select(candidates, dedup_skip, call_map, mode=_strategy_mode)
 
-    with _state_lock:
-        _recent_nodes.append(chosen)
-        if count_call:
-            _NODE_CALL_COUNTS[chosen] = _NODE_CALL_COUNTS.get(chosen, 0) + 1
-    return chosen
+    # 最多尝试 3 个候选，避免死循环
+    for attempt in range(3):
+        chosen = _p2c_select(candidates, dedup_skip, call_map)
+
+        # 快速可用性探测（3s 超时），不更新 _NODE_DELAYS
+        if test_node_quick(chosen, timeout_ms=3000):
+            with _state_lock:
+                _recent_nodes.append(chosen)
+                if count_call:
+                    _NODE_CALL_COUNTS[chosen] = _NODE_CALL_COUNTS.get(chosen, 0) + 1
+            return chosen
+        else:
+            # 探测失败：指数退避 TTL（与健康检查一致），从候选中移除，重试
+            with _state_lock:
+                # Only increment fail_count if this is a new failure (not already in _DEAD_NODES)
+                if chosen in _DEAD_NODES:
+                    # Already tracked, use existing fail_count for TTL calculation
+                    fail_count = _dead_fail_count.get(chosen, 0)
+                else:
+                    _DEAD_NODES.add(chosen)
+                    fail_count = _dead_fail_count.get(chosen, 0) + 1
+                    _dead_fail_count[chosen] = fail_count
+                if fail_count > len(_DEAD_TTL_STAGES):
+                    ttl = _DEAD_TTL_MAX
+                    ttl_desc = "永久"
+                else:
+                    ttl = _DEAD_TTL_STAGES[fail_count - 1]
+                    ttl_desc = f"{ttl}s"
+                _DEAD_NODES_RELEASE_TS[chosen] = time.time() + ttl
+            log(f"  ✗ 快速探测失败，标记死节点并重选: {chosen} (失败{fail_count}次, TTL={ttl}s) (尝试 {attempt + 1}/3)")
+            # 从候选中移除
+            candidates = [n for n in candidates if n != chosen]
+            dedup_skip.add(chosen)
+
+            if not candidates:
+                log(f"⚠ 重选后无可用节点")
+                return None
+
+    log(f"⚠ 3 次快速探测均失败，放弃")
+    return None
 
 # ============= Sing-box Watchdog (Windows) =============
 def _singbox_pids() -> list[int]:
@@ -824,9 +1035,8 @@ def restart_singbox() -> bool:
         config_file = CFG["singbox"]["config_file"]
         log_dir = os.path.dirname(CFG["log_file"])
 
-        # ponytail: 显式保存文件句柄，避免 fd 泄漏
-        log_path = os.path.join(log_dir, "singbox.log")
         # 单文件轮转：>10MB 时备份为 .1 并截断
+        log_path = os.path.join(log_dir, "singbox.log")
         try:
             if os.path.getsize(log_path) > 10 * 1024 * 1024:
                 bak = log_path + ".1"
@@ -836,14 +1046,14 @@ def restart_singbox() -> bool:
                 log(f"  singbox.log 轮转 (>{10}MB)")
         except Exception as e:
             log(f"⚠ singbox 日志轮转失败: {e}")
-        log_file = open(log_path, "a")
-        try:
+
+        # 使用文件路径而非打开的句柄，避免 fd 泄漏
+        # subprocess 会自动打开/关闭文件
+        with open(log_path, "a") as log_file:
             subprocess.Popen(
                 [singbox_bin, "run", "-c", config_file],
                 stdout=log_file, stderr=subprocess.STDOUT,
                 start_new_session=True)
-        finally:
-            log_file.close()
         time.sleep(CFG["singbox"]["startup_grace_sec"])
 
         if is_singbox_alive():
@@ -873,16 +1083,29 @@ def restart_singbox() -> bool:
 
 
 # ============= 订阅刷新 =============
+# 多个订阅源合并：okz（主力）+ hd.23n.club + dasho.pqjc.site + dasho.xn--cp3a08l.com（补充）
+_SUB_URLS = [
+    CFG["okz"]["sub_url"],
+    CFG.get("hd23n", {}).get("sub_url", ""),
+    CFG.get("dasho", {}).get("sub_url", ""),
+    CFG.get("dasho_alt", {}).get("sub_url", ""),
+]
+
 def refresh_subscription() -> bool:
-    """重新拉 okz 订阅 + 生成 sing-box config + 重启 sing-box"""
+    """拉所有订阅源 + merge 去重 + 生成 sing-box config + 重启 sing-box"""
     log("🔄 刷新订阅...")
     try:
         parse_script = os.path.join(os.path.dirname(__file__), "parse_subscription.py")
         config_file = CFG["singbox"]["config_file"]
+        urls = [u for u in _SUB_URLS if u]
+        if not urls:
+            log("✗ 无可用订阅源")
+            return False
         subprocess.run(
             [sys.executable, parse_script,
-             "--out", config_file],
-            capture_output=True, text=True, timeout=60)
+             "--out", config_file,
+             "--urls", *urls],
+            capture_output=True, text=True, timeout=120)
         log("✓ 订阅刷新完毕，重启 sing-box 加载新配置...")
         return restart_singbox()
     except Exception as e:
@@ -1006,8 +1229,6 @@ def main():
 
     # 状态
     cooldown_until = 0
-    fail_set: set[str] = set()
-    _fail_set_release_ts: dict[str, float] = {}
     last_singbox_check = 0
     last_health_check = 0
     last_sub_refresh = time.time()  # 启动时不立即触发刷新
@@ -1069,12 +1290,6 @@ def main():
         cached_all_nodes = _data.get("all", []) if _data else []
         cached_current_proxy = _data.get("now") if _data else None
         try:
-            # ---- 清理过期 fail_set（每轮循环） ----
-            expired_fail = [n for n, ts in _fail_set_release_ts.items() if ts < now]
-            for n in expired_fail:
-                fail_set.discard(n)
-                _fail_set_release_ts.pop(n, None)
-
             # ---- 0. 9router 代理配置检查 (每 60s) ----
             if now - last_proxy_check > CFG["intervals"]["proxy_check_sec"]:
                 check_9router_outbound_proxy()
@@ -1085,16 +1300,18 @@ def main():
 
             # ---- 1b. 自适应策略切换（带回滞） ----
             error_rate = errors / total if total > 0 else 0
-            old_mode = _strategy_mode
-            if _strategy_mode == "normal":
-                # 正常 → 均匀: 需要超过高压阈值
-                if error_rate >= CFG["thresholds"]["pressure_error_rate"] and total >= 3:
-                    _strategy_mode = "pressure"
-            else:
-                # 均匀 → 正常: 需要降到回滞阈值以下
-                if error_rate <= CFG["thresholds"]["normal_error_rate"] or total < 3:
-                    _strategy_mode = "normal"
-            if old_mode != _strategy_mode:
+            with _state_lock:  # 与 _p2c_select 读取同锁，保证 mode 与 usage_counts/delays 快照一致
+                old_mode = _strategy_mode
+                if _strategy_mode == "normal":
+                    # 正常 → 均匀: 需要超过高压阈值
+                    if error_rate >= CFG["thresholds"]["pressure_error_rate"] and total >= 3:
+                        _strategy_mode = "pressure"
+                else:
+                    # 均匀 → 正常: 需要降到回滞阈值以下
+                    if error_rate <= CFG["thresholds"]["normal_error_rate"] or total < 3:
+                        _strategy_mode = "normal"
+                switched = old_mode != _strategy_mode
+            if switched:
                 log(f"🔄 策略切换: {old_mode} → {_strategy_mode} (429率={error_rate:.0%}, {errors}/{total}, 连续失败={consecutive_errors})")
 
             # ---- 2b. 错误触发轮换 ----
@@ -1108,7 +1325,7 @@ def main():
                 nodes = cached_all_nodes
 
                 if nodes:
-                    next_node = pick_next_node(current or "", nodes, fail_set)
+                    next_node = pick_next_node(current or "", nodes, set())
                     if next_node and next_node != current:
                         reason = "主动轮换"
                         delay_info = f" ({_NODE_DELAYS[next_node]}ms)" if next_node in _NODE_DELAYS else ""
@@ -1116,7 +1333,7 @@ def main():
                         if switch_proxy(next_node):
                             update_node_info_async(next_node)
                     elif not next_node:
-                        log(f"⚠ 主动轮换: 无可用节点 (dead={len(_DEAD_NODES)} fail={len(fail_set)})")
+                        log(f"⚠ 主动轮换: 无可用节点 (dead={len(_DEAD_NODES)})")
 
                 last_proactive_rotate = now
 
@@ -1145,13 +1362,14 @@ def main():
 
                 if nodes:
                     if current:
-                        fail_set.add(current)
-                        _fail_set_release_ts[current] = now + BAD_NODES_TTL  # TTL 5 分钟
+                        with _state_lock:
+                            _DEAD_NODES.add(current)
+                            _DEAD_NODES_RELEASE_TS[current] = now + BAD_NODES_TTL  # TTL 5 分钟
 
                     check_and_handle_fallback(nodes, current or "")
 
                     # 错误触发轮换不计入调用次数（429 的请求不算成功调用）
-                    next_node = pick_next_node(current or "", nodes, fail_set, count_call=False)
+                    next_node = pick_next_node(current or "", nodes, set(), count_call=False)
                     if next_node:
                         reason = f"err={errors}/{total}"
                         delay_info = f" ({_NODE_DELAYS[next_node]}ms)" if next_node in _NODE_DELAYS else ""
@@ -1160,34 +1378,57 @@ def main():
                             cooldown_until = now + CFG["intervals"]["cooldown_after_switch_sec"]
                             update_node_info_async(next_node)
                     else:
-                        log(f"⚠ 无可用节点 (dead={len(_DEAD_NODES)} fail={len(fail_set)})")
+                        log(f"⚠ 无可用节点 (dead={len(_DEAD_NODES)})")
 
-            # ---- 5. 节点健康检查 (每 300s) ----
+            # ---- 5. 节点健康检查 (每 300s，后台异步执行不阻塞主循环) ----
             if now - last_health_check > CFG["intervals"]["node_health_sec"]:
                 if _initial_health_done.is_set():
-                    # 健康检查前直接从 Clash API 获取最新节点列表，避免用陈旧缓存
+                    # 健康检查前直接从 Clash API 获取最新节点列表
                     try:
                         hc_r, hc_data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}')
                         if hc_data:
                             cached_all_nodes = hc_data.get("all", [])
                             cached_current_proxy = hc_data.get("now")
                     except Exception:
-                        pass  # 失败时用上一次缓存
+                        pass
                     nodes = cached_all_nodes
                     current = cached_current_proxy
                     if nodes and current:
-                        dead, alive = batch_test_nodes(nodes, current)
-                        # ponytail: batch_test_nodes 已更新 _DEAD_NODES 和 TTL（含指数退避），无需重复操作
+                        # 启动后台健康检查，避免阻塞主循环（原子检查+提交）
+                        with _state_lock:
+                            if _health_check_future is None or _health_check_future.done():
+                                _health_check_nodes = nodes
+                                _health_check_current = current
+                                _health_check_future = _io_pool.submit(_run_health_check_async, nodes, current)
+                        last_health_check = now
+            else:
+                # 检查后台健康检查是否完成
+                with _state_lock:
+                    future_done = _health_check_future is not None and _health_check_future.done()
+                    if future_done:
+                        future = _health_check_future
+                        check_nodes = _health_check_nodes
+                        check_current = _health_check_current
+                        _health_check_future = None
+                        _health_check_nodes = None
+                        _health_check_current = None
+                    else:
+                        future = None
+
+                if future is not None:
+                    try:
+                        dead, alive = future.result()
                         # 清理活过来的节点
                         with _state_lock:
                             for n in list(_DEAD_NODES):
                                 if n in alive:
                                     _DEAD_NODES.discard(n)
                                     _DEAD_NODES_RELEASE_TS.pop(n, None)
-
                         # 降级检查
-                        check_and_handle_fallback(nodes, current)
-                last_health_check = now
+                        if check_nodes and check_current:
+                            check_and_handle_fallback(check_nodes, check_current)
+                    except Exception as e:
+                        log(f"⚠ 后台健康检查异常: {e}")
 
             # ---- 6. 订阅刷新 (每 1h，后台执行避免阻塞主循环) ----
             if now - last_sub_refresh > CFG["intervals"]["subscription_refresh_sec"]:

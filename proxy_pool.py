@@ -18,9 +18,40 @@ import threading
 import time
 import requests
 import concurrent.futures
+from functools import lru_cache
 
 # 从共享配置导入
-from config import SINGBOX_API, SINGBOX_SECRET, SELECTOR, NODE_INFO_DB, MIXED_PORT, CFG
+from config import SINGBOX_API, get_singbox_secret, SELECTOR, NODE_INFO_DB, MIXED_PORT, CFG, BAD_NODES_MAX_TTL
+
+# 与 daemon._load_shared_bad_nodes 同源：proxy_pool 是 test-only/dormant 模块，
+# 不 import 整个 daemon（会拉入 DB/atexit 等重状态），这里直接读共享 .bad_nodes.json。
+_BAD_NODES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bad_nodes.json")
+
+
+def _load_shared_bad_nodes() -> set[str]:
+    """读 .bad_nodes.json，返回未过期死节点名集合（与 daemon 导出格式一致）。
+
+    ponytail: daemon 独占写入、proxy_pool 只读，避免争用。要跨进程拿到 daemon
+    内存态 _DEAD_NODES 需 import daemon（重），本模块只读文件，足够保持权重一致。
+    升级路径: proxy_pool 若升为常驻进程，改为 import daemon._DEAD_NODES 走同一进程内存。
+    """
+    now = int(time.time())
+    max_allowed = now + BAD_NODES_MAX_TTL
+    try:
+        if not os.path.exists(_BAD_NODES_FILE):
+            return set()
+        with open(_BAD_NODES_FILE) as f:
+            nodes = json.load(f)
+        out = set()
+        for n, v in nodes.items():
+            if isinstance(v, dict) and "expire" in v:
+                if v["expire"] > now and v["expire"] <= max_allowed:
+                    out.add(n)
+            elif isinstance(v, (int, float)) and v > now and v <= max_allowed:
+                out.add(n)
+        return out
+    except Exception:
+        return set()
 
 # 权重参数 - imported from shared weights module
 from weights import (
@@ -34,10 +65,14 @@ from weights import (
 class OKZProxyPool:
     """sing-box 代理池：每次 rotate() 返回代理 URL，内部按自适应概率选节点"""
 
+    # 共享线程池：延迟测试复用，避免频繁创建/销毁
+    _delay_pool: concurrent.futures.ThreadPoolExecutor | None = None
+    _delay_pool_lock = threading.Lock()
+
     def __init__(
         self,
         singbox_api: str = SINGBOX_API,
-        secret: str = SINGBOX_SECRET,
+        secret: str | None = None,
         selector: str = SELECTOR,
         node_info_db: str = NODE_INFO_DB,
         cache_ttl_sec: int = 60,
@@ -45,7 +80,7 @@ class OKZProxyPool:
         skip_init: bool = False,  # 测试用：跳过网络初始化
     ):
         self.api = singbox_api
-        self.secret = secret
+        self.secret = secret if secret is not None else get_singbox_secret()
         self.selector = selector
         self.db_path = node_info_db
         self.cache_ttl = cache_ttl_sec
@@ -59,11 +94,23 @@ class OKZProxyPool:
         self._lock = threading.Lock()
         self._strategy_mode: str = "normal"  # "normal" or "pressure"
 
+        # 线程池走 _get_delay_pool() 惰性单例，避免与 __init__ 重复创建
         if not skip_init:
             self._refresh_data()
 
+    @classmethod
+    def _get_delay_pool(cls) -> concurrent.futures.ThreadPoolExecutor:
+        """获取共享延迟测试线程池"""
+        with cls._delay_pool_lock:
+            if cls._delay_pool is None:
+                cls._delay_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=30, thread_name_prefix="proxy_pool_delay"
+                )
+            return cls._delay_pool
+
     def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.secret}"}
+        # ponytail: secret file mtime 自动刷新 — get_singbox_secret() 内部有缓存+检测
+        return {"Authorization": f"Bearer {get_singbox_secret()}"}
 
     def _refresh_nodes(self):
         """从 sing-box 拿所有可用节点 tag"""
@@ -81,43 +128,14 @@ class OKZProxyPool:
         except Exception as e:
             print(f"  ⚠ proxy_pool 刷新节点失败: {e}")  # 保留旧缓存
 
-    def _refresh_delays(self):
-        """批量测延迟（并发 10，超时 10s），结果缓存到 _delays_cache"""
-        if not self._nodes_cache:
-            return
-
-        current = self.get_current()
-        to_test = [n for n in self._nodes_cache if n != current]
-
-        def test_one(node: str) -> tuple[str, int | None]:
-            try:
-                r = requests.get(
-                    f"{self.api}/proxies/{node}/delay",
-                    params={"timeout": 10000, "url": CFG['thresholds']['node_test_url']},
-                    headers=self._headers(),
-                    timeout=15,
-                )
-                if r.status_code == 200:
-                    return node, r.json().get("delay")
-            except Exception:
-                pass
-            return node, None
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-            futures = {pool.submit(test_one, n): n for n in to_test}
-            for f in concurrent.futures.as_completed(futures):
-                node, delay = f.result()
-                if delay is not None and delay < 10000:
-                    self._delays_cache[node] = delay
-                else:
-                    self._delays_cache.pop(node, None)
-
     def _refresh_ip_scores(self):
         """从 node_info 表读 IP/地区，算 IP 质量分：有国家=1.0, 只有 IP=0.5, 无=0.1"""
         if not self._nodes_cache:
             return
         try:
-            with sqlite3.connect(self.db_path) as c:
+            # 设置 busy_timeout=5000 与 daemon.py 保持一致，避免 "database is locked"
+            with sqlite3.connect(self.db_path, timeout=5) as c:
+                c.execute("PRAGMA busy_timeout=5000")
                 c.row_factory = sqlite3.Row
                 placeholders = ",".join("?" for _ in self._nodes_cache)
                 rows = c.execute(
@@ -139,15 +157,59 @@ class OKZProxyPool:
                 self._ip_scores_cache.setdefault(n, IP_SCORE_NONE)
 
     def _refresh_data(self):
-        """从网络刷新节点/延迟/IP分，然后计算权重"""
+        """从网络刷新节点/延迟/IP分，然后计算权重
+        优化：并行获取节点列表、延迟、IP分（节点列表是前置依赖）
+        """
         self._refresh_nodes()
-        self._refresh_delays()
-        self._refresh_ip_scores()
+        if not self._nodes_cache:
+            self._weights_cache = []
+            self._cache_ts = time.time()
+            return
+
+        # 并行执行延迟测试和 IP 分数查询（互不依赖）
+        pool = self._get_delay_pool()
+        f1 = pool.submit(self._refresh_delays)
+        f2 = pool.submit(self._refresh_ip_scores)
+        f1.result()
+        f2.result()
+
         self._weights_cache = self._compute_weights()
         self._cache_ts = time.time()
 
+    def _refresh_delays(self):
+        """批量测延迟（并发 30，超时 10s），结果缓存到 _delays_cache"""
+        if not self._nodes_cache:
+            return
+
+        current = self.get_current()
+        to_test = [n for n in self._nodes_cache if n != current]
+
+        def test_one(node: str) -> tuple[str, int | None]:
+            try:
+                r = requests.get(
+                    f"{self.api}/proxies/{node}/delay",
+                    params={"timeout": 10000, "url": CFG['thresholds']['node_test_url']},
+                    headers=self._headers(),
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    return node, r.json().get("delay")
+            except Exception:
+                pass
+            return node, None
+
+        # 使用共享线程池
+        pool = self._get_delay_pool()
+        futures = {pool.submit(test_one, n): n for n in to_test}
+        for f in concurrent.futures.as_completed(futures):
+            node, delay = f.result()
+            if delay is not None and delay < 10000:
+                self._delays_cache[node] = delay
+            else:
+                self._delays_cache.pop(node, None)
+
     def _compute_weights(self) -> list[tuple[str, float]]:
-        """权重 = 自适应排序: normal=延迟优先, pressure=调用次数优先"""
+        """权重 = 自适应排序: normal=延迟优先, pressure=调用次数优先。"""
         return compute_all_weights(
             nodes=self._nodes_cache,
             ip_scores=self._ip_scores_cache,

@@ -1655,8 +1655,34 @@ console.log('All proxy-global unit tests PASS');
 
 ---
 
+## 9. switch-proxy.py 修复验证 (P1 增补)
+
+> 覆盖 `asi-fixes.md` 中的 switch-proxy.py / proxy_pool.py / config.py 修复点。
+
+| ID | 描述 | 优先级 | 验证方法 |
+|----|------|--------|----------|
+| T-090 | `SINGBOX_SECRET` 替换为 `get_singbox_secret()`，secret 轮换后不 401 | P0 | `grep 'SINGBOX_SECRET' *.py` (仅 config.py 内部残留) → 运行 proxy_global 刷新后，`asi-s` 仍正常 |
+| T-091 | `cmd_next(count=0/-5)` 守卫: 返回错误码 1 而非静默成功 | P1 | `python3 switch-proxy.py next 0` → "count 必须是正整数", exit 1 |
+| T-092 | `cmd_goto("")` 空串守卫 | P1 | `python3 switch-proxy.py goto ""` → "节点名不能为空", exit 1 |
+| T-093 | `main()` 未知指令不再回退为节点名 | P1 | `python3 switch-proxy.py restart` → "未知指令 'restart'", exit 1 |
+| T-094 | 错误路径日志可诊断 (401/timeout/JSON 区分) | P1 | `python3 -W error switch-proxy.py status 2>&1` 显示 `logging.warning` 带异常类型 |
+| T-095 | `_strategy_mode` 写侧加 `_state_lock` (daemon.py) | P2 | `python3 -m py_compile daemon.py` → PASS; Codex verify |
+| T-096 | `_export_dead_nodes_locked` 锁外预取 total_count | P2 | 实测 daemon health check 不阻塞 P2C 选节点 (latency < 1s) |
+| T-097 | `config.py` 不再导出冻结 `SINGBOX_SECRET` 常量 | P1 | `python3 -c "from config import SINGBOX_SECRET"` → ImportError |
+| T-098 | `proxy_pool.py` `skip_init=True` 不网络初始化 | P1 | `OKZProxyPool(skip_init=True)` 不触发 Clash API 调用 |
+
+**验证命令**:
+```bash
+python3 switch-proxy.py next 0; echo $?       # 应为 1
+python3 switch-proxy.py goto ''; echo $?      # 应为 1
+python3 switch-proxy.py restart; echo $?      # 应为 1, 打印未知指令
+python3 -c "from config import SINGBOX_SECRET" 2>&1 | tail -1  # ImportError
+python3 -m pytest test_proxy_pool.py -v 2>&1 | tail -3  # 13 pass
+```
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
 |------|------|----------|------|
 | v1.0 | 2026-07-07 | 初始版本：72 个测试点，P0/P1/P2 分级，完整测试流程 | - |
+| v1.1 | 2026-08-22 | 新增 switch-proxy.py 安全/健壮性测试点 (T-090~T-098), 覆盖 secret 刷新、count/empty/guard、CLI fallback、logging、daemon 锁优化 | 4-Agent review |

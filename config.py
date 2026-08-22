@@ -10,23 +10,32 @@ import time
 
 # ============= 配置常量 =============
 SECRET_FILE = "/home/administrator/.singbox_secret"
-def _read_secret():
+
+# Module-level cache for secret + mtime
+_SINGBOX_SECRET: str = ""
+_SINGBOX_SECRET_MTIME: float = 0
+
+def get_singbox_secret() -> str:
+    """Get sing-box secret with mtime-based auto-refresh."""
+    global _SINGBOX_SECRET, _SINGBOX_SECRET_MTIME
     try:
         st = os.stat(SECRET_FILE)
+        mtime = st.st_mtime
+        if _SINGBOX_SECRET and mtime == _SINGBOX_SECRET_MTIME:
+            return _SINGBOX_SECRET
         if st.st_mode & 0o077:
-            raise PermissionError(
-                f"密钥文件 {SECRET_FILE} 权限过宽 ({oct(st.st_mode & 0o777)})，"
-                f"请执行 chmod 600 {SECRET_FILE}")
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ Secret file loose perms ({oct(st.st_mode & 0o777)})")
         with open(SECRET_FILE) as f:
-            return f.read().strip()
+            _SINGBOX_SECRET = f.read().strip()
+        _SINGBOX_SECRET_MTIME = mtime
+        return _SINGBOX_SECRET
     except Exception as e:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✗ 读取密钥文件失败: {e}")
-        return None
+        return ""
 
-SINGBOX_SECRET = _read_secret()
-if SINGBOX_SECRET is None or SINGBOX_SECRET == "":
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WARNING: SINGBOX_SECRET not set — create {SECRET_FILE} (chmod 600) with a base64 secret", file=sys.stderr)
-    SINGBOX_SECRET = ""
+# 启动时校验密钥 (活值) — 不冻结常量, 避免 secret 轮换后失效
+if not get_singbox_secret():
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WARNING: sing-box secret 未设置 — 在 {SECRET_FILE} (chmod 600) 中写入 base64 secret", file=sys.stderr)
 
 CFG = {
     "9router": {
@@ -35,7 +44,7 @@ CFG = {
     },
     "singbox": {
         "clash_api": "http://127.0.0.1:9090",
-        "secret": SINGBOX_SECRET,
+        "secret": "",  # 运行时通过 get_singbox_secret() 刷新, 此处留空占位
         "selector": "proxy",
         "binary": "/home/administrator/dkk-projects/auto-switch-ip/sing-box",
         "config_file": "/home/administrator/dkk-projects/auto-switch-ip/singbox-config.json",
@@ -46,6 +55,19 @@ CFG = {
     "okz": {
         "proxy_url": "http://127.0.0.1:6696",
         "name": "okz",
+        "sub_url": "https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=7c00e506cb827821ad76e93053737c61",
+    },
+    "hd23n": {
+        "name": "hd.23n.club",
+        "sub_url": "http://hd.23n.club/api/v1/client/subscribe?token=5b4815ade93497224153e0bb0ae60cc6",
+    },
+    "dasho": {
+        "name": "dasho.pqjc.site",
+        "sub_url": "https://dasho.pqjc.site/api/v1/pq/d6b05bf5edc2d676335d0726371868bf",
+    },
+    "dasho_alt": {
+        "name": "dasho.xn--cp3a08l.com",
+        "sub_url": "https://dasho.xn--cp3a08l.com/api/v1/pq/d6b05bf5edc2d676335d0726371868bf",
     },
     "intervals": {
         "monitor_sec": 2,
@@ -65,19 +87,22 @@ CFG = {
         "normal_error_rate": 0.1,     # 429 率低于此阈值 → 切回延迟优先
     },
     "bad_nodes": {
-        "ttl_sec": 300,  # 5 minutes - shared by proxy-global.js and daemon
+        "ttl_sec": 300,       # 5 minutes - shared by proxy-global.js and daemon
+        "max_ttl_sec": 604800,  # 7 days max TTL (replaces float('inf') permanent blacklist)
     },
     "log_file": "/home/administrator/dkk-projects/auto-switch-ip/daemon.log",
     "log_format": "%Y-%m-%d %H:%M:%S",
 }
 
 # ============= 便捷常量 =============
+# ponytail: SINGBOX_SECRET 不在此导出为模块级常量——CFG["singbox"]["secret"] 是 import 时冻结的
+# 旧快照，轮换后不会刷新。调用方必须走 get_singbox_secret()（mtime 自动刷新）。
 NODE_INFO_DB = CFG["9router"]["db_path"]
 SINGBOX_API = CFG["singbox"]["clash_api"]
-SINGBOX_SECRET = CFG["singbox"]["secret"]
 SELECTOR = CFG["singbox"]["selector"]
 MIXED_PORT = CFG["singbox"]["mixed_port"]
 BAD_NODES_TTL = CFG["bad_nodes"]["ttl_sec"]
+BAD_NODES_MAX_TTL = CFG["bad_nodes"]["max_ttl_sec"]
 LOG_FORMAT = CFG["log_format"]
 RECENT_WINDOW = CFG["thresholds"]["recent_window"]
 

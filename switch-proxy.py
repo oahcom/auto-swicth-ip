@@ -14,11 +14,14 @@ import os
 import random
 import sys
 import time
+import logging
 
 import requests
 
+logger = logging.getLogger(__name__)
+
 # ============= 配置 =============
-from config import CFG, SINGBOX_SECRET
+from config import CFG, get_singbox_secret
 
 CLASH_API = CFG["singbox"]["clash_api"]
 SELECTOR = CFG["singbox"]["selector"]
@@ -26,21 +29,21 @@ TIMEOUT = 3
 
 
 def _headers():
-    return {"Authorization": "Bearer " + SINGBOX_SECRET, "Content-Type": "application/json"}
+    return {"Authorization": "Bearer " + get_singbox_secret(), "Content-Type": "application/json"}
 
 
 def get_nodes():
     try:
         r = requests.get(
             CLASH_API + "/proxies/" + SELECTOR,
-            headers={"Authorization": "Bearer " + SINGBOX_SECRET},
+            headers={"Authorization": "Bearer " + get_singbox_secret()},
             timeout=TIMEOUT,
         )
         if r.status_code == 200:
             d = r.json()
             return d.get("now", "?"), d.get("all", [])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("get_nodes 失败 (sing-box 可能不可达/密钥失效/非JSON响应): %s", e)
     return None, []
 
 
@@ -50,8 +53,8 @@ def get_9router_proxy():
         if r.status_code == 200:
             d = r.json()
             return d.get("outboundProxyEnabled", False), d.get("outboundProxyUrl", "N/A")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("get_9router_proxy 失败 (9router 不可达?): %s", e)
     return None, "N/A"
 
 
@@ -84,6 +87,9 @@ def cmd_list():
 
 
 def cmd_next(count=1):
+    if count < 1:
+        print("count 必须是正整数")
+        return 1
     for i in range(count):
         current, nodes = get_nodes()
         if current is None:
@@ -102,7 +108,8 @@ def cmd_next(count=1):
                 timeout=TIMEOUT,
             )
             ok = r.status_code in (200, 204)
-        except Exception:
+        except Exception as e:
+            logger.warning("cmd_next PUT 失败: %s", e)
             ok = False
         if ok:
             if count == 1:
@@ -121,6 +128,9 @@ def cmd_goto(name):
     current, nodes = get_nodes()
     if current is None:
         print("sing-box 连接失败")
+        return 1
+    if not name:
+        print("节点名不能为空，用 list 查看可用节点")
         return 1
     if name not in nodes:
         matches = [n for n in nodes if name in n]
@@ -142,7 +152,8 @@ def cmd_goto(name):
             timeout=TIMEOUT,
         )
         ok = r.status_code in (200, 204)
-    except Exception:
+    except Exception as e:
+        logger.warning("cmd_goto PUT 失败: %s", e)
         ok = False
     if ok:
         print(current + " -> " + name)
@@ -178,7 +189,8 @@ def main():
         print(__doc__)
         return 0
     else:
-        return cmd_goto(cmd)
+        print("未知指令 '%s' — 用法: switch-proxy goto <节点名>  或输入 help 查看帮助" % cmd)
+        return 1
 
 
 if __name__ == "__main__":
