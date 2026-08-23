@@ -72,8 +72,10 @@ def run_check(name, context, state=None):
                  "-w", "%{http_code} %{time_total}", "http://127.0.0.1:7890"],
                 capture_output=True, text=True, timeout=10
             )
-            ok = out.stdout.strip() in ("400", "204")
-            return ok, float(out.stdout.split()[1]) if out.stdout else 999, out.stdout.strip()
+            code = out.stdout.split()[0] if out.stdout.strip() else ""
+            ok = code in ("400", "204")  # 代理端口裸 GET 返回 400/204 即连通
+            lat = float(out.stdout.split()[1]) if out.stdout.split()[1:] else 999
+            return ok, lat, out.stdout.strip()
         elif name == "dead_nodes":
             out = subprocess.run(
                 ["grep", "-a", "dead=", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
