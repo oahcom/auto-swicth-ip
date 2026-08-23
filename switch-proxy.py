@@ -59,6 +59,26 @@ def get_9router_proxy():
 
 
 # ============= 子命令 =============
+def cmd_report(window_min: int = 60):
+    """展示过去 window_min 内各出口节点的请求成功率（轮换效果）"""
+    try:
+        import daemon as _daemon  # noqa: E402 (late import breaks CLI↔daemon cycle)
+        rates = _daemon.get_per_egress_error_rate(window_min=window_min)
+    except Exception as e:
+        logger.warning("per-egress 归因失败: %s", e)
+        print("  (暂无归因数据)")
+        return 1
+    if not rates:
+        print("  (暂无出口归因记录 — daemon 可能未在日志周期内切换)")
+        return 0
+    print("=== 轮换效果 (最近 %d 分钟 per-egress 成功率) ===" % window_min)
+    rows = sorted(rates.items(), key=lambda kv: kv[1][2], reverse=True)
+    for node, (total, errs, rate) in rows:
+        bar = "#" * int((1 - rate) * 20)
+        print("  %-40.40s %4d/%-4d ok  %5.1f%%  |%s" % (node, total - errs, total, (1 - rate) * 100, bar))
+    return 0
+
+
 def cmd_status():
     current, nodes = get_nodes()
     if current is None:
@@ -180,6 +200,13 @@ def main():
             print("count 必须是整数")
             return 1
         return cmd_next(count)
+    elif cmd in ("report", "rpt", "r"):
+        try:
+            w = int(args[1]) if len(args) > 1 else 60
+        except ValueError:
+            print("窗口分钟数必须是整数 (默认 60)")
+            return 1
+        return cmd_report(w)
     elif cmd in ("goto", "go", "g"):
         if len(args) < 2:
             print("用法: switch-proxy goto <节点名>")
