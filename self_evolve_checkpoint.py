@@ -77,15 +77,21 @@ def run_check(name, context, state=None):
             lat = float(out.stdout.split()[1]) if out.stdout.split()[1:] else 999
             return ok, lat, out.stdout.strip()
         elif name == "dead_nodes":
-            out = subprocess.run(
-                ["grep", "-a", "dead=", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
-                capture_output=True, text=True, timeout=5
-            )
-            # Extract latest dead count
-            import re
-            matches = re.findall(r"dead=(\d+)", out.stdout)
-            dead = int(matches[-1]) if matches else 0
-            return dead <= 5, dead, f"dead={dead}"
+            # 权威来源是 daemon 独占写入的 .bad_nodes.json（未过期条目），
+            # 而非 daemon.log 全量历史里的最后一行 dead=（滞后且含陈旧值）。
+            import json as _json
+            bn = STATE_FILE.parent / ".bad_nodes.json"
+            now_ts = int(time.time())
+            dead = 0
+            if bn.exists():
+                try:
+                    data = _json.loads(bn.read_text())
+                    dead = sum(1 for v in data.values()
+                               if isinstance(v, dict) and v.get("expire", 0) > now_ts)
+                except Exception:
+                    dead = 0
+            # 与 daemon 阀门一致：允许 70% 节点被拉黑（_POOL_MIN_RATIO=0.3）
+            return dead <= 65, dead, f"dead={dead}"
 
         elif name == "bypass_events":
             out = subprocess.run(
