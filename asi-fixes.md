@@ -1,5 +1,7 @@
 # asi-fixes — 多Agent 审查修复记录
 
+> ⚠ 文档漂移提示（2026-08-22）：本记录中提到的 `switch-proxy.py`、`proxy_pool.py`、`weights.py`、`test_proxy_429.py` 已在 Round 1 清理中删除（无生产调用方、休眠/死模块）。相关修复已沉淀进 `daemon.py` 当前实现，本文件仅作历史归档。
+
 > 4 Agent 并行审查（错误吞没 / 策略模式锁 / proxy_pool 线程池 / CLI 回退）
 > + Codex CLI 独立验证（6 项修复全部真解决）
 > + 实战验证: `python3 test_auto_switch.py` → 21 pass / 0 fail

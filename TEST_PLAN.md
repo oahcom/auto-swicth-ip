@@ -1,8 +1,10 @@
 # Auto-Switch-IP 测试工作流文档
 
-> 文档版本: v1.0
-> 最后更新: 2026-07-07
+> 文档版本: v1.1
+> 最后更新: 2026-08-22
 > 测试对象: 9router proxy-global.js + daemon 代理自动切换系统
+
+> ⚠ 文档漂移提示（2026-08-22）：第 9 节 `switch-proxy.py` / `proxy_pool.py` 验证用例（T-091~T-098）依赖的模块已在 Round 1 删除（无生产调用方）。其覆盖点已并入 `daemon.py` 与新增 `test_daemon_unit.py` 的确定性单测。第 9 节保留为历史归档，不再执行。
 
 ---
 

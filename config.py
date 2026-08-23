@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Shared configuration for auto-switch-ip.
-Both daemon.py and proxy_pool.py import from this module.
+daemon.py imports from this module.
 """
 
 import os

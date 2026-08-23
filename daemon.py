@@ -32,11 +32,10 @@ import logging
 import atexit
 import shutil
 from logging.handlers import RotatingFileHandler
-# daemon uses its own _delay_score; proxy_pool.py imports weights directly
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
-from config import CFG, NODE_INFO_DB, FREE_PROVIDERS, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret
+from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret
 
 # 全局复用连接 - 避免每次操作开/关 SQLite 连接
 _db_conn: sqlite3.Connection | None = None
@@ -178,6 +177,21 @@ _NODE_CALL_RESET_TS: float = 0  # 上次重置时间
 _strategy_mode: str = "normal"  # "normal"=延迟优先, "pressure"=均匀分散
 _state_lock = threading.RLock()  # 保护所有全局共享状态
 _last_wal_checkpoint: float = 0  # WAL checkpoint 时间戳
+
+
+def _update_strategy_mode(prev_mode: str, error_rate: float, total: int,
+                          pressure_rate: float, normal_rate: float) -> str:
+    """自适应策略回滞切换（纯函数，便于单测）。
+    normal→pressure: error_rate ≥ pressure_rate 且 total ≥ 3。
+    pressure→normal: error_rate ≤ normal_rate 或 total < 3（样本太少不判压）。"""
+    if prev_mode == "normal":
+        if error_rate >= pressure_rate and total >= 3:
+            return "pressure"
+        return "normal"
+    else:
+        if error_rate <= normal_rate or total < 3:
+            return "normal"
+        return "pressure"
 # 健康检查后台任务状态
 _health_check_future = None
 _health_check_nodes = None
@@ -310,8 +324,7 @@ def _load_shared_bad_nodes() -> dict[str, float]:
     global _shared_bad_cache, _shared_bad_mtime, _shared_bad_check_ts, _shared_bad_loaded
     now = _now_ts()
     max_allowed = now + _DEAD_TTL_MAX
-    import_max_allowed = now + 3600  # 导入时上限 1h
-    
+
     # 先检查是否需要刷新 cache（不更新 check_ts，避免加载失败时标记为已检查）
     with _state_lock:
         if now - _shared_bad_check_ts < 5:
@@ -463,38 +476,6 @@ def switch_proxy(new_node: str) -> bool:
         return False
 
 
-# ponytail: _ban_node 暂未被调用，预留给未来错误触发路径显式 ban。
-# 目前错误路径用 fail_set + TTL 机制，_ban_node 的 dict 格式已被 proxy-global.js 读取端兼容。
-# 升级路径: 需要更精细的 reason 分类（429/timeout/error/dead）时启用。
-def _ban_node(node: str, ttl: int = 300, reason: str = "unknown") -> None:
-    """将节点加入共享坏节点列表。写 None 作为 expire，由 daemon 独占写入。
-    ponytail: 双进程 TOCTOU 竞争目前通过 daemon 独占写入 + proxy-global 只读缓解。
-    升级路径: 改用 fcntl.flock 或 SQLite 共享队列。"""
-    try:
-        now = _now_ts()
-        nodes = {}
-        if os.path.exists(_BAD_NODES_FILE):
-            with open(_BAD_NODES_FILE) as f:
-                nodes = json.load(f)
-        # 过滤过期 + 清理非节点名格式的 key（proxy-global 的 host:port-any 条目）
-        nodes = {k: v for k, v in nodes.items()
-                 if (v.get("expire", 0) if isinstance(v, dict) else v) > now
-                 and not k.endswith("-any")}
-        # 如果已有记录且未过期，不覆盖（保留更长的 TTL）
-        existing = nodes.get(node)
-        if isinstance(existing, dict) and existing.get("expire", 0) > now + ttl:
-            return
-        elif isinstance(existing, (int, float)) and existing > now + ttl:
-            return
-        nodes[node] = {"expire": now + ttl, "reason": reason}
-        tmp = _BAD_NODES_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(nodes, f)
-        os.replace(tmp, _BAD_NODES_FILE)
-        log(f"  🚫 ban 节点: {node} (TTL={ttl}s, reason={reason})")
-    except Exception as e:
-        log(f"  ⚠ ban 节点失败: {e}")
-
 def _probe_node(node: str, timeout_ms: int, strict: bool = False) -> int | None:
     """统一节点探测核心函数
 
@@ -606,8 +587,10 @@ def _apply_test_results(nodes: list[str], results: dict[str, int | None], now: f
                 ttl = _DEAD_TTL_STAGES[fail_count - 1]
                 ttl_desc = f"{ttl}s"
             alive_count = len(nodes) - len(_DEAD_NODES)
-            if alive_count < len(nodes) * _POOL_MIN_RATIO:
-                log(f"  ⚠ {node} 跳过拉黑（保底: {alive_count}/{len(nodes)} < {_POOL_MIN_RATIO*100:.0f}%）")
+            # 保底: 永远允许 (1-ratio) 节点拉黑。边界: alive == floor 时不再拉黑
+            # （strict < 导致 alive=3/10 时 still-blacklist，越过 70% 上限 — off-by-one）。
+            if alive_count <= len(nodes) * _POOL_MIN_RATIO:
+                log(f"  ⚠ {node} 跳过拉黑（保底: {alive_count}/{len(nodes)} <= {_POOL_MIN_RATIO*100:.0f}%）")
                 _dead_fail_count.pop(node, None)
             else:
                 _DEAD_NODES.add(node)
@@ -690,7 +673,6 @@ def cleanup_dead_ttl():
     with _state_lock:
         now = time.time()
         max_allowed = now + _DEAD_TTL_MAX
-        import_max_allowed = now + 3600
 
         # 应用复活结果
         for n in revived:
@@ -726,11 +708,11 @@ def _export_dead_nodes_locked(total_count: int = 0):
         return
 
     try:
-        # 安全阀：Clash API 不通或节点数为 0 → Clash 自身有问题，不导出
+        # 安全阀：Clash API 不通或节点数为 0 → Clash 自身有问题。
+        # 注意：只跳过本次导出，不清空已标记的 _DEAD_NODES——否则单次 API 抖动
+        # 会抹掉 proxy-global.js 以 "-any" 键写入的共享坏节点状态（原 bug）。
         if total_count == 0:
-            _DEAD_NODES.clear()
-            _DEAD_NODES_RELEASE_TS.clear()
-            log("  ⚠ Clash API 不通或节点数为 0，清空 _DEAD_NODES 并跳过 bad_nodes 导出")
+            log("  ⚠ Clash API 不通或节点数为 0，跳过 bad_nodes 导出（保留已标记状态）")
             return
 
         # 防全误判：死节点超过总节点 60% 时跳过导出
@@ -1210,8 +1192,6 @@ def main():
     log(f"  sing-box: {CFG['singbox']['clash_api']}")
 
     all_nodes = get_all_proxy_nodes()
-    log(f"  sing-box: {CFG['singbox']['clash_api']}")
-
     log(f"  节点数: {len(all_nodes)}")
     log(f"  轮换: 每 {CFG['intervals']['proactive_rotate_sec']}s P2C")
     log(f"  健康: 每 {CFG['intervals']['node_health_sec']}s 批量测延迟")
@@ -1296,20 +1276,16 @@ def main():
                 last_proxy_check = now
 
             # ---- 1. 读取错误率 ----
-            total, errors, recent, consecutive_errors = get_9router_error_rate()
+            total, errors, _, consecutive_errors = get_9router_error_rate()
 
             # ---- 1b. 自适应策略切换（带回滞） ----
             error_rate = errors / total if total > 0 else 0
             with _state_lock:  # 与 _p2c_select 读取同锁，保证 mode 与 usage_counts/delays 快照一致
                 old_mode = _strategy_mode
-                if _strategy_mode == "normal":
-                    # 正常 → 均匀: 需要超过高压阈值
-                    if error_rate >= CFG["thresholds"]["pressure_error_rate"] and total >= 3:
-                        _strategy_mode = "pressure"
-                else:
-                    # 均匀 → 正常: 需要降到回滞阈值以下
-                    if error_rate <= CFG["thresholds"]["normal_error_rate"] or total < 3:
-                        _strategy_mode = "normal"
+                _strategy_mode = _update_strategy_mode(
+                    _strategy_mode, error_rate, total,
+                    CFG["thresholds"]["pressure_error_rate"], CFG["thresholds"]["normal_error_rate"],
+                )
                 switched = old_mode != _strategy_mode
             if switched:
                 log(f"🔄 策略切换: {old_mode} → {_strategy_mode} (429率={error_rate:.0%}, {errors}/{total}, 连续失败={consecutive_errors})")
@@ -1346,13 +1322,17 @@ def main():
                         valid_set = set(current_all)
                         with _db_lock:
                             c = _get_db()
-                            stale_nodes = c.execute("SELECT node FROM node_info").fetchall()
-                            for (n,) in stale_nodes:
-                                if n not in valid_set:
-                                    c.execute("DELETE FROM node_info WHERE node=?", (n,))
-                                    log(f"  ♻ 清理过期 node_info: {n}")
-                except Exception:
-                    pass
+                            # 批量删除过期节点：单条参数化 DELETE + 显式 commit，
+                            # 避免循环内 DELETE 因未提交被 SQLite 隐式事务丢弃（原 bug）。
+                            placeholders = ",".join("?" * len(valid_set))
+                            c.execute(
+                                f"DELETE FROM node_info WHERE node NOT IN ({placeholders})",
+                                tuple(valid_set),
+                            )
+                            c.commit()
+                            log(f"  ♻ 清理过期 node_info 完成 (保留 {len(valid_set)} 个有效节点)")
+                except Exception as e:
+                    log(f"  ⚠ 清理 node_info 失败: {e}")
 
             # ---- 3c. 错误触发轮换（错误率高时立即切） ----
             if should_error and not in_cooldown:

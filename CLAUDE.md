@@ -95,7 +95,7 @@ node_test_timeout_ms: 15000                    # 节点测试超时
 singbox.max_restart_attempts: 3                # 最大重启次数
 bad_nodes.ttl_sec: 300                         # bad node TTL (5min)
 _DEAD_TTL_STAGES: [60, 120, 300, 600]          # 指数退避 TTL
-_pool_POOL_MIN_RATIO: 0.3                      # 允许 70% 节点被拉黑
+_POOL_MIN_RATIO: 0.3                          # 允许 70% 节点被拉黑（config.py 同名常量）
 ```
 
 ## proxy-global.js 关键设计（当前迭代）
@@ -164,9 +164,9 @@ _pool_POOL_MIN_RATIO: 0.3                      # 允许 70% 节点被拉黑
 | `~/.9router/bootstrap-undici.js` | ~50 | NODE_OPTIONS 入口 |
 | `daemon.py` | ~1200 | 节点管理 + 错误检测 + 轮换 |
 | `config.py` | ~90 | 共享配置常量 |
-| `proxy_pool.py` | ~280 | 请求级代理池（按节点加权）|
 | `singbox-config.json` | ~600 | sing-box 代理节点配置 |
 | `.bad_nodes.json` | 动态 | 坏节点共享文件 |
+| `test_daemon_unit.py` | ~240 | 确定性单测（无网络，覆盖错误率/策略/评分/坏节点/看门狗）|
 
 ## provider 多样性约束（2026-07-08 确认）
 
