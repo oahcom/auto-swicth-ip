@@ -378,10 +378,16 @@ def test_per_egress_error_rate_按节点分桶():
 def test_per_egress_error_rate_无切换日志返回空():
     orig_db, orig_log = daemon._get_db, daemon._load_egress_log
 
+    class _Cur:
+        def fetchall(self):
+            return [("2026-08-23T00:00:00+00:00", "success")]
+
+    class _Conn:
+        def execute(self, sql, params=None):
+            return _Cur()
+
     def fake_db():
-        mem = types.SimpleNamespace()
-        mem.fetchall = lambda: [("2026-08-23T00:00:00+00:00", "success")]
-        return mem
+        return _Conn()
 
     daemon._get_db = fake_db
     daemon._load_egress_log = lambda: []

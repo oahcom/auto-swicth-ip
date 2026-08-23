@@ -19,6 +19,33 @@ from collections import defaultdict, Counter
 
 STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 PROJECT_DIR = STATE_FILE.parent
+_BAD_NODES_FILE = PROJECT_DIR / ".bad_nodes.json"
+# 复用 daemon 的 bad-node 过期常量（单源真值），避免魔表。
+try:
+    sys.path.insert(0, str(PROJECT_DIR))
+    from config import BAD_NODES_TTL as _BAD_NODES_TTL
+except Exception:
+    _BAD_NODES_TTL = 300
+
+
+def _write_bad_nodes(bad: dict) -> None:
+    """把归因出的坏出口节点写入 daemon 共享 .bad_nodes.json（原子 read-modify-write）。
+
+    格式与 daemon 完全一致：{node: {"expire": now+TTL, "reason": "egress_error_rate"}}。
+    daemon 的 cleanup_dead_ttl 已读取此文件并受 _POOL_MIN_RATIO 阀门保护，故写入即接入拉黑闭环。
+    """
+    now = int(time.time())
+    try:
+        data = json.loads(_BAD_NODES_FILE.read_text()) if _BAD_NODES_FILE.exists() else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    for node in bad:
+        data[node] = {"expire": now + _BAD_NODES_TTL, "reason": "egress_error_rate"}
+    tmp = _BAD_NODES_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False))
+    tmp.replace(_BAD_NODES_FILE)
 
 # 与 daemon.py 阀门一致：允许 70% 节点拉黑（_POOL_MIN_RATIO=0.3）。
 # 天花板从 Clash API 实时节点数 derivation，防止订阅变更后 65 这类魔表失效。
@@ -205,6 +232,11 @@ def run_check(name, context, state=None):
             import daemon as _daemon
             rates = _daemon.get_per_egress_error_rate(window_min=30)
             bad = {n: r for n, (t, e, r) in rates.items() if r >= 0.5 and t >= 3}
+            # 价值闭环：坏出口节点写入 daemon 共享 .bad_nodes.json（格式与 daemon 一致），
+            # daemon 的 _export_dead_nodes_locked / cleanup_dead_ttl 已读取该文件并受阀门保护，
+            # 无需 daemon 改代码即可触发拉黑 + 自愈。
+            if bad:
+                _write_bad_nodes(bad)
             return len(bad) == 0, len(bad), f"bad_egress={dict({n: round(r,3) for n,(_,_,r) in bad.items()})}"
 
     except Exception as e:

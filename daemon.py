@@ -337,7 +337,19 @@ def _load_egress_log() -> list[dict]:
         log(f"✗ 读 egress_log 失败: {e}")
         return []
     out.sort(key=lambda x: x["ts"])
-    return out
+    # 裁剪：仅保留最近 7 天，避免文件无限增长（append-only 无 truncate）。
+    keep_after = int(time.time()) - 7 * 86400
+    pruned = [d for d in out if d.get("ts", 0) >= keep_after]
+    if len(pruned) != len(out):
+        try:
+            tmp = _EGRESS_LOG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for d in pruned:
+                    f.write(json.dumps(d) + "\n")
+            os.replace(tmp, _EGRESS_LOG_FILE)
+        except Exception:
+            pass
+    return pruned
 
 
 def _active_node_at(ts: int, switches: list[dict]) -> str | None:
@@ -364,11 +376,14 @@ def get_per_egress_error_rate(window_min: int = 60) -> dict[str, tuple[int, int,
     try:
         with _db_lock:
             c = _get_db()
+            # 宽松时间窗下推：先粗滤 7 天，避免 requestDetails 2000+ 行全量解析。
+            # 9router 存为 ISO 'YYYY-MM-DDTHH:MM:SS.fffZ'，词典序比较等价于时间序。
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
             rows = c.execute(
                 """SELECT timestamp, status FROM requestDetails
-                   WHERE provider = ?
+                   WHERE provider = ? AND timestamp >= ?
                    ORDER BY timestamp ASC""",
-                (OPENCODE_FREE_PROVIDER,),
+                (OPENCODE_FREE_PROVIDER, cutoff),
             ).fetchall()
         if not rows:
             return {}
