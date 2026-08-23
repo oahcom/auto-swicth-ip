@@ -166,6 +166,8 @@ _POOL_MIN_RATIO: 0.3                          # 允许 70% 节点被拉黑（con
 | `config.py` | ~90 | 共享配置常量 |
 | `singbox-config.json` | ~600 | sing-box 代理节点配置 |
 | `.bad_nodes.json` | 动态 | 坏节点共享文件 |
+| `self_evolve_checkpoint.py` | ~240 | 自进化巡检引擎（每 10min 由 asi-selfcheck.timer 触发，写 .monitor_state.json）|
+| `asi-selfcheck.timer` | — | systemd 用户定时器：每 10min 触发 asi-selfcheck.service 跑巡检引擎 |
 | `test_daemon_unit.py` | ~240 | 确定性单测（无网络，覆盖错误率/策略/评分/坏节点/看门狗）|
 
 ## provider 多样性约束（2026-07-08 确认）

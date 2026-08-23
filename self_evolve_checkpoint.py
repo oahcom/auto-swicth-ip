@@ -17,10 +17,33 @@ from pathlib import Path
 from collections import defaultdict
 
 STATE_FILE = Path(__file__).parent / ".monitor_state.json"
+PROJECT_DIR = STATE_FILE.parent
+
+# 与 daemon.py 阀门一致：允许 70% 节点拉黑（_POOL_MIN_RATIO=0.3）。
+# 天花板从 Clash API 实时节点数 derivation，防止订阅变更后 65 这类魔表失效。
+BLACKLIST_CEILING_RATIO = 0.7
+_FALLBACK_CEILING = 65  # 当 Clash API 不可达时退避（当前 93 节点池 *0.7）
+
+
+def _clash_pool_size():
+    """从 sing-box Clash API 读取可用节点总数；失败退为 _FALLBACK_CEILING。"""
+    try:
+        sys.path.insert(0, str(PROJECT_DIR))
+        import config  # 复用单源真值
+        import requests
+        r = requests.get(
+            config.CFG["singbox"]["clash_api"] + "/proxies/" + config.CFG["singbox"]["selector"],
+            headers={"Authorization": "Bearer " + config.get_singbox_secret()},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            return len(r.json().get("all", []))
+    except Exception:
+        pass
+    return _FALLBACK_CEILING
 
 # Default check suite - evolves over time
 DEFAULT_CHECKS = [
-    {"name": "7890_connectivity", "enabled": True, "interval": 1},
     {"name": "7890_connectivity", "enabled": True, "interval": 1},
     {"name": "dead_nodes", "enabled": True, "interval": 1},
     {"name": "bypass_events", "enabled": True, "interval": 1},
@@ -90,8 +113,11 @@ def run_check(name, context, state=None):
                                if isinstance(v, dict) and v.get("expire", 0) > now_ts)
                 except Exception:
                     dead = 0
-            # 与 daemon 阀门一致：允许 70% 节点被拉黑（_POOL_MIN_RATIO=0.3）
-            return dead <= 65, dead, f"dead={dead}"
+            # 与 daemon.py 阀门一致：允许 70% 节点被拉黑（_POOL_MIN_RATIO=0.3）。
+            # 天花板从 Clash API 实时节点数推导，防止订阅变更后魔表失效。
+            pool = _clash_pool_size()
+            ceiling = int(pool * BLACKLIST_CEILING_RATIO)
+            return dead <= ceiling, dead, f"dead={dead}/{ceiling}"
 
         elif name == "bypass_events":
             out = subprocess.run(
