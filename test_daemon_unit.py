@@ -326,6 +326,73 @@ def test_restart_singbox_resets_count_on_success():
         daemon.time.sleep = orig_sleep
 
 
+# ============= 8. get_per_egress_error_rate（出口归属） =============
+def test_per_egress_error_rate_按节点分桶():
+    """请求按 .egress_log.jsonl 切换点归属到当时活跃节点，各节点独立统计。"""
+    base = 1_787_443_300  # 锚点 epoch
+    # 切换序列：base 切到 A，base+200 切到 B
+    switches = [
+        {"ts": base, "node": "A"},
+        {"ts": base + 200, "node": "B"},
+    ]
+    # 请求：A 期间(base+50,100,150 → 2 成功 1 失败)；B 期间(base+250,300 → 1 成功 1 失败)
+    from datetime import datetime, timezone, timedelta
+    def iso(delta):
+        return (datetime.fromtimestamp(base + delta, tz=timezone.utc)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    reqs = [
+        (iso(50), "success"),
+        (iso(100), "error"),
+        (iso(150), "success"),
+        (iso(250), "error"),
+        (iso(300), "success"),
+    ]
+    import types
+    # mock conn: c.execute(...).fetchall() -> reqs
+    class _Cursor:
+        def fetchall(self_inner):
+            return [(ts, st) for ts, st in reqs]
+    class _Conn:
+        def execute(self_inner, sql, params=None):
+            return _Cursor()
+
+    def fake_db():
+        return _Conn()
+
+    orig_db, orig_log = daemon._get_db, daemon._load_egress_log
+    daemon._get_db = fake_db
+    daemon._load_egress_log = lambda: switches
+    try:
+        rates = daemon.get_per_egress_error_rate(window_min=60)
+    finally:
+        daemon._get_db = orig_db
+        daemon._load_egress_log = orig_log
+    assert "A" in rates and "B" in rates, f"应含 A/B，实际 {list(rates)}"
+    a_total, a_err, a_rate = rates["A"]
+    b_total, b_err, b_rate = rates["B"]
+    assert a_total == 3 and a_err == 1, f"A 应为 3/1，实际 {a_total}/{a_err}"
+    assert b_total == 2 and b_err == 1, f"B 应为 2/1，实际 {b_total}/{b_err}"
+    assert abs(a_rate - 1/3) < 1e-9, f"A rate 应为 1/3，实际 {a_rate}"
+    assert len(rates) == 2, f"仅 2 个有归属节点，实际 {len(rates)}"
+
+
+def test_per_egress_error_rate_无切换日志返回空():
+    orig_db, orig_log = daemon._get_db, daemon._load_egress_log
+
+    def fake_db():
+        mem = types.SimpleNamespace()
+        mem.fetchall = lambda: [("2026-08-23T00:00:00+00:00", "success")]
+        return mem
+
+    daemon._get_db = fake_db
+    daemon._load_egress_log = lambda: []
+    try:
+        rates = daemon.get_per_egress_error_rate()
+    finally:
+        daemon._get_db = orig_db
+        daemon._load_egress_log = orig_log
+    assert rates == {}, f"无切换日志应返回空，实际 {rates}"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = failed = 0

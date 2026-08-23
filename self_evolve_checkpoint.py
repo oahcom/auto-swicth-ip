@@ -53,6 +53,7 @@ DEFAULT_CHECKS = [
     {"name": "response_latency_p95", "enabled": True, "interval": 5},
     {"name": "upstream_failure_rate", "enabled": True, "interval": 5},
     {"name": "repeat_failure_nodes", "enabled": True, "interval": 5},
+    {"name": "egress_error_attribution", "enabled": True, "interval": 5},
 ]
 
 # Anomaly patterns that trigger new check activation.
@@ -64,6 +65,7 @@ ANOMALY_PATTERNS = {
     "node_skew_spike": {"threshold": 0.4, "check": "node_switch_distribution"},
     "latency_degradation": {"threshold": 5.0, "check": "response_latency_p95"},
     "pool_pressure": {"threshold": 3, "check": "bounded_pool_pressure"},
+    "egress_quality_drop": {"threshold": 0.5, "check": "egress_error_attribution"},
 }
 
 
@@ -196,6 +198,14 @@ def run_check(name, context, state=None):
                     nodes[m.group(1)] += 1
             repeat = {n: c for n, c in nodes.items() if c >= 3}
             return len(repeat) == 0, len(repeat), f"repeat_failures={dict(repeat)}"
+
+        elif name == "egress_error_attribution":
+            # 复用 daemon 的 per-egress 归因函数（单源真理）。
+            sys.path.insert(0, str(PROJECT_DIR))
+            import daemon as _daemon
+            rates = _daemon.get_per_egress_error_rate(window_min=30)
+            bad = {n: r for n, (t, e, r) in rates.items() if r >= 0.5 and t >= 3}
+            return len(bad) == 0, len(bad), f"bad_egress={dict({n: round(r,3) for n,(_,_,r) in bad.items()})}"
 
     except Exception as e:
         return False, None, f"check_error: {e}"

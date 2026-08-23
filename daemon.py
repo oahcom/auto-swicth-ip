@@ -41,6 +41,8 @@ from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, BAD
 _db_conn: sqlite3.Connection | None = None
 _db_lock = threading.RLock()  # RLock: init_node_info_db 里 _get_db 需重入
 _BAD_NODES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bad_nodes.json")
+# 出口节点归属日志：每次成功切换追加 (ts,node)，供 per-egress 错误率归因用。
+_EGRESS_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".egress_log.jsonl")
 # bad_nodes cache (mtime-based, avoid repeated I/O)
 _shared_bad_cache: dict[str, float] = {}
 _shared_bad_mtime: float = 0
@@ -314,6 +316,98 @@ def get_9router_error_rate() -> tuple[int, int, list, int]:
         log(f"✗ 读 SQLite 失败: {e}")
         return 0, 0, [], 0
 
+def _load_egress_log() -> list[dict]:
+    """读 .egress_log.jsonl → 按 ts 升序的切换记录 [(ts, node), ...]。"""
+    if not os.path.exists(_EGRESS_LOG_FILE):
+        return []
+    out = []
+    try:
+        with open(_EGRESS_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    if "ts" in d and "node" in d:
+                        out.append(d)
+                except Exception:
+                    continue
+    except Exception as e:
+        log(f"✗ 读 egress_log 失败: {e}")
+        return []
+    out.sort(key=lambda x: x["ts"])
+    return out
+
+
+def _active_node_at(ts: int, switches: list[dict]) -> str | None:
+    """返回 ts 时刻活跃的出口节点（最近一次 ts<=切换点 的 node）；无切换记录返回 None。"""
+    active = None
+    for s in switches:
+        if s["ts"] <= ts:
+            active = s["node"]
+        else:
+            break
+    return active
+
+
+def get_per_egress_error_rate(window_min: int = 60) -> dict[str, tuple[int, int, float]]:
+    """按出口节点归属 opencode 请求错误率。
+
+    根因：9router requestDetails 无 egress 字段，出口由 daemon 实时 PUT 设置。
+    故用 .egress_log.jsonl 的时间窗把请求关联到"当时活跃节点"。
+
+    返回 {node: (total, errors, rate)}，仅含 window_min 内、且有归属的请求。
+    ponytail: 时间窗关联推断（切换点精度 ~0.2s），非逐连接 join；足以区分"节点级质量"，
+    不足以精确到单个 request。升级路径：让 9router 在 insertions 写入 outboundNode 字段。
+    """
+    try:
+        with _db_lock:
+            c = _get_db()
+            rows = c.execute(
+                """SELECT timestamp, status FROM requestDetails
+                   WHERE provider = ?
+                   ORDER BY timestamp ASC""",
+                (OPENCODE_FREE_PROVIDER,),
+            ).fetchall()
+        if not rows:
+            return {}
+        switches = _load_egress_log()
+        if not switches:
+            return {}
+        # 先解析所有请求为 epoch，按最晚请求时间的 window_min 窗口过滤。
+        # 原因：9router 与 daemon 可能时钟不一致，用 wall-clock cutoff 会造成越来越多
+        # 合格请求被排除（skew）。相对于最晚请求的相对窗口更稳。
+        parsed: list[tuple[int, str]] = []
+        max_ts = 0
+        for r in rows:
+            try:
+                ts = int(datetime.fromisoformat(str(r[0]).replace("Z", "+00:00")).timestamp())
+            except Exception:
+                continue
+            parsed.append((ts, r[1]))
+            if ts > max_ts:
+                max_ts = ts
+        cutoff = max_ts - window_min * 60
+        buckets: dict[str, list[int]] = {}
+        for ts, status in parsed:
+            if ts < cutoff:
+                continue
+            node = _active_node_at(ts, switches)
+            if node is None:
+                continue  # 请求早于任何切换记录，无法归属
+            buckets.setdefault(node, []).append(1 if status != "success" else 0)
+        result = {}
+        for node, err_flags in buckets.items():
+            total = len(err_flags)
+            errors = sum(err_flags)
+            result[node] = (total, errors, errors / total if total else 0.0)
+        return result
+    except Exception as e:
+        log(f"✗ per-egress 错误率失败: {e}")
+        return {}
+
+
 def _load_shared_bad_nodes() -> dict[str, float]:
     """Read bad nodes from shared .bad_nodes.json. Returns {node: expire_ts}, expired filtered out.
     ponytail: cached per-mtime to avoid repeated I/O (checked every 5s at most).
@@ -456,6 +550,15 @@ def get_all_proxy_nodes() -> list[str]:
     r, data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}')
     return data.get("all", []) if data else []
 
+def _record_egress(node: str) -> None:
+    """切换成功后记录 (ts,node)，供 per-egress 错误率归因。append-only 原子写。"""
+    try:
+        with open(_EGRESS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": _now_ts(), "node": node}) + "\n")
+    except Exception as e:
+        log(f"✗ 写 egress_log 失败: {e}")
+
+
 def switch_proxy(new_node: str) -> bool:
     """切换代理节点并验证切换生效。不 ban 旧节点——ban 只在错误触发路径处理。"""
     r, _ = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}',
@@ -470,6 +573,7 @@ def switch_proxy(new_node: str) -> bool:
     actual = verify_data.get("now") if verify_data else None
     if actual == new_node:
         log(f"✓ 切到: {new_node} (已验证)")
+        _record_egress(new_node)
         return True
     else:
         log(f"✗ 切代理验证失败 ({new_node}): PUT 返回 {r} 但实际 now={actual}")
