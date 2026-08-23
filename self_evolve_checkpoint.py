@@ -10,11 +10,12 @@ Meta-goal: The monitoring loop should evolve its own checks.
 
 import json
 import os
+import re
 import time
 import subprocess
 import sys
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 PROJECT_DIR = STATE_FILE.parent
@@ -54,12 +55,15 @@ DEFAULT_CHECKS = [
     {"name": "repeat_failure_nodes", "enabled": True, "interval": 5},
 ]
 
-# Anomaly patterns that trigger new check activation
+# Anomaly patterns that trigger new check activation.
+# threshold 单位与对应 check 的 metric 一致：dead/bypass/upstream 为次数(整数)，
+# skew(节点分布)为 0~1 比率，latency 为秒。
 ANOMALY_PATTERNS = {
-    "dead_nodes_spike": {"threshold": 5, "check": "node_switch_distribution"},
+    "dead_nodes_spike": {"threshold": 30, "check": "dead_nodes"},
     "bypass_spike": {"threshold": 2, "check": "upstream_failure_rate"},
+    "node_skew_spike": {"threshold": 0.4, "check": "node_switch_distribution"},
     "latency_degradation": {"threshold": 5.0, "check": "response_latency_p95"},
-    "pool_pressure": {"threshold": 0.5, "check": "bounded_pool_pressure"},
+    "pool_pressure": {"threshold": 3, "check": "bounded_pool_pressure"},
 }
 
 
@@ -102,13 +106,12 @@ def run_check(name, context, state=None):
         elif name == "dead_nodes":
             # 权威来源是 daemon 独占写入的 .bad_nodes.json（未过期条目），
             # 而非 daemon.log 全量历史里的最后一行 dead=（滞后且含陈旧值）。
-            import json as _json
             bn = STATE_FILE.parent / ".bad_nodes.json"
             now_ts = int(time.time())
             dead = 0
             if bn.exists():
                 try:
-                    data = _json.loads(bn.read_text())
+                    data = json.loads(bn.read_text())
                     dead = sum(1 for v in data.values()
                                if isinstance(v, dict) and v.get("expire", 0) > now_ts)
                 except Exception:
@@ -124,7 +127,7 @@ def run_check(name, context, state=None):
                 ["grep", "-a", "BYPASS\\|bypass", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
                 capture_output=True, text=True, timeout=5
             )
-            count = len([l for l in out.stdout.splitlines() if "enabled" in l.lower() or "BYPASS" in l.upper()][-10:])
+            count = len([l for l in out.stdout.splitlines() if today in l and ("enabled" in l.lower() or "BYPASS" in l.upper())][-10:])
             return count == 0, count, f"bypass_count={count}"
 
         elif name == "bounded_pool_pressure":
@@ -133,19 +136,19 @@ def run_check(name, context, state=None):
                 ["grep", "-a", "pool.*满\\|queue.*full", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
                 capture_output=True, text=True, timeout=5
             )
-            count = len(out.stdout.strip().splitlines())
+            count = len([l for l in out.stdout.splitlines() if today in l])
             return count == 0, count, f"pool_warnings={count}"
 
         elif name == "node_switch_distribution":
             out = subprocess.run(
-                ["bash", "-c", "grep -a '→ 切' /home/administrator/dkk-projects/auto-switch-ip/daemon.log 2>/dev/null | grep -v '冷却\\|fallback\\|okz' | tail -50 | grep -oP '(?<=-> ).*?(?= |$)' | sort | uniq -c | sort -rn | head -10"],
+                ["bash", "-c", "grep -a '切' /home/administrator/dkk-projects/auto-switch-ip/daemon.log 2>/dev/null | grep -v '冷却\\|fallback\\|okz\\|标记死节点' | tail -50 | grep -oP '(?<=-> ).*?(?= |$)' | sort | uniq -c | sort -rn | head -10"],
                 capture_output=True, text=True, timeout=10
             )
             dist = out.stdout.strip()
             # Check if any single node dominates (>40% of switches)
-            lines = dist.strip().splitlines()
-            total = sum(int(l.split()[0]) for l in lines if l.split()[0].isdigit())
-            dominant = max((int(l.split()[0]) for l in lines if l.split()[0].isdigit()), default=0)
+            lines = [l for l in dist.strip().splitlines() if l.split() and l.split()[0].isdigit()]
+            total = sum(int(l.split()[0]) for l in lines)
+            dominant = max((int(l.split()[0]) for l in lines), default=0)
             skew = dominant / total if total > 0 else 0
             return skew < 0.4, skew, f"dominant_node_share={skew:.1%}"
 
@@ -184,12 +187,10 @@ def run_check(name, context, state=None):
                 ["grep", "-a", "死", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
                 capture_output=True, text=True, timeout=5
             )
-            from collections import Counter
             nodes = Counter()
             for line in out.stdout.splitlines():
                 if today not in line:
                     continue
-                import re
                 m = re.search(r"✗\s+(.+?)\s+死", line)
                 if m:
                     nodes[m.group(1)] += 1
@@ -223,25 +224,25 @@ def main():
         status = "✅" if ok else "❌"
         print(f"  {status} {name}: {detail}")
 
-        # Anomaly detection
+        # Anomaly detection: 当某 check 的 metric 超过其对应 pattern 阈值时记录异常，
+        # 并确保该 pattern 推荐的检查始终启用（自进化杠杆：异常→激活检查）。
         for pattern, config in ANOMALY_PATTERNS.items():
-            if name == config.get("check") or pattern in name:
-                if metric is not None and metric >= config["threshold"]:
-                    anomaly = {
-                        "round": round_num,
-                        "pattern": pattern,
-                        "check": name,
-                        "metric": metric,
-                        "threshold": config["threshold"]
-                    }
-                    state["anomalies"].append(anomaly)
-                    print(f"  ⚠️ ANOMALY: {pattern} (metric={metric}, threshold={config['threshold']})")
-
-                    # Activate recommended check if not already
-                    rec_check = config.get("check")
-                    if rec_check and rec_check not in state.get("enabled_checks", []):
-                        state["enabled_checks"].append(rec_check)
-                        print(f"  🔄 Auto-activated check: {rec_check}")
+            if name != config.get("check"):
+                continue
+            if metric is not None and metric >= config["threshold"]:
+                anomaly = {
+                    "round": round_num,
+                    "pattern": pattern,
+                    "check": name,
+                    "metric": metric,
+                    "threshold": config["threshold"]
+                }
+                state["anomalies"].append(anomaly)
+                print(f"  ⚠️ ANOMALY: {pattern} (metric={metric}, threshold={config['threshold']})")
+                rec_check = config.get("check")
+                if rec_check and rec_check not in state.get("enabled_checks", []):
+                    state["enabled_checks"].append(rec_check)
+                    print(f"  🔄 Auto-activated check: {rec_check}")
 
     # Record history
     state["history"].append({
