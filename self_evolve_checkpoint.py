@@ -20,7 +20,7 @@ STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 
 # Default check suite - evolves over time
 DEFAULT_CHECKS = [
-    {"name": "7890_connectivity", "enabled": true, "interval": 1},
+    {"name": "7890_connectivity", "enabled": True, "interval": 1},
     {"name": "7890_connectivity", "enabled": True, "interval": 1},
     {"name": "dead_nodes", "enabled": True, "interval": 1},
     {"name": "bypass_events", "enabled": True, "interval": 1},
@@ -65,6 +65,7 @@ def save_state(state):
 def run_check(name, context, state=None):
     """Run a specific check and return (status, metric_value, details)."""
     try:
+        today = time.strftime("%Y-%m-%d")
         if name == "7890_connectivity":
             out = subprocess.run(
                 ["curl", "-m", "5", "-s", "-o", "/dev/null",
@@ -140,7 +141,7 @@ def run_check(name, context, state=None):
                 ["grep", "-a", "upstream connect fail", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
                 capture_output=True, text=True, timeout=5
             )
-            lines = [l for l in out.stdout.splitlines() if "2026-06-30" in l][-20:]  # last 20 today
+            lines = [l for l in out.stdout.splitlines() if today in l][-20:]  # last 20 today
             return len(lines) < 10, len(lines), f"recent_upstream_fails={len(lines)}"
 
         elif name == "repeat_failure_nodes":
@@ -152,7 +153,7 @@ def run_check(name, context, state=None):
             from collections import Counter
             nodes = Counter()
             for line in out.stdout.splitlines():
-                if "2026-06-30" not in line:
+                if today not in line:
                     continue
                 import re
                 m = re.search(r"✗\s+(.+?)\s+死", line)
@@ -205,7 +206,7 @@ def main():
                     # Activate recommended check if not already
                     rec_check = config.get("check")
                     if rec_check and rec_check not in state.get("enabled_checks", []):
-                        state["enabled_checks"].add(rec_check)
+                        state["enabled_checks"].append(rec_check)
                         print(f"  🔄 Auto-activated check: {rec_check}")
 
     # Record history

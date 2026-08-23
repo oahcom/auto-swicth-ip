@@ -5,3 +5,6 @@
 *.out
 .idea
 __pycache__
+# 运行时状态文件（daemon/engine 动态写入，非源码）
+.bad_nodes.json
+.monitor_state.json
