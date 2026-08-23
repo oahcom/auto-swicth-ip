@@ -220,6 +220,16 @@ def main():
 
     print(f"=== Self-Evolution Checkpoint Round {round_num} ===")
 
+    # 幂等回填：确保 DEFAULT_CHECKS 全部存在于 state["checks"] 且启用，
+    # 避免新增检查因旧 state 缺少条目/未启用而永不运行。
+    state.setdefault("enabled_checks", [])
+    existing = {c["name"] for c in state.get("checks", [])}
+    for c in DEFAULT_CHECKS:
+        if c["name"] not in existing:
+            state.setdefault("checks", []).append(c)
+        if c["name"] not in state["enabled_checks"]:
+            state["enabled_checks"].append(c["name"])
+
     # Run enabled checks
     results = {}
     for check in state["checks"]:
