@@ -43,6 +43,11 @@ _db_lock = threading.RLock()  # RLock: init_node_info_db 里 _get_db 需重入
 _BAD_NODES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bad_nodes.json")
 # 出口节点归属日志：每次成功切换追加 (ts,node)，供 per-egress 错误率归因用。
 _EGRESS_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".egress_log.jsonl")
+
+def _egress_log_path() -> str:
+    """egress_log 路径（EGRESS_LOG_FILE_PATH 可覆盖，测试用隔离；与 proxy-global.js
+    的 BAD_NODES_FILE_PATH 同款）。读写必须都走这里，否则测试会写到生产文件。"""
+    return os.environ.get("EGRESS_LOG_FILE_PATH") or _EGRESS_LOG_FILE
 # bad_nodes cache (mtime-based, avoid repeated I/O)
 _shared_bad_cache: dict[str, float] = {}
 _shared_bad_mtime: float = 0
@@ -318,11 +323,12 @@ def get_9router_error_rate() -> tuple[int, int, list, int]:
 
 def _load_egress_log() -> list[dict]:
     """读 .egress_log.jsonl → 按 ts 升序的切换记录 [(ts, node), ...]。"""
-    if not os.path.exists(_EGRESS_LOG_FILE):
+    path = _egress_log_path()
+    if not os.path.exists(path):
         return []
     out = []
     try:
-        with open(_EGRESS_LOG_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -337,19 +343,63 @@ def _load_egress_log() -> list[dict]:
         log(f"✗ 读 egress_log 失败: {e}")
         return []
     out.sort(key=lambda x: x["ts"])
-    # 裁剪：仅保留最近 7 天，避免文件无限增长（append-only 无 truncate）。
+    # 仅返回窗口内的记录（裁剪见 prune_egress_log）——读取路径不做写操作：
+    # 这里的 read-modify-write 会与 daemon 的 append 竞争，丢掉期间的切换记录，
+    # 而 _active_node_at 会因此把后续请求归因给上一个节点（错误的出口）。
     keep_after = int(time.time()) - 7 * 86400
-    pruned = [d for d in out if d.get("ts", 0) >= keep_after]
-    if len(pruned) != len(out):
-        try:
-            tmp = _EGRESS_LOG_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                for d in pruned:
-                    f.write(json.dumps(d) + "\n")
-            os.replace(tmp, _EGRESS_LOG_FILE)
-        except Exception:
-            pass
-    return pruned
+    return [d for d in out if d.get("ts", 0) >= keep_after]
+
+
+def prune_egress_log():
+    """裁剪 .egress_log.jsonl 到最近 7 天。由 daemon 主循环周期性调用。
+
+    单纯 read → 写 tmp → os.replace 仍会丢掉写入窗口内的 append；这里在
+    rename 之前重新读一次并集，把窗口内新追加的记录一并写回。
+    """
+    target = _egress_log_path()
+    if not os.path.exists(target):
+        return 0
+    try:
+        def _read(path):
+            recs = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                        if "ts" in d and "node" in d:
+                            recs.append(d)
+                    except Exception:
+                        continue
+            return recs
+
+        keep_after = int(time.time()) - 7 * 86400
+        before = _read(target)
+        kept = [d for d in before if d.get("ts", 0) >= keep_after]
+        if len(kept) == len(before):
+            return 0
+        tmp = target + ".tmp"
+        # 写 tmp 后、rename 前，把期间追加进来的记录合并（避免丢切换记录）
+        seen = {(d["ts"], d["node"]) for d in kept}
+        for d in _read(target):
+            key = (d["ts"], d["node"])
+            if key not in seen and d.get("ts", 0) >= keep_after:
+                kept.append(d)
+                seen.add(key)
+        kept.sort(key=lambda x: x["ts"])
+        with open(tmp, "w", encoding="utf-8") as f:
+            for d in kept:
+                f.write(json.dumps(d) + "\n")
+        os.replace(tmp, target)
+        removed = len(before) - len(kept)
+        if removed > 0:
+            log(f"✓ egress_log 裁剪: 移除 {removed} 条 7 天前记录")
+        return removed
+    except Exception as e:
+        log(f"✗ egress_log 裁剪失败: {e}")
+        return 0
 
 
 def _active_node_at(ts: int, switches: list[dict]) -> str | None:
@@ -362,6 +412,17 @@ def _active_node_at(ts: int, switches: list[dict]) -> str | None:
             break
     return active
 
+
+# 上一次归因查询失败的原因（None = 成功或无数据）
+_last_egress_error: str | None = None
+
+def _set_egress_error(reason: str):
+    global _last_egress_error
+    _last_egress_error = reason
+
+def get_last_egress_error() -> str | None:
+    """返回上次 get_per_egress_error_rate 的失败原因（供 CLI 区分无数据/出错）"""
+    return _last_egress_error
 
 def get_per_egress_error_rate(window_min: int = 60) -> dict[str, tuple[int, int, float]]:
     """按出口节点归属 opencode 请求错误率。
@@ -385,10 +446,13 @@ def get_per_egress_error_rate(window_min: int = 60) -> dict[str, tuple[int, int,
                    ORDER BY timestamp ASC""",
                 (OPENCODE_FREE_PROVIDER, cutoff),
             ).fetchall()
+        # 提前返回的空结果都带上原因，供 CLI 区分"确实没数据"与"查询出错"
         if not rows:
+            _set_egress_error("requestDetails 无 opencode 请求")
             return {}
         switches = _load_egress_log()
         if not switches:
+            _set_egress_error("egress_log 为空")
             return {}
         # 先解析所有请求为 epoch，按最晚请求时间的 window_min 窗口过滤。
         # 原因：9router 与 daemon 可能时钟不一致，用 wall-clock cutoff 会造成越来越多
@@ -417,9 +481,11 @@ def get_per_egress_error_rate(window_min: int = 60) -> dict[str, tuple[int, int,
             total = len(err_flags)
             errors = sum(err_flags)
             result[node] = (total, errors, errors / total if total else 0.0)
+        _set_egress_error("")   # 成功：清空上次的失败原因
         return result
     except Exception as e:
         log(f"✗ per-egress 错误率失败: {e}")
+        _set_egress_error(str(e))
         return {}
 
 
@@ -568,9 +634,7 @@ def get_all_proxy_nodes() -> list[str]:
 def _record_egress(node: str) -> None:
     """切换成功后记录 (ts,node)，供 per-egress 错误率归因。append-only 原子写。"""
     try:
-        # 环境变量可覆盖路径（与 proxy-global.js 的 BAD_NODES_FILE_PATH 同款），
-        # 测试用它隔离，避免把 mock 节点写进生产归因数据
-        path = os.environ.get("EGRESS_LOG_FILE_PATH") or _EGRESS_LOG_FILE
+        path = _egress_log_path()
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": _now_ts(), "node": node}) + "\n")
     except Exception as e:
@@ -1482,6 +1546,7 @@ def main():
             # ---- 3b. 清理过期 node_info (每 10 分钟) ----
             if now - last_node_info_cleanup > 600:
                 last_node_info_cleanup = now
+                prune_egress_log()   # 附带裁剪 egress_log（读取路径不再承担写操作）
                 try:
                     current_all = cached_all_nodes
                     if current_all:

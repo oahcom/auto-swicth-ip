@@ -69,13 +69,21 @@ def cmd_report(window_min: int = 60):
         print("  (暂无归因数据)")
         return 1
     if not rates:
+        # 归因失败时 daemon 内部吞异常并返回 {}，与"确实没数据"无法区分。
+        # 读它记录的失败原因，把二者分开报告 —— 避免把查询故障误读成"daemon 没切换"。
+        err = _daemon.get_last_egress_error()
+        if err:
+            print("  (归因查询失败: %s)" % err)
+            return 2          # 数据不可信，与"确实无数据"区分
         print("  (暂无出口归因记录 — daemon 可能未在日志周期内切换)")
         return 0
     print("=== 轮换效果 (最近 %d 分钟 per-egress 成功率) ===" % window_min)
-    rows = sorted(rates.items(), key=lambda kv: kv[1][2], reverse=True)
+    # rate 是错误率；表头/柱子讲的是成功率，所以按 rate 升序（成功率降序）
+    rows = sorted(rates.items(), key=lambda kv: kv[1][2])
     for node, (total, errs, rate) in rows:
-        bar = "#" * int((1 - rate) * 20)
-        print("  %-40.40s %4d/%-4d ok  %5.1f%%  |%s" % (node, total - errs, total, (1 - rate) * 100, bar))
+        ok_pct = (1 - rate) * 100
+        bar = "#" * round((1 - rate) * 20)
+        print("  %-38s %4d/%-4d ok  %5.1f%%  |%s" % (node, total - errs, total, ok_pct, bar))
     return 0
 
 
@@ -205,6 +213,10 @@ def main():
             w = int(args[1]) if len(args) > 1 else 60
         except ValueError:
             print("窗口分钟数必须是整数 (默认 60)")
+            return 1
+        if w < 1:
+            # 负数会让 cutoff 落到未来 → 空结果，被误读成"daemon 没切换"
+            print("窗口分钟数必须 ≥ 1 (收到 %d)" % w)
             return 1
         return cmd_report(w)
     elif cmd in ("goto", "go", "g"):

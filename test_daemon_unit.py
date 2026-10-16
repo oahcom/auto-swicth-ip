@@ -11,6 +11,7 @@
 import os
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -430,3 +431,45 @@ if __name__ == "__main__":
     print(f"\n结果: ✅ {passed} 通过 / ❌ {failed} 失败 ({len(tests)} 个用例)")
     import sys
     sys.exit(1 if failed else 0)
+
+
+# ============= 9. egress_log 读写隔离与裁剪 =============
+def test_egress_log_read_does_not_write(tmp_path, monkeypatch):
+    """读取路径不得写文件 —— 原实现的 read-modify-write 会丢掉期间的 append，
+    导致 _active_node_at 把请求归因给错误的节点。"""
+    import json as _json
+    f = tmp_path / "egress.jsonl"
+    old = int(time.time()) - 8 * 86400
+    f.write_text(_json.dumps({"ts": old, "node": "ancient"}) + "\n"
+                 + _json.dumps({"ts": int(time.time()), "node": "fresh"}) + "\n")
+    monkeypatch.setenv("EGRESS_LOG_FILE_PATH", str(f))
+
+    mtime_before = f.stat().st_mtime
+    got = daemon._load_egress_log()
+    assert [d["node"] for d in got] == ["fresh"], "只应返回窗口内记录"
+    assert f.stat().st_mtime == mtime_before, "读取不应修改文件"
+    assert "ancient" in f.read_text(), "读取不应删除记录"
+
+
+def test_prune_egress_log_preserves_appended(tmp_path, monkeypatch):
+    """prune 必须保留 rename 窗口内新追加的记录。"""
+    import json as _json
+    f = tmp_path / "egress.jsonl"
+    old = int(time.time()) - 8 * 86400
+    f.write_text(_json.dumps({"ts": old, "node": "ancient"}) + "\n"
+                 + _json.dumps({"ts": int(time.time()), "node": "fresh"}) + "\n")
+    monkeypatch.setenv("EGRESS_LOG_FILE_PATH", str(f))
+
+    removed = daemon.prune_egress_log()
+    assert removed == 1, f"应移除 1 条过期记录, 实际 {removed}"
+    nodes = [_json.loads(l)["node"] for l in f.read_text().splitlines() if l.strip()]
+    assert nodes == ["fresh"], f"窗口内记录必须保留: {nodes}"
+
+
+def test_egress_log_path_env_override(tmp_path, monkeypatch):
+    """读写都必须走 _egress_log_path()，否则测试会写进生产文件。"""
+    f = tmp_path / "iso.jsonl"
+    monkeypatch.setenv("EGRESS_LOG_FILE_PATH", str(f))
+    assert daemon._egress_log_path() == str(f)
+    daemon._record_egress("isolation-check-node")
+    assert f.exists() and "isolation-check-node" in f.read_text()
