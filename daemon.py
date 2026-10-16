@@ -1271,6 +1271,18 @@ def _discard(path: str):
     except OSError:
         pass
 
+def _stderr_reason(stderr: str) -> str:
+    """从子进程 stderr 提取最有诊断价值的一行。
+
+    traceback 的异常行不一定在最后（多个 traceback / 后续警告会让它被淹没），
+    优先找最后一条 `XxxError:` / `XxxException:` 行。
+    """
+    lines = [l.strip() for l in (stderr or "").splitlines() if l.strip()]
+    if not lines:
+        return "no stderr"
+    exc = [l for l in lines if _re.search(r"\w+(Error|Exception|Warning):", l)]
+    return (exc[-1] if exc else lines[-1])[:200]
+
 def _config_check_error(path: str) -> str:
     """用 sing-box 校验配置；通过返回 ""，否则返回错误摘要。"""
     try:
@@ -1291,8 +1303,24 @@ _SUB_URLS = [
     CFG.get("dasho_alt", {}).get("sub_url", ""),
 ]
 
+_REFRESH_LOCK = threading.Lock()   # 串行化订阅刷新：启动路径与主循环会撞在一起
+
 def refresh_subscription() -> bool:
-    """拉所有订阅源 + merge 去重 + 生成 sing-box config + 重启 sing-box"""
+    """拉所有订阅源 + merge 去重 + 生成 sing-box config + 重启 sing-box
+
+    非阻塞获取锁：已有刷新在跑时直接返回 False，不再排队。两个并发刷新
+    会写同一个 .tmp（交错内容让 _count_outbounds 读到 0），且第二次
+    restart 会 pkill 掉第一次刚恢复的连接。
+    """
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        log("⚠ 已有订阅刷新在进行，跳过本次")
+        return False
+    try:
+        return _refresh_subscription_locked()
+    finally:
+        _REFRESH_LOCK.release()
+
+def _refresh_subscription_locked() -> bool:
     log("🔄 刷新订阅...")
     try:
         parse_script = os.path.join(os.path.dirname(__file__), "parse_subscription.py")
@@ -1310,7 +1338,7 @@ def refresh_subscription() -> bool:
              "--urls", *urls],
             capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
-            log(f"✗ 订阅解析失败 (rc={r.returncode}): {r.stderr.strip().splitlines()[-1][:200] if r.stderr.strip() else 'no stderr'}")
+            log(f"✗ 订阅解析失败 (rc={r.returncode}): {_stderr_reason(r.stderr)}")
             _discard(tmp_file)
             return False
         new_n = _count_outbounds(tmp_file)

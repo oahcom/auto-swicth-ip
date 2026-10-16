@@ -54,6 +54,30 @@ def fetch_and_decode_sub(url: str) -> list[str]:
 
     return all_lines
 
+def _clash_transport_query(proxy: dict) -> str:
+    """把 Clash 节点的 network/ws-opts/grpc-opts 转成 URL query 片段。
+
+    Clash YAML 源的节点带 network 字段；不转发的话转出的 URL 缺 type，
+    解析回 sing-box 时 transport 丢失 —— 节点照常入池，但握手必失败。
+    """
+    net = str(proxy.get("network", "tcp")).lower()
+    if net in ("tcp", ""):
+        return ""
+    q = f"&type={net}"
+    if net == "ws":
+        ws = proxy.get("ws-opts", {}) or {}
+        path = ws.get("path", "/")
+        host = (ws.get("headers", {}) or {}).get("Host", "")
+        q += f"&path={urllib.parse.quote(path)}"
+        if host:
+            q += f"&host={urllib.parse.quote(host)}"
+    elif net == "grpc":
+        grpc = proxy.get("grpc-opts", {}) or {}
+        svc = grpc.get("grpc-service-name", "")
+        if svc:
+            q += f"&serviceName={urllib.parse.quote(svc)}"
+    return q
+
 def _clash_proxy_to_url(proxy: dict) -> str | None:
     """将 Clash proxy 字典转为标准 URL 格式（简化版，仅支持常见字段）"""
     ptype = proxy.get("type", "").lower()
@@ -92,6 +116,8 @@ def _clash_proxy_to_url(proxy: dict) -> str | None:
             q += f"&sid={urllib.parse.quote(sid)}"
         if network == "ws":
             q += f"&host={urllib.parse.quote(host)}&path={urllib.parse.quote(path)}"
+        elif network == "grpc":
+            q += f"&serviceName={urllib.parse.quote(proxy.get('grpc-opts', {}).get('grpc-service-name', ''))}"
 
         return f"vless://{uuid}@{server}:{port}?{q}#{urllib.parse.quote(name)}"
 
@@ -102,6 +128,9 @@ def _clash_proxy_to_url(proxy: dict) -> str | None:
         q = f"security={'tls' if tls else 'none'}"
         if sni and sni != server:
             q += f"&sni={urllib.parse.quote(sni)}"
+        # 转发 transport：不转发会让 ws/grpc 节点转成 URL 后丢 transport，
+        # 入池但每次连接都失败
+        q += _clash_transport_query(proxy)
         return f"trojan://{password}@{server}:{port}?{q}#{urllib.parse.quote(name)}"
 
     elif ptype == "vmess":
@@ -119,15 +148,16 @@ def _clash_proxy_to_url(proxy: dict) -> str | None:
         q = f"alterId={alter_id}&security={security}"
         if network != "tcp":
             q += f"&type={network}"
+            if network == "ws":
+                q += f"&host={urllib.parse.quote(host)}&path={urllib.parse.quote(path)}"
+            elif network == "grpc":
+                q += f"&serviceName={urllib.parse.quote(proxy.get('grpc-opts', {}).get('grpc-service-name', ''))}"
         if tls:
             q += "&tls=1"
         if sni and sni != server:
             q += f"&sni={urllib.parse.quote(sni)}"
         if fp:
             q += f"&fp={fp}"
-        if network == "ws":
-            q += f"&host={urllib.parse.quote(host)}&path={urllib.parse.quote(path)}"
-
         return f"vmess://{uuid}@{server}:{port}?{q}#{urllib.parse.quote(name)}"
 
     elif ptype == "shadowsocks" or ptype == "ss":
@@ -314,12 +344,9 @@ def parse_vmess(url: str) -> dict:
             "utls": {"enabled": True, "fingerprint": fp},
         },
     }
-    if network == "ws":
-        out["transport"] = {
-            "type": "ws",
-            "path": ws_path,
-            "headers": {"Host": ws_host} if ws_host else {},
-        }
+    tr = _transport_from_query(p)
+    if tr:
+        out["transport"] = tr
     return out
 
 def parse_shadowsocks(url: str) -> dict:

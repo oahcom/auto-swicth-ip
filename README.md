@@ -20,19 +20,21 @@
 
 ## 文件
 
-- `parse_subscription.py` — 拉 okz 订阅 + 解析 hysteria2/anytls/trojan + 生成 sing-box config
+- `parse_subscription.py` — 拉 okz 订阅 + 解析 vless/vmess/hysteria2/anytls/trojan/shadowsocks + 生成 sing-box config
 - `daemon.py` — 监控 9router + 主动轮换 sing-box 节点
-- `singbox-config.json` — 生成的 sing-box 配置（56 anytls + 1 trojan + selector + clash API）
+- `singbox-config.json` — 生成的 sing-box 配置（**不入库**，含 Clash API secret 与节点凭据；启动时按需生成）
 - `sing-box` — Linux x64 二进制（1.13.0）
 - `daemon.log` — daemon 运行日志
 
 ## 安装
 
 ```bash
-# 1. 装 sing-box（如果还没装）
-./parse_subscription.py  # 拉订阅 + 生成 config
+# 1. 生成 config（订阅地址见 config.py CFG["okz"]["sub_url"]）
+python3 parse_subscription.py                      # 用 OKZ_SUB_URL 环境变量
+# 或显式指定：
+python3 parse_subscription.py --urls "<订阅URL>" [更多源...]
 
-# 2. 启动 sing-box
+# 2. 启动 sing-box（先确认 config 已生成）
 ./sing-box run -c singbox-config.json &
 
 # 3. 改 9router 出口代理为 7890

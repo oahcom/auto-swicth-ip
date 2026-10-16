@@ -17,9 +17,26 @@ for i in $(seq 1 15); do
 done
 
 # Start sing-box if not running
+# 配置缺失时 sing-box 会立刻退出（FATAL read config），不能盲目启动后报成功 ——
+# 先生成（配置不入库，全新 clone / 误删即此状态）
+if [ ! -f "$CONFIG" ]; then
+    echo "config missing, generating from subscription..."
+    python3 "$LOG_DIR/parse_subscription.py" --out "$CONFIG" \
+        || echo "WARN: config generation failed; daemon will retry on startup" >&2
+fi
+
 if ! pgrep -f "sing-box run" >/dev/null; then
-    nohup "$SINGBOX" run -c "$CONFIG" > "$LOG_DIR/singbox.log" 2>&1 &
-    echo "started sing-box PID $!"
+    if [ ! -f "$CONFIG" ]; then
+        echo "ERROR: $CONFIG absent and could not be generated; skipping sing-box" >&2
+    else
+        nohup "$SINGBOX" run -c "$CONFIG" > "$LOG_DIR/singbox.log" 2>&1 &
+        sleep 1
+        if kill -0 $! 2>/dev/null; then
+            echo "started sing-box PID $!"
+        else
+            echo "ERROR: sing-box exited immediately; see $LOG_DIR/singbox.log" >&2
+        fi
+    fi
 fi
 
 # Start daemon if not running

@@ -51,14 +51,25 @@ def hdr():
     return {"Authorization": f"Bearer {get_singbox_secret()}"}
 
 
+class ClashUnreachable(RuntimeError):
+    """Clash API 不可达 —— 比裸 traceback 更能说明问题。"""
+
+
+def _selector() -> dict:
+    try:
+        r = requests.get(f"{CLASH_API}/proxies/proxy", headers=hdr(), timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        raise ClashUnreachable(f"Clash API {CLASH_API} 不可达: {type(e).__name__}: {e}") from e
+
+
 def nodes() -> list[str]:
-    r = requests.get(f"{CLASH_API}/proxies/proxy", headers=hdr(), timeout=10)
-    return [n for n in r.json()["all"] if n != "direct"]
+    return [n for n in _selector()["all"] if n != "direct"]
 
 
 def current() -> str:
-    r = requests.get(f"{CLASH_API}/proxies/proxy", headers=hdr(), timeout=10)
-    return r.json().get("now", "")
+    return _selector().get("now", "")
 
 
 def switch(node: str) -> bool:
@@ -149,7 +160,10 @@ def verify_switch(samples: int, quick: bool) -> list[str]:
     # 只挑 Clash API 已确认健康的节点：切到死节点会得到 FAIL，
     # 那是节点问题而非切换功能问题，会污染本项判定
     pool = [n for n in all_nodes if not n.endswith("-h2")]  # h2 在 WSL2 被过滤
-    healthy = _healthy_nodes(pool) or pool
+    healthy = _healthy_nodes(pool)
+    if not healthy:
+        print("  ⚠ Clash API 延迟测试无健康节点，回退到未验证节点池")
+        healthy = pool
     step = max(1, len(healthy) // 5)
     picks = healthy[::step][:5]
 
@@ -216,7 +230,9 @@ def verify_reasonableness(all_nodes: list[str], quick: bool):
               f"中位数={med:.0f}s, 样本={len(gaps)}")
         print(f"  全部间隔: {[int(g) for g in gaps]}")
     else:
-        print(f"  (轮换样本不足: {len(stamps)} 次，跳过节律检查)")
+        # 轮换完全停滞时不能静默 exit 0 —— 这正是本项要发现的情况
+        check(f"轮换运行中（近 30 分钟 ≥4 次，实际 {len(stamps)} 次）", False,
+              "无轮换事件：daemon 可能未运行或轮换停了")
 
     # 3.2 切换避让死节点
     # 必须按事件时序判定：节点被判死后由 TTL 机制释放、随后被选中是**正常流程**，
@@ -306,9 +322,14 @@ def main() -> int:
     print("=" * 60)
 
     t0 = time.time()
-    verify_port()
-    all_nodes = verify_switch(args.samples, args.quick)
-    verify_reasonableness(all_nodes, args.quick)
+    try:
+        verify_port()
+        all_nodes = verify_switch(args.samples, args.quick)
+        verify_reasonableness(all_nodes, args.quick)
+    except ClashUnreachable as e:
+        print(f"\n✗ {e}")
+        print("  （先把 sing-box/daemon 拉起来再跑本脚本）")
+        return 1
 
     print("\n" + "=" * 60)
     print(f"结果: {PASS} 通过 / {FAIL} 失败  ({time.time() - t0:.0f}s)")

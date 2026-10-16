@@ -262,6 +262,9 @@ def test_parse_failure_makes_refresh_return_false(monkeypatch, tmp_path):
     lg.handlers = []
     monkeypatch.setattr(daemon, "_logger", None)          # 强制重新 _init_logger
     monkeypatch.setitem(daemon.CFG, "log_file", str(tmp_path / "daemon.log"))
+    # config_file 必须一并重定向：refresh 失败路径会 _discard(config_file + ".tmp")，
+    # 不重定向就会删掉生产 singbox-config.json.tmp（含刚拉取的节点凭据）
+    monkeypatch.setitem(daemon.CFG["singbox"], "config_file", str(tmp_path / "cfg.json"))
 
     try:
         monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
@@ -342,3 +345,41 @@ def test_is_loopback_handles_non_string():
                            "uuid": "u", "alter_id": 0, "security": "auto"}],
                          listen_port=7890, clash_port=9090)
     assert cfg["outbounds"], "数字 server 不应导致 make_config 崩溃"
+
+
+# ============= 7. 并发刷新与 Clash transport 转发 =============
+def test_refresh_locked_is_nonblocking():
+    """已有刷新在跑时第二次调用应立刻返回 False，而不是排队等锁。"""
+    import threading
+    import time as _time
+    with daemon._REFRESH_LOCK:
+        t0 = _time.time()
+        assert daemon.refresh_subscription() is False
+        assert _time.time() - t0 < 0.5, "非阻塞获取锁失败（阻塞等待了）"
+
+
+def test_clash_transport_roundtrip():
+    """Clash YAML 源的 ws/grpc 节点转 URL 后必须保留 transport。
+
+    此前 _clash_proxy_to_url 不转发 network，节点入池但每次连接都失败。
+    """
+    for ptype, net in [("trojan", "ws"), ("trojan", "grpc"),
+                       ("vmess", "ws"), ("vmess", "grpc"),
+                       ("vless", "ws"), ("vless", "grpc")]:
+        proxy = {"type": ptype, "name": "n", "server": "1.2.3.4", "port": 443, "network": net}
+        proxy["password" if ptype == "trojan" else "uuid"] = "x"
+        if net == "ws":
+            proxy["ws-opts"] = {"path": "/p", "headers": {"Host": "a.com"}}
+        else:
+            proxy["grpc-opts"] = {"grpc-service-name": "svc"}
+        url = ps._clash_proxy_to_url(proxy)
+        out = ps.PARSERS[ptype](url)
+        assert out.get("transport", {}).get("type") == net, \
+            f"{ptype} {net} transport 丢失: URL={url}"
+
+
+def test_stderr_reason_picks_exception_line():
+    """traceback 的异常行可能不在最后（后续警告会淹没它）。"""
+    s = "Traceback:\n  File x\nNameError: boom\ntrailing warning"
+    assert daemon._stderr_reason(s) == "NameError: boom"
+    assert daemon._stderr_reason("") == "no stderr"
