@@ -409,6 +409,17 @@ def parse_url(url: str) -> dict | None:
         return None
 
 # ============= 生成 sing-box config =============
+def _is_loopback(host: str) -> bool:
+    """回环/本机地址（127.0.0.0/8, ::1, localhost）不可能是有效代理出口。"""
+    import ipaddress
+    h = (host or "").strip().lower()
+    if h == "localhost" or h.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
 def make_config(nodes: list[dict], listen_port: int = 0,
                 clash_port: int = 0, clash_secret: str = "",
                 include_h2: bool = False) -> dict:
@@ -424,8 +435,10 @@ def make_config(nodes: list[dict], listen_port: int = 0,
     # 条目（sing-box check 不报错），daemon 会把它当正常节点轮换，白白浪费一次切换
     before = len(nodes)
     nodes = [n for n in nodes if n.get("server") and n.get("server_port")]
+    # 回环/本机地址不可能是有效出口，混在池里同样会让 daemon 空轮换一次
+    nodes = [n for n in nodes if not _is_loopback(n["server"])]
     if len(nodes) < before:
-        print(f"  dropped {before - len(nodes)} invalid nodes (missing server/port)", file=sys.stderr)
+        print(f"  dropped {before - len(nodes)} invalid nodes (missing server/port or loopback)", file=sys.stderr)
     if not include_h2:
         nodes = [n for n in nodes if n.get("type") != "hysteria2"]
     outbounds = nodes[:]

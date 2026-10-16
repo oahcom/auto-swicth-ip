@@ -194,6 +194,54 @@ def test_dead_source_still_writes_config(tmp_path):
 
 
 # ============= 4. refresh_subscription 检查 returncode =============
+def test_loopback_nodes_filtered():
+    """订阅源套餐过期时会返回 ss://...@127.0.0.1:6666 占位节点，必须过滤。"""
+    assert ps._is_loopback("127.0.0.1") and ps._is_loopback("::1") and ps._is_loopback("localhost")
+    assert not ps._is_loopback("1.2.3.4") and not ps._is_loopback("hk.example.com")
+    good = ps.parse_trojan("trojan://pw@a.example.com:443#t")
+    loop = ps.parse_shadowsocks("ss://YWVzLTEyOC1nY206cHc@127.0.0.1:6666#expired")
+    cfg = ps.make_config([good, loop], listen_port=7890, clash_port=9090)
+    assert not any("127.0.0.1" in o.get("server", "") for o in cfg["outbounds"])
+
+
+def test_count_outbounds():
+    """节点计数用于判断刷新是否骤降（订阅源故障时返回占位节点）。"""
+    import json as _json
+    assert daemon._count_outbounds("/nonexistent/x.json") == 0
+
+
+def test_shrunken_refresh_rejected(monkeypatch, tmp_path):
+    """节点数骤降时必须拒绝覆盖配置，保留现有节点池。
+
+    实测事故：dasho 套餐过期返回占位节点，刷新把 56 节点池覆盖成 1 个无效节点，
+    代理直接断掉。
+    """
+    import json as _json
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(_json.dumps({"outbounds": [
+        {"type": "trojan", "tag": f"n{i}", "server": f"1.2.3.{i}", "server_port": 443}
+        for i in range(1, 20)] + [{"type": "direct", "tag": "direct"}]}))
+    monkeypatch.setitem(daemon.CFG["singbox"], "config_file", str(cfg))
+
+    def fake_run(cmd, **k):
+        out = cmd[cmd.index("--out") + 1]
+        with open(out, "w") as f:                       # 模拟故障源产出 1 个节点
+            _json.dump({"outbounds": [{"type": "ss", "tag": "x",
+                                       "server": "1.2.3.4", "server_port": 1}]}, f)
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(daemon, "restart_singbox", lambda: pytest.fail("不应重启 sing-box"))
+    original = cfg.read_text()
+    assert daemon.refresh_subscription() is False
+    assert cfg.read_text() == original, "骤降的配置覆盖了现有节点池"
+    assert not (tmp_path / "cfg.json.tmp").exists(), "临时文件未清理"
+
+
 def test_parse_failure_makes_refresh_return_false(monkeypatch, tmp_path):
     """rc != 0 时必须返回 False，不得声称刷新成功。
 

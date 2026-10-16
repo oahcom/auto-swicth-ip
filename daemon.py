@@ -1184,6 +1184,22 @@ def restart_singbox() -> bool:
 
 
 # ============= 订阅刷新 =============
+def _count_outbounds(path: str) -> int:
+    """数配置文件里的代理节点数（不存在/损坏返回 0）"""
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        return len([o for o in cfg.get("outbounds", [])
+                    if o.get("type") not in ("direct", "selector")])
+    except Exception:
+        return 0
+
+def _discard(path: str):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
 # 多个订阅源合并：okz（主力）+ hd.23n.club + dasho.pqjc.site + dasho.xn--cp3a08l.com（补充）
 _SUB_URLS = [
     CFG["okz"]["sub_url"],
@@ -1202,15 +1218,30 @@ def refresh_subscription() -> bool:
         if not urls:
             log("✗ 无可用订阅源")
             return False
+        # 先写临时文件，节点数骤降时拒绝覆盖（订阅源故障/套餐过期时会返回
+        # 占位节点，一旦覆盖会把正常节点池整个换掉）
+        tmp_file = config_file + ".tmp"
         r = subprocess.run(
             [sys.executable, parse_script,
-             "--out", config_file,
+             "--out", tmp_file,
              "--urls", *urls],
             capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             log(f"✗ 订阅解析失败 (rc={r.returncode}): {r.stderr.strip().splitlines()[-1][:200] if r.stderr.strip() else 'no stderr'}")
+            _discard(tmp_file)
             return False
-        log("✓ 订阅刷新完毕，重启 sing-box 加载新配置...")
+        new_n = _count_outbounds(tmp_file)
+        old_n = _count_outbounds(config_file)
+        if new_n == 0:
+            log("✗ 刷新产出 0 节点，保留现有配置")
+            _discard(tmp_file)
+            return False
+        if old_n and new_n < old_n * 0.5:
+            log(f"✗ 刷新节点数骤降 ({old_n} → {new_n})，疑似订阅源故障，保留现有配置")
+            _discard(tmp_file)
+            return False
+        os.replace(tmp_file, config_file)
+        log(f"✓ 订阅刷新完毕 ({old_n} → {new_n} 节点)，重启 sing-box 加载新配置...")
         return restart_singbox()
     except Exception as e:
         log(f"✗ 订阅刷新失败: {e}")
