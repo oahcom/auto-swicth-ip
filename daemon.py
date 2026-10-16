@@ -1312,6 +1312,7 @@ def refresh_subscription() -> bool:
         return restart_singbox()
     except Exception as e:
         log(f"✗ 订阅刷新失败: {e}")
+        _discard(config_file + ".tmp")   # 超时/异常时清除残留（含凭据）
         return False
 
 # ============= 降级逻辑 =============

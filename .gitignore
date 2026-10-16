@@ -11,3 +11,6 @@ __pycache__
 .egress_log.jsonl
 # 订阅刷新生成，含 Clash API secret + 节点凭据
 singbox-config.json
+# 刷新写到 .tmp 再 os.replace；超时/SIGKILL 会残留（同样含凭据）
+singbox-config.json.tmp
+*.json.tmp

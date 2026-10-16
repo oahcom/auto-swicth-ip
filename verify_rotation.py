@@ -81,6 +81,21 @@ def egress_ip() -> str:
     return out if out and "." in out and "<" not in out else "FAIL"
 
 
+def _healthy_nodes(candidates: list[str]) -> list[str]:
+    """用 Clash API 的延迟测试筛出当前可用的节点（并发，最多 15s）。"""
+    def one(n):
+        try:
+            r = requests.get(f"{CLASH_API}/proxies/{requests.utils.quote(n, safe='')}/delay",
+                             params={"url": PROBE_URL, "timeout": 5000},
+                             headers=hdr(), timeout=8)
+            return n if "delay" in r.json() else None
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+        return [n for n in ex.map(one, candidates) if n]
+
+
 def journal(since: str, pattern: str) -> list[str]:
     try:
         r = subprocess.run(
@@ -131,16 +146,24 @@ def verify_switch(samples: int, quick: bool) -> list[str]:
     all_nodes = nodes()
     check("节点池非空", len(all_nodes) > 10, f"实际={len(all_nodes)}")
 
-    # 连续强制切换，观察出口 IP 是否真的改变
+    # 只挑 Clash API 已确认健康的节点：切到死节点会得到 FAIL，
+    # 那是节点问题而非切换功能问题，会污染本项判定
     pool = [n for n in all_nodes if not n.endswith("-h2")]  # h2 在 WSL2 被过滤
-    step = max(1, len(pool) // 5)
-    picks = pool[::step][:5]
+    healthy = _healthy_nodes(pool) or pool
+    step = max(1, len(healthy) // 5)
+    picks = healthy[::step][:5]
+
     seen: list[tuple[str, str]] = []
     for n in picks:
         if not switch(n):
             continue
-        time.sleep(2)
-        seen.append((n, egress_ip()))
+        ip = "FAIL"
+        for _ in range(4):                 # 切换后代理就绪需要时间，重试而非一次判定
+            time.sleep(1.5)
+            ip = egress_ip()
+            if ip != "FAIL":
+                break
+        seen.append((n, ip))
     ips = [ip for _, ip in seen if ip != "FAIL"]
     print(f"  切换采样: {[(n.split(':')[1], ip) for n, ip in seen]}")
     check("切换后出口 IP 可获取", len(ips) >= 3, f"有效={len(ips)}/{len(seen)}")
@@ -196,21 +219,37 @@ def verify_reasonableness(all_nodes: list[str], quick: bool):
         print(f"  (轮换样本不足: {len(stamps)} 次，跳过节律检查)")
 
     # 3.2 切换避让死节点
-    log = journal("10 minutes ago", "切代理")
-    picked = set()
-    for l in log:
-        m = re.search(r"-> (\S+)", l)
-        if m:
-            picked.add(m.group(1))
-    dead = journal("10 minutes ago", r"死 \(连续失败|无可用节点")
-    dead_nodes = set()
-    for l in dead:
-        m = re.search(r"(\S+?) 死", l)
-        if m:
-            dead_nodes.add(m.group(1))
-    check("切换目标不含死节点", not (picked & dead_nodes),
-          f"交集={picked & dead_nodes}")
-    print(f"  近期切换目标 {len(picked)} 个, 死节点 {len(dead_nodes)} 个")
+    # 必须按事件时序判定：节点被判死后由 TTL 机制释放、随后被选中是**正常流程**，
+    # 单纯对集合求交会把这种正常回收误报成违规。
+    ts_re = re.compile(r"\[([\d-]+ [\d:]+)\]")
+
+    def _events(lines, pat):
+        out = []
+        for l in lines:
+            mt, mp = ts_re.search(l), re.search(pat, l)
+            if mt and mp:
+                out.append((mt.group(1), mp.group(1)))
+        return out
+
+    picks = _events(journal("10 minutes ago", "切代理"), r"-> (\S+)")
+    deaths = _events(journal("10 minutes ago", r"死 \(连续失败"), r"(\S+?) 死")
+    releases = _events(journal("10 minutes ago", r"释放 \d+ 个黑名单节点"), r"\[(.+?)\]")
+
+    # 同一节点在窗口内可能判死/释放多次，必须取"选中时刻之前最近一次状态"：
+    # 该次事件是 death → 违规；是 release → 正常（TTL 回收后重选是设计行为）。
+    events = [(ts, n, "death") for ts, n in deaths] + \
+             [(ts, n, "release") for ts, n in releases]
+
+    violations = []
+    for pick_ts, node in picks:
+        before = [(ts, kind) for ts, n, kind in events if n == node and ts <= pick_ts]
+        if not before:
+            continue                       # 选中前无死亡记录 → 正常
+        if max(before)[1] == "death":      # 最近的先导事件是"判死" → 违规
+            violations.append(f"{node}(选中 {pick_ts} 时仍处于死亡状态)")
+
+    check("切换目标不含未释放的死节点", not violations, f"违规={violations}")
+    print(f"  近期切换目标 {len(picks)} 个, 判死 {len(deaths)} 次, 释放 {len(releases)} 次")
 
     # 3.3 策略模式判定正确
     strat = set(re.findall(r"策略=(\w+)", "\n".join(

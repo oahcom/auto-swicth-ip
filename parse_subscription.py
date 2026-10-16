@@ -436,7 +436,7 @@ def make_config(nodes: list[dict], listen_port: int = 0,
     before = len(nodes)
     nodes = [n for n in nodes if n.get("server") and n.get("server_port")]
     # 回环/本机地址不可能是有效出口，混在池里同样会让 daemon 空轮换一次
-    nodes = [n for n in nodes if not _is_loopback(n["server"])]
+    nodes = [n for n in nodes if not _is_loopback(n.get("server", ""))]
     if len(nodes) < before:
         print(f"  dropped {before - len(nodes)} invalid nodes (missing server/port or loopback)", file=sys.stderr)
     if not include_h2:

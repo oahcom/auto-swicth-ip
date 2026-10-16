@@ -414,25 +414,6 @@ def test_per_egress_error_rate_无切换日志返回空():
     assert rates == {}, f"无切换日志应返回空，实际 {rates}"
 
 
-if __name__ == "__main__":
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    passed = failed = 0
-    for t in tests:
-        try:
-            t()
-            print(f"  ✅ {t.__name__}")
-            passed += 1
-        except AssertionError as e:
-            print(f"  ❌ {t.__name__}: {e}")
-            failed += 1
-        except Exception as e:
-            print(f"  💥 {t.__name__}: 异常 {e}")
-            failed += 1
-    print(f"\n结果: ✅ {passed} 通过 / ❌ {failed} 失败 ({len(tests)} 个用例)")
-    import sys
-    sys.exit(1 if failed else 0)
-
-
 # ============= 9. egress_log 读写隔离与裁剪 =============
 def test_egress_log_read_does_not_write(tmp_path, monkeypatch):
     """读取路径不得写文件 —— 原实现的 read-modify-write 会丢掉期间的 append，
