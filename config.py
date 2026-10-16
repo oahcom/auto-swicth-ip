@@ -73,6 +73,7 @@ CFG = {
         "monitor_sec": 2,
         "proactive_rotate_sec": 60,
         "cooldown_after_switch_sec": 10,
+        "429_cooldown_sec": 10,   # 实测：429 后 5-10s 即恢复（0-5s 成功率 63%，5-10s 已 98%）
         "singbox_watchdog_sec": 30,
         "node_health_sec": 300,
         "subscription_refresh_sec": 3600,

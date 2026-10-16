@@ -142,6 +142,12 @@ _DEAD_NODES_RELEASE_TS: dict[str, float] = {}
 # 死节点指数退避参数
 _DEAD_TTL_MAX = BAD_NODES_MAX_TTL          # 最大 TTL（替代 float('inf）永久拉黑）
 
+# 429 冷却池：与 _DEAD_NODES 语义不同——节点本身健康，只是刚被上游限流，
+# 需要短暂让开让上游的速率窗口重置。不进指数退避、不影响 bad_nodes 导出。
+# 实测（1998 条请求 × 1836 次切换归属）：429 后 0-5s 重试成功率 62.7%，
+# 5-10s 已回升到 97.7%，10s 后稳定 93-98% —— 重置窗口是秒级，不是分钟级。
+_COOLDOWN_NODES: dict[str, float] = {}     # node -> 可再次被选中的时刻
+
 def _generate_ttl_stages() -> list[int]:
     """算法生成 TTL 阶梯：
     - 第 1-10 次：平滑渐进 30s → 120s (指数平滑)
@@ -985,30 +991,51 @@ def _precompute_delay_stats(all_delays: list[int]) -> tuple[int, int, int]:
     return median, min_d, max_d
 
 
+def _cool_down_node(node: str, seconds: int | None = None):
+    """把刚被上游限流(429)的节点放进冷却池，短暂让开让速率窗口重置。
+
+    与 _DEAD_NODES 不同：不判死、不进指数退避、不导出到 bad_nodes——
+    节点本身是健康的（连通性探测正常），只是这一刻上游不接收请求。
+    """
+    secs = seconds if seconds is not None else CFG["intervals"]["429_cooldown_sec"]
+    with _state_lock:
+        _COOLDOWN_NODES[node] = time.time() + secs
+
+
+def _prune_cooldown():
+    """清掉冷却已到期的节点（需在 _state_lock 内调用或自行加锁）。"""
+    now = time.time()
+    with _state_lock:
+        for n in [n for n, exp in _COOLDOWN_NODES.items() if exp <= now]:
+            _COOLDOWN_NODES.pop(n, None)
+
+
 def _filter_candidates(current: str, all_nodes: list, fail_set: set) -> list[str]:
     """Filter usable candidates, apply anti-sticky, fallback if < 5."""
     cleanup_dead_ttl()
+    _prune_cooldown()
 
     def usable(n):
         if n == "direct" or n == current:
             return False
         if n in fail_set or n in _DEAD_NODES or n in _recent_nodes:
             return False
+        if _COOLDOWN_NODES.get(n, 0) > time.time():
+            return False   # 刚吃 429，让上游限流窗口过去
         return True
 
     with _state_lock:
         candidates = [n for n in all_nodes if usable(n)]
-        # ponytail: 候选不足时临时放行最近节点，不弹出 deque（保持防粘记忆）
+        # 候选不足时临时放行最近节点，但仍须排除冷却中的节点——
+        # 刚吃 429 的节点必须让开，否则池子抽干时切回它只会继续 429。
         if len(candidates) < 5:
+            now = time.time()
             for n in _recent_nodes:
                 if len(candidates) >= 5:
                     break
-                if n not in fail_set and n not in _DEAD_NODES and n != current and n not in candidates:
+                if (n not in fail_set and n not in _DEAD_NODES and n != current
+                        and n not in candidates and _COOLDOWN_NODES.get(n, 0) <= now):
                     candidates.append(n)
-            if len(candidates) < 5:
-                candidates = [n for n in all_nodes
-                              if n != "direct" and n != current
-                              and n not in fail_set and n not in _DEAD_NODES]
     return candidates
 
 
@@ -1641,6 +1668,11 @@ def main():
                     if current and errors_after_switch == 0:
                         log(f"  ↷ {current} 切换后无新错误，错误来自上游限流或旧节点")
 
+                    # 让刚被限流的节点进冷却池：立即切回同一节点只会继续 429
+                    if current:
+                        _cool_down_node(current)
+                        log(f"  ❄ {current} 进 429 冷却 {CFG['intervals']['429_cooldown_sec']}s")
+
                     check_and_handle_fallback(nodes, current or "")
 
                     # 错误触发轮换不计入调用次数（429 的请求不算成功调用）
@@ -1653,7 +1685,7 @@ def main():
                             cooldown_until = now + CFG["intervals"]["cooldown_after_switch_sec"]
                             update_node_info_async(next_node)
                     else:
-                        log(f"⚠ 无可用节点 (dead={len(_DEAD_NODES)})")
+                        log(f"⚠ 无可用节点 (dead={len(_DEAD_NODES)} cooldown={len(_COOLDOWN_NODES)})")
 
             # ---- 5. 节点健康检查 (每 300s，后台异步执行不阻塞主循环) ----
             if now - last_health_check > CFG["intervals"]["node_health_sec"]:
@@ -1755,13 +1787,14 @@ def main():
             # ---- 9. 健康摘要（每 10s 最多一条） ----
             with _state_lock:
                 dead_count = len(_DEAD_NODES)
+                cool_count = len(_COOLDOWN_NODES)
                 err_threshold = 1 - CFG["thresholds"]["opencode_min_success_rate"]
             with _RESTART_LOCK:
                 rc_display = _RESTART_COUNT
             log_health(f"节点={len(cached_all_nodes)} 错误={errors}/{total} "
                        f"err>{(err_threshold*100):.0f}%→切"
                        f"冷却至={time.strftime('%H:%M:%S', time.localtime(cooldown_until)) if cooldown_until>0 else '-'}"
-                       f" dead={dead_count} 策略={_strategy_mode}"
+                       f" dead={dead_count} cool={cool_count} 策略={_strategy_mode}"
                        f" singbox={'🟢' if rc_display==0 else '🔴'}")
 
             time.sleep(CFG["intervals"]["monitor_sec"])

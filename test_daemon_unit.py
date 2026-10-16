@@ -500,3 +500,39 @@ def test_egress_log_path_env_override(tmp_path, monkeypatch):
     assert daemon._egress_log_path() == str(f)
     daemon._record_egress("isolation-check-node")
     assert f.exists() and "isolation-check-node" in f.read_text()
+
+
+# ============= 429 冷却池 =============
+def test_cooldown_node_excluded_from_candidates(monkeypatch):
+    """刚吃 429 的节点必须从候选中剔除，否则立刻切回只会继续 429。"""
+    monkeypatch.setattr(daemon, "_DEAD_NODES", set())
+    monkeypatch.setattr(daemon, "_COOLDOWN_NODES", {})
+    monkeypatch.setattr(daemon, "_recent_nodes", __import__("collections").deque(maxlen=5))
+    monkeypatch.setattr(daemon, "cleanup_dead_ttl", lambda: None)
+
+    nodes = ["n1", "n2", "n3", "n4", "n5", "n6"]
+    daemon._cool_down_node("n2", seconds=60)
+    out = daemon._filter_candidates("n1", nodes, set())
+    assert "n2" not in out, f"冷却中的节点不应出现在候选中: {out}"
+
+
+def test_cooldown_expires_and_node_returns(monkeypatch):
+    """冷却到期后节点必须回到候选池，不能被永久排除。"""
+    monkeypatch.setattr(daemon, "_DEAD_NODES", set())
+    monkeypatch.setattr(daemon, "_recent_nodes", __import__("collections").deque(maxlen=5))
+    monkeypatch.setattr(daemon, "cleanup_dead_ttl", lambda: None)
+    monkeypatch.setattr(daemon, "_COOLDOWN_NODES", {"n2": time.time() - 1})  # 已过期
+
+    nodes = ["n1", "n2", "n3", "n4", "n5", "n6"]
+    out = daemon._filter_candidates("n1", nodes, set())
+    assert "n2" in out, f"冷却已到期的节点应回到候选池: {out}"
+
+
+def test_cooldown_does_not_mark_node_dead(monkeypatch):
+    """429 冷却不得污染死节点集合——两者语义必须隔离。"""
+    dead = set()
+    monkeypatch.setattr(daemon, "_DEAD_NODES", dead)
+    monkeypatch.setattr(daemon, "_COOLDOWN_NODES", {})
+    daemon._cool_down_node("n9", seconds=10)
+    assert "n9" not in dead, "429 冷却不应把节点标记为死节点"
+    assert "n9" in daemon._COOLDOWN_NODES
