@@ -299,3 +299,46 @@ def test_generated_config_passes_singbox_check(tmp_path):
     r = subprocess.run([binary, "check", "-c", str(cfg_file)],
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, f"sing-box check 失败: {r.stderr.strip()[:300]}"
+
+
+# ============= 6. config 校验护栏（promote 前用 sing-box check） =============
+def test_config_check_rejects_invalid_pbk(tmp_path):
+    """非法 reality pbk 会让整个配置 FATAL；guard 必须在覆盖前拦下。"""
+    import json as _json
+    n = ps.parse_vless("vless://u@h.example.com:443?type=tcp&security=reality&pbk=not_base64!!#n")
+    cfg = ps.make_config([n], listen_port=7890, clash_port=9090)
+    f = tmp_path / "cfg.json"
+    f.write_text(_json.dumps(cfg))
+    assert daemon._config_check_error(str(f)), "非法 pbk 的配置应被 sing-box check 拒绝"
+
+
+def test_config_check_accepts_valid(tmp_path):
+    import json as _json
+    n = ps.parse_trojan("trojan://pw@a.example.com:443#t")
+    cfg = ps.make_config([n], listen_port=7890, clash_port=9090)
+    f = tmp_path / "ok.json"
+    f.write_text(_json.dumps(cfg))
+    assert daemon._config_check_error(str(f)) == "", "合法配置不应被拒"
+
+
+def test_transport_for_all_valid_types():
+    """http/quic/httpupgrade 曾被静默丢弃 —— 节点入池但每次连接都失败。"""
+    for net in ps.VALID_TRANSPORTS:
+        t = ps._transport_from_query({"type": [net]})
+        assert t and t["type"] == net, f"{net} transport 丢失"
+
+
+def test_transport_none_for_invalid_types():
+    """tcp 是非法 transport（sing-box FATAL）；未知类型也不应下发。"""
+    for net in ("tcp", "weird", ""):
+        assert ps._transport_from_query({"type": [net]}) is None
+
+
+def test_is_loopback_handles_non_string():
+    """vmess JSON 里 add 可能是数字；不做类型防护会让 make_config 整体崩溃。"""
+    assert ps._is_loopback(1234567) is False
+    assert ps._is_loopback(None) is False
+    cfg = ps.make_config([{"type": "vmess", "tag": "t", "server": 1234567, "server_port": 443,
+                           "uuid": "u", "alter_id": 0, "security": "auto"}],
+                         listen_port=7890, clash_port=9090)
+    assert cfg["outbounds"], "数字 server 不应导致 make_config 崩溃"

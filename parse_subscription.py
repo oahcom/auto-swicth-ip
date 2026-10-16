@@ -194,6 +194,29 @@ def parse_anytls(url: str) -> dict:
         },
     }
 
+# sing-box 接受这些 transport；显式 "tcp" 是非法值（会导致启动 FATAL），
+# 其余未知类型也一律不发（宁可用默认 TCP 行为，也不发非法值）
+VALID_TRANSPORTS = ("ws", "grpc", "http", "quic", "httpupgrade")
+
+def _transport_from_query(p: dict) -> dict | None:
+    """从 URL query 构造 sing-box transport 块（trojan/vless 共用）。
+
+    合法类型全部转发（http/quic/httpupgrade 此前被静默丢弃，节点会进入池子
+    但每次连接都失败）；ws 带 path/host，grpc 带 service_name。
+    """
+    network = p.get("type", [""])[0]
+    if network not in VALID_TRANSPORTS:
+        return None
+    if network == "ws":
+        return {
+            "type": "ws",
+            "path": p.get("path", ["/"])[0],   # parse_qs 已解码，再 unquote 会二次解码
+            "headers": {"Host": p["host"][0]} if p.get("host") else {},
+        }
+    if network == "grpc":
+        return {"type": "grpc", "service_name": p.get("serviceName", [""])[0]}
+    return {"type": network}                    # http / quic / httpupgrade
+
 def parse_trojan(url: str) -> dict:
     u = urllib.parse.urlparse(url)
     p = urllib.parse.parse_qs(u.query)
@@ -211,16 +234,9 @@ def parse_trojan(url: str) -> dict:
             "insecure": insecure,
         },
     }
-    # sing-box 只接受 ws/grpc/http/quic 等 transport，显式 tcp 是非法值（会导致启动 FATAL）
-    network = p.get("type", [""])[0]
-    if network == "ws":
-        out["transport"] = {
-            "type": "ws",
-            "path": p.get("path", ["/"])[0],   # parse_qs 已解码，再 unquote 会二次解码
-            "headers": {"Host": p["host"][0]} if p.get("host") else {},
-        }
-    elif network == "grpc":
-        out["transport"] = {"type": "grpc", "service_name": p.get("serviceName", [""])[0]}
+    tr = _transport_from_query(p)
+    if tr:
+        out["transport"] = tr
     return out
 
 def _parse_vmess_b64(raw_body: str) -> dict:
@@ -375,14 +391,9 @@ def parse_vless(url: str) -> dict:
             "public_key": pbk,
             "short_id": p.get("sid", [""])[0],
         }
-    if network == "ws":
-        out["transport"] = {
-            "type": "ws",
-            "path": p.get("path", ["/"])[0],   # parse_qs 已解码，再 unquote 会二次解码
-            "headers": {"Host": p["host"][0]} if p.get("host") else {},
-        }
-    elif network == "grpc":
-        out["transport"] = {"type": "grpc", "service_name": p.get("serviceName", [""])[0]}
+    tr = _transport_from_query(p)
+    if tr:
+        out["transport"] = tr
     return out
 
 PARSERS = {
@@ -409,10 +420,14 @@ def parse_url(url: str) -> dict | None:
         return None
 
 # ============= 生成 sing-box config =============
-def _is_loopback(host: str) -> bool:
-    """回环/本机地址（127.0.0.0/8, ::1, localhost）不可能是有效代理出口。"""
+def _is_loopback(host) -> bool:
+    """回环/本机地址（127.0.0.0/8, ::1, localhost）不可能是有效代理出口。
+
+    host 可能是非字符串（订阅 JSON 里 add 写成数字，v2rayN 对纯 IP 主机
+    会这么干），强转 str 避免 make_config 整体崩溃导致节点池冻结。
+    """
     import ipaddress
-    h = (host or "").strip().lower()
+    h = str(host or "").strip().lower()
     if h == "localhost" or h.endswith(".localhost"):
         return True
     try:

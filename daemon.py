@@ -420,6 +420,9 @@ def _set_egress_error(reason: str):
     global _last_egress_error
     _last_egress_error = reason
 
+def _clear_egress_error():
+    _set_egress_error("")
+
 def get_last_egress_error() -> str | None:
     """返回上次 get_per_egress_error_rate 的失败原因（供 CLI 区分无数据/出错）"""
     return _last_egress_error
@@ -447,12 +450,13 @@ def get_per_egress_error_rate(window_min: int = 60) -> dict[str, tuple[int, int,
                 (OPENCODE_FREE_PROVIDER, cutoff),
             ).fetchall()
         # 提前返回的空结果都带上原因，供 CLI 区分"确实没数据"与"查询出错"
+        # 无数据是正常状态（还没请求 / 还没切换过），不记为失败
         if not rows:
-            _set_egress_error("requestDetails 无 opencode 请求")
+            _clear_egress_error()
             return {}
         switches = _load_egress_log()
         if not switches:
-            _set_egress_error("egress_log 为空")
+            _clear_egress_error()
             return {}
         # 先解析所有请求为 epoch，按最晚请求时间的 window_min 窗口过滤。
         # 原因：9router 与 daemon 可能时钟不一致，用 wall-clock cutoff 会造成越来越多
@@ -481,7 +485,7 @@ def get_per_egress_error_rate(window_min: int = 60) -> dict[str, tuple[int, int,
             total = len(err_flags)
             errors = sum(err_flags)
             result[node] = (total, errors, errors / total if total else 0.0)
-        _set_egress_error("")   # 成功：清空上次的失败原因
+        _clear_egress_error()
         return result
     except Exception as e:
         log(f"✗ per-egress 错误率失败: {e}")
@@ -1267,6 +1271,18 @@ def _discard(path: str):
     except OSError:
         pass
 
+def _config_check_error(path: str) -> str:
+    """用 sing-box 校验配置；通过返回 ""，否则返回错误摘要。"""
+    try:
+        r = subprocess.run([CFG["singbox"]["binary"], "check", "-c", path],
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return f"check 无法执行: {e}"
+    if r.returncode == 0:
+        return ""
+    msg = (r.stderr or r.stdout).strip().splitlines()
+    return msg[-1][:200] if msg else f"rc={r.returncode}"
+
 # 多个订阅源合并：okz（主力）+ hd.23n.club + dasho.pqjc.site + dasho.xn--cp3a08l.com（补充）
 _SUB_URLS = [
     CFG["okz"]["sub_url"],
@@ -1303,8 +1319,22 @@ def refresh_subscription() -> bool:
             log("✗ 刷新产出 0 节点，保留现有配置")
             _discard(tmp_file)
             return False
+        # 节点数骤降：old_n 为 0（配置缺失/损坏/编码异常）时护栏不可用，
+        # 此时若旧配置本来存在，宁可拒绝也不要冒风险覆盖
+        if old_n == 0 and os.path.exists(config_file):
+            log("✗ 现有配置不可读（0 节点），无法判断刷新是否合理，保留现有配置")
+            _discard(tmp_file)
+            return False
         if old_n and new_n < old_n * 0.5:
             log(f"✗ 刷新节点数骤降 ({old_n} → {new_n})，疑似订阅源故障，保留现有配置")
+            _discard(tmp_file)
+            return False
+        # 最后一道防线：promote 前用 sing-box 自身校验。单个坏节点
+        # （非法 pbk/sid、缺 password 等）会让整个配置 FATAL，而一旦覆盖，
+        # 好节点池就没了 —— 只能等下一小时刷新重装同一份毒配置。
+        err = _config_check_error(tmp_file)
+        if err:
+            log(f"✗ 新配置未通过 sing-box check，保留现有配置: {err}")
             _discard(tmp_file)
             return False
         os.replace(tmp_file, config_file)

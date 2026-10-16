@@ -19,14 +19,26 @@ import daemon
 
 
 @pytest.fixture(autouse=True)
-def _isolate_egress_log(tmp_path, monkeypatch):
-    """把 egress_log 重定向到 tmp。
+def _isolate_production_files(tmp_path, monkeypatch):
+    """把测试会写到的生产文件全部重定向到 tmp。
 
-    switch_proxy() 成功后会调 _record_egress() 写生产 .egress_log.jsonl，
-    而测试只 mock 了 singbox_api —— 实测泄漏过 15 条 "new-node-x" 记录，
-    污染 daemon 用于 per-egress 错误率归因的数据。
+    1) egress_log：switch_proxy() 成功后会调 _record_egress() 写生产
+       .egress_log.jsonl（实测泄漏过 15 条 "new-node-x"）。
+    2) daemon.log：log() 会写到生产日志，注入伪造的 "✗ nN 死" 行，而
+       self_evolve_checkpoint 的 repeat_failure_nodes 检查正是 grep 该文件 ——
+       实测污染出 7 个不存在的节点（n0~n6）被判为重复失败。
     """
+    import logging
     monkeypatch.setenv("EGRESS_LOG_FILE_PATH", str(tmp_path / "egress.jsonl"))
+    lg = logging.getLogger("auto-switch-ip")
+    saved = lg.handlers[:]
+    lg.handlers = []
+    monkeypatch.setattr(daemon, "_logger", None)      # 强制重新 _init_logger
+    monkeypatch.setitem(daemon.CFG, "log_file", str(tmp_path / "daemon.log"))
+    yield
+    for h in lg.handlers:
+        h.close()
+    lg.handlers = saved
 
 
 # ============= 1. get_9router_error_rate（mock _get_db） =============

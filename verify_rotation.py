@@ -233,7 +233,16 @@ def verify_reasonableness(all_nodes: list[str], quick: bool):
 
     picks = _events(journal("10 minutes ago", "切代理"), r"-> (\S+)")
     deaths = _events(journal("10 minutes ago", r"死 \(连续失败"), r"(\S+?) 死")
-    releases = _events(journal("10 minutes ago", r"释放 \d+ 个黑名单节点"), r"\[(.+?)\]")
+    # 节点列表形如 `: ['a', 'b']`，必须锚定在 ": [" 之后；
+    # 用 r"\[(.+?)\]" 会先命中行首的 [时间戳]（实测到的是 PID [1]）
+    releases = []
+    for line in journal("10 minutes ago", r"释放 \d+ 个黑名单节点"):
+        mt = ts_re.search(line)
+        ml = re.search(r": \[([^\]]*)\]", line)
+        if not (mt and ml):
+            continue
+        for node in re.findall(r"'([^']+)'", ml.group(1)):
+            releases.append((mt.group(1), node))
 
     # 同一节点在窗口内可能判死/释放多次，必须取"选中时刻之前最近一次状态"：
     # 该次事件是 death → 违规；是 release → 正常（TTL 回收后重选是设计行为）。
