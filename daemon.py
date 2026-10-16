@@ -568,7 +568,10 @@ def get_all_proxy_nodes() -> list[str]:
 def _record_egress(node: str) -> None:
     """切换成功后记录 (ts,node)，供 per-egress 错误率归因。append-only 原子写。"""
     try:
-        with open(_EGRESS_LOG_FILE, "a", encoding="utf-8") as f:
+        # 环境变量可覆盖路径（与 proxy-global.js 的 BAD_NODES_FILE_PATH 同款），
+        # 测试用它隔离，避免把 mock 节点写进生产归因数据
+        path = os.environ.get("EGRESS_LOG_FILE_PATH") or _EGRESS_LOG_FILE
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": _now_ts(), "node": node}) + "\n")
     except Exception as e:
         log(f"✗ 写 egress_log 失败: {e}")

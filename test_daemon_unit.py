@@ -8,10 +8,24 @@
 - _apply_test_results：坏节点标记 + TTL 升级 + 安全阀
 - is_singbox_alive / restart_singbox：看门狗 + 重启互斥
 """
+import os
 import sqlite3
 import threading
 
+import pytest
+
 import daemon
+
+
+@pytest.fixture(autouse=True)
+def _isolate_egress_log(tmp_path, monkeypatch):
+    """把 egress_log 重定向到 tmp。
+
+    switch_proxy() 成功后会调 _record_egress() 写生产 .egress_log.jsonl，
+    而测试只 mock 了 singbox_api —— 实测泄漏过 15 条 "new-node-x" 记录，
+    污染 daemon 用于 per-egress 错误率归因的数据。
+    """
+    monkeypatch.setenv("EGRESS_LOG_FILE_PATH", str(tmp_path / "egress.jsonl"))
 
 
 # ============= 1. get_9router_error_rate（mock _get_db） =============
