@@ -1741,14 +1741,17 @@ python3 verify_rotation.py --samples 30   # 加大逐节点采样
 
 ### 10.4 换订阅 token 的操作清单
 
-换 token 时必须同步改 **3 处**（漏改会导致新旧订阅混用或 daemon 用旧 URL）：
+换 **okz** token 时必须同步改 **3 处**（漏改会导致新旧订阅混用或 daemon 用旧 URL）：
 
 ```bash
-grep -rn 'token=' *.py *.sh *.ps1          # 应只列出这 3 处
+grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 #   config.py               CFG["okz"]["sub_url"]   ← daemon 实际使用
 #   start-auto-switch-ip.sh OKZ_SUB_URL             ← WSL2 启动时导出
 #   win_test_nodes.ps1      $sub                    ← Windows 侧测试
 ```
+
+> 不加 `okz/sub?` 过滤时 `grep -rn 'token=' *.py *.sh *.ps1` 会多列一处
+> （`config.py` 的 `CFG["hd23n"]["sub_url"]`，另一个订阅源，与 okz token 无关）。
 
 顺序：改 token → `python3 -m pytest test_subscription_parse.py` → 重启 daemon →
 `python3 verify_rotation.py` → 确认节点池已换（比对出口 IP 与旧池不同）。
