@@ -12,6 +12,7 @@ import os
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -96,6 +97,39 @@ def test_错误率_全成功返回零():
         daemon._get_db = orig
     assert total == 10 and errors == 0 and consecutive == 0, (total, errors, consecutive)
 
+
+
+def test_错误率_切换点过滤_旧节点错误不背锅():
+    """新节点上线后，切换点之前的旧节点错误不应触发拉黑"""
+    schema = "CREATE TABLE requestDetails (provider TEXT, model TEXT, status TEXT, timestamp REAL)"
+    mem = sqlite3.connect(":memory:")
+    mem.execute(schema)
+    mem.row_factory = sqlite3.Row
+    # 生产表 timestamp 为 ISO TEXT（'2026-10-16T17:33:48.877Z'），fixture 须对齐
+    iso = lambda epoch: datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    switch_ts = 1_700_000_000 - 5  # 5 秒前切换
+    rows = [
+        # 切换点之后：2 success + 1 error
+        ("opencode", "m", "success", iso(switch_ts + 1)),
+        ("opencode", "m", "success", iso(switch_ts + 2)),
+        ("opencode", "m", "error",   iso(switch_ts + 3)),
+        # 切换点之前：全 error（旧节点的锅）
+        ("opencode", "m", "error", iso(switch_ts - 1)),
+        ("opencode", "m", "error", iso(switch_ts - 2)),
+    ]
+    mem.executemany("INSERT INTO requestDetails VALUES (?,?,?,?)", rows)
+    orig = daemon._get_db
+    daemon._get_db = lambda: mem
+    try:
+        # 不过滤：5 条中 3 error
+        total_all, errors_all, _, _ = daemon.get_9router_error_rate()
+        assert errors_all == 3, f"无过滤应 3 errors, got {errors_all}"
+        # 过滤切换点后：只剩切换后的 3 条，其中 1 error
+        total_f, errors_f, _, _ = daemon.get_9router_error_rate(max_backoff_ts=switch_ts)
+        assert total_f == 3, f"过滤后应 3 条, got {total_f}"
+        assert errors_f == 1, f"过滤后应 1 error, got {errors_f}"
+    finally:
+        daemon._get_db = orig
 
 # ============= 2. _update_strategy_mode（纯函数） =============
 def test_策略_normal_to_pressure():

@@ -178,6 +178,7 @@ _RESTART_COUNT = 0          # sing-box 连续重启计数（受 _restart_lock �
 _RESTART_LOCK = threading.Lock()  # 保护 _RESTART_COUNT 的线程安全读写
 _LAST_HEALTH_LOG = 0        # 健康状态最后打印时间（防刷屏）
 _ALL_DEAD_FALLBACK = False  # 全部节点死时是否已经切到了 okz
+_last_successful_switch_ts: float = 0  # 上次成功切换的 epoch 秒，用于切分错误检测窗口
 _NODE_DELAYS: dict[str, int] = {}  # 节点延迟缓存 (ms)
 _NODE_CALL_COUNTS: dict[str, int] = {}  # 节点调用计数（仅成功调用）
 _NODE_CALL_RESET_TS: float = 0  # 上次重置时间
@@ -277,7 +278,7 @@ def log_health(msg: str):
 
 # ============= 9router 监控 =============
 
-def get_9router_error_rate() -> tuple[int, int, list, int]:
+def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int, list, int]:
     """从 SQLite 读最近 N 个 OpenCode Free 请求，返回 (total, errors, details_list, consecutive_errors)
 
     明确针对 OpenCode Free provider（`requestDetails.provider = "opencode"`）。
@@ -287,6 +288,9 @@ def get_9router_error_rate() -> tuple[int, int, list, int]:
     - 窗口检测：最近 RECENT_WINDOW 条的总错误率
     - 连续检测：从最新条往前数，连续失败的个数（防止 success 稀释 error）
     任一超过阈值就触发切换。
+
+    max_backoff_ts：上次成功切换的 epoch 秒。传入后只统计切换点之后的请求，
+    避免新节点刚上线就背切换前旧节点留下的错误（6-16s 内被误拉黑）。
     """
     try:
         with _db_lock:
@@ -297,6 +301,10 @@ def get_9router_error_rate() -> tuple[int, int, list, int]:
                 WHERE provider = ?
                 ORDER BY timestamp DESC LIMIT ?
             """, (OPENCODE_FREE_PROVIDER, RECENT_WINDOW)).fetchall()
+        if max_backoff_ts is not None:
+            # 9router timestamp 为 ISO UTC 字符串，词典序比较等价于时间序
+            cutoff = datetime.fromtimestamp(max_backoff_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            rows = [r for r in rows if str(r["timestamp"]) > cutoff]
 
         if not rows:
             return 0, 0, [], 0
@@ -660,6 +668,8 @@ def switch_proxy(new_node: str) -> bool:
     if actual == new_node:
         log(f"✓ 切到: {new_node} (已验证)")
         _record_egress(new_node)
+        global _last_successful_switch_ts
+        _last_successful_switch_ts = _now_ts()
         return True
     else:
         log(f"✗ 切代理验证失败 ({new_node}): PUT 返回 {r} 但实际 now={actual}")
@@ -714,8 +724,12 @@ def test_node_delay(node: str) -> int | None:
     return _probe_node(node, CFG["thresholds"]["node_test_timeout_ms"], strict=False)
 
 
-def test_node_quick(node: str, timeout_ms: int = 3000) -> bool:
-    """快速可用性探测（切换前验证用），返回True/False"""
+def test_node_quick(node: str, timeout_ms: int = 10000) -> bool:
+    """快速可用性探测（切换前验证用），返回True/False
+
+    超时从 3s 提升到 10s，与健康检查的 15s 对齐。原 3s 误杀大量慢节点
+    （跨洋 600-1200ms 延迟 + TLS 握手），导致 56 节点池在 23:51 爆发式拉黑。
+    """
     delay = _probe_node(node, timeout_ms, strict=True)
     return delay is not None
 
@@ -844,7 +858,7 @@ def cleanup_dead_ttl():
     # 阶段 2：无锁网络探测（探测过期节点）
     revived = []
     for n in expired:
-        probe_ok = test_node_quick(n, timeout_ms=3000)
+        probe_ok = test_node_quick(n, timeout_ms=10000)
         if probe_ok:
             revived.append(n)
         else:
@@ -1070,7 +1084,7 @@ def pick_next_node(current: str, all_nodes: list, fail_set: set, count_call: boo
     - pressure 模式: 调用次数优先 (-calls, ds) — 均匀分散
     count_call=False 时, 选中节点不计入调用次数（用于 429 错误触发的轮换）
 
-    增加: 选中后快速探测可用性，失败则标记为死节点并重选（最多 3 次）。
+    增加: 选中后快速探测可用性（预检，不判死），失败则重选（最多 3 次）。
     """
     global _strategy_mode
     candidates = _filter_candidates(current, all_nodes, fail_set)
@@ -1085,36 +1099,20 @@ def pick_next_node(current: str, all_nodes: list, fail_set: set, count_call: boo
     # 最多尝试 3 个候选，避免死循环
     for attempt in range(3):
         chosen = _p2c_select(candidates, dedup_skip, call_map)
-
-        # 快速可用性探测（3s 超时），不更新 _NODE_DELAYS
-        if test_node_quick(chosen, timeout_ms=3000):
+        # 快速可用性探测（10s 超时），不更新 _NODE_DELAYS
+        if test_node_quick(chosen, timeout_ms=10000):
             with _state_lock:
                 _recent_nodes.append(chosen)
                 if count_call:
                     _NODE_CALL_COUNTS[chosen] = _NODE_CALL_COUNTS.get(chosen, 0) + 1
             return chosen
         else:
-            # 探测失败：指数退避 TTL（与健康检查一致），从候选中移除，重试
-            with _state_lock:
-                # Only increment fail_count if this is a new failure (not already in _DEAD_NODES)
-                if chosen in _DEAD_NODES:
-                    # Already tracked, use existing fail_count for TTL calculation
-                    fail_count = _dead_fail_count.get(chosen, 0)
-                else:
-                    _DEAD_NODES.add(chosen)
-                    fail_count = _dead_fail_count.get(chosen, 0) + 1
-                    _dead_fail_count[chosen] = fail_count
-                if fail_count > len(_DEAD_TTL_STAGES):
-                    ttl = _DEAD_TTL_MAX
-                    ttl_desc = "永久"
-                else:
-                    ttl = _DEAD_TTL_STAGES[fail_count - 1]
-                    ttl_desc = f"{ttl}s"
-                _DEAD_NODES_RELEASE_TS[chosen] = time.time() + ttl
-            log(f"  ✗ 快速探测失败，标记死节点并重选: {chosen} (失败{fail_count}次, TTL={ttl}s) (尝试 {attempt + 1}/3)")
-            # 从候选中移除
+            # 探测失败：只是当前候选不可用，不判死——快速探测是切换前预检，
+            # 不是健康检查，不该消耗指数退避 TTL 或把节点拉黑（会误杀慢节点）。
+            # 从候选中移除，重试；3 次后返回 None 交由上层兜底。
             candidates = [n for n in candidates if n != chosen]
             dedup_skip.add(chosen)
+            log(f"  ⚠ 快速探测未通过，重选: {chosen} (尝试 {attempt + 1}/3)")
 
             if not candidates:
                 log(f"⚠ 重选后无可用节点")
@@ -1631,10 +1629,17 @@ def main():
                 nodes = cached_all_nodes
 
                 if nodes:
-                    if current:
-                        with _state_lock:
-                            _DEAD_NODES.add(current)
-                            _DEAD_NODES_RELEASE_TS[current] = now + BAD_NODES_TTL  # TTL 5 分钟
+                    # 错误触发只换 IP，不拉黑节点。
+                    # WHY: 错误率无法区分「节点故障」与「上游限流」。实测最近 40 条错误
+                    # 100% 是 opencode FreeUsageLimitError(429)，而被拉黑节点复测 9/10
+                    # 连通正常（485-3557ms）——429 恰恰证明链路通（TCP/TLS/HTTP 走完），
+                    # 拉黑纯属误杀，曾把节点池抽干至 dead=50/56。判死交给基于真实探测的
+                    # 健康检查 _apply_test_results，它有 60% 保底守卫。
+                    errors_after_switch, _, _, _ = get_9router_error_rate(
+                        max_backoff_ts=_last_successful_switch_ts or None
+                    )
+                    if current and errors_after_switch == 0:
+                        log(f"  ↷ {current} 切换后无新错误，错误来自上游限流或旧节点")
 
                     check_and_handle_fallback(nodes, current or "")
 
