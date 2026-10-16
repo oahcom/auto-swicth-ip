@@ -1,7 +1,7 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # 从订阅测试所有节点延迟
-$sub = 'https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=7c00e506cb827821ad76e93053737c61'
+$sub = 'https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=aa0f63eb1e9a65d23fcae0dcc8a867ab'
 $resp = Invoke-WebRequest $sub -TimeoutSec 15 -UseBasicParsing
 $raw = [Convert]::FromBase64String($resp.Content)
 $decoded = [Text.Encoding]::UTF8.GetString($raw)

@@ -8,7 +8,7 @@ CONFIG="/home/administrator/dkk-projects/auto-switch-ip/singbox-config.json"
 DAEMON="/home/administrator/dkk-projects/auto-switch-ip/daemon.py"
 LOG_DIR="/home/administrator/dkk-projects/auto-switch-ip"
 
-export OKZ_SUB_URL="https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=7c00e506cb827821ad76e93053737c61"
+export OKZ_SUB_URL="https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=aa0f63eb1e9a65d23fcae0dcc8a867ab"
 
 # Wait for networking
 for i in $(seq 1 15); do

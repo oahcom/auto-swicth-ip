@@ -170,6 +170,8 @@ _POOL_MIN_RATIO: 0.3                          # 允许 70% 节点被拉黑（con
 | `.egress_log.jsonl` | 动态 | 出口节点归属日志（每次成功切换 append (ts,node)，供 per-egress 错误率归因）|
 | `asi-selfcheck.timer` | — | systemd 用户定时器：每 10min 触发 asi-selfcheck.service 跑巡检引擎 |
 | `test_daemon_unit.py` | ~240 | 确定性单测（无网络，覆盖错误率/策略/评分/坏节点/看门狗）|
+| `test_subscription_parse.py` | ~150 | 订阅解析回归单测（无网络，覆盖 vless/trojan transport/单源失败/rc 检查）|
+| `verify_rotation.py` | ~230 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），`--quick` 约 20s |
 
 ## provider 多样性约束（2026-07-08 确认）
 

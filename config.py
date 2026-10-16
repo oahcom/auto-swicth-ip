@@ -55,7 +55,7 @@ CFG = {
     "okz": {
         "proxy_url": "http://127.0.0.1:6696",
         "name": "okz",
-        "sub_url": "https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=7c00e506cb827821ad76e93053737c61",
+        "sub_url": "https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=aa0f63eb1e9a65d23fcae0dcc8a867ab",
     },
     "hd23n": {
         "name": "hd.23n.club",

@@ -1,8 +1,9 @@
 # Auto-Switch-IP 测试工作流文档
 
-> 文档版本: v1.1
-> 最后更新: 2026-08-22
+> 文档版本: v1.2
+> 最后更新: 2026-10-16
 > 测试对象: 9router proxy-global.js + daemon 代理自动切换系统
+> 订阅链路与轮换健康的验证资产见 §10（`test_subscription_parse.py` / `verify_rotation.py`）
 
 > ⚠ 文档漂移提示（2026-08-22）：第 9 节 `switch-proxy.py` / `proxy_pool.py` 验证用例（T-091~T-098）依赖的模块已在 Round 1 删除（无生产调用方）。其覆盖点已并入 `daemon.py` 与新增 `test_daemon_unit.py` 的确定性单测。第 9 节保留为历史归档，不再执行。
 
@@ -1682,9 +1683,75 @@ python3 -c "from config import SINGBOX_SECRET" 2>&1 | tail -1  # ImportError
 python3 -m pytest test_proxy_pool.py -v 2>&1 | tail -3  # 13 pass
 ```
 
+## 10. 订阅链路与轮换健康 (T-099~T-112)
+
+> 背景：2026-10-16 更换 okz 订阅 token 时发现 5 个阻断性 bug，订阅刷新此前**一直静默失效**。
+> 本节把修复点和三项运维验证固化为可重复执行的资产。
+
+### 10.1 测试资产
+
+| 脚本 | 覆盖 | 耗时 | 网络 |
+|------|------|------|------|
+| `test_subscription_parse.py` | T-099~T-106 订阅解析确定性回归 | ~30s | 否 |
+| `verify_rotation.py --quick` | T-107~T-110, T-112 端口/切换/合理性 | ~20s | 是 |
+| `verify_rotation.py` | 上述全部 + T-111 全池扫描 + 地理分布 | ~2min | 是 |
+
+```bash
+# 解析侧回归（无网络，可在 CI 跑）
+python3 -m pytest test_subscription_parse.py -v
+
+# 运维侧健康验证
+python3 verify_rotation.py --quick        # 快速：每次改代理配置后
+python3 verify_rotation.py                # 全量：换订阅/换节点池后
+python3 verify_rotation.py --samples 30   # 加大逐节点采样
+```
+
+### 10.2 订阅解析回归 (test_subscription_parse.py)
+
+| ID | 描述 | 优先级 | 验证方法 |
+|----|------|--------|----------|
+| T-099 | `PARSERS` 所有值可调用（防 `parse_vless` 缺失类 NameError） | P0 | `test_所有PARSERS值均可调用` |
+| T-100 | `parse_vless` 已定义且可解析 reality/tls/ws | P0 | `test_parse_vless_已定义`, `test_parse_vless_解析tls与reality`, `test_parse_vless_解析ws` |
+| T-101 | `parse_trojan` 不生成 `transport.type="tcp"`（sing-box 视为非法 → 启动 FATAL） | P0 | `test_parse_trojan_不生成tcp_transport` (参数化 `""` / `?type=tcp`) |
+| T-102 | `parse_trojan` 正确解析 ws transport | P1 | `test_parse_trojan_ws_transport` |
+| T-103 | 单个订阅源失败（403/连接拒绝）不中断全流程，活源仍产出配置 | P0 | `test_单源失败_仍产出配置`（本地 HTTP 模拟死源+活源，离线端到端） |
+| T-104 | `refresh_subscription()` 在解析 rc≠0 时返回 False，不重启 sing-box | P0 | `test_解析失败_refresh返回False` |
+| T-105 | `make_config` 产出的所有 outbound 无非法 transport | P0 | `test_make_config_无非法transport` |
+| T-106 | 生成的配置可通过 `sing-box check` | P0 | `test_生成配置可被singbox接受`（真实调用 `sing-box check`） |
+
+**回归触发条件**：任何对 `parse_subscription.py` / `config.py` 订阅字段 / `daemon.refresh_subscription` 的改动。
+
+### 10.3 端口与轮换健康 (verify_rotation.py)
+
+| ID | 描述 | 优先级 | 验证方法 |
+|----|------|--------|----------|
+| T-107 | 7890 + 9090 监听，sing-box 进程存活 | P0 | `[1]` 段前 3 项 |
+| T-108 | 7890 全协议可用：HTTP / HTTPS / CONNECT 隧道 / DNS over / 大文件 | P0 | `[1]` 段 curl 组 |
+| T-109 | 9router 网关 (`:20128/v1/models`) 可达 | P0 | `[1]` 段末项 |
+| T-110 | 连续强制切换节点，出口 IP 互不相同 | P0 | `[2]` 段切换采样 |
+| T-111 | 逐节点出口 IP 唯一率 >80%（IP 去重有效） | P1 | `[2]` 段采样（`--quick` 跳过） |
+| T-112 | 切换合理性：轮换间隔中位数 ≈ `proactive_rotate_sec`、切换目标不含死节点、策略模式已判定、daemon 无异常 | P0 | `[3]` 段 |
+
+**已知干扰**：服务重启或人工切换会引入离群间隔（如 10s / 158s），故 T-112 用**中位数**判定而非均值。判定日志窗口默认近 30 分钟。
+
+### 10.4 换订阅 token 的操作清单
+
+换 token 时必须同步改 **3 处**（漏改会导致新旧订阅混用或 daemon 用旧 URL）：
+
+```bash
+grep -rn 'token=' *.py *.sh *.ps1          # 应只列出这 3 处
+#   config.py               CFG["okz"]["sub_url"]   ← daemon 实际使用
+#   start-auto-switch-ip.sh OKZ_SUB_URL             ← WSL2 启动时导出
+#   win_test_nodes.ps1      $sub                    ← Windows 侧测试
+```
+
+顺序：改 token → `python3 -m pytest test_subscription_parse.py` → 重启 daemon →
+`python3 verify_rotation.py` → 确认节点池已换（比对出口 IP 与旧池不同）。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
 |------|------|----------|------|
 | v1.0 | 2026-07-07 | 初始版本：72 个测试点，P0/P1/P2 分级，完整测试流程 | - |
 | v1.1 | 2026-08-22 | 新增 switch-proxy.py 安全/健壮性测试点 (T-090~T-098), 覆盖 secret 刷新、count/empty/guard、CLI fallback、logging、daemon 锁优化 | 4-Agent review |
+| v1.2 | 2026-10-16 | 新增 §10 订阅链路与轮换健康 (T-099~T-112)：订阅换 token 时修复 5 个阻断性 bug（parse_vless 缺失、单源失败中断全流程、refresh 不检查 rc、trojan tcp transport 致 sing-box FATAL、daemon global 声明缺失）；新增 test_subscription_parse.py（11 项）与 verify_rotation.py（19 项） | - |

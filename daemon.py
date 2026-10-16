@@ -1202,11 +1202,14 @@ def refresh_subscription() -> bool:
         if not urls:
             log("✗ 无可用订阅源")
             return False
-        subprocess.run(
+        r = subprocess.run(
             [sys.executable, parse_script,
              "--out", config_file,
              "--urls", *urls],
             capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            log(f"✗ 订阅解析失败 (rc={r.returncode}): {r.stderr.strip().splitlines()[-1][:200] if r.stderr.strip() else 'no stderr'}")
+            return False
         log("✓ 订阅刷新完毕，重启 sing-box 加载新配置...")
         return restart_singbox()
     except Exception as e:
@@ -1337,6 +1340,7 @@ def main():
     last_proactive_rotate = 0
 
     global _RESTART_COUNT, _NODE_CALL_RESET_TS, _last_wal_checkpoint, _strategy_mode
+    global _health_check_future, _health_check_nodes, _health_check_current
     with _RESTART_LOCK:
         _RESTART_COUNT = 0
     _NODE_CALL_RESET_TS = time.time()

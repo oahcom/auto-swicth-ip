@@ -199,7 +199,7 @@ def parse_trojan(url: str) -> dict:
     p = urllib.parse.parse_qs(u.query)
     insecure = p.get("allowInsecure", ["0"])[0] == "1"
     sni = p.get("sni", [u.hostname])[0] or u.hostname
-    return {
+    out = {
         "type": "trojan",
         "tag": _tag_for(u, "tr"),
         "server": u.hostname,
@@ -210,10 +210,18 @@ def parse_trojan(url: str) -> dict:
             "server_name": sni,
             "insecure": insecure,
         },
-        "transport": {
-            "type": p.get("type", ["tcp"])[0],
-        },
     }
+    # sing-box 只接受 ws/grpc/http/quic 等 transport，显式 tcp 是非法值（会导致启动 FATAL）
+    network = p.get("type", [""])[0]
+    if network == "ws":
+        out["transport"] = {
+            "type": "ws",
+            "path": urllib.parse.unquote(p.get("path", ["/"])[0]),
+            "headers": {"Host": p["host"][0]} if p.get("host") else {},
+        }
+    elif network == "grpc":
+        out["transport"] = {"type": "grpc", "service_name": p.get("serviceName", [""])[0]}
+    return out
 
 def parse_vmess(url: str) -> dict:
     u = urllib.parse.urlparse(url)
@@ -291,6 +299,44 @@ def parse_shadowsocks(url: str) -> dict:
                 plugin_opts[k] = v
         out["plugin"] = plugin_name
         out["plugin_opts"] = plugin_opts
+    return out
+
+def parse_vless(url: str) -> dict:
+    u = urllib.parse.urlparse(url)
+    p = urllib.parse.parse_qs(u.query)
+    network = p.get("type", ["tcp"])[0]
+    security = p.get("security", ["none"])[0]
+
+    out = {
+        "type": "vless",
+        "tag": _tag_for(u, "vl"),
+        "server": u.hostname,
+        "server_port": u.port,
+        "uuid": urllib.parse.unquote(u.username) if u.username else "",
+    }
+    if p.get("flow", [""])[0]:
+        out["flow"] = p["flow"][0]
+    if security in ("tls", "reality"):
+        out["tls"] = {
+            "enabled": True,
+            "server_name": p.get("sni", [u.hostname])[0] or u.hostname,
+            "insecure": p.get("allowInsecure", ["0"])[0] == "1",
+            "utls": {"enabled": True, "fingerprint": p.get("fp", ["chrome"])[0]},
+        }
+        if security == "reality":
+            out["tls"]["reality"] = {
+                "enabled": True,
+                "public_key": p.get("pbk", [""])[0],
+                "short_id": p.get("sid", [""])[0],
+            }
+    if network == "ws":
+        out["transport"] = {
+            "type": "ws",
+            "path": urllib.parse.unquote(p.get("path", ["/"])[0]),
+            "headers": {"Host": p["host"][0]} if p.get("host") else {},
+        }
+    elif network == "grpc":
+        out["transport"] = {"type": "grpc", "service_name": p.get("serviceName", [""])[0]}
     return out
 
 PARSERS = {
@@ -392,7 +438,11 @@ if __name__ == "__main__":
     for url in sub_urls:
         safe_url = url.split("@")[-1] if "@" in url else url[:60]
         print(f"fetching subscription from {safe_url}...")
-        urls = fetch_and_decode_sub(url)
+        try:
+            urls = fetch_and_decode_sub(url)
+        except Exception as e:
+            print(f"  ✗ 源失败，跳过: {type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
+            continue
         print(f"  got {len(urls)} raw URLs")
         all_urls.extend(urls)
 

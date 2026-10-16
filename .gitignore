@@ -9,3 +9,5 @@ __pycache__
 .bad_nodes.json
 .monitor_state.json
 .egress_log.jsonl
+# 订阅刷新生成，含 Clash API secret + 节点凭据
+singbox-config.json
