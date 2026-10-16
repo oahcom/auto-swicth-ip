@@ -1333,7 +1333,9 @@ def main():
     cooldown_until = 0
     last_singbox_check = 0
     last_health_check = 0
-    last_sub_refresh = time.time()  # 启动时不立即触发刷新
+    # 启动时不立即触发刷新；但配置文件缺失时必须立刻重建，否则 sing-box
+    # 起不来且要等到下一个 1h 刷新周期（配置不入库，全新 clone/误删即此状态）
+    last_sub_refresh = 0 if not os.path.exists(CFG["singbox"]["config_file"]) else time.time()
     last_node_info_cleanup = time.time()
     last_proxy_check = 0
     last_summary_ts = 0

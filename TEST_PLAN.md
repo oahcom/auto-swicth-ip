@@ -1,6 +1,6 @@
 # Auto-Switch-IP 测试工作流文档
 
-> 文档版本: v1.2
+> 文档版本: v1.3
 > 最后更新: 2026-10-16
 > 测试对象: 9router proxy-global.js + daemon 代理自动切换系统
 > 订阅链路与轮换健康的验证资产见 §10（`test_subscription_parse.py` / `verify_rotation.py`）
@@ -1692,7 +1692,7 @@ python3 -m pytest test_proxy_pool.py -v 2>&1 | tail -3  # 13 pass
 
 | 脚本 | 覆盖 | 耗时 | 网络 |
 |------|------|------|------|
-| `test_subscription_parse.py` | T-099~T-106 订阅解析确定性回归 | ~30s | 否 |
+| `test_subscription_parse.py` | T-099~T-107 订阅解析确定性回归 | ~30s | 否 |
 | `verify_rotation.py --quick` | T-107~T-110, T-112 端口/切换/合理性 | ~20s | 是 |
 | `verify_rotation.py` | 上述全部 + T-111 全池扫描 + 地理分布 | ~2min | 是 |
 
@@ -1710,14 +1710,16 @@ python3 verify_rotation.py --samples 30   # 加大逐节点采样
 
 | ID | 描述 | 优先级 | 验证方法 |
 |----|------|--------|----------|
-| T-099 | `PARSERS` 所有值可调用（防 `parse_vless` 缺失类 NameError） | P0 | `test_所有PARSERS值均可调用` |
-| T-100 | `parse_vless` 已定义且可解析 reality/tls/ws | P0 | `test_parse_vless_已定义`, `test_parse_vless_解析tls与reality`, `test_parse_vless_解析ws` |
-| T-101 | `parse_trojan` 不生成 `transport.type="tcp"`（sing-box 视为非法 → 启动 FATAL） | P0 | `test_parse_trojan_不生成tcp_transport` (参数化 `""` / `?type=tcp`) |
+| T-099 | `PARSERS` 所有值可调用（防 `parse_vless` 缺失类 NameError） | P0 | `test_all_parsers_are_callable` |
+| T-100 | `parse_vless` 已定义且可解析 reality/tls/ws | P0 | `test_parse_vless_is_defined`, `test_parse_vless_tls_and_reality`, `test_parse_vless_ws_transport` |
+| T-101 | `parse_trojan` 不生成 `transport.type="tcp"`（sing-box 视为非法 → 启动 FATAL） | P0 | `test_parse_trojan_no_tcp_transport` (参数化 `""` / `?type=tcp`) |
 | T-102 | `parse_trojan` 正确解析 ws transport | P1 | `test_parse_trojan_ws_transport` |
-| T-103 | 单个订阅源失败（403/连接拒绝）不中断全流程，活源仍产出配置 | P0 | `test_单源失败_仍产出配置`（本地 HTTP 模拟死源+活源，离线端到端） |
-| T-104 | `refresh_subscription()` 在解析 rc≠0 时返回 False，不重启 sing-box | P0 | `test_解析失败_refresh返回False` |
-| T-105 | `make_config` 产出的所有 outbound 无非法 transport | P0 | `test_make_config_无非法transport` |
-| T-106 | 生成的配置可通过 `sing-box check` | P0 | `test_生成配置可被singbox接受`（真实调用 `sing-box check`） |
+| T-103 | 单个订阅源失败（403/连接拒绝）不中断全流程，活源仍产出配置 | P0 | `test_dead_source_still_writes_config`（本地 HTTP 模拟死源+活源，离线端到端） |
+| T-104 | `refresh_subscription()` 在解析 rc≠0 时返回 False，不重启 sing-box | P0 | `test_parse_failure_makes_refresh_return_false` |
+| T-105 | `make_config` 产出的所有 outbound 无非法 transport | P0 | `test_make_config_no_invalid_transport` |
+| T-106 | 生成的配置可通过 `sing-box check` | P0 | `test_generated_config_passes_singbox_check`（真实调用 `sing-box check`） |
+| T-107 | ws `path` 只解码一次（`parse_qs` 已解码，二次 `unquote` 会破坏 `%2F`） | P1 | `test_ws_path_decoded_once` |
+| T-108 | ss `plugin_opts` 为分号拼接字符串（dict 形式 sing-box FATAL） | P0 | `test_ss_plugin_opts_is_string` |
 
 **回归触发条件**：任何对 `parse_subscription.py` / `config.py` 订阅字段 / `daemon.refresh_subscription` 的改动。
 
@@ -1755,3 +1757,4 @@ grep -rn 'token=' *.py *.sh *.ps1          # 应只列出这 3 处
 | v1.0 | 2026-07-07 | 初始版本：72 个测试点，P0/P1/P2 分级，完整测试流程 | - |
 | v1.1 | 2026-08-22 | 新增 switch-proxy.py 安全/健壮性测试点 (T-090~T-098), 覆盖 secret 刷新、count/empty/guard、CLI fallback、logging、daemon 锁优化 | 4-Agent review |
 | v1.2 | 2026-10-16 | 新增 §10 订阅链路与轮换健康 (T-099~T-112)：订阅换 token 时修复 5 个阻断性 bug（parse_vless 缺失、单源失败中断全流程、refresh 不检查 rc、trojan tcp transport 致 sing-box FATAL、daemon global 声明缺失）；新增 test_subscription_parse.py（11 项）与 verify_rotation.py（19 项） | - |
+| v1.3 | 2026-10-16 | 补齐 T-107/T-108（ws path 二次解码、ss plugin_opts 类型）；标识符改英文；§10.4 引导路径修复 | - |

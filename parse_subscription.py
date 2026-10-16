@@ -216,7 +216,7 @@ def parse_trojan(url: str) -> dict:
     if network == "ws":
         out["transport"] = {
             "type": "ws",
-            "path": urllib.parse.unquote(p.get("path", ["/"])[0]),
+            "path": p.get("path", ["/"])[0],   # parse_qs 已解码，再 unquote 会二次解码
             "headers": {"Host": p["host"][0]} if p.get("host") else {},
         }
     elif network == "grpc":
@@ -290,15 +290,12 @@ def parse_shadowsocks(url: str) -> dict:
     }
     if plugin:
         # 解析 plugin options: obfs-local;obfs=http;obfs-host=example.com
+        # sing-box 要求 plugin_opts 是分号拼接的字符串，传 dict 会 FATAL
         plugin_parts = plugin.split(";")
-        plugin_name = plugin_parts[0]
-        plugin_opts = {}
-        for part in plugin_parts[1:]:
-            if "=" in part:
-                k, v = part.split("=", 1)
-                plugin_opts[k] = v
-        out["plugin"] = plugin_name
-        out["plugin_opts"] = plugin_opts
+        out["plugin"] = plugin_parts[0]
+        opts = ";".join(plugin_parts[1:])
+        if opts:
+            out["plugin_opts"] = opts
     return out
 
 def parse_vless(url: str) -> dict:
@@ -332,7 +329,7 @@ def parse_vless(url: str) -> dict:
     if network == "ws":
         out["transport"] = {
             "type": "ws",
-            "path": urllib.parse.unquote(p.get("path", ["/"])[0]),
+            "path": p.get("path", ["/"])[0],   # parse_qs 已解码，再 unquote 会二次解码
             "headers": {"Host": p["host"][0]} if p.get("host") else {},
         }
     elif network == "grpc":
@@ -429,7 +426,8 @@ if __name__ == "__main__":
     ap.add_argument("--filter", default="", help="substring filter node name (case-insensitive)")
     args = ap.parse_args()
 
-    sub_urls = args.urls or ([args.url] if args.url else [])
+    # 无参数时回退到 OKZ_SUB_URL 环境变量（README 的引导命令依赖此路径）
+    sub_urls = args.urls or ([args.url] if args.url else []) or ([_OKZ_SUB_URL] if _OKZ_SUB_URL else [])
     if not sub_urls:
         print("ERROR: no subscription URLs provided (use --urls or --url)", file=sys.stderr)
         sys.exit(1)
