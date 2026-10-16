@@ -93,6 +93,63 @@ def test_ss_plugin_opts_is_string():
         f"plugin_opts 必须是 str, 实际 {type(out['plugin_opts']).__name__}"
 
 
+# ============= 2c. vmess base64-JSON（v2rayN/Clash 主流格式） =============
+def test_vmess_base64_json_parsed():
+    """base64-JSON 是 vmess 主流格式；不识别会把整个串当 hostname。"""
+    import base64 as _b64
+    import json as _json
+    payload = {"v": "2", "ps": "东京", "add": "1.2.3.4", "port": "443",
+               "id": "12345678-1234-1234-1234-123456789abc", "aid": "0",
+               "net": "ws", "host": "a.com", "path": "/p", "tls": "tls", "sni": "x.com"}
+    url = "vmess://" + _b64.b64encode(_json.dumps(payload).encode()).decode()
+    out = ps.parse_vmess(url)
+    assert out["server"] == "1.2.3.4", f"server 应为 1.2.3.4, 实际 {out['server']!r}"
+    assert out["server_port"] == 443
+    assert out["uuid"] == payload["id"]
+    assert out["tls"]["enabled"] is True
+    assert out["transport"]["type"] == "ws"
+
+
+def test_vmess_standard_url_format_still_works():
+    out = ps.parse_vmess(
+        "vmess://uuid-1@h.example.com:443?alterId=0&security=auto&type=ws&path=/p&host=a.com#n")
+    assert out["server"] == "h.example.com"
+    assert out["uuid"] == "uuid-1"
+
+
+def test_vmess_garbage_returns_empty():
+    """解析失败必须返回空 dict（被 make_config 丢弃），不能产出半成品节点。"""
+    out = ps.parse_vmess("vmess://bm90LWpzb24")
+    assert not out.get("server"), f"垃圾输入不应产出 server, 实际 {out.get('server')!r}"
+
+
+def test_make_config_drops_incomplete_nodes():
+    """残缺节点（无 server/port）必须被丢弃，否则 daemon 会拿它轮换、白白浪费切换。"""
+    good = ps.parse_trojan("trojan://pw@a.example.com:443#t")
+    bad = {"type": "vmess", "tag": "garbage", "server": "", "server_port": None}
+    cfg = ps.make_config([good, bad], listen_port=7890, clash_port=9090)
+    tags = [o["tag"] for o in cfg["outbounds"]]
+    assert "garbage" not in tags, "残缺节点泄漏进配置"
+    assert "a.example.com:443-tr" in tags, "合法节点被误删"
+
+
+# ============= 2d. reality 块以 pbk 为准 =============
+def test_reality_from_clash_source_kept():
+    """Clash-YAML 源的 reality 节点被转成 security=tls 但仍带 pbk，不能丢 reality 块。"""
+    proxy = {"type": "vless", "name": "r", "server": "1.2.3.4", "port": 443, "uuid": "u",
+             "tls": True, "network": "tcp", "servername": "x.com",
+             "reality-opts": {"public-key": "REALKEY", "short-id": "ab"}}
+    out = ps.parse_vless(ps._clash_proxy_to_url(proxy))
+    assert "reality" in out["tls"], "Clash 源 reality 节点丢失 reality 块"
+    assert out["tls"]["reality"]["public_key"] == "REALKEY"
+
+
+def test_reality_without_pbk_omitted():
+    """security=reality 但无 pbk 时不得下发 reality 块 —— sing-box 会 FATAL。"""
+    out = ps.parse_vless("vless://u@h.example.com:443?type=tcp&security=reality&sni=x.com#n")
+    assert "reality" not in out.get("tls", {}), "空 pbk 会致 sing-box invalid public_key"
+
+
 # ============= 3. 单源失败不中断全流程 =============
 def test_dead_source_still_writes_config(tmp_path):
     """真实端到端（离线）：一个死源 + 一个本地活源 → 脚本 rc=0 且写出配置。

@@ -1353,15 +1353,22 @@ def main():
         time.sleep(5)
         all_nodes = get_all_proxy_nodes()
         if not all_nodes:
-            log("⚠ sing-box 不通，尝试启动...")
-            _set_outbound_proxy(enabled=False)  # 先 bypass
-            if not restart_singbox():
-                log("✗ sing-box 启动失败，等 30s 重试")
-                time.sleep(30)
+            # 配置文件不存在时直接重启必然失败（要白等 30s+60s 且 9router 走直连），
+            # 先重建再重启。配置不入库，全新 clone / 误删即此状态。
+            if not os.path.exists(CFG["singbox"]["config_file"]):
+                log("⚠ 配置文件缺失，先重建订阅配置...")
+                refresh_subscription()
+                all_nodes = get_all_proxy_nodes()
+            if not all_nodes:
+                log("⚠ sing-box 不通，尝试启动...")
+                _set_outbound_proxy(enabled=False)  # 先 bypass
                 if not restart_singbox():
-                    log("✗ 无法启动 sing-box，降级到 okz:6696")
-                    check_and_handle_fallback([], "")
-                    time.sleep(60)
+                    log("✗ sing-box 启动失败，等 30s 重试")
+                    time.sleep(30)
+                    if not restart_singbox():
+                        log("✗ 无法启动 sing-box，降级到 okz:6696")
+                        check_and_handle_fallback([], "")
+                        time.sleep(60)
 
         all_nodes = get_all_proxy_nodes()
         if all_nodes:
