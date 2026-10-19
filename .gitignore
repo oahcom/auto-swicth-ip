@@ -14,3 +14,5 @@ singbox-config.json
 # 刷新写到 .tmp 再 os.replace；超时/SIGKILL 会残留（同样含凭据）
 singbox-config.json.tmp
 *.json.tmp
+.warp/
+.warp_ip_used.json

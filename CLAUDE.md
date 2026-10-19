@@ -37,7 +37,8 @@ sing-box (port 7890)
 
 daemon.py
     ← 读 9router SQLite requestDetails（只查 provider="opencode"）
-    → 两层检测：10条窗口错误率 > 10% 或 连续失败 ≥ 2 → 立即切
+    → 切换后出现任意 1 条新错误 → 立即再切（不等 cooldown_after_switch_sec）
+    → 403 与 429 同等触发轮换
     → 主动轮换：每 60s 加权选新节点
     → 自适应策略：normal=延迟优先 / pressure=均匀分散
     → 节点健康检查：每 300s 并发测试（_health_pool, _Dead_TTL_STAGES）
@@ -53,6 +54,111 @@ daemon.py
     → SQLite 连接优雅关闭：atexit 关闭 WAL checkpoint
 ```
 
+## WARP 专用出口（opencode）
+
+```
+9router → sing-box:7890 → route: domain_suffix ["opencode.ai"]
+        → selector opencode-out
+             ├── WARP-CF     socks 127.0.0.1:1080  usque-warp.service   （主, -6 → SJC）
+             ├── WARP-CF-B   socks 127.0.0.1:1081  usque-warp-b.service （备, v4 → LAX）
+             ├── WARP-CF-C   socks 127.0.0.1:1082  usque-warp-c.service （备, v4 → LAX）
+             ├── WARP-CF-D   socks 127.0.0.1:1083  usque-warp-d.service （备, v4）
+             ├── WARP-CF-E   socks 127.0.0.1:1084  usque-warp-e.service （备, v4）
+             └── proxy       轮换池（隧道全不通时兜底）
+        → opencode.ai
+```
+
+### 主备换线（daemon 自动）
+
+- 触发（两类出口级拦截，阈值不同）：
+  - `abuse403` ≥ `warp.block_threshold`（默认 1）—— IP 信誉拦截，出现即说明当前出口已被标记。
+  - `rate429` ≥ `warp.rate429_threshold`（默认 **1**）—— **免费层按 IP 的配额限流**，同样换出口即拿到新配额。
+    两者都是 1：任何一条出口级拦截出现即换。曾把 429 设为 5（担心频繁重启），
+    但实测 22:35~22:38 风暴期每多等一条就是继续失败，而换线冷却只有 20s。
+  - 实测 16:24 切 WARP 成员后成功率 3.5% → 9.3%（90s 窗口），429 换线确有效。
+  - 两类同时达阈值只换一次线，理由串成 `"abuse403 ×N + rate429 ×M"`。
+- **判定不受节点切换时间戳约束**：主循环的主动轮换（每 60s）会刷新 `_last_successful_switch_ts`，若拿它当窗口起点，爆发期间 403 会被整段吞掉（实测 15:47~15:52 共 252 条 403 零换线）。
+- **换线前校验目标出口 IP**：`_WARP_IP_USED` 记录每个出口 IP 最后一次使用时间，窗口
+  `ip_reuse_guard_sec`（默认 **3600s**）内用过的地址必须先重启目标隧道换会话 IP 再切 ——
+  否则等于从一个被限流的出口切到另一个同样被限流的出口，白换一次（实测 16:53:59
+  WARP-CF-B 刷出 `19c0:10::3ff:6d`，16:59:27 又切回同一地址，随之 429 爆发）。
+  刷新后仍是旧地址就跳过该备线，所有备线都不新鲜才退回原地重连当前线。
+  3600s 依据：同一 IP 被重新切回的实测间隔分布里，25.2 / 28.3 / 49.1 分钟都出现过，
+  而 8~11 分钟就切回的那些几乎立刻再次 403（18:58:05 用过的
+  `2a09:bac5:1efb:281e::3ff:42` 在 10.6 分钟后的 19:08:41 被原样切回，53 秒后爆发）。
+  记录落盘 `.warp_ip_used.json`，跨重启保留。
+- 动作：探测备线连通性 → `PUT /proxies/opencode-out` 切过去（`interrupt_exist_connections: false`，在途请求不断）→ 后台重连刚被换下的那条，刷新其会话 IP，下次可原样切回。
+- 备线不通时先拉起；所有备线都不可用（或目标 IP 刷新不出新鲜值、备线均忙于在途
+  连接）时**切轮换池 `proxy`**，而不是原地重连 —— 切 proxy 只是一次 PUT，秒级且
+  不断流；原地重连要 `systemctl restart usque-*`，D-Bus 不可用时必败且流量会干等
+  在坏出口上（实测 2026-10-19 19:09 三条线同时失效 → 原地重连全败 → 403-abuse
+  每分钟 10~116 条持续 7 分钟）。仅当切 proxy 也失败时才退回原地重连，最多
+  `max_attempts`（3）次，重试间隔 `retry_backoff_sec`（2/5/10s）。
+- 冷却：`cooldown_ok_sec` 固定 20s，**不随连续失败放大**。WHY：2^n 退避曾在风暴期锁死到
+  600s —— 实测 17:02~17:09 九分钟零换线、1752 条请求全废。换线只要目标出口 IP 新鲜
+  就值得做，拉长冷却只会让错误持续积累。
+- 换线动作本身失败（两条线都不通）：`cooldown_fail_sec` 60s 后重试。
+- 换线后 `refresh_delay_sec`（20s）刷新被换下的闲置线；刷新前最多等 `idle_wait_sec`
+  （40s）让该线闲下来，等不到则**补刷重试**直到 `ip_refresh_retry_sec`（600s）用完。
+  WHY 必须补刷：单次超时就放弃会让这条线永远停在旧地址上 —— 实测 WARP-CF-C 被
+  换下 8 次仅刷 2 次，13 次换线里 7 次切回同一个 10 分钟前的地址。
+  「闲」的判据是**字节增量**（`warp_line_busy`），不是连接数：活跃线上恒有 7~10
+  条连接且从不归零（SSE 长连接 + 连接复用，实测单条存活 936s），按连接数等必然
+  超时。强刷会掐断长命连接 → `upstream connection lost`。
+- sing-box 重启会把 selector 重置为 default（主线），`restart_singbox()` 会记住并恢复重启前的线路。
+
+**部署约束（勿改）**：sing-box 由 daemon 用 `Popen(start_new_session=True)` 拉起，进程仍属于
+`auto-switch-ip.service` 的 cgroup。该 unit 必须保持 `KillMode=process` —— 默认的
+`control-group` 会让每次 `systemctl restart auto-switch-ip.service` 连带杀掉 sing-box，
+daemon 随即置 bypass 直连，opencode 看到本地 IP 直接返回 abuse 403
+（实测 15:31/15:36/15:50 三次重启各触发 50~100 条 403）。
+
+**为什么换线比原地重连好**：Cloudflare 的 WARP 会话地址重连即换，但原地重连有几秒断流；换到备线是秒级且在途请求不断，被换下的线在后台慢慢重连刷新。
+
+**双向兜底（任一炸了，另一个必须察觉并顶上）**
+
+`opencode-out` 成员含 `proxy`（83 节点池），两个方向都是**主动探测**，不等下游报错：
+
+| 方向 | 触发 | 实现 |
+|---|---|---|
+| WARP → proxy | 全部隧道不可用或出口 IP 已被标记（换线时探测） | `_fallback_to_proxy()`，一次 PUT，不掐断在途连接 |
+| proxy → WARP | 三条判据任一成立（每 `proxy_check_sec`(60s) 评估）：①池健康探测**连续** `proxy_fail_streak`(3) 次全失败；②落池后 opencode 仍被 403/429 拦截 ≥ `proxy_blocked_threshold`(5) 条；③黑名单节点占比 ≥ `proxy_dead_ratio`(0.5)。另需 WARP 至少一条能出未标记 IP | `_maybe_failback_to_warp()` |
+
+WHY 反向必须主动探：停在 proxy 上时 `opencode_out_on_warp()` 为 False，错误分支走
+`_rotate_on_error()`，只在 83 个节点内部打转 —— 正是 INC-002 的失败模式（全天轮换
+成功率 3~5%）。靠下游 429 累计到阈值才动，期间流量全废。
+
+WHY 不按「WARP 探测又通了」回切：探测会抖动，实测 00:02:45 落到 proxy、00:02:52
+就因一次探测通过切回（7s），83 节点池一条 opencode 请求都没服务过。代理池是兜底
+资源，能服务流量就该让它服务完；只有池真的不堪用（上面三条判据）才回切。
+池健康采样**随机 3 个节点并发探测**：固定取前 3 个时，这 3 个恰好挂了就把整池判死。
+
+池健康只采样前 3 个节点：全池逐个探测代价过高，而"能连"与"全死"之间没有需要
+精确刻画的中间态 —— 有一个通就还能兜底。注意 INC-002 记录过该池的失败模式，
+所以它只作**最后兜底**，不作主力。
+
+- 原理：opencode 免费层的 403 有两种文案，9router 命中的是 "abusive traffic from this IP" —— IP 信誉拦截，换干净出口可解；另一种 "only be used from within OpenCode" 是客户端指纹，换 IP 无效。
+- WireGuard 版 WARP 在本机不通（UDP 2408/4500/500/1701 握手全超时），只能用 MASQUE(TCP/443)。
+- 配置来源：`.warp/warp-outbound.json`（600，gitignored），单个对象或数组皆可，`make_config()` 自动并入；文件不存在则整条链路不生成，行为回到旧版。
+- 设备凭据：`.warp/usque/config.json`（主）、`.warp/usque2/config.json`（备），各自独立注册的 usque 设备（600，gitignored）。
+- 五个 WARP 成员都不在 `proxy` 轮换池里，daemon 的节点轮换不影响 opencode 出口。
+- opencode 走 WARP 时换轮换池节点没有意义（错误由 WARP 出口决定），daemon 此时改走 WARP 换线路径（`_rotate_on_error` 仅在该路径下调用）。
+- 手动回落：`PUT /proxies/opencode-out {"name":"proxy"}`；手动换线：`POST` 同名接口 `{"name":"WARP-CF-B"}`。
+- **WARP 开关**：`asip warp stop`（切 proxy + 停全部隧道）/ `start` / `restart` / `status`。
+  单元是 `Restart=always`，`systemctl stop` 后 5s 会重生，因此 stop 走「停 + 把单元文件
+  换成 /dev/null 软链 + daemon-reload」，start 从 `.asip-bak` 还原（原文件会被覆盖，
+  故停之前先备份）。stop 后 daemon 的 `_maybe_recheck_warp` 仍会尝试切回 WARP，
+  但隧道不可达时它不会动作。
+
+**出口 IP 污染记录**
+`.warp_ip_used.json`（gitignored）：`{ip: {ts: 最后使用时刻, blocked: 是否被 403/429 标记}}`。
+落盘而非仅进程内 —— 实测 22:22 重启后旧 IP 全变「干净」，22:27 立即切回已被烧的地址，
+403 持续 144s。写入点：换线切过去时（`blocked=False`）和触发换线时把当前出口标
+`blocked=True`。`_warp_any_reachable()` 要求至少一条线出**未被标记**的 IP 才算可达；
+否则「连通探测全过、403 依旧 100%」—— 实测 22:36:28 切到 `2a09:bac1:19c0:18::1d2:c4`
+后仍 403 10/10，同段换两个 IP 才恢复。
+- 路由规则必须排在 `action: resolve` 之前，且域名写 `opencode.ai`（`.opencode.ai` 匹配不到裸域）。
+
 ## 检测与触发机制
 
 ```
@@ -66,7 +172,8 @@ proxy-global.js 侧（请求级，低延迟）:
   - server_error / upstream / connection 等 error 体 → 重试
 
 daemon.py 侧（聚合级，高延迟）:
-  - 两层检测: RECENT_WINDOW 窗口错误率 or 连续失败 ≥ 2
+  - 触发: 上次成功切换后出现任意 1 条新错误即立即再切（不受冷却限制）
+  - 403 与 429 一样触发轮换；403 占比仅记录在日志中用于诊断
   - 只查 provider="opencode"（OpenCode Free）
   - 不查 kiro/nvidia/ollama 等（不触发 IP 轮换）
   - 结果: 错误模型名日志（如 "mimo-v2.5-free"）
@@ -89,7 +196,12 @@ opencode_min_success_rate: 0.9                 # 错误率 > 10% → 轮换
 pressure_error_rate: 0.3                       # 正常→压力模式阈值
 normal_error_rate: 0.1                         # 压力→正常模式阈值
 proactive_rotate_sec: 60                       # 主动轮换间隔
-cooldown_after_switch_sec: 10                  # 切换后冷却
+proxy_fail_streak: 3                           # 池连续探测失败 N 次 → 回切 WARP
+proxy_blocked_threshold: 5                     # 落池后仍被拦截 N 条 → 回切 WARP
+proxy_dead_ratio: 0.5                          # 黑名单节点占比 ≥N → 回切 WARP
+cooldown_after_switch_sec: 60                  # 切换后冷却（主动/错误触发共用）
+429_cooldown_sec: 60                           # 429 节点让开时长
+reject_window: 50                              # 403 客户端拒绝占比统计窗口
 node_health_sec: 300                           # 健康检查间隔 (5min)
 node_test_timeout_ms: 15000                    # 节点测试超时
 singbox.max_restart_attempts: 3                # 最大重启次数
@@ -179,9 +291,16 @@ _POOL_MIN_RATIO: 0.3                          # 允许 70% 节点被拉黑（con
 
 **限制**：其他 provider（nvidia、openrouter、pollinations、alicode 等）虽配置了 API key，但有硬配额限制，**无法通过代理 IP 轮换绕过配额**。只有 opencode.ai 的免费接口能通过 sing-box 代理轮换 IP 来绕过限额。
 
+> **更正（2026-10-19 实测）**：上文"换 IP 对配额无效"的说法对 **429 限流不成立**。
+> opencode 免费层的 `FreeUsageLimitError`（429 "Rate limit exceeded"）**按出口 IP 判定**，
+> 换出口即拿到新配额。实测 16:24 手动切 WARP 成员后成功率 3.5% → 9.3%（90s 窗口）。
+> 因此"配额耗尽就无解"的判断被推翻：根本解法是**出口级换线**，不只是多 key。
+> 现在 daemon 对 abuse403（阈值 1）与 rate429（阈值 5）都自动换线。
+> 只有 abuse403 中"客户端指纹"那一类（"only be used from within OpenCode"）换 IP 真无效。
+
 **结论**：不能简单在 combo 添加其他 provider 作为 fallback，因为一旦 opencode 配额耗尽，fallback 到的 provider 同样会立即触发配额限制。根本解决路径是：
 1. 维护 sing-box 节点池健康（确保 IP 轮换有效）
-2. 优化轮换策略（更快切换、更准的错误检测）
+2. 出口级换线已覆盖 abuse403 与 rate429，是目前对免费层限额唯一有效的手段
 3. 如需 provider 多样性，必须获取可付费/可续费的 API key（alicode renew、openrouter 付费等）
 
 ## 测试工作流要求

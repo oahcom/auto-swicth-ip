@@ -461,6 +461,28 @@ def _is_loopback(host) -> bool:
         return ipaddress.ip_address(h).is_loopback
     except ValueError:
         return False
+def _load_warp_outbounds() -> list[dict]:
+    """WARP 出口（主+备）：.warp/warp-outbound.json（600，gitignore）。
+
+    单个对象或对象数组皆可；缺失/损坏/条目不完整返回 []，整条链路不生成。
+    多个出口时 opencode-out 是主备 selector，可在隧道失效时秒切另一条。
+    """
+    p = Path(__file__).resolve().parent / ".warp" / "warp-outbound.json"
+    try:
+        with open(p) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        print(f"  WARP 配置读取失败，跳过: {e}", file=sys.stderr)
+        return []
+    items = data if isinstance(data, list) else [data]
+    out = [o for o in items if isinstance(o, dict) and o.get("tag") and o.get("server_port")]
+    if len(out) != len(items):
+        print(f"  dropped {len(items) - len(out)} invalid WARP entries", file=sys.stderr)
+    return out
+
+
 
 def make_config(nodes: list[dict], listen_port: int = 0,
                 clash_port: int = 0, clash_secret: str = "",
@@ -483,7 +505,10 @@ def make_config(nodes: list[dict], listen_port: int = 0,
         print(f"  dropped {before - len(nodes)} invalid nodes (missing server/port or loopback)", file=sys.stderr)
     if not include_h2:
         nodes = [n for n in nodes if n.get("type") != "hysteria2"]
-    outbounds = nodes[:]
+    # 与订阅节点同 tag 时丢弃 WARP 条目（订阅里同名节点优先）
+    node_tags = {n["tag"] for n in nodes}
+    warps = [w for w in _load_warp_outbounds() if w["tag"] not in node_tags]
+    outbounds = nodes[:] + warps
     outbounds.append({"type": "direct", "tag": "direct"})
 
     return {
@@ -504,12 +529,48 @@ def make_config(nodes: list[dict], listen_port: int = 0,
                 "default": nodes[0]["tag"] if nodes else "direct",
                 "interrupt_exist_connections": False,
             },
+            # opencode 流量固定走 WARP：403 实为 IP 信誉拦截，轮换池全在脏 IP 上。
+            # 多个 WARP 出口时是主备 selector：daemon 切到备线即可让主隧道重连换 IP。
+            *([{
+                "type": "selector",
+                "tag": "opencode-out",
+                "outbounds": [w["tag"] for w in warps] + ["proxy"],
+                "default": warps[0]["tag"],
+                "interrupt_exist_connections": False,
+            }] if warps else []),
         ],
+        # opencode 域名独立解析：WSL2 下 /etc/resolv.conf 的 8.8.8.8 不可达，
+        # 走阿里 DoH 本地解析后把 IP 交给节点（route 的 resolve 动作），
+        # 而非透传域名由节点侧解析。其余域名仍用系统 DNS。
+        #
+        # 域名必须写裸域 `opencode.ai` 而非 `.opencode.ai`：后者是
+        # domain_suffix 的"以 .opencode.ai 结尾"形式，**匹配不到裸域**。
+        # 实测流量 12086 次裸域 / 2 次子域，写错形式等于专用 DNS 与
+        # 本地 resolve 两个动作全部落空，裸域只能回落到 dns-default，
+        # 依赖不稳定的系统解析器。与 route 出站规则保持同一种写法。
+        # 注意 dns server 不能加 detour: "direct" —— sing-box check 通过但
+        # 运行时 FATAL "detour to an empty direct outbound makes no sense"。
+        "dns": {
+            "servers": [
+                {"type": "https", "tag": "dns-opencode", "server": "223.5.5.5"},
+                {"type": "local", "tag": "dns-default"},
+            ],
+            "rules": [
+                {"domain_suffix": ["opencode.ai", ".opencode.ai"],
+                 "server": "dns-opencode"},
+            ],
+            "final": "dns-default",
+        },
         "route": {
             "rules": [
                 {"action": "sniff"},
+                # 必须先于 resolve：resolve 后 destination 变为 IP，domain 规则不再命中
+                *([{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"}] if warps else []),
+                {"action": "resolve", "domain_suffix": ["opencode.ai", ".opencode.ai"]},
             ],
             "final": "proxy",
+            # 配了多个 dns server 时缺此字段 → sing-box 1.12+ 拒绝启动
+            "default_domain_resolver": {"server": "dns-default"},
             "auto_detect_interface": True,
         },
         "experimental": {

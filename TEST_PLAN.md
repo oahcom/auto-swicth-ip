@@ -1756,6 +1756,56 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 顺序：改 token → `python3 -m pytest test_subscription_parse.py` → 重启 daemon →
 `python3 verify_rotation.py` → 确认节点池已换（比对出口 IP 与旧池不同）。
 
+## 11. WARP 专用出口（opencode）
+
+背景：opencode 免费层的 403 有两种文案——`abusive traffic from this IP` 是 IP 信誉拦截（9router 命中的就是这种），`only be used from within OpenCode` 是客户端指纹（裸 curl 必现，换 IP 无效）。因此出口换成 WARP 后即可恢复。
+
+| ID | 级别 | 测试点 | 方法 | 预期 |
+|----|------|--------|------|------|
+| T-118 | P0 | opencode 流量走 WARP | `grep opencode.ai singbox.log \| tail -2` | 出站为 `outbound/socks[WARP-CF]` |
+| T-119 | P0 | 端到端可用 | `curl -H 'Authorization: Bearer 9router-local' -d '{"model":"oc-ds-mimo","messages":[{"role":"user","content":"ping"}],"max_tokens":4}' :20127/v1/chat/completions` | 200 且返回 choices |
+| T-120 | P1 | 轮换池不含 WARP | Clash API `/proxies/proxy` 的 all 列表 | 不含 `WARP-CF` |
+| T-121 | P1 | usque 服务自愈 | `kill $(pgrep -f '[u]sque socks')` | systemd 5s 内拉起，`is-active` = active |
+| T-122 | P1 | 配置刷新保留 WARP | 手跑 `parse_subscription.py --urls <sub>` 后 `sing-box check` | 新配置仍有 `opencode-out` 与 `WARP-CF` |
+| T-123 | P2 | 回落路径 | `PUT /proxies/opencode-out {"name":"proxy"}` | 改走轮换池；再切回 `WARP-CF` 恢复 |
+| T-124 | P0 | 主备换线：备线可用时切过去而非原地重启 | `python3 -c "import daemon; daemon.reconnect_warp('手动验证')"` | 日志 `✓ WARP 换线成功: WARP-CF -> WARP-CF-B`；`active_warp_tag()` 变为备线 |
+| T-125 | P1 | 被换下的线后台刷新会话 | 同上，随后 `grep 会话已刷新 daemon.log` | `↻ WARP-CF 会话已刷新: <新 IP>` |
+| T-126 | P0 | abuse 403 达阈值自动换线 | 观察 `grep 换线 daemon.log` | 日志 `↻ WARP 换线 (abusive 403 ×N)` 后跟 `✓ 换线成功` |
+| T-127 | P1 | 换线冷却防风暴 | 连续两次 `maybe_reconnect_warp` | 冷却窗口内第二次不产生新换线日志 |
+| T-128 | P2 | sing-box 重启保留线路 | 在备线上 `restart_singbox()` | 日志 `↺ WARP 线路恢复为 WARP-CF-B`，`active_warp_tag()` 不变 |
+| T-129 | P0 | 换线不受节点切换时间戳门控 | `test_warp_failover_not_gated_by_node_switch` | 一次 abuse 403 即触发换线；主动轮换刷新时间戳不影响 |
+| T-130 | P0 | daemon 重启不连带杀 sing-box | `systemctl --user restart auto-switch-ip.service` 后比对 sing-box PID | PID 不变；`KillMode=process` |
+
+| T-135 | P0 | IP 新鲜度守卫：窗口内用过的出口先刷新再切 | `test_warp_ip_reuse_window_and_cleanup` | 300s 内用过的 IP 触发刷新；窗口外的直接用 |
+| T-136 | P0 | 换线前刷新目标线出口 | `test_warp_failover_refreshes_target_ip_before_switch` | 日志 `↻ <tag> 会话已刷新: <IP>` 后再 `✓ 换线成功` |
+| T-137 | P1 | 目标线 IP 已新鲜则跳过刷新 | `test_warp_failover_skips_refresh_for_fresh_ip` | 不产生刷新日志，直接换线 |
+| T-138 | P1 | 刷新后仍是旧 IP 则换下一条备线 | `test_warp_failover_skips_target_when_refresh_keeps_stale_ip` | 跳过该线；全不新鲜则切轮换池 `proxy` |
+| T-139 | P0 | 有在途连接不强刷（防 upstream connection lost） | `systemctl --user stop auto-switch-ip` 后 `grep '备线均在服务在途连接' daemon.log` | 日志出现该行时**不**出现 `强刷`；连接归零后才刷新 |
+| T-140 | P0 | user manager 未重启（排「全线崩」） | `systemctl --user show user@1000.service -p ActiveEnterTimestamp --value` + `journalctl -u user@1000.service \| grep -E 'Exit the Session\|Deactivated'` | manager Active 起始时间早于当前故障窗口；出现 `Exit the Session` 则按 INC-006 处置（非代理问题） |
+| T-141 | P0 | 判「线忙闲」用字节增量而非连接数 | `pytest test_warp_refresh.py -k line_busy` | 字节增长=忙、不变/回落=闲、查询失败=None；活跃线恒有 7~10 连接故连接数判据必然超时 |
+| T-142 | P0 | 被换下的线等不到空闲必须补刷 | `pytest test_warp_refresh.py -k retry_loop` | 首轮忙之后仍重试并刷新成功；恒忙/刷不出新 IP 时重试到 `ip_refresh_retry_sec` 为止。实测旧行为致 WARP-CF-C 被换下 8 次仅刷 2 次 |
+| T-143 | P0 | 三条隧道全不可用时切轮换池 proxy | `pytest test_daemon_unit.py -k falls_back_to_proxy or skips_dead_standby` | 日志 `⚠ 无可用备线，切轮换池兜底` 后 `✓ 已切到轮换池 proxy`；**不**原地重连（D-Bus 断时必败） |
+| T-144 | P0 | 停在 proxy 时可切回 WARP | `python3 -c "import daemon; daemon.reconnect_warp('手动验证')"` | 切回 WARP 前日志 `当前在轮换池 proxy，尝试切回 WARP 隧道`；成功后 `active_warp_tag()` 非空 |
+| T-145 | P1 | 测试不得写真实 sing-box | `pytest test_daemon_unit.py -q`（fixture 含写操作防线） | 漏 stub 时 `AssertionError: 测试试图写真实 sing-box`，而非静默翻转生产 selector（实测发生过） |
+| T-146 | P1 | 测试文件可被 pytest 收集 | `pytest test_warp_refresh.py --collect-only -q \| tail -1` | 收集到 15 个用例。函数式 `main()`+`check()` 写法 pytest 收集不到，`no tests ran` 仍退出 0 —— 假成功 |
+| T-147 | P0 | 补刷中的线不得被选为换线目标 | `pytest test_daemon_unit.py -k excludes_line_under_refresh` | 该线在 `_WARP_REFRESHING` 时跳过；切到其他空闲新鲜线。补刷窗口 60→600s 后撞上概率显著上升 |
+| T-148 | P0 | 出口 IP 复用窗口生效（事故复现对照） | `grep "✓ WARP 换线成功" daemon.log` 后统计同一 IP 的相邻使用间隔 | 900s 内不得出现重复地址。**旧代码实测**：`2a09:bac5:1efa:183c::26a:bf` 在 21:10:15/21:18:16/21:27:50/21:38:38 连续三次切回（间隔 8.0/9.6/10.8min），同期 opencode abuse403 365+102 条、成功率 12%→57% |
+| T-149 | P0 | proxy 池健康探测（双向兜底反向） | `pytest test_daemon_unit.py -k "proxy_pool or failback"` | 采样 3 节点有 1 个通=健康；全失败=不可用；查询失败=None；WARP 成员不参与探测 |
+| T-150 | P0 | 池挂且 WARP 可达时主动切回 | `pytest test_daemon_unit.py -k failback` | 已走 WARP 不重复触发；WARP 不可达不切；`proxy_check_sec` 内不重复探测 |
+| T-151 | P1 | 双向兜底接线未丢失 | `pytest test_warp_refresh.py -k wired` | 主循环含 `_maybe_failback_to_warp(now)`；换线路径 `_fallback_to_proxy(` ≥4 处 |
+| T-152 | P1 | opencode 域名规则覆盖裸域 | 生成配置后检查 `dns.rules` / `resolve` | `["opencode.ai", ".opencode.ai"]` 两种形式都要有。实测流量 12086 次裸域 / 2 次子域 |
+| T-153 | P0 | 五条 WARP 隧道全部进入 selector | 生成配置后打印 `opencode-out.outbounds` | 含 WARP-CF/-B/-C/-D/-E **五条** + proxy。实测 `.warp/warp-outbound.json` 只有 A/B/C，D/E 两条隧道空转，池更快耗尽（03:35 "17 个 IP 全被标记"） |
+| T-154 | P0 | 回切 WARP 由三条证据判据触发，非「WARP 探测通过」 | `pytest test_daemon_unit.py -k failback` | ①池健康探测**连续** `proxy_fail_streak` 次全失败；②落池后仍被 403/429 拦截 ≥ `proxy_blocked_threshold`；③黑名单占比 ≥ `proxy_dead_ratio`。池健康时必须留在池上。实测旧行为 00:02:45 落池、00:02:52 即回切（7s），83 节点池零请求 |
+| T-155 | P0 | 池健康采样随机且并发 | `pytest test_daemon_unit.py -k proxy_pool` | 随机 3 节点并发探测；固定取前 3 个时这 3 个恰好挂了就把整池判死。串行 3×15s 会卡主循环 |
+| T-156 | P0 | 落池时刻取切换生效当下而非调用方 now | `pytest test_daemon_unit.py -k stale_caller_now` | `reconnect_warp` 的 now 取自探测/重启前，可能已过数分钟；用它当 `_proxy_dwell_since` 会让判据②统计到落池前的旧 403/429 |
+| T-157 | P1 | 未发起切换时不得清空回切证据 | `pytest test_daemon_unit.py -k keeps_evidence` | `_reconnect_warp_now` 在冷却/锁竞争时返回 False，此时清 `_proxy_fail_streak` 等于丢掉已积累的判据 |
+| T-158 | P1 | 补刷成功后不二次重启隧道 | `grep -c "会话已刷新" daemon.log` 与换线次数对照 | `_schedule_idle_refresh` 只调 `_retry_refresh_idle_warp`；叠加无条件 `_refresh_idle_warp` 会再换一个 IP 并可能掐断在途连接 |
+| T-159 | P1 | 探测超时放宽到 20s | `for p in 1080..1084; curl --max-time 20 --socks5 ...` | 实测 B/C 偶发 >8s 响应（触发旧超时），20s 内稳定 1.2-1.4s |
+
+路由两条硬约束（踩过的坑）：
+1. `domain_suffix` 写 `opencode.ai`，写 `.opencode.ai` 匹配不到裸域；
+2. 出站规则必须排在 `action: resolve` 之前，resolve 后 destination 变成 IP，domain 规则不再命中。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
@@ -1764,3 +1814,12 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | v1.1 | 2026-08-22 | 新增 switch-proxy.py 安全/健壮性测试点 (T-090~T-098), 覆盖 secret 刷新、count/empty/guard、CLI fallback、logging、daemon 锁优化 | 4-Agent review |
 | v1.2 | 2026-10-16 | 新增 §10 订阅链路与轮换健康 (T-099~T-112)：订阅换 token 时修复 5 个阻断性 bug（parse_vless 缺失、单源失败中断全流程、refresh 不检查 rc、trojan tcp transport 致 sing-box FATAL、daemon global 声明缺失）；新增 test_subscription_parse.py（11 项）与 verify_rotation.py（19 项） | - |
 | v1.3 | 2026-10-16 | 补齐 T-113~T-117（ws path 二次解码、ss plugin_opts 类型、vmess base64、节点完整性 guard、reality pbk）；标识符改英文；§10.4 引导路径修复 | - |
+| v1.4 | 2026-10-19 | 新增 §11 WARP 专用出口 (T-118~T-123)：opencode 403 实为 IP 信誉拦截，经 usque MASQUE 的 `opencode-out` 出口恢复 | - |
+| v1.5 | 2026-10-19 | WARP 改主备双隧道 (T-124~T-128)：abuse 403 达阈值时切到备线并后台刷新被换下的线；单线退化为原地重连 | - |
+| v1.6 | 2026-10-19 | 阈值降为 1 条、冷却 20s 起指数退避 (T-129/T-131)；修复换线被 `_last_successful_switch_ts` 门控吞掉的根因；unit 加 `KillMode=process` 防 daemon 重启连带杀 sing-box (T-130) | - |
+| v1.7 | 2026-10-19 | 429 纳入换线触发（阈值 5，T-132~T-134）；更正"429 换 IP 无效"的错误结论 —— 实测切 WARP 成员后成功率 3.5%→9.3% | - |
+| v1.8 | 2026-10-19 | 三隧道 (WARP-CF/-B/-C) + 移除 2^n 退避改固定冷却；换线前 IP 新鲜度校验与 idle 守卫 (T-135~T-138)；新增 T-139 防强刷掐断在途连接、T-140 系统层排查；删 T-131（退避机制已移除）；记 INC-006（WSL 用户会话退出致 user@1000.service 整体重启；伴生 swap 满与 OOM）| - |
+| v1.9 | 2026-10-19 | 修 INC-006 三项根因：判闲改字节增量 (T-141)、延迟刷新改补刷重试 (T-142)、全不可用切轮换池代理 (T-143/T-144)；复用窗口 300→900s（实测复用间隔 10.6min）；测试隔离加写操作防线 (T-145)、test_warp_refresh 改为 pytest 可收集 (T-146) | - |
+| v1.10 | 2026-10-19 | 换线候选排除正在补刷的线 (T-147)：补刷窗口拉长到 600s 后，切到一台即将被重启的隧道会掐断在途连接 | - |
+| v1.11 | 2026-10-19 | 双向兜底 (T-149~T-151)：proxy 池健康探测 + 主动切回 WARP，不再只靠下游 429 触发；接线断言防重构删除。修 opencode 域名规则裸域匹配 (T-152，codex review 发现) | - |
+| v1.12 | 2026-10-20 | 五隧道补齐 (T-153)：`.warp/warp-outbound.json` 仅 A/B/C，D/E 空转；回切改为三条证据判据 (T-154)，不再因 WARP 探测通过就回切；池采样随机并发 (T-155)；修落池时间戳陈旧 (T-156)、失败丢证据 (T-157)、补刷后二次重启 (T-158)；探测超时 8→20s (T-159) | codex review |

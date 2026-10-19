@@ -19,6 +19,27 @@ import parse_subscription as ps
 VALID_TRANSPORTS = {"ws", "grpc", "http", "quic", "httpupgrade"}
 
 
+@pytest.fixture(autouse=True)
+def _isolate_production_log(tmp_path, monkeypatch):
+    """daemon.log 重定向到 tmp。
+
+    刷新路径会调 daemon.log()，而 logger 上的 RotatingFileHandler 指向生产
+    daemon.log（O_APPEND）。实测 test_shrunken_refresh_rejected 的夹具
+    （19 节点 → 1）曾以 "刷新节点数骤降 (19 → 1)" 的形式写进生产日志，
+    读日志时会把它当成真实订阅故障排查。
+    """
+    import logging
+    lg = logging.getLogger("auto-switch-ip")
+    saved = lg.handlers[:]
+    lg.handlers = []
+    monkeypatch.setattr(daemon, "_logger", None)
+    monkeypatch.setitem(daemon.CFG, "log_file", str(tmp_path / "daemon.log"))
+    yield
+    for h in lg.handlers:
+        h.close()
+    lg.handlers = saved
+
+
 def _bad_transports(config: dict) -> list[str]:
     bad = []
     for o in config["outbounds"]:
@@ -194,8 +215,9 @@ def test_dead_source_still_writes_config(tmp_path):
 
 
 # ============= 4. refresh_subscription 检查 returncode =============
-def test_loopback_nodes_filtered():
+def test_loopback_nodes_filtered(monkeypatch):
     """订阅源套餐过期时会返回 ss://...@127.0.0.1:6666 占位节点，必须过滤。"""
+    monkeypatch.setattr(ps, "_load_warp_outbounds", lambda: [])  # 本地 WARP 出口也是 127.0.0.1，隔离掉
     assert ps._is_loopback("127.0.0.1") and ps._is_loopback("::1") and ps._is_loopback("localhost")
     assert not ps._is_loopback("1.2.3.4") and not ps._is_loopback("hk.example.com")
     good = ps.parse_trojan("trojan://pw@a.example.com:443#t")
@@ -250,34 +272,23 @@ def test_parse_failure_makes_refresh_return_false(monkeypatch, tmp_path):
     RotatingFileHandler（O_APPEND）。只 addHandler 会多写一份到生产日志，
     导致下游 grep 到假故障。这里整体接管 handlers + 重定向 log_file。
     """
-    import logging
-
     class R:
         returncode = 1
         stderr = "NameError: name 'parse_vless' is not defined"
         stdout = ""
 
-    lg = logging.getLogger("auto-switch-ip")
-    saved_handlers = lg.handlers[:]
-    lg.handlers = []
     monkeypatch.setattr(daemon, "_logger", None)          # 强制重新 _init_logger
-    monkeypatch.setitem(daemon.CFG, "log_file", str(tmp_path / "daemon.log"))
     # config_file 必须一并重定向：refresh 失败路径会 _discard(config_file + ".tmp")，
     # 不重定向就会删掉生产 singbox-config.json.tmp（含刚拉取的节点凭据）
     monkeypatch.setitem(daemon.CFG["singbox"], "config_file", str(tmp_path / "cfg.json"))
 
-    try:
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
-        monkeypatch.setattr(daemon, "restart_singbox",
-                            lambda: pytest.fail("不应重启 sing-box"))
-        assert daemon.refresh_subscription() is False
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
+    monkeypatch.setattr(daemon, "restart_singbox",
+                        lambda: pytest.fail("不应重启 sing-box"))
+    assert daemon.refresh_subscription() is False
 
-        text = (tmp_path / "daemon.log").read_text()
-        assert "订阅解析失败" in text, f"日志未落在 tmp: {text!r}"
-    finally:
-        for h in lg.handlers:
-            h.close()
-        lg.handlers = saved_handlers
+    text = (tmp_path / "daemon.log").read_text()
+    assert "订阅解析失败" in text, f"日志未落在 tmp: {text!r}"
 
 
 # ============= 5. 生成配置对 sing-box 合法 =============
@@ -302,6 +313,35 @@ def test_generated_config_passes_singbox_check(tmp_path):
     r = subprocess.run([binary, "check", "-c", str(cfg_file)],
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, f"sing-box check 失败: {r.stderr.strip()[:300]}"
+
+
+def test_opencode_dns_resolve_rule_present():
+    """opencode 域名必须本地解析（DoH）后把 IP 交给节点。
+
+    仅保留 sniff 时 sing-box 会把域名原样透传给出口节点、本地零 DNS 查询，
+    节点侧解析结果不可控。route 里必须有 resolve 动作。
+    """
+    nodes = [ps.parse_trojan("trojan://pw@a.example.com:443#t")]
+    cfg = ps.make_config(nodes, listen_port=7890, clash_port=9090)
+    actions = [r.get("action") for r in cfg["route"]["rules"]]
+    assert "resolve" in actions, f"route 缺少 resolve 动作: {cfg['route']['rules']}"
+    assert any(".opencode.ai" in (r.get("domain_suffix") or [])
+               for r in cfg["route"]["rules"] if r.get("action") == "resolve"), \
+        "resolve 动作未限定到 .opencode.ai"
+    # 多 dns server 时必须显式指定默认解析器，否则 sing-box 1.12+ 拒启
+    assert cfg["route"].get("default_domain_resolver"), "缺少 route.default_domain_resolver"
+
+
+def test_dns_server_has_no_detour_field():
+    """dns server 带 detour:\"direct\" 时 sing-box check 通过但 run 时 FATAL。"""
+    nodes = [ps.parse_trojan("trojan://pw@a.example.com:443#t")]
+    cfg = ps.make_config(nodes, listen_port=7890, clash_port=9090)
+    dns = cfg.get("dns", {})
+    assert dns.get("servers"), "缺少 dns servers"
+    assert any(s.get("tag") == "dns-opencode" for s in dns["servers"]), \
+        "缺少 dns-opencode server"
+    for s in dns["servers"]:
+        assert "detour" not in s, f"dns server {s.get('tag')} 带 detour，运行时将 FATAL"
 
 
 # ============= 6. config 校验护栏（promote 前用 sing-box check） =============

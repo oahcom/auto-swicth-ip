@@ -36,3 +36,437 @@
 - 不要直接 `kill` next-server，让 cli.js 管理进程生命周期
 - `--tray` 模式适合无终端后台运行，`--no-browser` 需要 TTY
 - 每次 deploy 后执行健康检查，确认服务就绪再通知用户
+
+## INC-002: opencode 免费层 403 持续限流，轮换 83 个节点无效
+
+**日期**: 2026-10-18 ~ 2026-10-19  
+**等级**: P1（opencode 全链路不可用，成功率 3–5%，持续约一天）  
+**原因**: 出口 IP 全在 opencode 的滥用名单里；轮换池本身没有干净 IP
+
+### 现象
+
+- 9router `opencode` provider 持续返回 403，daemon 每 10–60s 切一次节点，切换后成功率仍是 3–5%。
+- 近 2000 条 `requestDetails` 中 1931 条 error，文案全部是：
+  `FreeTierError: ... detected abusive traffic from this IP address`。
+
+### 根因
+
+1. **两种 403 被混为一谈**。另一条文案 `only be used from within OpenCode` 才是客户端指纹（裸 curl 必现，换 IP 无效）；`abusive traffic from this IP` 是**IP 信誉**拦截，换干净出口可解。之前按"指纹"结论处理，方向错了。
+2. **83 个代理节点全部撞名单**。轮换只在同一批脏 IP 里打转，所以切得再快也没有收益。
+3. WireGuard 版 WARP 在本机不通：UDP 2408/4500/500/1701 握手全部超时（同网段 UDP 19302/3478 正常，属端口/协议过滤）。
+
+### 修复
+
+```
+9router → sing-box:7890
+        → route: domain_suffix ["opencode.ai"]
+        → selector opencode-out（默认 WARP-CF，备选 proxy）
+        → socks 127.0.0.1:1080（usque MASQUE，systemd usque-warp.service）
+        → opencode.ai
+```
+
+- WARP 走 MASQUE（TCP/443），`cloudflare.com/cdn-cgi/trace` 验证 `warp=on`。
+- `parse_subscription.py:make_config()` 读取 `.warp/warp-outbound.json`（600，gitignored）自动并入；文件缺失时整条链路不生成。
+- `opencode-out` 不在 `proxy` 轮换池内，daemon 的轮换不再影响 opencode 出口。
+
+### 时间线
+
+| 时间 | 事件 |
+|------|------|
+| 10-18 全天 | 403 持续，轮换频率 10s/次，成功率无改善 |
+| 10-19 14:29 | 提高冷却 + 错误即时触发切换，仍 403 |
+| 10-19 15:00 | 从 DB 取到 403 原文，确认是 IP 信誉而非客户端指纹 |
+| 10-19 15:02 | WireGuard 版 WARP 多 endpoint/端口握手失败 |
+| 10-19 15:01 | 注册 usque MASQUE 账户，`warp=on` 验证通过 |
+| 10-19 15:07 | 路由生效：`outbound/socks[WARP-CF] → opencode.ai:443` |
+| 10-19 15:08~15:11 | 连续 9 次端到端请求全部 200，daemon `错误=0/10` |
+
+### 经验
+
+- **先取原文再下结论**：错误体里的 message 才是判据，按类型名（FreeTierError）归类会漏掉同一类型下的不同拦截原因。
+- 路由规则两条硬约束：
+  1. `domain_suffix` 写 `opencode.ai`，写 `.opencode.ai` 匹配不到裸域；
+  2. 出站规则必须排在 `action: resolve` 之前，resolve 后 destination 变成 IP，domain 规则不再命中。
+- 验证链路要看 sing-box 日志的出站标签，不能只看 HTTP 状态——403 的两种文案在状态码上完全一样。
+
+### 遗留
+
+- WARP 是单一出口 IP，被标记后无自动替换；回落命令 `PUT /proxies/opencode-out {"name":"proxy"}`。
+- 15:10 订阅刷新出现 `刷新节点数骤降 (19 → 1)`，护栏拒绝覆盖（配置完好），但 `19` 与当时 83 个节点对不上，原因未查明。
+
+## INC-003: WARP 单一出口被标记后无替换机制
+
+**现象**：opencode 走 WARP 后接口恢复，但 WARP 出口是单一的。一旦这个会话地址被
+Cloudflare 判定为 abusive，`opencode-out` 无处可换——只能手动重启 usque 等新地址，
+期间 opencode 断流。
+
+**根因**：出口只有一个 usque 实例（`127.0.0.1:1080`），`opencode-out` 的备选只有轮换池
+`proxy`，而轮换池全在脏 IP 上（见 INC-002）。没有第二条干净的 WARP 通道可切。
+
+**修复**（2026-10-19）：
+1. 用 `usque register` 注册第二个独立设备，落在 `.warp/usque2/`，监听 `127.0.0.1:1081`，
+   由 `usque-warp-b.service` 托管。
+2. `.warp/warp-outbound.json` 从单对象改为数组（主 + 备），`make_config()` 据此生成含两个
+   WARP 成员的 `opencode-out` selector：`[WARP-CF, WARP-CF-B, proxy]`。
+3. daemon 新增换线路径：abuse 403 达阈值 → 探测备线 → `PUT /proxies/opencode-out` 切过去
+   （`interrupt_exist_connections: false`，在途请求不断）→ 后台重连被换下的线刷新会话 IP，
+   下次可原样切回。
+4. 备线不可用时退回原地重连当前线（有几秒断流），受 `max_attempts` 与指数退避限制。
+5. sing-box 重启会把 selector 重置为 default，`restart_singbox()` 记住并恢复重启前线路。
+
+**验证**（15:32–15:34 实测）：
+- 手动：`换线前 WARP-CF 出口=2a09:bac5:1ef8:372d::57f:92` → `✓ 换线成功: WARP-CF -> WARP-CF-B`
+  → `↻ WARP-CF 会话已刷新`。
+- 自动：`15:33:01 ↻ WARP 换线 (abusive 403 ×49)` → `15:33:08 ✓ 换线成功: WARP-CF-B -> WARP-CF
+  (出口 2a09:bac1:19c0:10::4e8:25)`；随后 `requestDetails` 最近 30 条 success=20/error=10。
+- 两端口出口互不相同：`1080=2a09:bac1:19c0:10::4e8:25`、`1081=2a09:bac5:1efa:1173::1bd:e7`。
+
+**遗留**：自动换线时 `abusive 403 ×49` 的计数包含了 daemon 启动前的历史错误（窗口起点为 0），
+已在启动时把窗口起点初始化为当前时刻；该修正在重启后生效，尚未在长跑中复核。
+
+**经验**：换线优于原地重连——Cloudflare 的 WARP 会话地址重连即换，但原地重连有几秒断流，
+换到备线是秒级且在途请求不断，被换下的线可在后台慢慢重连。
+
+## INC-004: 换线逻辑形同虚设 —— 被节点切换时间戳门控吞掉 + daemon 重启连带杀 sing-box
+
+**现象**：用户连续报告 opencode 返回 abuse 403。实测 15:47~15:52 期间 `requestDetails`
+累计 252 条 abuse 403（单次爆发 15:50:30~50 共 100 条），但 `daemon.log` 里**一条换线日志都没有**。
+
+**根因（两个，独立叠加）**：
+
+1. **换线被错误门控吞掉**。主循环里"主动轮换"（步骤 3，每 60s）排在"错误触发"（3c）之前，
+   主动轮换成功调用 `switch_proxy()` 会把 `_last_successful_switch_ts` 刷到当前时刻，
+   而 3c 的判定 `errors_after_switch >= 1` 正是以该时间戳为窗口起点
+   —— 每次轮换都把窗口推成 0 错误，爆发期间的 403 全部落在窗口外。
+   probe 验证：`opencode_out_on_warp()=True`、`count_warp_blocked_since(0)=50`、
+   `block_threshold=1`，条件全满足，但主循环从未进入换线分支。
+
+2. **daemon 重启连带杀死 sing-box**。`restart_singbox()` 用 `Popen(start_new_session=True)`
+   拉起 sing-box，但进程仍留在 `auto-switch-ip.service` 的 cgroup 内；该 unit 是默认的
+   `KillMode=control-group`，于是每次 `systemctl restart auto-switch-ip.service` 都会连带
+   杀掉 sing-box → daemon 启动时置 bypass 直连 → opencode 看到本地真实 IP → 直接 403。
+   实测 252 条 abuse 403 中 **125 条（50%）**落在 sing-box 重启后 30s 窗口内
+   （15:31/15:36/15:50 三次重启各触发 50~100 条）。前几轮"重启 daemon 加载新代码"的操作
+   本身就是 403 爆发的直接推手。
+
+**修复**（2026-10-19）：
+1. 3c 拆分：`opencode_out_on_warp()` 为真时直接走 `maybe_reconnect_warp()`，不再读
+   `_last_successful_switch_ts`；该门控只保留给轮换池路径（那条路径下它仍有意义）。
+2. `auto-switch-ip.service` 增加 `KillMode=process`，daemon 重启不再连带杀 sing-box。
+3. `warp.block_threshold` 3 → 1；`cooldown_ok_sec` 300 → 20 并新增 `cooldown_max_sec=600`
+   指数退避（换线后仍被拦说明新出口也被标，冷却 20→40→80…→600，干净窗口归零）。
+4. 换线后同步刷新被换下的线（原为另起线程，worker 会先释放 `_WARP_LOCK`，
+   下次换线可能在刷新途中切回这条刚重启的线）。
+5. `_warp_reconnect_worker` 不再用 `cooldown_ok_sec` 覆写调度处算好的退避值。
+
+**验证**：
+- 回归单测 `test_warp_failover_not_gated_by_node_switch`（T-129）、
+  `test_daemon_restart_keeps_singbox`→T-130 用 PID 比对实测：
+  `重启前 sing-box PID=2395312 → 重启后 PID=2395312`（PASS）。
+- `test_warp_escalates_cooldown_when_new_line_also_blocked`：20→40→80，上限 600（PASS）。
+
+**遗留**：根治方案是让 systemd 直接托管 sing-box（独立 unit），使 daemon 重启与
+sing-box 生命周期完全解耦；当前 `KillMode=process` 只是把影响面收窄到"sing-box 不再被连带杀死"，
+daemon 自身的重启仍会短暂中断看护。另：剩余 50% 的 403 与重启无关，属于出口 IP 本身被标，
+由换线机制处理。
+
+**经验**：复用同一个"上次成功切换"时间戳给两条语义不同的路径做窗口起点，是会静默失效的耦合。
+轮换池的窗口起点（节点切换）与隧道换线的窗口起点（隧道换线）必须是两个独立变量。
+
+---
+
+## INC-005 — 把 429 限流误判为"换 IP 无效"（2026-10-19）
+
+**症状**：用户报告 opencode 持续 429 `FreeUsageLimitError: Rate limit exceeded`，
+daemon 日志每 2 秒一条 `[OpenCode Free] N/10 请求错误`，`403占比=0%`。
+
+**误判**：我依据 CLAUDE.md「provider 多样性约束」下"无法通过代理 IP 轮换绕过配额"一句，
+回答"429 是账号级限额，换 IP 无效"。用户指出这是错的。
+
+**实测证据（推翻旧结论）**：
+手动 `PUT /proxies/opencode-out {"name":"WARP-CF-B"}` 切换 WARP 成员后，逐分钟统计：
+
+| 窗口 | 请求 | 成功 | 成功率 |
+|------|------|------|--------|
+| 切换前 90s | 451 | 16 | 3.5% |
+| 切换后 90s | 259 | 24 | 9.3% |
+
+429 按出口 IP 计配额，换出口即拿到新配额。
+
+**根因**：`count_warp_blocked_since()` 只匹配 `"abusive traffic"` 一个字符串，
+429 完全不进入换线触发条件 —— 换线逻辑对占比 100% 的错误类型视而不见。
+
+**修复**：
+1. 计数字符串改为分类型返回 `{"abuse403": n, "rate429": m}`；
+2. `maybe_reconnect_warp()` 两类各自比阈值（403=1，429=5），同时达阈值只换一次线；
+3. 更正 CLAUDE.md「provider 多样性约束」中被证伪的那句结论。
+
+**经验**：错误文案是判断"换出口有无意义"的唯一依据，不能靠"账号级/ IP 级"的先验猜测。
+两类文案（abusive traffic / Rate limit exceeded）都必须实测过才有资格下结论。
+
+## INC-006 — WARP 隧道失效致 9router 直连，出口 IP 被 opencode 判为滥用（2026-10-19）
+
+**日期**: 2026-10-19
+**等级**: P0（19:09~19:17 约 9 分钟 94~100% 请求失败）
+**用户观感**: "全崩了" —— 所有 CCS 角色一起报错
+
+### 因果方向（先立此节）
+
+**代理链路先坏，直连是被动结果**，不是故障传播的一环。用户纠正原话：
+"是因为本身出问题了我才直连的"。
+
+秒级证据（DB `provider='opencode'`，`timestamp` 为 UTC 字符串，+8 得 CST）：
+
+```
+19:08:41  ✓ WARP 换线成功: WARP-CF-B -> WARP-CF-C (出口 2a09:bac5:1efb:281e::3ff:42)
+19:09:05  最后一条 429（配额类，正常流量）
+19:09:10  最后一条 OK
+19:09:12  ↻ WARP 换线 (rate429 ×6)：当前 WARP-CF-C 出口=未知   ← selector 所在线已探不到出口
+19:09:13  ↻ 备线 WARP-CF 不通，先拉起
+19:09:14  ✗ 备线 WARP-CF 探测失败，跳过
+19:09:14  ★ 第一条 403-abuse（此后每分钟 10~116 条）
+19:09:14  ✗ 备线 WARP-CF-B 探测失败，跳过
+19:09:16  ✗ Clash API 连接失败: http://127.0.0.1:9090/proxies/proxy
+19:09:16  ✗ 重启 usque-warp-b.service 失败: Transport endpoint is not connected
+19:09:16  daemon 收到 SIGTERM
+```
+
+403 首现于 19:09:14，session 停服在 19:09:16 —— **403 早 2 秒**。
+若因果是"停服 → 直连 → 403"，403 不可能早于停服出现。
+
+实际链条：**WARP-CF-C（selector 所在线）在 19:09:12 前失效 → sing-box 出口断
+→ proxy-global.js CONNECT 重试失败 → BYPASS 直连 → opencode 看到本机公网 IP
+→ 403 `abusive traffic from this IP`**。2 秒间隔与 CONNECT 重试节奏吻合。
+
+### 现象
+
+逐分钟错误类型（`data` 字段归类，provider=opencode）：
+
+| CST 分钟 | 403-abuse | 429-usage | OK | 状态 |
+|---------|-----------|-----------|-----|------|
+| 19:07 | 0 | 7 | 41 | 正常 |
+| 19:08 | 0 | 7 | 25 | 正常（1 条 upstream-lost） |
+| **19:09** | **116** | 4 | 7 | **直连开始，403 突发** |
+| 19:10~19:15 | 157 | 0 | 2 | 全程直连，无恢复 |
+| 19:16 | 41 | **328** | 0 | 新会话拉起，本机 IP 配额耗尽 |
+| 19:17 | 1 | 125 | 34 | 代理恢复中 |
+| 19:18~19:24 | 0 | 39 | 190 | 恢复 |
+
+### 根因
+
+**主因：WARP-CF-C 失效，且同期无备线可切**
+
+19:09:12 daemon 连自己的当前线出口都探不到（`出口=未知`），19:09:13~14 两条备线
+同样探测失败。三条隧道同时失效，换线无路可走。
+
+失效形态不同（`singbox.log`）：
+
+- **1080（WARP-CF）：`dial tcp 127.0.0.1:1080: i/o timeout` 共 79 次**。
+  i/o timeout 而非 connection refused —— 端口存在、TCP 握手被接受，但应用层
+  不响应，是**进程僵死态**，不是进程退出。
+- **1081（WARP-CF-B）：`EOF`（连接建立后被对端关闭）**。
+- 1082：3 次 `connection refused`（进程确已不在）。
+
+**为何三条同时失效 —— 仍未查明。** 可能方向有三，均无直接证据：
+usque 的 MASQUE 服务端（Cloudflare）侧波动、WSL 网络栈异常、或内存压力下的
+调度饥饿。18:55~19:22 内核日志完全空白（WSL 内核日志已轮转丢失），
+关键窗口无内核侧证据。会后补查：`dmesg -T` 全量仅 17:58:23 一次
+`ccs@consumer.service` cgroup OOM（pid 21165 claude，total-vm 5908384kB），
+与 19:09 无时间关联；`/var/log/syslog` 19:0x 段无网络事件。
+
+**18:59:06~19:08:01 的 9 分钟换线静默 —— 已定位，不是故障。**
+该窗口内 WARP 未触发换线的原因是 403/429 计数未达阈值：18:59:06 换到
+WARP-CF 后 `403占比=0%`，19:00~19:07 每分钟错误 0~2 条且全是 429，
+低于 `rate429_threshold=5`。19:08:00 累积到 4/10、19:08:01 达 5 条，
+随即触发 `↻ WARP 换线 (rate429 ×5)`。守卫行为正确。
+
+**根因 1（决定性）：被换下的线从不刷新，导致切回陈旧地址**
+
+这一条在事后量化时才定位到，它是本次事故最直接的可修复原因。
+
+`daemon.py _schedule_idle_refresh()` 的 `_run()` 在等 idle 超时后**直接 return**，
+不重试、不排队：
+
+```python
+if not _wait_warp_idle(member):
+    log(f"  ⚠ {member['tag']} {_warp()['idle_wait_sec']}s 内仍有连接，推迟刷新")
+    return                      # ← 放弃，此线永远停在旧地址
+```
+
+量化后果（daemon.log 全量统计）：
+
+| 线 | 换线次数 | 刷新成功次数 | 唯一出口 IP |
+|---|---|---|---|
+| WARP-CF | 38 | 30 | 32 |
+| WARP-CF-B | 37 | 29 | 31 |
+| **WARP-CF-C** | **13** | **2** | **6** |
+
+C 线被换下 8 次，7 次直接放弃。「推迟刷新」在 daemon.log 全量 42 次，
+其中 C 线 8 次。C 线 13 次换线里 **7 次切回同一个地址**
+`2a09:bac5:1efb:281e::3ff:42`：
+
+```
+18:07:25  2a09:bac5:1efb:281e::3ff:42   ✗ 用了陈旧地址
+18:13:57  2a09:bac5:1efb:281e::3ff:42   ✗ 用了陈旧地址
+18:45:31  2a09:bac5:1efb:281e::3ff:42   ✗ 用了陈旧地址
+18:51:41  2a09:bac5:1efb:281e::3ff:42   ✗ 用了陈旧地址
+18:58:05  2a09:bac5:1efb:281e::3ff:42   ✗ 用了陈旧地址
+19:08:41  2a09:bac5:1efb:281e::3ff:42   ✗ 用了陈旧地址   ← 53s 后爆发 403
+```
+
+**19:08:41 切回后 53 秒（19:09:14）出现本轮第一条 403-abuse。**
+
+**根因 2：判「闲」的判据本身不成立**
+
+上一条的补刷之所以必要，是因为 `_wait_warp_idle()` 原本比较**连接数是否为 0**。
+90 秒连续采样证明这个前提在活跃线上永不成立：
+
+```
+20:29:27  WARP-CF=8 WARP-CF-C=1   总=9
+20:29:37  WARP-CF=7 WARP-CF-C=1   总=8
+20:29:47  WARP-CF=7 WARP-CF-C=1   总=8
+...
+20:30:57  WARP-CF=7 WARP-CF-C=1   总=8
+```
+
+活跃线上恒有 7~10 条连接。单条连接实测存活 936s / 748s（上传 16.8MB），
+属 SSE 长连接 + 9router 连接复用。**按连接数等下去必然超时**，所以根因 1 的
+放弃分支是必然触发的，不是偶发。
+
+**根因 3：复用守卫窗口（300s）短于实测复用间隔**
+
+同一出口 IP 的相邻使用间隔实测：6.2 / 6.4 / **10.6** / 11.6 / 17.1 / 50.1 分钟，
+全部 > 300s。守卫判「已出窗口」放行，19:08:41 那次因此只用 7 秒就完成切换
+（19:08:34 → 19:08:41），日志中**没有** `在 300s 内用过，先刷新会话 IP`。
+
+原文档此处写「它重复触发的是 rate429（不是 403）」——**这个说法与逐条日志不符**。
+19:08:41 切回 `…::3ff:42` 后 53 秒出现的正是 **403-abuse**（19:09:14 首现），
+不是 rate429。该地址被复用时触发的就是信誉拦截。
+
+**加剧因素 2：user@1000.service 在故障中途整体退出**
+
+`journalctl -u user@1000.service` 原始序列：
+
+```
+19:09:16  Stopping auto-switch-ip.service ...  (全部 30+ 用户服务一起停)
+19:11:18  Finished systemd-exit.service - Exit the Session
+19:11:18  user@1000.service: Deactivated successfully
+          (Consumed 8h 14min CPU, 8.0G memory peak, 2.1G swap peak)
+19:15:00  systemd[1]: Starting user@1000.service  ← 新 manager
+```
+
+判据：`Exit the Session` 是 `systemd-exit.service` 的
+`SuccessAction=exit-force` 触发，属**会话正常终结**，不是 OOM。用户
+`Linger=yes`，但 linger 只保证"无登录会话时 manager 不被销毁"，
+**挡不住 exit-force**。
+
+后果：19:09:16~19:15:00 期间用户级 D-Bus 不存在，daemon 连重启隧道的能力
+都丧失 —— 19:13:03 起日志为：
+
+```
+✗ 重启 usque-warp-b.service 失败: Failed to connect to bus: Connection refused
+```
+
+即：**首家失效（隧道）→ 直连 → 403 已经发生；6 分钟后 manager 退出又切断了
+唯一的自救路径（重启隧道）**。两层故障叠加，形成 19:09~19:15 的连续 100% 失败。
+manager 退出**不是** 403 的起因，是**放大器**。
+
+**同期存在但非本因**：WSL swap 100% 满（4096/4096 MB）；
+`ccs@consumer.service` 在 19:24 被 cgroup OOM 杀（`MemoryMax=2G`，
+`constraint=CONSTRAINT_MEMCG`）；内核 OOM 日志首现于 17:58:23。
+
+**双 daemon 实例并存**：19:11:42 有人从终端手动起 daemon（PID 2908280），
+19:15:00 systemd 起权威实例（PID 3149171）。并存至 19:19，违反架构红线
+"Daemon 必须 PID 锁单实例"。已收敛。
+
+### 修复
+
+1. 杀掉重复 daemon（PID 2908280），收敛为 systemd 单实例。
+2. `daemon.py reconnect_warp()` 同步换线路径补 idle 守卫 —— `_wait_warp_idle()`
+   返回值原本被丢弃，40s 超时后照样强刷目标隧道，掐断在途连接致 9router 报
+   `upstream connection lost`。现改为：有在途连接先等 → 等不到改刷闲置备线 →
+   都没有则切轮换池 `proxy` 兜底（见下条）。
+3. **判闲判据改为字节增量**：`warp_active_conns()`（连接数）→ `warp_line_busy()`，
+   比较两次 Clash `/connections` 快照的 upload+download 增量：增长=忙、
+   不变/回落=闲、查询失败=None（保守当忙）。活跃线连接数从不归零，旧判据必然超时。
+4. **延迟刷新改为补刷重试**：`_schedule_idle_refresh()` 的 `run()` 单次超时不再
+   `return`，改为 `_retry_refresh_idle_warp()`，重试到 `ip_refresh_retry_sec`
+   （600s）用完。这是根因 1 的正解。
+5. **复用窗口 300 → 900s**：覆盖实测最长复用间隔 10.6 分钟。
+6. **三条隧道全不可用时切轮换池 `proxy`**（`_fallback_to_proxy()`）：新增路径。
+   切 selector 只是一次 PUT，秒级且不掐断在途连接；原地重连要
+   `systemctl restart usque-*`，D-Bus 不可用时必败（本次事故正是如此）。
+   停在 proxy 后，下次换线时 `active_warp_tag()` 返回 None，`reconnect_warp`
+   把全部 WARP 成员作为候选自动切回。
+7. 澄清 `upstream connection lost` 不是 error 状态：它是 9router SSE **末帧注入值**
+   （`~/.9router/.next/server/chunks/8895.js` 中 `m` 的初始值），对应 DB 记录
+   `status=success`，按 status 过滤永远查不到。
+
+### INC-006 后续发现（codex review 2026-10-19 21:47）
+
+**DNS 规则域名形式错误：专用 DNS 与本地 resolve 双双落空**
+
+`parse_subscription.py` 生成配置时，`dns.rules` 与 `route` 的 `resolve` 动作都写
+`domain_suffix: [".opencode.ai"]`，而 `route` 的出站规则写 `["opencode.ai"]`。
+
+`.opencode.ai` 是 domain_suffix 的「以 `.opencode.ai` 结尾」形式，**匹配不到裸域**
+`opencode.ai`。CLAUDE.md 与 INCIDENTS.md 都明确记载了这条约束（"写 `.opencode.ai`
+匹配不到裸域"），但生成器自己违反了它。
+
+实测流量形态：`singbox.log` 中 `opencode.ai:443` 出现 **12086 次**，
+`api.opencode.ai:443` 仅 2 次。即 **99.98% 是裸域**，写错形式意味着这两条规则
+实际只覆盖了极少数流量，裸域回落到 `dns-default`（`local` 类型 → 系统解析器
+`/etc/resolv.conf` 的 8.8.8.8）。
+
+设计意图（见 `parse_subscription.py` 注释）是「WSL2 下 8.8.8.8 不可达，走阿里 DoH
+本地解析后把 IP 交给节点」。域名写错使这个意图**完全失效**，opencode 流量实际依赖
+系统解析器 —— 一旦 8.8.8.8 真的不可达（WSL2 的已知情形），解析会失败。
+
+**修复**：`parse_subscription.py` 两处域名改为 `["opencode.ai", ".opencode.ai"]`
+（同时覆盖裸域与子域），与出站规则保持同一写法。验证：
+
+```
+dns.rules : [{"domain_suffix": ["opencode.ai", ".opencode.ai"], "server": "dns-opencode"}]
+route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
+             {"action": "resolve", "domain_suffix": ["opencode.ai", ".opencode.ai"]}]
+```
+
+**生效时机**：无需手动干预。daemon 的订阅刷新（每 3600s）会调
+`parse_subscription.py` 重新生成配置，`sing-box check` 通过后 `os.replace` 覆盖并
+`restart_singbox()`。
+
+**未验证**：当前 8.8.8.8 实测可达（`/dev/tcp/8.8.8.8/53` 成功），所以这个 bug
+**没有造成实际故障** —— 它是个**潜伏缺陷**：一旦 WSL2 网络栈回到「8.8.8.8 不可达」
+状态，opencode 解析会直接失败。同理未验证的是：修复后阿里 DoH 路径是否真能替代
+系统解析器。
+
+### 未修复（需人工决策）
+
+- **三条隧道为何同时失效未查明**，这是本次的真正起点。内核日志缺失使得
+  WSL 侧因素无法排除。可考虑加 usque 存活探针（进程在但端口不响应 = 僵死）
+  以区分"进程死"与"进程僵死"，后者当前只有抓包或 i/o timeout 才看得出。
+- **swap 100% 未缓解**。28 个 claude 进程合计 6.0 GB RSS，另有 GPTSoVits
+  （1.5 GB）、node（1.5 GB）。
+- `earlyoom` 的 `--avoid hermes|mimo|claude|python3|node|...` 把最大内存消费者
+  全部排除，压力只能由内核 OOM 处理，OOM 命中 `ccs@consumer`（`MemoryMax=2G`），
+  systemd `Restart=on-failure` 再拉起，形成消耗循环。属编排决策，本文件不擅改。
+- **`Linger=yes` 挡不住 session exit** —— 若需用户级服务在会话终结后存活，
+  需另寻机制（本项目未采用，仅记录）。
+- 停服窗口内的人工启动应与 systemd 协调（`systemctl --user restart`），
+  不要裸跑 `python3 daemon.py`。
+
+### 经验
+
+- **先定因果方向，再查环节**。本次我最初把"直连"写成故障链的一环，方向错了：
+  直连是代理失效的**结果**。判据很简单 —— 比时间戳：结果不可能早于原因。
+- 用户级服务"同时全崩"查 `journalctl -u user@1000.service` 的
+  `Exit the Session` / `ActiveExitTimestamp`：本次 manager 确实重启了，
+  但它晚于首家故障 2 秒，只是放大器不是起因。**伴随现象不等于因果。**
+- 区分 `Exit the Session`（会话结束）与 OOM（内存不足）：处置完全不同。
+- `i/o timeout` 与 `connection refused` 意义不同：前者是僵死（端口活着，
+  应用不响应），后者是进程不在。本次 1080 是前者，1082 是后者。
+- DB 里查错误要同时看 `status` 和 `data`：部分语义错误（SSE 末帧注入）落在
+  `status=success` 的行上。
+- `timeout` 缺失时 `awk`/`journalctl` 可静默返回空，看似"无事件"实为查询本身
+  失败。关键窗口的"日志空白"要先确认日志系统本身是否健康（本次 user journal
+  最早条目仅到 19:29:55，之前的已丢失）。
