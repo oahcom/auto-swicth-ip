@@ -126,6 +126,13 @@ CFG = {
         # 80.8%、最热两个前缀仅 32%/24%。60 ≈ 中位成功数的 4 倍，也让两次
         # 错误触发换线之间的正常流量能跑完。
         "proactive_after_requests": 60,
+        # 主动轮换判据三选一：
+        #   lifetime — 按实测 IP 可用寿命（首条成功→末条成功，中位 14s）减
+        #              换线耗时裁定切点，跟随线上实际情况漂移；
+        #   requests — 当前出口服务满 proactive_after_requests 条就换；
+        #   fixed    — 无论流量快慢，每 proactive_fixed_sec 秒换一次。
+        "proactive_mode": "lifetime",
+        "proactive_fixed_sec": 60,
         # 备线「可服务性」探针：暂未实现。曾尝试经目标隧道的 SOCKS 直接向
         # opencode 发最小请求，但免费层的客户端指纹校验无法通过 —— 试过
         # /zen/v1 与 /inference/v1 两个端点、v1/v2 两种 UA、cli/desktop 两种

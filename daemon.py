@@ -308,17 +308,29 @@ def _record_warp_cycle(ip: str | None, cycle: float, now: float, ok: int = 0) ->
     """
     if not ip or cycle < 0:
         return
+    # 真实可用寿命 = 首条成功 → 末条成功，而不是「换上去 → 首次报错」：
+    # 后者把换上去到流量抵达的空窗算进寿命，又在第一次间歇性 403/429 处截断，
+    # 实测中位只有 2s，而真实可用跨度中位 14s。主动轮换的切点必须按后者定，
+    # 否则每个 IP 只用掉不到三成就被扔掉。
+    with _WARP_IP_LOCK:
+        entry = _WARP_IP_USED.get(ip)
+    span = None
+    if isinstance(entry, dict) and entry.get("first_ok_ts") and entry.get("last_ok_ts"):
+        span = max(float(entry["last_ok_ts"]) - float(entry["first_ok_ts"]), 0.0)
     with _WARP_CYCLES_LOCK:
         _WARP_IP_CYCLES.append({"ip": ip, "cycle": float(cycle),
+                                "span": span,
                                 "ended_at": now, "ok": int(ok)})
         _WARP_IP_CYCLES[:] = _prune_warp_cycles(_WARP_IP_CYCLES, now)
         snapshot = list(_WARP_IP_CYCLES)
     _write_json_atomic(_warp_ip_cycles_path(), {"cycles": snapshot})
 
 
-# 主动轮换的最小生效周期下限。实测切换动作本身耗时 p50=4s / p90=14s；
-# 比 5s 更快地再切一次只会打断尚未生效的切换，隧道永远切不出一条能用的线。
-_WARP_MIN_CYCLE_FLOOR_SEC = 5.0
+# 主动轮换的寿命下限（秒）。实测一个出口 IP 的可用跨度（首条成功→末条成功）
+# 中位 14s / p25 9s，扣掉 switch_lead_sec(3s) 后切点应落在 10~11s。
+# 下限不能压到 5s：那等于每个 IP 只用掉三成就扔，换来的是更快的地址消耗。
+# 旧样本只有 cycle（换上去→首次报错，中位 2s）时靠这个下限兜住。
+_WARP_MIN_CYCLE_FLOOR_SEC = 13.0
 
 
 def _recompute_min_warp_cycle(now: float) -> float:
@@ -335,22 +347,27 @@ def _recompute_min_warp_cycle(now: float) -> float:
                   if float(c["cycle"]) > 0 and int(c.get("ok", 0) or 0) > 0]
     total = len(recent)
     dropped = total - len(usable)
-    if not usable:
+    # 优先用 span（首条成功→末条成功）。旧样本没有 span，回退到 cycle 只是为了
+    # 不让样本断档 —— 它系统性偏短（中位 2s vs 真实 14s），只作过渡。
+    spans = [float(c["span"]) for c in usable if c.get("span") is not None]
+    if spans:
+        vals, src = sorted(spans), "span"
+    elif usable:
+        vals, src = sorted(float(c["cycle"]) for c in usable), "cycle"
+    else:
         _WARP_MIN_CYCLE_SEC = 0.0
         log(f"↻ 最小可用周期重算: 无可用样本（24h {total} 条，首错即废 {dropped} 条已排除），"
             f"主动轮换回退到按请求数")
         return 0.0
     # 用中位而非最小值：最小值由「最倒霉的那一条线」决定 —— 24h 窗口里只要
     # 出现一条成功服务 1 条后就死的段，最小值就塌到 0.1s 级，主动轮换变成
-    # 每几秒换一次（实测 98 条可用样本：min 0.1s、p10 2.4s、中位 20.2s、
-    # p75 21.5s）。中位才代表「一条线典型能服务多久」。
-    vals = sorted(float(c["cycle"]) for c in usable)
+    # 每几秒换一次。中位才代表「一条线典型能服务多久」。
     median = vals[len(vals) // 2]
     effective = max(median, _WARP_MIN_CYCLE_FLOOR_SEC)
     _WARP_MIN_CYCLE_SEC = effective
-    log(f"↻ 典型可用周期重算: 中位 {median:.1f}s（min {vals[0]:.1f}s / "
+    log(f"↻ 典型可用寿命重算({src}): 中位 {median:.1f}s（min {vals[0]:.1f}s / "
         f"p25 {vals[len(vals)//4]:.1f}s / p75 {vals[3*len(vals)//4]:.1f}s，"
-        f"可用样本 {len(usable)} 条，首错即废 {dropped} 条已排除）→ 生效 {effective:.0f}s")
+        f"可用样本 {len(vals)} 条，首错即废 {dropped} 条已排除）→ 生效 {effective:.0f}s")
     return effective
 
 
@@ -1267,7 +1284,13 @@ def _record_active_ip_success(total: int, errors: int) -> None:
             # 重启后隧道换出的新地址此前没有记录（只有被选为出口时才写），
             # 不补一条的话成功流量永远打不上点，选线日志恒为「有成功记录 0 条」。
             _warp_ip_used_locked(ip, now, False)
-        _WARP_IP_USED[ip]["last_ok_ts"] = now
+        entry = _WARP_IP_USED[ip]
+        # first_ok_ts 是本段「可用寿命」的起点。比 ts 还旧说明是上一个 stint
+        # 留下的（同址在出窗口后被再次选中），必须重置，否则跨度跨段串算。
+        first = entry.get("first_ok_ts")
+        if not first or float(first) < float(entry.get("ts") or 0):
+            entry["first_ok_ts"] = now
+        entry["last_ok_ts"] = now
         _save_warp_ip_used()
 
 
@@ -2052,6 +2075,26 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) 
     return True
 
 
+def _proactive_mode() -> str:
+    """主动轮换判据：lifetime（寿命）/ requests（请求数）/ fixed（固定秒数）。"""
+    mode = str(_warp().get("proactive_mode", "lifetime")).lower()
+    if mode not in ("lifetime", "requests", "fixed"):
+        return "lifetime"
+    return mode
+
+
+def _proactive_lead() -> float:
+    """主动轮换的触发点：典型寿命减去换线耗时。
+
+    换线从发起到新线承载流量还要 switch_lead_sec（缓存命中时 ~0s，退化为
+    探测时 2~7s）。等「已服务满寿命」再起手，新线在旧线到寿之后才生效。
+    下限 1s 只是防同一 tick 内反复起手；寿命本身已由 `_WARP_MIN_CYCLE_FLOOR_SEC`
+    兜底，这里不能再套一次那个下限，否则提前量会被吃掉。
+    """
+    target = max(_WARP_MIN_CYCLE_SEC, _WARP_MIN_CYCLE_FLOOR_SEC)
+    return max(target - _warp().get("switch_lead_sec", 3.0), 1.0)
+
+
 def _maybe_proactively_rotate_warp(now: float) -> None:
     """当前出口还在成功服务时就换线，不必等 403 冲断在途对话。
 
@@ -2067,11 +2110,13 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
     """
     global _last_proactive_warp_check, _last_cycle_recalc_ts
     # 计数要查 SQLite，5s 一次足够：配额以秒级速度消耗，多查无益。
+    # fixed 模式的判据是纯时长，不查库，但同样只需秒级精度。
     if now - _last_proactive_warp_check < 5:
         return
     _last_proactive_warp_check = now
-    # 周期样本重算（按时间判断，不查库）
-    if now - _last_cycle_recalc_ts >= _warp()["min_cycle_recalc_sec"]:
+    mode = _proactive_mode()
+    # 周期样本重算（按时间判断，不查库）。fixed 模式不看样本，跳过省一次计算。
+    if mode != "fixed" and now - _last_cycle_recalc_ts >= _warp()["min_cycle_recalc_sec"]:
         _last_cycle_recalc_ts = now
         _recompute_min_warp_cycle(now)
     # 用「换线生效时刻」而非「发起时刻」：发起早于生效数秒，期间旧出口仍在
@@ -2094,28 +2139,46 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
         start = float(entry.get("ts") or 0) if isinstance(entry, dict) else 0.0
         if start <= 0:
             return
-    if _WARP_MIN_CYCLE_SEC > 0:
-        elapsed = now - start
-        # 换线生效后还要再花 switch_lead_sec 才真正把流量挪走（探测+切 selector）。
-        # 拿「已服务时长 ≥ 典型寿命」当判据等于让旧线多跑一个换线耗时 —— 实测
-        # 换线 p50=2s / p90=7s，而首错延迟 p50=3s，赶不上。提前这个量发起，
-        # 让新线在旧线到寿时已经就位。
-        if elapsed >= max(_WARP_MIN_CYCLE_SEC - _warp().get("switch_lead_sec", 3.0),
-                          _WARP_MIN_CYCLE_FLOOR_SEC):
-            # 只绕 cooldown_ok：上次换线失败时 `_warp_cooldown_until` 是
-            # cooldown_fail_sec，那是防隧道雷暴的，不能绕。
-            lead = max(_WARP_MIN_CYCLE_SEC - _warp().get("switch_lead_sec", 3.0),
-                       _WARP_MIN_CYCLE_FLOOR_SEC)
+    elapsed = now - start
+
+    if mode == "fixed":
+        target = float(_warp()["proactive_fixed_sec"])
+        # 固定时长不看样本：运维要求「无论流量快慢每 N 秒换一次」时用。
+        if elapsed >= max(target - _warp().get("switch_lead_sec", 3.0), 1.0):
             _reconnect_warp_now(
-                f"主动轮换 周期 {elapsed:.0f}s ≥ {lead:.0f}s"
-                f"（寿命 {_WARP_MIN_CYCLE_SEC:.0f}s − 换线耗时）",
+                f"主动轮换 固定 {elapsed:.0f}s ≥ {target:.0f}s − 换线耗时",
                 now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
         return
-    if now < _warp_cooldown_until:
+
+    if mode == "requests":
+        if now < _warp_cooldown_until:
+            return
+        n = count_opencode_since(start)
+        if n >= _warp()["proactive_after_requests"]:
+            _reconnect_warp_now(f"主动轮换 已服务 {n} 条", now)
         return
-    n = count_opencode_since(start)
-    if n >= _warp()["proactive_after_requests"]:
-        _reconnect_warp_now(f"主动轮换 已服务 {n} 条", now)
+
+    # mode == "lifetime"：按实测寿命裁定切点
+    if _WARP_MIN_CYCLE_SEC <= 0:
+        # 尚无寿命样本：退回请求数判据，否则冷启动期永不主动轮换。
+        if now < _warp_cooldown_until:
+            return
+        n = count_opencode_since(start)
+        if n >= _warp()["proactive_after_requests"]:
+            _reconnect_warp_now(f"主动轮换 已服务 {n} 条（暂无寿命样本）", now)
+        return
+    # 换线生效后还要再花 switch_lead_sec 才真正把流量挪走（探测+切 selector）。
+    # 拿「已服务时长 ≥ 典型寿命」当判据等于让旧线多跑一个换线耗时 —— 实测
+    # 换线 p50=2s / p90=7s，而首错延迟 p50=3s，赶不上。提前这个量发起，
+    # 让新线在旧线到寿时已经就位。
+    if elapsed >= _proactive_lead():
+        # 只绕 cooldown_ok：上次换线失败时 `_warp_cooldown_until` 是
+        # cooldown_fail_sec，那是防隧道雷暴的，不能绕。
+        lead = _proactive_lead()
+        _reconnect_warp_now(
+            f"主动轮换 周期 {elapsed:.0f}s ≥ {lead:.0f}s"
+            f"（寿命 {_WARP_MIN_CYCLE_SEC:.0f}s − 换线耗时）",
+            now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
 
 
 def _prewarm_standby_warp(now: float) -> None:

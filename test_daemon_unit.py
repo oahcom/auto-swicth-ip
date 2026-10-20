@@ -1162,7 +1162,8 @@ def test_proactive_rotate_switches_after_n_requests_without_errors(monkeypatch):
                         lambda reason, now: fired.append(reason) or True)
 
     daemon._maybe_proactively_rotate_warp(2000.0)
-    assert fired == ["主动轮换 已服务 20 条"], f"应主动换线，实际 {fired}"
+    assert len(fired) == 1 and fired[0].startswith("主动轮换 已服务 20 条"), \
+        f"应主动换线，实际 {fired}"
     # 换线路径本来就会打 `↻ WARP 换线 (主动轮换 已服务 20 条)`，这里不得重复
     assert daemon._last_warp_reconnect_ts == 1000.0, "本函数不该自己改换线窗口起点"
 
@@ -1889,7 +1890,7 @@ def test_cached_standby_rejects_stale_blocked_and_closed_port(monkeypatch):
 
 def test_proactive_rotation_leads_by_switch_cost(monkeypatch):
     """主动轮换必须提前 switch_lead_sec 发起，否则新线在旧线到寿之后才生效。"""
-    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 10.0)
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 20.0)
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 100.0)
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
@@ -1899,11 +1900,11 @@ def test_proactive_rotation_leads_by_switch_cost(monkeypatch):
     monkeypatch.setattr(daemon, "_reconnect_warp_now",
                         lambda reason, now, ignore_cooldown=False: calls.append(reason) or True)
 
-    # 寿命 10s − 换线提前量 3s = 7s；已服务 6s 还不该动，7s 必须动
-    daemon._maybe_proactively_rotate_warp(106.0)
+    # 寿命 20s − 换线提前量 3s = 17s；已服务 16s 还不该动，17s 必须动
+    daemon._maybe_proactively_rotate_warp(116.0)
     assert calls == [], "未到提前量就换线等于把地址寿命提前烧掉"
     daemon._last_proactive_warp_check = 0.0
-    daemon._maybe_proactively_rotate_warp(107.0)
+    daemon._maybe_proactively_rotate_warp(117.0)
     assert len(calls) == 1 and "换线耗时" in calls[0]
 
 
@@ -1930,13 +1931,31 @@ def test_recompute_cycle_excludes_zero_ok_zero():
     样本 min 0.1s / 中位 20.2s），按最小值换线等于每几秒切一次。
     """
     daemon._WARP_IP_CYCLES = [
-        {"ip": "a", "cycle": 5.0, "ended_at": time.time() - 100, "ok": 1},
+        {"ip": "a", "cycle": 15.0, "ended_at": time.time() - 100, "ok": 1},
         {"ip": "b", "cycle": 0.0, "ended_at": time.time() - 200, "ok": 0},  # 首错即废
-        {"ip": "c", "cycle": 10.0, "ended_at": time.time() - 300, "ok": 1},
+        {"ip": "c", "cycle": 17.0, "ended_at": time.time() - 250, "ok": 1},
+        {"ip": "d", "cycle": 20.0, "ended_at": time.time() - 300, "ok": 1},
     ]
     res = daemon._recompute_min_warp_cycle(time.time())
-    assert res == 10.0, f"应取可用样本中位数 10，实际 {res}"
-    assert daemon._WARP_MIN_CYCLE_SEC == 10.0
+    assert res == 17.0, f"应取可用样本中位数 17，实际 {res}"
+    assert daemon._WARP_MIN_CYCLE_SEC == 17.0
+
+
+def test_recompute_prefers_span_over_cycle():
+    """有 span（首条成功→末条成功）时优先用它，cycle 只作过渡回退。
+
+    WHY：cycle 是「换上去→首次报错」，既含流量抵达前的空窗，又在第一次间歇性
+    403/429 处截断；实测中位 2s，而真实可用跨度中位 14s。按 cycle 定切点会让
+    每个 IP 只用掉不到三成就被扔掉。
+    """
+    daemon._WARP_IP_CYCLES = [
+        {"ip": "a", "cycle": 2.0, "span": 12.0, "ended_at": time.time() - 100, "ok": 1},
+        {"ip": "b", "cycle": 3.0, "span": 14.0, "ended_at": time.time() - 150, "ok": 1},
+        {"ip": "c", "cycle": 3.0, "span": 16.0, "ended_at": time.time() - 200, "ok": 1},
+        {"ip": "d", "cycle": 1.0, "span": None, "ended_at": time.time() - 300, "ok": 1},
+    ]
+    res = daemon._recompute_min_warp_cycle(time.time())
+    assert res == 14.0, f"应取 span 中位 14，实际 {res}"
 
 
 def test_recompute_min_cycle_empty_when_no_usable():
@@ -2015,8 +2034,11 @@ def test_proactive_rotate_uses_min_cycle_sample(monkeypatch):
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 9999.0)   # 冷却中也要能触发
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 1000.0)
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
+    # 寿命下限 13s 高于这里给的样本值 10s，所以样本必须是 span 且高于下限，
+    # 否则生效值被下限顶到 13 而不是样本值。
     monkeypatch.setattr(daemon, "_WARP_IP_CYCLES",
-                        [{"ip": "seed", "cycle": 7.0, "ended_at": 1000.0, "ok": 1}])
+                        [{"ip": "seed", "cycle": 20.0, "span": 20.0,
+                          "ended_at": 1000.0, "ok": 1}])
     monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 0.0)
     monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 0.0)
     seen_sql = []
@@ -2027,16 +2049,78 @@ def test_proactive_rotate_uses_min_cycle_sample(monkeypatch):
                         lambda reason, now, ignore_cooldown=False:
                         fired.append((reason, ignore_cooldown)) or True)
 
-    daemon._maybe_proactively_rotate_warp(1003.0)   # 3s < 7s 阈值
+    daemon._maybe_proactively_rotate_warp(1003.0)   # 3s < 17s 触发点
     assert not fired, "周期未到不得换线"
-    assert daemon._WARP_MIN_CYCLE_SEC == 7.0
+    assert daemon._WARP_MIN_CYCLE_SEC == 20.0
 
     monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
-    daemon._maybe_proactively_rotate_warp(1010.0)   # 10s ≥ 7s
-    assert len(fired) == 1, f"应按最短周期换线，实际 {fired}"
+    daemon._maybe_proactively_rotate_warp(1100.0)   # 100s ≥ 17s
+    assert len(fired) == 1, f"应按寿命判据换线，实际 {fired}"
     assert "周期" in fired[0][0]
     assert fired[0][1] is True, "时间判据必须绕开成功换线后的 20s 冷却"
     assert seen_sql == [], "有样本时不再查请求计数"
+
+
+def _proactive_mode_env(monkeypatch, mode, **over):
+    """固定主动轮换判据的可控环境，三种模式共用。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "proactive_mode": mode,
+                         "proactive_fixed_sec": 60, "proactive_after_requests": 60,
+                         "min_cycle_recalc_sec": 1e9, **over})
+    monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 1000.0)
+    fired = []
+    monkeypatch.setattr(daemon, "_reconnect_warp_now",
+                        lambda reason, now, ignore_cooldown=False:
+                        fired.append(reason) or True)
+    return fired
+
+
+def test_proactive_mode_fixed_ignores_traffic_and_samples(monkeypatch):
+    """fixed 模式按固定秒数换线，不看请求数也不看寿命样本。"""
+    fired = _proactive_mode_env(monkeypatch, "fixed")
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 20.0)  # 有样本也不用
+    monkeypatch.setattr(daemon, "count_opencode_since",
+                        lambda ts: (_ for _ in ()).throw(AssertionError("fixed 不得查请求数")))
+
+    daemon._maybe_proactively_rotate_warp(1055.0)   # 55s < 60s - 3s = 57s
+    assert fired == [], "未到固定间隔不得换线"
+    monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
+    daemon._maybe_proactively_rotate_warp(1058.0)   # 58s ≥ 57s
+    assert len(fired) == 1 and "固定" in fired[0]
+
+
+def test_proactive_mode_requests_by_request_count(monkeypatch):
+    """requests 模式只看请求条数，不看已用时长。"""
+    fired = _proactive_mode_env(monkeypatch, "requests")
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 20.0)  # 有样本也不用
+    monkeypatch.setattr(daemon, "count_opencode_since", lambda ts: 59)
+    daemon._maybe_proactively_rotate_warp(1100.0)   # 已用 100s，但只有 59 条
+    assert fired == [], "请求数未到不得换线"
+    monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
+    monkeypatch.setattr(daemon, "count_opencode_since", lambda ts: 60)
+    daemon._maybe_proactively_rotate_warp(1100.0)
+    assert len(fired) == 1 and "60 条" in fired[0]
+
+
+def test_proactive_mode_lifetime_falls_back_when_no_samples(monkeypatch):
+    """lifetime 模式无样本时回退请求数，冷启动期才不会永不轮换。"""
+    fired = _proactive_mode_env(monkeypatch, "lifetime")
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 0.0)
+    monkeypatch.setattr(daemon, "count_opencode_since", lambda ts: 60)
+    daemon._maybe_proactively_rotate_warp(1100.0)
+    assert len(fired) == 1 and "暂无寿命样本" in fired[0]
+
+
+def test_proactive_mode_unknown_falls_back_to_lifetime(monkeypatch):
+    """配置写错不得让轮换静默停摆：非法值按 lifetime 处理。"""
+    fired = _proactive_mode_env(monkeypatch, "nonsense")
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 20.0)
+    daemon._maybe_proactively_rotate_warp(1100.0)   # 100s ≥ 17s
+    assert len(fired) == 1 and "周期" in fired[0]
 
 
 def test_proactive_rotate_keeps_fail_cooldown(monkeypatch):
