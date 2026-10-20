@@ -126,6 +126,13 @@ CFG = {
         # 80.8%、最热两个前缀仅 32%/24%。60 ≈ 中位成功数的 4 倍，也让两次
         # 错误触发换线之间的正常流量能跑完。
         "proactive_after_requests": 60,
+        # 备线「可服务性」探针：暂未实现。曾尝试经目标隧道的 SOCKS 直接向
+        # opencode 发最小请求，但免费层的客户端指纹校验无法通过 —— 试过
+        # /zen/v1 与 /inference/v1 两个端点、v1/v2 两种 UA、cli/desktop 两种
+        # client、完整 read+shell 工具定义与 9router 的 applyFingerprintTools，
+        # 全部返回 403 FreeTierError（真实 9router 请求里带的是 exec_command
+        # 等另一套工具，指纹规则比源码注释描述的更复杂）。只有 9router 自己
+        # 发出的请求能通过。在没有可靠探针之前，主动轮换仍是盲切。
         # 每隔多久预热一条闲置备线（重启它换会话 IP）。ip_reuse_guard_sec=24h，
         # 不预热的话换线时只有刚补刷的一条是新鲜的，流量会在两条线间往返。
         "prewarm_sec": 120,

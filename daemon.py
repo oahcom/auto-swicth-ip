@@ -322,10 +322,10 @@ _WARP_MIN_CYCLE_FLOOR_SEC = 5.0
 
 
 def _recompute_min_warp_cycle(now: float) -> float:
-    """重算 24h 内「成功服务过 ≥1 条后出错」的段的最小周期，返回生效值。
+    """重算 24h 内「成功服务过 ≥1 条后出错」的段的**典型**周期，返回生效值。
 
-    只统计 cycle > 0 且 ok > 0 的样本：cycle=0 是「切上去第一条请求就错」，
-    不是可用周期；计入会让最小值恒为 0~1s，主动轮换退化成永动机。
+    取中位而非最小（原因见函数体内的注释）。只统计 cycle > 0 且 ok > 0 的
+    样本：cycle=0 是「切上去第一条请求就错」，不反映可用寿命。
     无样本返回 0（调用方回退到按请求数轮换）。
     """
     global _WARP_MIN_CYCLE_SEC
@@ -340,12 +340,17 @@ def _recompute_min_warp_cycle(now: float) -> float:
         log(f"↻ 最小可用周期重算: 无可用样本（24h {total} 条，首错即废 {dropped} 条已排除），"
             f"主动轮换回退到按请求数")
         return 0.0
-    raw = min(float(c["cycle"]) for c in usable)
-    effective = max(raw, _WARP_MIN_CYCLE_FLOOR_SEC)
+    # 用中位而非最小值：最小值由「最倒霉的那一条线」决定 —— 24h 窗口里只要
+    # 出现一条成功服务 1 条后就死的段，最小值就塌到 0.1s 级，主动轮换变成
+    # 每几秒换一次（实测 98 条可用样本：min 0.1s、p10 2.4s、中位 20.2s、
+    # p75 21.5s）。中位才代表「一条线典型能服务多久」。
+    vals = sorted(float(c["cycle"]) for c in usable)
+    median = vals[len(vals) // 2]
+    effective = max(median, _WARP_MIN_CYCLE_FLOOR_SEC)
     _WARP_MIN_CYCLE_SEC = effective
-    sample = min(usable, key=lambda c: float(c["cycle"]))
-    log(f"↻ 最小可用周期重算: 原始 {raw:.0f}s → 生效 {effective:.0f}s"
-        f"（可用样本 {len(usable)} 条，首错即废 {dropped} 条已排除，最小来自 {sample['ip']}）")
+    log(f"↻ 典型可用周期重算: 中位 {median:.1f}s（min {vals[0]:.1f}s / "
+        f"p25 {vals[len(vals)//4]:.1f}s / p75 {vals[3*len(vals)//4]:.1f}s，"
+        f"可用样本 {len(usable)} 条，首错即废 {dropped} 条已排除）→ 生效 {effective:.0f}s")
     return effective
 
 
@@ -1716,12 +1721,15 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) 
 def _maybe_proactively_rotate_warp(now: float) -> None:
     """当前出口还在成功服务时就换线，不必等 403 冲断在途对话。
 
-    判据只按「已服务请求数」。曾用 `_WARP_MIN_CYCLE_SEC`（历史换线段的最短
-    时长）当时间判据，但那个统计是**自证循环**：403 多在换线后 1 秒内出现
-    （实测 45 段，首错延迟中位 1s、16 段首请求即错），全落在 20 秒冷却期内被
-    `maybe_reconnect_warp` 丢弃，于是样本最小值恒等于冷却值（实测 18 条样本
-    全部 20.0~21.9s），主动轮换被锁成每 20 秒一次。换成请求数后实测每段中位
-    成功 14 条、30% 的段零错误，按 20s 换线只会把还能用的地址提前烧掉。
+    有周期样本时按「24h 内成功服务过的段的最短周期」换线；无样本时回退到
+    「已服务请求数」。时间判据曾因**自证循环**被弃用：采样写在冷却判断之后，
+    换线后 1 秒内的 403 全被 20s 冷却丢弃，样本最小值恒等于冷却值。f68ab66
+    起采样先于冷却判断，样本反映真实周期，判据恢复可用。
+
+    周期下限 5s 短于 cooldown_ok_sec(20s)，受冷却就永远等不到触发，故成功换线后
+    的 cooldown 绕过（并发仍由 `_WARP_LOCK` 保证）；换线失败后的冷却不绕，
+    那是防隧道雷暴的。请求数回退路径保持受冷却约束。
+
     """
     global _last_proactive_warp_check, _last_cycle_recalc_ts
     # 计数要查 SQLite，5s 一次足够：配额以秒级速度消耗，多查无益。
@@ -1734,9 +1742,32 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
         _recompute_min_warp_cycle(now)
     # 用「换线生效时刻」而非「发起时刻」：发起早于生效数秒，期间旧出口仍在
     # 服务流量，用发起时刻会把旧线的消耗算进新线配额。
-    # 两者都为 0 表示本次启动后还没换过线，窗口起点无意义。
+    # 两者都为 0 表示本次启动后还没换过线。此时**不要**直接返回后从零计数：
+    # service 重启后 `_last_warp_switch_ok_ts` 归零，若拿 0 当窗口起点，
+    # `count_opencode_since` 会把重启前已经服务过的那一段整段算进来 ——
+    # 实测 16:31:08 重启、16:32:18（70 秒后）就报「已服务 63 条」并换线，
+    # 而那条线实际只服务了几条。改用该出口 IP 在 `.warp_ip_used.json` 里的
+    # 使用时刻恢复段起点，跨重启仍然正确。
     start = _last_warp_switch_ok_ts or _last_warp_reconnect_ts
     if start <= 0:
+        # 内存变量重启即归零，但 sing-box 的 selector 不变 —— 现探当前出口，
+        # 再用它在 IP 表里的使用时刻恢复段起点（两者都可能探测失败，失败就
+        # 放弃本轮，下一 tick 再试，不会误判）。
+        member = _warp_member(active_warp_tag())
+        ip = warp_egress_ip(member["port"]) if member else None
+        with _WARP_IP_LOCK:
+            entry = _WARP_IP_USED.get(ip) if ip else None
+        start = float(entry.get("ts") or 0) if isinstance(entry, dict) else 0.0
+        if start <= 0:
+            return
+    if _WARP_MIN_CYCLE_SEC > 0:
+        elapsed = now - start
+        if elapsed >= _WARP_MIN_CYCLE_SEC:
+            # 只绕 cooldown_ok：上次换线失败时 `_warp_cooldown_until` 是
+            # cooldown_fail_sec，那是防隧道雷暴的，不能绕。
+            _reconnect_warp_now(
+                f"主动轮换 周期 {elapsed:.0f}s ≥ {_WARP_MIN_CYCLE_SEC:.0f}s",
+                now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
         return
     if now < _warp_cooldown_until:
         return

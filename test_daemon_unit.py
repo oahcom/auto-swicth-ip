@@ -1685,16 +1685,21 @@ def test_warp_cycle_pruning_24h_window():
     assert {c["ip"] for c in kept} == {"a", "b", "d"}
 
 
-def test_recompute_min_cycle_excludes_zero_ok_zero():
-    """只统计 cycle>0 且 ok>0 的样本；cycle=0/ok=0 的不参与最小值。"""
+def test_recompute_cycle_excludes_zero_ok_zero():
+    """只统计 cycle>0 且 ok>0 的样本，取中位数作为典型周期。
+
+    cycle=0/ok=0 是「切上去第一条请求就错」，不反映可用寿命；它会把统计
+    拉向 0。取值用中位而非最小：最小值由最倒霉的一条线决定（实测 98 条
+    样本 min 0.1s / 中位 20.2s），按最小值换线等于每几秒切一次。
+    """
     daemon._WARP_IP_CYCLES = [
         {"ip": "a", "cycle": 5.0, "ended_at": time.time() - 100, "ok": 1},
         {"ip": "b", "cycle": 0.0, "ended_at": time.time() - 200, "ok": 0},  # 首错即废
         {"ip": "c", "cycle": 10.0, "ended_at": time.time() - 300, "ok": 1},
     ]
     res = daemon._recompute_min_warp_cycle(time.time())
-    assert res == 5.0, f"应取可用样本最小值 5，实际 {res}"
-    assert daemon._WARP_MIN_CYCLE_SEC == 5.0
+    assert res == 10.0, f"应取可用样本中位数 10，实际 {res}"
+    assert daemon._WARP_MIN_CYCLE_SEC == 10.0
 
 
 def test_recompute_min_cycle_empty_when_no_usable():
@@ -1756,13 +1761,13 @@ def test_maybe_reconnect_marks_ip_blocked_inside_cooldown(monkeypatch):
     assert len(daemon._WARP_IP_CYCLES) == 1, "每段只采一条样本"
 
 
-def test_proactive_rotate_ignores_min_cycle_samples(monkeypatch):
-    """即使有「最小可用周期」样本，主动轮换也只按请求数触发。
+def test_proactive_rotate_uses_min_cycle_sample(monkeypatch):
+    """有周期样本时按最短可用周期换线，并绕开冷却。
 
-    旧行为按时间样本触发，但那些样本从换线耗时统计而来，被 20 秒冷却期
-    截断（403 多在换线后 1 秒内出现并被冷却丢弃），样本最小值恒等于冷却值，
-    导致每 20 秒换一次线、把还能服务的地址提前烧掉。此测试锁定：样本存在
-    时也必须走请求数判据。
+    403 一出现对话就已中断，只能赶在它前面；阈值取 24h 内成功服务过的段
+    的最短周期（下限 5s）。它短于 cooldown_ok_sec(20s)，受冷却就永远等不到
+    触发，故绕过；换线失败后的冷却不能绕（见下一个用例）。
+    无样本时才回退到请求数判据。
     """
     _warp_env(monkeypatch, WARP_TWO)
     monkeypatch.setitem(daemon.CFG, "warp",
@@ -1770,31 +1775,53 @@ def test_proactive_rotate_ignores_min_cycle_samples(monkeypatch):
                          "min_cycle_recalc_sec": 1,
                          "cooldown_ok_sec": 20})
     monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
-    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0.0)
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 9999.0)   # 冷却中也要能触发
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 1000.0)
-    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1010.0)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
     monkeypatch.setattr(daemon, "_WARP_IP_CYCLES",
                         [{"ip": "seed", "cycle": 7.0, "ended_at": 1000.0, "ok": 1}])
     monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 0.0)
     monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 0.0)
     seen_sql = []
     monkeypatch.setattr(daemon, "count_opencode_since",
-                        lambda ts: seen_sql.append(ts) or 10)   # 低于阈值 999
+                        lambda ts: seen_sql.append(ts) or 0)
     fired = []
     monkeypatch.setattr(daemon, "_reconnect_warp_now",
-                        lambda reason, now, ignore_cooldown=False: fired.append((reason, ignore_cooldown)) or True)
+                        lambda reason, now, ignore_cooldown=False:
+                        fired.append((reason, ignore_cooldown)) or True)
 
-    # 时间远超 7s 样本周期，但请求数未达阈值 → 不换线
-    daemon._maybe_proactively_rotate_warp(1500.0)
-    assert not fired, "请求数未达阈值时不应因时间样本触发"
-    assert seen_sql, "必须按请求数判据查询计数"
+    daemon._maybe_proactively_rotate_warp(1003.0)   # 3s < 7s 阈值
+    assert not fired, "周期未到不得换线"
+    assert daemon._WARP_MIN_CYCLE_SEC == 7.0
 
-    # 请求数达标 → 触发（走冷却保护的常规路径，不 ignore_cooldown）
-    fired.clear()
-    monkeypatch.setattr(daemon, "count_opencode_since", lambda ts: 1000)
-    daemon._maybe_proactively_rotate_warp(1600.0)
-    assert fired and "已服务 1000 条" in fired[0][0], f"应主动换线，实际 {fired}"
-    assert fired[0][1] is False, "请求数判据不绕冷却"
+    monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
+    daemon._maybe_proactively_rotate_warp(1010.0)   # 10s ≥ 7s
+    assert len(fired) == 1, f"应按最短周期换线，实际 {fired}"
+    assert "周期" in fired[0][0]
+    assert fired[0][1] is True, "时间判据必须绕开成功换线后的 20s 冷却"
+    assert seen_sql == [], "有样本时不再查请求计数"
+
+
+def test_proactive_rotate_keeps_fail_cooldown(monkeypatch):
+    """上次换线失败（reconnect 晚于 switch_ok）时，周期判据也必须守失败冷却。
+
+    cooldown_fail_sec 是防「连切连败」把隧道重启成雷暴的，绕过它会让周期判据
+    在换线一直失败时每 5s(最小周期下限) 重试一次。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 5.0)
+    monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 9999.0)   # 不重算
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 1030.0)  # 之后失败
+    seen = []
+    monkeypatch.setattr(daemon, "_reconnect_warp_now",
+                        lambda reason, now, ignore_cooldown=False:
+                        seen.append(ignore_cooldown) or True)
+
+    daemon._maybe_proactively_rotate_warp(1100.0)
+    assert seen == [False], "换线失败过就不得绕失败冷却"
+
 
 
 def test_ignore_cooldown_still_requires_warp_lock(monkeypatch):
@@ -1889,3 +1916,40 @@ def test_persistence_write_is_atomic_and_logs_failure(monkeypatch, tmp_path):
     assert json.loads(p.read_text(encoding="utf-8")) == {"used": {"keep": True}}, \
         "写入失败时覆盖了原文件"
     assert any("写 rec.json 失败" in m for m in logged), f"失败未记日志: {logged}"
+
+
+def test_proactive_rotate_recovers_segment_start_after_restart(monkeypatch):
+    """service 重启后段起点必须从 IP 使用记录恢复，不能从零重算。
+
+    重启会让 `_last_warp_switch_ok_ts` / `_last_warp_reconnect_ts` 归零。
+    旧实现拿 0 当窗口起点，`count_opencode_since(0)` 会把重启**之前**已经
+    服务过的那一段整段算进来 —— 实测 16:31:08 重启、16:32:18（70 秒后）
+    就报「已服务 63 条」并换线，而那条线实际只服务了几条。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG, "warp", {
+        **daemon.CFG["warp"], "proactive_after_requests": 60,
+        "min_cycle_recalc_sec": 99999, "cooldown_ok_sec": 20})
+    monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0.0)
+    # 重启后状态：两个内存时间戳都是 0
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 0.0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0.0)
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 0.0)
+    monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 0.0)
+    monkeypatch.setattr(daemon, "_WARP_IP_CYCLES", [])
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "ip-w1")
+    monkeypatch.setattr(daemon, "_WARP_IP_USED",
+                        {"ip-w1": {"ts": 1000.0, "blocked": False}})
+    seen = []
+    monkeypatch.setattr(daemon, "count_opencode_since",
+                        lambda ts: seen.append(ts) or 5)
+    fired = []
+    monkeypatch.setattr(daemon, "_reconnect_warp_now",
+                        lambda reason, now, ignore_cooldown=False:
+                        fired.append(reason) or True)
+
+    daemon._maybe_proactively_rotate_warp(1100.0)
+    assert seen == [1000.0], f"段起点必须取自 IP 记录（1000），实际 {seen}"
+    assert not fired, "只服务了 5 条，不该换线"
