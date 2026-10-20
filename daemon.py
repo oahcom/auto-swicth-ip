@@ -1865,9 +1865,6 @@ def reconnect_warp(reason: str) -> bool:
         log(f"  ⚡ 缓存命中 {m['tag']} 出口 {ip}"
             f"（{now - _warp_line_ip_ts(m['tag']):.0f}s 前验证），跳过探测")
         probes.append((m, ip))
-        if len(fast) > 1:
-            # 其余缓存命中的线也不再探测，但它们没被选中，不需要进 probes。
-            pass
     else:
         probed = _probe_warp_egress(standby)
         for m in standby:
