@@ -356,6 +356,9 @@ def _recompute_min_warp_cycle(now: float) -> float:
 
 _WARP_REFRESH_LOCK = threading.RLock()
 _WARP_REFRESHING: set[str] = set()  # 正在延迟刷新的线，防重复调度
+# 脏线守护的探测中集合。探测不占用 _WARP_REFRESHING —— 那条集合会被换线路径
+# 当作「不可选」，探测中的干净线若也算进去，换线会看到「备线 0 条」直接落池。
+_WARP_PROBING: set[str] = set()
 _last_proxy_pool_check: float = 0  # 上次探测轮换池可用性的 epoch 秒（双向兜底）
 _proxy_dwell_since: float = 0  # 落到轮换池的时刻；0 = 现不在 proxy 上
 _proxy_fail_streak: int = 0     # 池健康探测连续失败次数（回切判据之一）
@@ -1364,34 +1367,53 @@ def _refresh_idle_warp(member: dict) -> str | None:
     return None
 
 
-_last_dirty_reclaim_ts: float = 0.0
+_dirty_janitor_started = False
 
 
-def _reclaim_dirty_warp_lines(now: float) -> None:
-    """任一 WARP 备线的出口是被标记过的脏 IP，就后台重连到换出干净地址。
+def _reclaim_dirty_pass() -> None:
+    """一次脏线巡检：为每条非当前出口、未在补刷的线启动探测/重连。
 
-    WHY 不等换线时再刷：停在 proxy 时主循环不调预热，五条线的脏 IP 会一直留着，
-    `_warp_any_reachable()` 恒 False → 回切永远不发生（实测 18:50~19:20 连续 30
-    分钟全 403）。当前出口线交给换线路径处理 —— 重启它会掐断在途连接。
+    当前出口不在此处理：重启它会掐断在途连接，该由换线路径换下后再刷。
     """
-    global _last_dirty_reclaim_ts
-    if now - _last_dirty_reclaim_ts < _warp()["prewarm_sec"]:
-        return
-    _last_dirty_reclaim_ts = now
     active = active_warp_tag()
     for m in _warp()["members"]:
         if m["tag"] == active:
             continue
         with _WARP_REFRESH_LOCK:
-            if m["tag"] in _WARP_REFRESHING:
+            if m["tag"] in _WARP_REFRESHING or m["tag"] in _WARP_PROBING:
                 continue
-            _WARP_REFRESHING.add(m["tag"])
+            _WARP_PROBING.add(m["tag"])
         threading.Thread(target=_reclaim_dirty_warp_worker, args=(m,),
                          daemon=True, name=f"warp-reclaim-{m['tag']}").start()
 
 
+def _dirty_line_janitor() -> None:
+    """常驻脏线守护：没有周期闸门，只要存在脏 IP 就一直重连到换出干净地址。
+
+    WHY 不用周期任务：实测出口 IP 存活中位 12.5s，任何按分钟计的闸门都意味着
+    脏线会滞留远超一个 IP 的寿命，换线时可选干净线随之变少。5s 只是防打爆
+    （每条线每轮一次探测），不是调度周期。
+    """
+    while True:
+        try:
+            _reclaim_dirty_pass()
+        except Exception as e:
+            log(f"✗ 脏线守护异常: {e}")
+        time.sleep(5)
+
+
+def _start_dirty_line_janitor() -> None:
+    global _dirty_janitor_started
+    with _WARP_REFRESH_LOCK:
+        if _dirty_janitor_started:
+            return
+        _dirty_janitor_started = True
+    threading.Thread(target=_dirty_line_janitor, daemon=True,
+                     name="warp-janitor").start()
+
+
 def _reclaim_dirty_warp_worker(member: dict) -> None:
-    """探测该线出口；脏 IP 就重启隧道，直到换出未被标记的地址或超时。"""
+    """探测该线出口；确认是脏 IP 才占用补刷标记并重启，直到换出干净地址或超时。"""
     try:
         deadline = time.time() + _warp()["ip_refresh_retry_sec"]
         while time.time() < deadline:
@@ -1402,6 +1424,15 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
             if ip and not _warp_ip_is_blocked(ip):
                 _set_warp_line_ip(member["tag"], ip)
                 return
+            # 探测期间这条线可能已被换线线程切成当前出口：此刻重启会掐断在途
+            # 连接（upstream connection lost）。判据必须落在重启之前。
+            if active_warp_tag() == member["tag"]:
+                log(f"  ↻ {member['tag']} 已被选为当前出口，取消脏线重连")
+                return
+            # 只有确认脏才占用补刷标记：换线路径据此排除该线，探测阶段不能占，
+            # 否则干净线被当成「不可选」，换线会报「备线 0 条」直接落池。
+            with _WARP_REFRESH_LOCK:
+                _WARP_REFRESHING.add(member["tag"])
             log(f"  ↻ {member['tag']} 出口 {ip or '探测失败'} 疑似脏 IP，重连换线")
             if _refresh_idle_warp(member):
                 return
@@ -1409,6 +1440,7 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
         log(f"  ✗ {member['tag']} {_warp()['ip_refresh_retry_sec']}s 内未换出干净出口")
     finally:
         with _WARP_REFRESH_LOCK:
+            _WARP_PROBING.discard(member["tag"])
             _WARP_REFRESHING.discard(member["tag"])
 
 
@@ -2934,6 +2966,8 @@ def main():
     # 恢复跨重启的出口 IP 使用/污染记录与可用周期样本
     _load_warp_ip_used()
     _load_warp_ip_cycles()
+    # 脏线守护：常驻线程，脏 IP 一出现就重连换干净地址，不依赖主循环周期
+    _start_dirty_line_janitor()
     # 日志标签用的当前 WARP 出口 IP：启动时探一次，之后由换线路径更新
     global _ACTIVE_WARP_IP
     _m = _warp_member(active_warp_tag())
@@ -3095,8 +3129,6 @@ def main():
 
             # ---- 3c0. 双向兜底的反向：停在 proxy 上时，池挂了或 WARP 复活都切回 ----
             _maybe_failback_to_warp(now)
-            # 任一备线出口是脏 IP 就重连换干净地址 —— 与当前在 WARP 还是 proxy 无关。
-            _reclaim_dirty_warp_lines(now)
 
             # 任一隧道出口疑似脏（403/429 标记或窗口内用过）就重连，直到换出优质
             # IP；掉在 proxy 池上时也要继续，否则池本身就是脏地址时永远回不来。

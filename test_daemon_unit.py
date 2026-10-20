@@ -611,6 +611,8 @@ def _warp_env(monkeypatch, members, max_attempts=3):
     # 本用例的出口误判成"窗口内用过"。
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {})
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    monkeypatch.setattr(daemon, "_WARP_PROBING", set())
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 0.0)
     monkeypatch.setattr(daemon.time, "sleep", lambda s: None)
 
@@ -1316,6 +1318,50 @@ def test_reconnect_warp_schedules_refresh_for_blocked_standbys(monkeypatch):
     assert daemon.reconnect_warp("abuse403") is True
     assert scheduled == ["W1", "W2"], \
         f"刚换下的旧线与脏备线都要补刷，实际 {scheduled}"
+
+
+def test_dirty_janitor_reclaims_all_non_active_lines(monkeypatch):
+    """脏线守护：为每条非当前出口的线起动重连，当前出口不动。
+
+    当前出口重启会掐断在途连接，只能等它被换下后由换线路径刷。
+    """
+    _warp_env(monkeypatch, WARP_TWO + [{"tag": "W3", "port": 1082,
+                                        "service": "usque-warp-c.service"}])
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W2")
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    launched = []
+
+    class T:
+        def __init__(self, target=None, args=(), **k):
+            self._t, self._a = target, args
+        def start(self):
+            launched.append(self._a[0]["tag"])
+
+    monkeypatch.setattr(daemon.threading, "Thread", T)
+    daemon._reclaim_dirty_pass()
+
+    assert launched == ["W1", "W3"], f"当前出口 W2 不得重连，实际 {launched}"
+    assert "W2" not in daemon._WARP_REFRESHING
+
+
+def test_dirty_worker_aborts_when_member_becomes_active(monkeypatch):
+    """探测期间这条线被切成当前出口 → 放弃重连，不得重启。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "burned-ip")
+    monkeypatch.setattr(daemon, "_WARP_IP_USED",
+                        {"burned-ip": {"ts": 1000.0, "blocked": True}})
+    monkeypatch.setattr(daemon.time, "time", lambda: 1000.0)
+    # 探测完成后它已是当前出口
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    restarted = []
+    monkeypatch.setattr(daemon, "_restart_service",
+                        lambda s: restarted.append(s) or True)
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+
+    daemon._reclaim_dirty_warp_worker({"tag": "W1", "port": 1080,
+                                       "service": "usque-warp.service"})
+
+    assert not restarted, f"已成当前出口的线不得重启，实际 {restarted}"
 
 
 def test_egress_label_shows_warp_with_ip(monkeypatch):
