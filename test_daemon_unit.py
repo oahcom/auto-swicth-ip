@@ -870,6 +870,11 @@ def _reuse_env(monkeypatch, egress: dict, guard: int = 300, now: float = 1000.0)
         "ready_timeout_sec": 1, "retry_backoff_sec": [0], "max_attempts": 3,
     })
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    # 快速选线读 `_WARP_LINE_STATE`（守护探到的 tag→IP+时刻）与 `_ACTIVE_WARP_IP`，
+    # 都是进程级全局：不隔离时上一用例的缓存会被本用例当成「刚验证过」，
+    # 直接跳过探测/刷新，断言全歪。
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {})
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon.time, "time", lambda: now)
     monkeypatch.setattr(daemon.time, "sleep", lambda s: None)
@@ -1833,6 +1838,73 @@ def test_reconnect_warp_picks_longest_rest_when_none_fresh(monkeypatch):
     assert daemon.reconnect_warp("test") is True
     assert switched == ["W3"], f"应兜底选休息最久的 W3，实际 {switched}"
     assert refreshed == ["W3"], "兜底路径仍须先刷新该线会话 IP"
+
+
+def test_cached_standby_skips_probe_when_fresh(monkeypatch):
+    """脏线守护刚验证过的出口地址直接用于选线，不再同步探测。
+
+    WHY：换线耗时全部花在探测上（p50 3s），而首错延迟 p50 只有 3s —— 不把
+    探测移出关键路径，主动换线永远赶在报错之后。
+    """
+    egress = _reuse_env(monkeypatch, {})
+    now = 1000.0
+    egress.update({"1080": "ip-w1", "1081": "ip-b"})
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE",
+                        {"W2": {"ip": "ip-b", "ip_ts": now - 2}})
+    monkeypatch.setattr(daemon, "_port_open", lambda p: True)
+    probed = []
+
+    def _probe(members):
+        probed.append(members)
+        return {m["tag"]: egress[str(m["port"])] for m in members}
+
+    monkeypatch.setattr(daemon, "_probe_warp_egress", _probe)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
+
+    assert daemon.reconnect_warp("test") is True
+    assert switched == ["W2"], "应直接切到缓存命中的备线"
+    assert probed == [], "缓存新鲜时不得同步探测"
+
+
+def test_cached_standby_rejects_stale_blocked_and_closed_port(monkeypatch):
+    """缓存过期、出口已被标记、端口不在监听时都不得采信。"""
+    monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "probe_cache_ttl_sec": 12})
+    members = [{"tag": "W2", "port": 1081, "service": "s2"},
+               {"tag": "W3", "port": 1082, "service": "s3"},
+               {"tag": "W4", "port": 1083, "service": "s4"}]
+    now = 1000.0
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "ip-blocked": {"ts": now - 100, "blocked": True, "last_ok_ts": now - 100},
+    })
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {
+        "W2": {"ip": "ip-stale", "ip_ts": now - 60},     # 过期
+        "W3": {"ip": "ip-blocked", "ip_ts": now - 1},    # 被标记
+        "W4": {"ip": "ip-ok", "ip_ts": now - 1},         # 端口关闭
+    })
+    monkeypatch.setattr(daemon, "_port_open", lambda p: p != 1083)
+    assert daemon._cached_warp_standby(members, now, 86400) == []
+
+
+def test_proactive_rotation_leads_by_switch_cost(monkeypatch):
+    """主动轮换必须提前 switch_lead_sec 发起，否则新线在旧线到寿之后才生效。"""
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 10.0)
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 100.0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
+    monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
+    monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 1e12)
+    calls = []
+    monkeypatch.setattr(daemon, "_reconnect_warp_now",
+                        lambda reason, now, ignore_cooldown=False: calls.append(reason) or True)
+
+    # 寿命 10s − 换线提前量 3s = 7s；已服务 6s 还不该动，7s 必须动
+    daemon._maybe_proactively_rotate_warp(106.0)
+    assert calls == [], "未到提前量就换线等于把地址寿命提前烧掉"
+    daemon._last_proactive_warp_check = 0.0
+    daemon._maybe_proactively_rotate_warp(107.0)
+    assert len(calls) == 1 and "换线耗时" in calls[0]
 
 
 def test_warp_cycle_pruning_24h_window():

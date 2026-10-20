@@ -181,6 +181,13 @@ CFG = {
         # 永远停在旧地址上：实测 WARP-CF-C 被换下 8 次，7 次放弃，13 次换线里
         # 7 次切回同一个 10 分钟前的地址。
         "ip_refresh_retry_sec": 600,
+        # 换线时直接采用脏线守护最近一次探测到的出口地址（见
+        # `_cached_warp_standby`），把同步探测移出关键路径。TTL 取 12s：
+        # 守护节奏是 5s + 单次探测 1.2~7s，一个完整周期仍有余量。
+        "probe_cache_ttl_sec": 12,
+        # 主动轮换提前量：换线从发起到达生效 p50=2s / p90=7s，等「已服务满
+        # 典型寿命」再发起就赶不上（首错延迟 p50=3s），必须提前这个时长。
+        "switch_lead_sec": 3.0,
     },
     "log_file": "/home/administrator/dkk-projects/auto-switch-ip/daemon.log",
     "log_format": "%Y-%m-%d %H:%M:%S",

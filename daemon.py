@@ -1095,12 +1095,70 @@ def _warp_line_sel(tag: str) -> float:
 
 def _set_warp_line_ip(tag: str, ip: str) -> None:
     with _WARP_LINE_LOCK:
-        _WARP_LINE_STATE.setdefault(tag, {})["ip"] = ip
+        st = _WARP_LINE_STATE.setdefault(tag, {})
+        st["ip"] = ip
+        st["ip_ts"] = time.time()
 
 
 def _warp_line_ip(tag: str) -> str | None:
     with _WARP_LINE_LOCK:
         return _WARP_LINE_STATE.get(tag, {}).get("ip")
+
+
+def _warp_line_ip_ts(tag: str) -> float:
+    """该线出口 IP 上次被实际验证的时刻；0 = 未验证过。"""
+    with _WARP_LINE_LOCK:
+        return float(_WARP_LINE_STATE.get(tag, {}).get("ip_ts") or 0.0)
+
+
+def _invalidate_warp_line_ip(tag: str) -> None:
+    """隧道重启后旧出口地址必然失效，清掉它，避免快速路径继续采信。
+
+    只清时间戳不够：`ip` 留着但 `ip_ts=0` 会让读方把它当成「刚验证过」的反面
+    （时间戳为 0 时 `now - ts` 极大，天然被 TTL 挡掉）。两个都清更直白。
+    """
+    with _WARP_LINE_LOCK:
+        st = _WARP_LINE_STATE.get(tag)
+        if st:
+            st.pop("ip", None)
+            st.pop("ip_ts", None)
+
+
+def _port_open(port: int) -> bool:
+    """隧道 SOCKS 端口是否在监听。本地 connect 通常 <1ms，可放进换线关键路径。"""
+    try:
+        with socket.create_connection((_warp()["socks_host"], port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _cached_warp_standby(standby: list[dict], now: float,
+                         guard: float) -> list[tuple[dict, str]]:
+    """返回缓存仍可信的备线 (member, ip)，按选线优先级排好序。
+
+    WHY 需要：换线耗时的中位 2s、p90 7s，全部花在同步探测出口 IP 上；真正
+    切 selector 是 0s。而 403/429 在换线后中位 3s 就到达 —— 探测本身就把
+    「抢在报错之前换线」的窗口吃光了。脏线守护每 ~5s 已经探过每条非当前
+    出口的线，结果就在 `_WARP_LINE_STATE` 里，直接拿来用即可。
+
+    TTL 取 12s：守护的探测节奏是 5s + 单次探测耗时（实测 1.2~7s），12s 覆盖
+    一个完整周期仍有余量；再长就可能拿到隧道已被其它路径重启前的旧地址。
+    """
+    ttl = _warp().get("probe_cache_ttl_sec", 12)
+    out: list[tuple[dict, str]] = []
+    for m in standby:
+        ip = _warp_line_ip(m["tag"])
+        ts = _warp_line_ip_ts(m["tag"])
+        if not ip or now - ts > ttl:
+            continue
+        if _warp_ip_is_blocked(ip) or _warp_ip_recently_used(ip, now, guard):
+            continue
+        if not _port_open(m["port"]):
+            continue
+        out.append((m, ip))
+    out.sort(key=lambda p: _warp_ip_rank(p[1], now, guard))
+    return out
 
 
 def _warp_line_selected(tag: str, ip: str, ts: float) -> None:
@@ -1343,6 +1401,7 @@ def _refresh_idle_warp(member: dict) -> str | None:
     """
     backoff = _warp()["retry_backoff_sec"]
     for attempt in range(1, _warp()["max_attempts"] + 1):
+        _invalidate_warp_line_ip(member["tag"])  # 重启后旧地址必然失效
         try:
             ok = (_restart_service(member["service"])
                   and _wait_port_ready(member["port"], _warp()["ready_timeout_sec"]))
@@ -1434,6 +1493,7 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
             with _WARP_REFRESH_LOCK:
                 _WARP_REFRESHING.add(member["tag"])
             log(f"  ↻ {member['tag']} 出口 {ip or '探测失败'} 疑似脏 IP，重连换线")
+            _invalidate_warp_line_ip(member["tag"])
             if _refresh_idle_warp(member):
                 return
             time.sleep(_warp()["refresh_delay_sec"])
@@ -1716,6 +1776,7 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
     backoff = _warp()["retry_backoff_sec"]
     for attempt in range(1, _warp()["max_attempts"] + 1):
         log(f"  ↻ {member['tag']} 原地重连 #{attempt}")
+        _invalidate_warp_line_ip(member["tag"])
         ok = (_restart_service(member["service"])
               and _wait_port_ready(member["port"], _warp()["ready_timeout_sec"]))
         if ok:
@@ -1742,11 +1803,16 @@ def reconnect_warp(reason: str) -> bool:
 
     不刷新刚换下的那条：在途请求仍走它，重启会掐断连接。
     """
+    global _ACTIVE_WARP_IP, _proxy_dwell_since, _last_warp_switch_ok_ts
     members = _warp()["members"]
     now = time.time()
     # 已停在轮换池 proxy 上时 active 为 None：挑一条新鲜隧道切回去即可。
     active = _warp_member(active_warp_tag())
-    old_ip = warp_egress_ip(active["port"]) if active else None
+    # 当前出口 IP 走内存缓存，不再同步探测：换线关键路径上每多一次 curl 就是
+    # 1.2~7s，而它只用于给旧地址打 blocked 标记。缓存缺失时才探测一次兜底。
+    old_ip = _ACTIVE_WARP_IP if active else None
+    if active and not old_ip:
+        old_ip = warp_egress_ip(active["port"])
     # 不做「地址池耗尽」短路：旧判据看 USED 全 blocked，而触发换线时刚把当前出口
     # 标 blocked，会让它短暂"全 blocked" —— 实测 05:14~06:52 五次假耗尽，把流量
     # 甩到同样被限流的池上再弹回。备线探测本来就会丢弃 blocked 出口，最坏多花
@@ -1764,29 +1830,43 @@ def reconnect_warp(reason: str) -> bool:
     with _WARP_REFRESH_LOCK:
         refreshing = set(_WARP_REFRESHING)
     standby = [m for m in standby if m["tag"] not in refreshing]
-    probed = _probe_warp_egress(standby)
+    guard = _warp_guard_for_reason(reason)
+
     probes: list[tuple[dict, str]] = []   # (member, ip)，探测到出口的备线
     blocked_lines: list[dict] = []        # 出口已被标记、待刷新换 IP 的备线
-    for m in standby:
-        ip = probed.get(m["tag"])
-        if not ip:
-            log(f"  ↻ 备线 {m['tag']} 不通，先拉起")
-            if not (_restart_service(m["service"])
-                    and _wait_port_ready(m["port"], _warp()["ready_timeout_sec"])):
-                log(f"  ✗ 备线 {m['tag']} 未就绪，跳过")
-                continue
-            ip = warp_egress_ip(m["port"])
-        if not ip:
-            log(f"  ✗ 备线 {m['tag']} 探测失败，跳过")
-            continue
-        if _warp_ip_is_blocked(ip):
-            # 被标记 ≠ 永久不可用：每条隧道同一时刻只有一个出口 IP，重启才会换
-            # 会话。全跳过会让候选池恒为 0（403 风暴几秒就能烧完全部备线），
-            # 流量被甩到同样被限流的 proxy 池 —— 19:16 的兜底死循环即由此而来。
-            log(f"  ↻ 备线 {m['tag']} 出口 {ip} 已被标记，排队刷新")
-            blocked_lines.append(m)
-            continue
+    # 快速路径：脏线守护刚探过的地址直接拿来用，把 2~7s 的同步探测移出关键路径。
+    # 没有可用缓存时才退回逐条探测（缓存过期、守护在重启隧道等）。
+    fast = _cached_warp_standby(standby, now, guard)
+    if fast:
+        m, ip = fast[0]
+        log(f"  ⚡ 缓存命中 {m['tag']} 出口 {ip}"
+            f"（{now - _warp_line_ip_ts(m['tag']):.0f}s 前验证），跳过探测")
         probes.append((m, ip))
+        if len(fast) > 1:
+            # 其余缓存命中的线也不再探测，但它们没被选中，不需要进 probes。
+            pass
+    else:
+        probed = _probe_warp_egress(standby)
+        for m in standby:
+            ip = probed.get(m["tag"])
+            if not ip:
+                log(f"  ↻ 备线 {m['tag']} 不通，先拉起")
+                if not (_restart_service(m["service"])
+                        and _wait_port_ready(m["port"], _warp()["ready_timeout_sec"])):
+                    log(f"  ✗ 备线 {m['tag']} 未就绪，跳过")
+                    continue
+                ip = warp_egress_ip(m["port"])
+            if not ip:
+                log(f"  ✗ 备线 {m['tag']} 探测失败，跳过")
+                continue
+            if _warp_ip_is_blocked(ip):
+                # 被标记 ≠ 永久不可用：每条隧道同一时刻只有一个出口 IP，重启才会换
+                # 会话。全跳过会让候选池恒为 0（403 风暴几秒就能烧完全部备线），
+                # 流量被甩到同样被限流的 proxy 池 —— 19:16 的兜底死循环即由此而来。
+                log(f"  ↻ 备线 {m['tag']} 出口 {ip} 已被标记，排队刷新")
+                blocked_lines.append(m)
+                continue
+            probes.append((m, ip))
 
     # 备线出口全被标记时刷新一条拿新会话 IP，刷新不出才落 proxy 池 —— 池只是
     # 最后兜底，不该是「地址全被标记」的直接结果。备线此刻不在服务流量，重启
@@ -1805,7 +1885,6 @@ def reconnect_warp(reason: str) -> bool:
     #   3) 都不满足时兜底复用最久未用的（见下面 elif probes 分支）。
     # 第 1 级单列是因为「从没用过」和「用过但已久」在 _warp_ip_last_ts 上都
     # 可能返回很小的值，混在一起排序会让刚清理掉的旧地址冒充新地址。
-    guard = _warp_guard_for_reason(reason)
     # 已被 403/429 标记的地址在探测阶段就被剔除了，这里只剩可尝试的备线。
     usable = [p for p in probes if not _warp_ip_recently_used(p[1], now, guard)]
     n_new = sum(1 for p in probes if _warp_ip_never_used(p[1]))
@@ -1853,7 +1932,7 @@ def reconnect_warp(reason: str) -> bool:
     _mark_warp_ip_used(ip, time.time())
     switched_at = time.time()
     _warp_line_selected(m["tag"], ip, switched_at)  # 轮转公平性
-    global _ACTIVE_WARP_IP, _proxy_dwell_since, _last_warp_switch_ok_ts
+    _set_warp_line_ip(m["tag"], ip)  # 刚验证过：刷新缓存时刻，供下次快速选线
     _last_warp_switch_ok_ts = switched_at
     _ACTIVE_WARP_IP = ip
     _proxy_dwell_since = 0          # 回到 WARP，驻留计时清零
@@ -2017,11 +2096,19 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
             return
     if _WARP_MIN_CYCLE_SEC > 0:
         elapsed = now - start
-        if elapsed >= _WARP_MIN_CYCLE_SEC:
+        # 换线生效后还要再花 switch_lead_sec 才真正把流量挪走（探测+切 selector）。
+        # 拿「已服务时长 ≥ 典型寿命」当判据等于让旧线多跑一个换线耗时 —— 实测
+        # 换线 p50=2s / p90=7s，而首错延迟 p50=3s，赶不上。提前这个量发起，
+        # 让新线在旧线到寿时已经就位。
+        if elapsed >= max(_WARP_MIN_CYCLE_SEC - _warp().get("switch_lead_sec", 3.0),
+                          _WARP_MIN_CYCLE_FLOOR_SEC):
             # 只绕 cooldown_ok：上次换线失败时 `_warp_cooldown_until` 是
             # cooldown_fail_sec，那是防隧道雷暴的，不能绕。
+            lead = max(_WARP_MIN_CYCLE_SEC - _warp().get("switch_lead_sec", 3.0),
+                       _WARP_MIN_CYCLE_FLOOR_SEC)
             _reconnect_warp_now(
-                f"主动轮换 周期 {elapsed:.0f}s ≥ {_WARP_MIN_CYCLE_SEC:.0f}s",
+                f"主动轮换 周期 {elapsed:.0f}s ≥ {lead:.0f}s"
+                f"（寿命 {_WARP_MIN_CYCLE_SEC:.0f}s − 换线耗时）",
                 now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
         return
     if now < _warp_cooldown_until:
