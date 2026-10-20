@@ -1801,6 +1801,24 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | T-157 | P1 | 未发起切换时不得清空回切证据 | `pytest test_daemon_unit.py -k keeps_evidence` | `_reconnect_warp_now` 在冷却/锁竞争时返回 False，此时清 `_proxy_fail_streak` 等于丢掉已积累的判据 |
 | T-158 | P1 | 补刷成功后不二次重启隧道 | `grep -c "会话已刷新" daemon.log` 与换线次数对照 | `_schedule_idle_refresh` 只调 `_retry_refresh_idle_warp`；叠加无条件 `_refresh_idle_warp` 会再换一个 IP 并可能掐断在途连接 |
 | T-159 | P1 | 探测超时放宽到 20s | `for p in 1080..1084; curl --max-time 20 --socks5 ...` | 实测 B/C 偶发 >8s 响应（触发旧超时），20s 内稳定 1.2-1.4s |
+| T-160 | P0 | 未报错也主动换线（按请求数） | `pytest test_daemon_unit.py -k proactively_rotate` | 无任何 403/429，累计 `proactive_after_requests`=20 条即发起换线；未达阈值不换。WHY：报错后才换已经冲断在途对话；实测同一 IP 首次 403/429 前请求数中位数 28（p25=10，p75=73） |
+| T-161 | P1 | 主动轮换遵守换线冷却 | `pytest test_daemon_unit.py -k proactively_rotate` | 冷却期内（换线后 20s）即使满足请求数也不换，防止请求突发把隧道变成永动机 |
+| T-162 | P0 | 选线按「线」的最近选择时刻轮转 | `pytest test_daemon_unit.py -k longest_unselected_fresh_line` | 多条新鲜备线时选 `_WARP_LINE_STATE[tag].sel` 最小的那条。按 IP 使用表排序不成立：出窗口的条目会被清理，清理后所有备线并列最老，退化成 members 顺序（实测 D/E 被选中 0 次） |
+| T-163 | P1 | 备线预热跳过新鲜线、只刷两条以内 | `pytest test_daemon_unit.py -k prewarm_picks` | 挑最久没被选过且已知 IP 不新鲜的线调度刷新；`_WARP_REFRESHING` ≥2 时不预热。目的：换线时总有现成新鲜 IP 可直接切，省掉 7~9s 同步刷新 |
+| T-164 | P0 | 出口 IP 复用窗口 24h 生效 | `pytest test_daemon_unit.py -k test_warp_ip_reuse_window_24h` | `ip_reuse_guard_sec` 与 `blocked_ttl_sec` 均为 86400：23h 前用过的 IP 仍判「窗口内」并触发先刷新会话；超 24h 的条目被清理、可直接切。WHY：实测出口 IP 可用周期 p50=19s、max=65s，10~50 分钟切回几乎立刻再 403，一天内复用等于反复踩同一批烧掉的地址 |
+| T-165 | P0 | cycle 样本采集与 24h 过滤 | `pytest test_daemon_unit.py -k test_warp_cycle_pruning_24h_window` | 换线生效记起点、该 IP 首次 403/429 记终点，样本 `{ip, cycle, ended_at, ok}` 落盘 `.warp_ip_cycles.json`（`WARP_IP_CYCLES_FILE_PATH` 可覆盖，测试隔离）；超 24h 的样本被清除 |
+| T-166 | P0 | 最小周期重算排除 0 值样本 | `pytest test_daemon_unit.py -k test_recompute_min_cycle_excludes_zero_ok_zero` | 每 `min_cycle_recalc_sec`(300s) 取 24h 内所有 **cycle > 0** 样本的最小值存入 `_WARP_MIN_CYCLE_SEC`；cycle == 0（切上去首请求即错）不参与，否则最小值恒为 1s、每个 tick 都换线。日志 `↻ 最小可用周期重算: 7s（可用样本 42 条，首个请求即错 13 条已排除）` |
+| T-167 | P0 | 主动轮换只按请求数触发（时间样本不得抢跑） | `pytest test_daemon_unit.py -k test_proactive_rotate_ignores_min_cycle_samples` | 即使存在 `_WARP_MIN_CYCLE_SEC` 样本、时间已远超样本周期，请求数未达 `proactive_after_requests` 也不换线；达标才换，且不传 `ignore_cooldown`（走冷却保护的常规路径）。WHY 废弃时间判据：它是自证循环 —— 403 多在换线后 1s 内出现，落进 20s 冷却期被 `maybe_reconnect_warp` 丢弃，样本最小值恒等于冷却值（实测 18 条全部 20.0~21.9s），主动轮换被锁成每 20 秒一次 |
+| T-167b | P0 | 冷却期内的 403 仍须标脏 IP 并采到周期样本 | `pytest test_daemon_unit.py -k test_maybe_reconnect_marks_ip_blocked_inside_cooldown` | 冷却未结束时触发采样：出口 IP `blocked=True`、本段写入一条 `cycle = now - _last_warp_switch_ok_ts` 样本、且不 spawn 换线线程；同段重复触发不重复采样。修复前这些段整体被丢弃，IP 不标脏会被下次换线当干净地址选回 |
+| T-168 | P1 | 请求数判据 | `pytest test_daemon_unit.py -k test_proactive_rotate_falls_back_to_request_count` | 已服务 `proactive_after_requests`(60) 条请求即换线，未达阈值不换。取 60 的依据：61 段实测 30% 零错误、每段成功中位 14 条（max 56） |
+| T-169 | P0 | ignore_cooldown 仍受 `_WARP_LOCK` 约束 | `pytest test_daemon_unit.py -k test_ignore_cooldown_still_requires_warp_lock` | 锁被占用时返回 False 且不 spawn 换线线程；锁空闲才发起。WHY：绕过冷却只是放宽时间判据，不能同时放宽并发互斥，否则两个换线线程会互相踩隧道 |
+| T-170 | P1 | 预热按 24h 流量门控 | `pytest test_daemon_unit.py -k test_prewarm_gate_uses_24h_window` | 最近 24h 内有 opencode 请求才预热备线（2h 前的旧流量仍算有）；24h 内零请求不预热。旧窗口 10 分钟会让冷启动/低峰期永不预热 |
+| T-171 | P1 | 全不新鲜时按休息时间兜底选线 | `pytest test_daemon_unit.py -k test_reconnect_warp_picks_longest_rest_when_none_fresh` | 所有备线都刷新不出 24h 窗口外的新 IP 时，选 `now - 上次使用时刻` 最大的一条；日志打印该 IP 休息时长与样本平均休息时长，切前仍先刷新会话 |
+| T-172 | P0 | 补刷不得重启已成当前出口的线 | `pytest test_warp_refresh.py -k test_retry_loop_aborts_when_member_becomes_active` | 空闲后这条线已被切成当前出口时必须放弃并返回 False，不得调 `_refresh_idle_warp`（重启会掐断在途连接 → upstream connection lost）。判据落在**重启之前**而非循环开头：换线线程的快照早于本次调度，等空闲的 40s 内这条线才变成出口 —— 放在本轮开头挡不住这一段。线下次被换下时 `reconnect_warp` 会重新调度补刷 |
+| T-173 | P0 | IP 使用记录与周期样本须原子落盘 | `pytest test_daemon_unit.py -k test_persistence_write_is_atomic_and_logs_failure` | `.warp_ip_used.json` 与 `.warp_ip_cycles.json` 走「写 `.tmp` → `os.replace`」；写入失败时原文件保持完好（不先截断），并记 `✗ 写 xxx 失败`。WHY：这两份记录是重启后唯一能恢复「哪些地址已被烧」的证据，直接 `open(w)` 在崩溃/掉电时留半截 JSON → 下次启动解析失败 → 记录全丢 → 脏地址被当干净地址切回（实测 22:22 重启即如此，22:27 切回已烧地址，403 持续 144s）。旧实现的 `except: pass` 让这种丢失无从察觉 |
+| T-174 | P0 | 补刷在途不得被并发换线踩到 | `pytest test_warp_refresh.py -k "retry_loop"` | `_WARP_REFRESH_LOCK` 用 RLock：`_prewarm_standby_warp` 持锁后调 `_schedule_idle_refresh`（后者同锁）不再自锁死。另：补刷循环里查当前出口的真函数 `active_warp_tag()` 会发 Clash API 请求，测试必须打桩 —— 否则假时钟 tick 预算被吃光且结果取决于线上此刻哪条线在服务（实测同一用例在不同时刻分别命中 WARP-CF-E / WARP-CF-C，flaky） |
+
+> 周期数据依据（2026-10-20）：修复前落盘的 18 条样本全部落在 20.0~21.9s —— 那不是 IP 寿命，是 20s 冷却期本身，因为冷却期内出现的 403 根本没被采样（T-167b）。修好采样后重启实测：样本 min 1.6s / 中位 3.1s，并出现 `ok=1` 的 2.5s 样本（服务成功过随即被烧）。同期按 DB 逐段核对 45 个有流量的换线段：首错延迟中位 1s、16 段首请求即错、30% 零错误、每段成功中位 14 条。据此**回退时间判据，主动轮换只按请求数（60）触发**（T-167/T-168），周期采集保留但仅作观测。
 
 路由两条硬约束（踩过的坑）：
 1. `domain_suffix` 写 `opencode.ai`，写 `.opencode.ai` 匹配不到裸域；
@@ -1823,3 +1841,7 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | v1.10 | 2026-10-19 | 换线候选排除正在补刷的线 (T-147)：补刷窗口拉长到 600s 后，切到一台即将被重启的隧道会掐断在途连接 | - |
 | v1.11 | 2026-10-19 | 双向兜底 (T-149~T-151)：proxy 池健康探测 + 主动切回 WARP，不再只靠下游 429 触发；接线断言防重构删除。修 opencode 域名规则裸域匹配 (T-152，codex review 发现) | - |
 | v1.12 | 2026-10-20 | 五隧道补齐 (T-153)：`.warp/warp-outbound.json` 仅 A/B/C，D/E 空转；回切改为三条证据判据 (T-154)，不再因 WARP 探测通过就回切；池采样随机并发 (T-155)；修落池时间戳陈旧 (T-156)、失败丢证据 (T-157)、补刷后二次重启 (T-158)；探测超时 8→20s (T-159) | codex review |
+| v1.13 | 2026-10-20 | 主动轮换 (T-160/T-161)：按已服务请求数触发换线，不等 403 冲断对话；选线改按「线」的最近选择时刻轮转 (T-162)，修掉 IP 表清理后排序退化、D/E 永不被选的问题；新增备线预热 (T-163) 让换线路径不必同步等待刷新；删 `_warp_ip_exhausted` 假耗尽短路；`_WARP_LINE_STATE` 记录每条线上次被选时刻与已知 IP | - |
+| v1.15 | 2026-10-20 | 订正 v1.14 的时间判据：周期样本最小值恒等于冷却值（403 落在冷却期被丢弃，未采样也未标脏），主动轮换被锁成每 20 秒一次。修采样先于冷却判断 (T-167b)、主动轮换回归纯请求数判据且阈值 20→60 (T-167/T-168)。实测依据：45 段首错延迟中位 1s、16 段首请求即错、30% 段零错误、每段成功中位 14 条；修复后样本 min 1.6s / 中位 3.1s | - |
+| v1.14 | 2026-10-20 | IP 复用窗口 3600→86400s (T-164)；新增出口 IP 周期采集 `.warp_ip_cycles.json` 与 24h 过滤 (T-165)、最小周期定期重算并排除 cycle=0 (T-166)；主动轮换改为按最小周期触发、无样本回退请求数判据 (T-167/T-168)；`ignore_cooldown` 仍受 `_WARP_LOCK` 约束 (T-169)；预热流量门控 10min→24h (T-170)；全不新鲜时按休息时间兜底选线 (T-171)。依据：24h 实测 80 个有流量换线段，42 段成功过再出错，cycle p25=7s / p50=19s / max=65s，13 段首请求即错 | - |
+| v1.16 | 2026-10-20 | 补刷并发收口：`_WARP_REFRESH_LOCK` 改 RLock 解开 `_prewarm_standby_warp` → `_schedule_idle_refresh` 的自我死锁 (T-174)；守卫移到重启前，补上「等空闲期间被切成出口」这一段 (T-172)；两份记录改原子落盘且失败记日志 (T-173)。测试侧修 flaky：补刷用例打桩 `active_warp_tag`，不再依赖线上此刻哪条线在服务 | codex review |
