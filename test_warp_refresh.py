@@ -11,6 +11,8 @@
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, '.')
 
 # 必须早于 import daemon —— 否则模块级已冻结点错文件
@@ -19,6 +21,17 @@ import config as C
 C.CFG["log_file"] = "/dev/null"
 
 import daemon
+
+
+@pytest.fixture(autouse=True)
+def _isolate_warp_state(monkeypatch):
+    """_probe_warp_egress 会把探测到的 tag→IP 写进 _WARP_LINE_STATE。
+
+    不隔离时别的用例留下的 IP 会让 _retry_refresh_idle_warp 误判「已知新鲜」
+    而提前返回，四个补刷用例全挂（实测单独跑 22 passed、与 unit 合跑 4 个挂）。
+    """
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
 
 
 class ScriptedBytes:
@@ -141,6 +154,9 @@ def test_retry_loop_refreshes_after_first_busy_round(monkeypatch):
 
     monkeypatch.setattr(daemon, "_wait_warp_idle", fake_wait)
     monkeypatch.setattr(daemon, "_refresh_idle_warp", fake_refresh)
+    # 必须打桩：真实 active_warp_tag() 会发 Clash API 请求（读 4 次时钟、耗时不定），
+    # 既把假时钟的 tick 预算吃光，也让用例结果取决于线上此刻哪条线在服务。
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-OTHER")
     monkeypatch.setattr(time, "time", lambda: 0.0)
 
     daemon._retry_refresh_idle_warp({"tag": "WARP-CF-C"})
@@ -171,6 +187,7 @@ def test_retry_loop_keeps_trying_when_refresh_yields_no_fresh_ip(monkeypatch):
     monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
                         lambda m: (st.__setitem__("refresh", st["refresh"] + 1), None)[1])
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-OTHER")
 
     clock = {"t": 0.0}
 
@@ -181,6 +198,30 @@ def test_retry_loop_keeps_trying_when_refresh_yields_no_fresh_ip(monkeypatch):
     monkeypatch.setattr(time, "time", tick)
     daemon._retry_refresh_idle_warp({"tag": "WARP-CF-C"})
     assert st["refresh"] > 1, f"应重试多次，实际 {st['refresh']}"
+
+
+def test_retry_loop_aborts_when_member_becomes_active(monkeypatch):
+    """空闲后这条线已成当前出口时必须放弃刷新，不得重启正在服务的隧道。
+
+    场景：换线线程的快照早于本次调度，等待期间目标线被切成出口；此时重启它
+    会掐断在途连接（upstream connection lost）。判据必须落在重启之前 ——
+    放在循环开头挡不住「等空闲的 40s 内才变成出口」那一段。
+    """
+    st = {"refresh": 0}
+    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
+    monkeypatch.setattr(daemon, "_refresh_idle_warp",
+                        lambda m: (st.__setitem__("refresh", st["refresh"] + 1), True)[1])
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-C")
+
+    clock = {"t": 0.0}
+
+    def tick():
+        clock["t"] += 100.0
+        return clock["t"]
+
+    monkeypatch.setattr(time, "time", tick)
+    assert daemon._retry_refresh_idle_warp({"tag": "WARP-CF-C"}) is False
+    assert st["refresh"] == 0, "已成当前出口的线不得被重启"
 
 
 def test_failback_is_wired_into_main_loop():

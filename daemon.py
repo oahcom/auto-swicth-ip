@@ -1116,9 +1116,145 @@ def _warp_ip_last_ts(ip: str | None) -> float:
     return float(ts) if ts is not None else 0.0
 
 
-def _warp_ip_recently_used(ip: str | None, now: float) -> bool:
-    """该出口 IP 是否在 ip_reuse_guard_sec 窗口内被用过。"""
-    return bool(ip) and now - _warp_ip_last_ts(ip) < _warp()["ip_reuse_guard_sec"]
+def _warp_ip_recently_used(ip: str | None, now: float,
+                           window: float | None = None) -> bool:
+    """该出口 IP 是否在 window 内**有过成功流量**。
+
+    判据是 `last_ok_ts`（最近一次成功响应的时刻），不是 `ts`（最近一次
+    被选为出口的时刻）。区别在于：一条被选上去后立刻 403 的线，`ts` 很新
+    但 `last_ok_ts` 是 0/很旧 —— 它其实从没服务成功过，不该因为"刚用过"
+    而被排除；反过来，一条正在稳定服务的线即使被选中很久，也算"刚成功过"。
+    没有 last_ok_ts 的老记录退回按 ts 判定（迁移期）。
+    """
+    if not ip:
+        return False
+    if window is None:
+        window = _warp()["ip_reuse_guard_sec"]
+    with _WARP_IP_LOCK:
+        entry = _WARP_IP_USED.get(ip)
+        ok = entry.get("last_ok_ts") if isinstance(entry, dict) else None
+    # 本函数只回答「窗口内有没有成功流量」，没有成功记录答 False。这与
+    # 「该不该用」不是一回事 —— 没成功过也没被标记的地址（实测 97/350 条）
+    # 由 _warp_ip_rank 排到第 1 档，不当新鲜地址直接切，但仍可作兜底。
+    return bool(ok) and now - float(ok) < window
+
+
+def _warp_ip_is_blocked(ip: str | None) -> bool:
+    """该出口 IP 是否已被 403/429 标记。"""
+    if not ip:
+        return False
+    with _WARP_IP_LOCK:
+        entry = _WARP_IP_USED.get(ip)
+    return bool(isinstance(entry, dict) and entry.get("blocked"))
+
+
+_last_success_probe: tuple[int, int] | None = None
+
+
+_ACTIVE_IP_INIT_TS: float = 0.0
+
+
+def _maybe_init_active_ip(now: float) -> None:
+    """`_ACTIVE_WARP_IP` 为空时后台补探一次。
+
+    启动时探测只做一次，那时 sing-box 可能还没就绪，`warp_egress_ip()` 返回
+    None；此后该变量只在换线成功时赋值。若一直没触发换线（流量正常），它就
+    永远是 None，成功流量打点全部因 `if not ip: return` 丢弃 —— 实测重启后
+    1 分钟仍全是 `ip=None`。探测要 curl（最长 20s），不能放在主循环里同步做，
+    所以丢给后台线程，30s 最多一次。
+    """
+    global _ACTIVE_IP_INIT_TS
+    if _ACTIVE_WARP_IP or now - _ACTIVE_IP_INIT_TS < 30:
+        return
+    _ACTIVE_IP_INIT_TS = now
+
+    def _probe() -> None:
+        global _ACTIVE_WARP_IP
+        m = _warp_member(active_warp_tag())
+        if m:
+            ip = warp_egress_ip(m["port"])
+            if ip:
+                _ACTIVE_WARP_IP = ip
+                log(f"  · 当前出口 IP 补探成功: {ip}（启动时探测未就绪）")
+
+    threading.Thread(target=_probe, daemon=True, name="active-ip-init").start()
+
+
+def _record_active_ip_success(total: int, errors: int) -> None:
+    """把「该出口 IP 有成功流量」记进 last_ok_ts。
+
+    判据是窗口内**成功条数的增量**：total 与 errors 都只统计最近
+    RECENT_WINDOW 条，成功数 = total - errors。增量 > 0 就说明这段时间里
+    有请求打成功了 —— 这正是选线要的「3 小时内有过成功流量」。
+    不能用「窗口里 success>0」：窗口滑动时同一条旧成功会被反复计入，
+    一个早已死掉的地址会永远看起来「刚刚还成功过」。
+    """
+    global _last_success_probe
+    ok_now = total - errors
+    prev_ip, prev_ok = _last_success_probe or (None, None)
+    ip = _ACTIVE_WARP_IP
+    _last_success_probe = (ip, ok_now)
+    if prev_ok is None or prev_ip != ip or not ip:
+        return
+    # 窗口里成功数没有增长 → 这一轮没有新的成功流量。窗口是跨 IP 的滑动窗口，
+    # 单看「窗口里有过 success」会把几分钟前别的出口的成功反复算到当前 IP 上。
+    if ok_now <= prev_ok:
+        return
+    now = time.time()
+    with _WARP_IP_LOCK:
+        if not isinstance(_WARP_IP_USED.get(ip), dict):
+            # 重启后隧道换出的新地址此前没有记录（只有被选为出口时才写），
+            # 不补一条的话成功流量永远打不上点，选线日志恒为「有成功记录 0 条」。
+            _warp_ip_used_locked(ip, now, False)
+        _WARP_IP_USED[ip]["last_ok_ts"] = now
+        _save_warp_ip_used()
+
+
+def _warp_ip_never_used(ip: str | None) -> bool:
+    """该出口 IP 是否从未出现在使用记录里 —— 首选，必然没被 opencode 见过。"""
+    if not ip:
+        return False
+    with _WARP_IP_LOCK:
+        return ip not in _WARP_IP_USED
+
+
+def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, float]:
+    """选线优先级：越小越优先。返回 (档位, 排序值)。
+
+    三档（对应「按使用来区分」）：
+      0. 从未出现过 —— 必然干净；
+      1. 出现过但**没有任何成功流量** —— 切上去就报错、或从没真正服务过。
+         这类不能当新鲜地址直接切（实测 350 条记录里 97 条属于此类），
+         排在有成功记录的地址后面，但仍可作兜底；
+      2. 有过成功流量 —— 按「距最近一次成功」排序，越久越优先（窗口内
+         越久未成功 = 越接近恢复）。
+    窗口外的地址由调用方先筛掉，不进本函数比较。
+    """
+    with _WARP_IP_LOCK:
+        entry = _WARP_IP_USED.get(ip) if ip else None
+    if entry is None:
+        return (0, 0.0)
+    ok = entry.get("last_ok_ts") if isinstance(entry, dict) else None
+    if not ok:
+        return (1, 0.0)
+    # 取负：调用方用 min()，而「越久没成功越该优先」意味着间隔越大排序值要越小。
+    return (2, -(now - float(ok)))
+
+
+def _warp_guard_for_reason(reason: str) -> float:
+    """按触发原因给出复用窗口（秒）。
+
+    403 与 429 是两个独立的轴，恢复速度不同：
+    - abuse403 = 出口信誉被标记。选取 3 小时内没用过的地址。
+    - rate429 = 按 IP 的限流，间隔要求更长：选取 24 小时内没用过的地址。
+      （实测同一出口 110s 内 ok/429 交替 8:4，单看时间会以为它很快恢复；
+      但那是同一段会话内的波动，换线要挑的是长期没碰过的地址。）
+    """
+    if "abuse403" in reason:
+        return _warp()["blocked_guard_sec"]
+    if "rate429" in reason:
+        return _warp()["rate429_guard_sec"]
+    return _warp()["ip_reuse_guard_sec"]
 
 
 def _warp_rest_time(ip: str | None, now: float) -> float:
@@ -1171,8 +1307,8 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool) -> None:
     无法回答"这个地址活了多久"。实测"休息越久越耐用"不成立（休息 <15min 复用
     存活中位 153s，>60min 反而 23s），所以这些字段只用于事后评估，不参与选线。
     """
-    fresh = {"ts": now, "blocked": blocked,
-             "first_seen": now, "blocked_ts": None, "served_sec": None}
+    fresh = {"ts": now, "blocked": blocked, "first_seen": now,
+             "blocked_ts": None, "served_sec": None, "last_ok_ts": None}
     entry = _WARP_IP_USED.setdefault(ip, fresh)
     if isinstance(entry, dict):
         entry["ts"] = now
@@ -1212,7 +1348,12 @@ def _refresh_idle_warp(member: dict) -> str | None:
             return None
         if ok:
             ip = warp_egress_ip(member["port"])
-            if ip and not _warp_ip_recently_used(ip, time.time()):
+            # 刷新后的判据是「这条地址没有近期成功流量」。但刚重启的隧道换出的
+            # 新地址本来就没成功过，按这个判据必然通过 —— 正是想要的：新地址
+            # 优先。若重连没真正生效、拿回的还是刚烧掉的那个，它若有近期成功
+            # 记录就会被挡下（没有成功记录的地址见 _warp_ip_recently_used 注释）。
+            if (ip and not _warp_ip_recently_used(ip, time.time())
+                    and not _warp_ip_is_blocked(ip)):
                 log(f"  ↻ {member['tag']} 会话已刷新: {ip}")
                 _set_warp_line_ip(member["tag"], ip)
                 return ip
@@ -1221,6 +1362,54 @@ def _refresh_idle_warp(member: dict) -> str | None:
             log(f"  ✗ {member['tag']} 刷新后端口未就绪")
         time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
     return None
+
+
+_last_dirty_reclaim_ts: float = 0.0
+
+
+def _reclaim_dirty_warp_lines(now: float) -> None:
+    """任一 WARP 备线的出口是被标记过的脏 IP，就后台重连到换出干净地址。
+
+    WHY 不等换线时再刷：停在 proxy 时主循环不调预热，五条线的脏 IP 会一直留着，
+    `_warp_any_reachable()` 恒 False → 回切永远不发生（实测 18:50~19:20 连续 30
+    分钟全 403）。当前出口线交给换线路径处理 —— 重启它会掐断在途连接。
+    """
+    global _last_dirty_reclaim_ts
+    if now - _last_dirty_reclaim_ts < _warp()["prewarm_sec"]:
+        return
+    _last_dirty_reclaim_ts = now
+    active = active_warp_tag()
+    for m in _warp()["members"]:
+        if m["tag"] == active:
+            continue
+        with _WARP_REFRESH_LOCK:
+            if m["tag"] in _WARP_REFRESHING:
+                continue
+            _WARP_REFRESHING.add(m["tag"])
+        threading.Thread(target=_reclaim_dirty_warp_worker, args=(m,),
+                         daemon=True, name=f"warp-reclaim-{m['tag']}").start()
+
+
+def _reclaim_dirty_warp_worker(member: dict) -> None:
+    """探测该线出口；脏 IP 就重启隧道，直到换出未被标记的地址或超时。"""
+    try:
+        deadline = time.time() + _warp()["ip_refresh_retry_sec"]
+        while time.time() < deadline:
+            ip = warp_egress_ip(member["port"])
+            if not ip:
+                time.sleep(3)
+                ip = warp_egress_ip(member["port"])
+            if ip and not _warp_ip_is_blocked(ip):
+                _set_warp_line_ip(member["tag"], ip)
+                return
+            log(f"  ↻ {member['tag']} 出口 {ip or '探测失败'} 疑似脏 IP，重连换线")
+            if _refresh_idle_warp(member):
+                return
+            time.sleep(_warp()["refresh_delay_sec"])
+        log(f"  ✗ {member['tag']} {_warp()['ip_refresh_retry_sec']}s 内未换出干净出口")
+    finally:
+        with _WARP_REFRESH_LOCK:
+            _WARP_REFRESHING.discard(member["tag"])
 
 
 # 补刷结果计数。补刷是后台线程，失败只在换线撞上「无可用备线」时才暴露，
@@ -1373,7 +1562,11 @@ def _probe_warp_egress(members: list[dict]) -> dict[str, str | None]:
         futs = {ex.submit(warp_egress_ip, m["port"]): m["tag"] for m in members}
         for f in concurrent.futures.as_completed(futs):
             try:
-                out[futs[f]] = f.result()
+                ip = f.result()
+                out[futs[f]] = ip
+                if ip:
+                    # 记下 tag→IP：预热/脏线巡检靠它判断「这条线现在出去是什么地址」。
+                    _set_warp_line_ip(futs[f], ip)
             except Exception as e:
                 log(f"  ✗ 探测 {futs[f]} 出口异常: {e}")
                 out[futs[f]] = None
@@ -1541,6 +1734,7 @@ def reconnect_warp(reason: str) -> bool:
     standby = [m for m in standby if m["tag"] not in refreshing]
     probed = _probe_warp_egress(standby)
     probes: list[tuple[dict, str]] = []   # (member, ip)，探测到出口的备线
+    blocked_lines: list[dict] = []        # 出口已被标记、待刷新换 IP 的备线
     for m in standby:
         ip = probed.get(m["tag"])
         if not ip:
@@ -1553,21 +1747,41 @@ def reconnect_warp(reason: str) -> bool:
         if not ip:
             log(f"  ✗ 备线 {m['tag']} 探测失败，跳过")
             continue
-        with _WARP_IP_LOCK:
-            ip_blocked = (_WARP_IP_USED.get(ip) or {}).get("blocked")
-        if ip_blocked:
-            log(f"  ✗ 备线 {m['tag']} 出口 {ip} 已被标记，跳过")
+        if _warp_ip_is_blocked(ip):
+            # 被标记 ≠ 永久不可用：每条隧道同一时刻只有一个出口 IP，重启才会换
+            # 会话。全跳过会让候选池恒为 0（403 风暴几秒就能烧完全部备线），
+            # 流量被甩到同样被限流的 proxy 池 —— 19:16 的兜底死循环即由此而来。
+            log(f"  ↻ 备线 {m['tag']} 出口 {ip} 已被标记，排队刷新")
+            blocked_lines.append(m)
             continue
         probes.append((m, ip))
 
-    # 优先挑已经新鲜的：先切过去，把 7~9s 的刷新省掉。刷新会重启目标隧道，
-    # 期间流量还停在已被标记的旧出口上 —— 实测同步刷新让换线多花 9s。
-    # 有第三条线轮转后，通常总能找到一条已经预热的线。
-    fresh = [p for p in probes if not _warp_ip_recently_used(p[1], now)]
-    if fresh:
-        # 按「线」而非 IP 的最久未用排序：按 IP 排不成立 —— 出窗口的条目会被
-        # 清理，清理后所有备线并列最老，又退化成 members 顺序。
-        m, ip = min(fresh, key=lambda p: _warp_line_sel(p[0]["tag"]))
+    # 备线出口全被标记时刷新一条拿新会话 IP，刷新不出才落 proxy 池 —— 池只是
+    # 最后兜底，不该是「地址全被标记」的直接结果。备线此刻不在服务流量，重启
+    # 不会掐断在途请求。
+    if not probes:
+        for m in blocked_lines:
+            ip = _refresh_idle_warp(m)
+            if ip:
+                probes.append((m, ip))
+                break
+            log(f"  ✗ {m['tag']} 刷新后仍无可用出口")
+
+    # 选线三级优先：
+    #   1) 从未用过的地址 —— 必然没被 opencode 见过，优先级最高；
+    #   2) 窗口外没用过的（窗口按触发原因取：403→3h，429→24h）；
+    #   3) 都不满足时兜底复用最久未用的（见下面 elif probes 分支）。
+    # 第 1 级单列是因为「从没用过」和「用过但已久」在 _warp_ip_last_ts 上都
+    # 可能返回很小的值，混在一起排序会让刚清理掉的旧地址冒充新地址。
+    guard = _warp_guard_for_reason(reason)
+    # 已被 403/429 标记的地址在探测阶段就被剔除了，这里只剩可尝试的备线。
+    usable = [p for p in probes if not _warp_ip_recently_used(p[1], now, guard)]
+    n_new = sum(1 for p in probes if _warp_ip_never_used(p[1]))
+    n_ok = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 2)
+    log(f"  ↻ 选线: 从没用过 {n_new} 条, 有成功记录 {n_ok} 条, "
+        f"{guard/3600:.0f}h 内无成功流量合计 {len(usable)} 条 / 备线 {len(probes)} 条")
+    if usable:
+        m, ip = min(usable, key=lambda p: _warp_ip_rank(p[1], now, guard))
     elif probes:
         # 极端兜底：所有备线 IP 都在复用窗口内。按「最久没用过」选一条再刷新。
         # WHY 不用"平均休息时间"排序：实测休息时长与存活无关（<15min 复用的
@@ -1617,6 +1831,15 @@ def reconnect_warp(reason: str) -> bool:
     # 自然结束；预先刷好则下次切回时无需在换线路径上同步等 7~9s。
     if active is not None:
         _schedule_idle_refresh(active)
+    # 任一备线出口疑似脏就不能留着：重连到换出优质 IP 为止（补刷内部有重试上限）。
+    # 同时最多两条在刷，避免多条隧道同时重启。
+    for bm in blocked_lines:
+        if bm["tag"] == m["tag"]:
+            continue
+        with _WARP_REFRESH_LOCK:
+            if len(_WARP_REFRESHING) >= 2:
+                break
+        _schedule_idle_refresh(bm)
     return True
 
 
@@ -1721,7 +1944,7 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) 
 def _maybe_proactively_rotate_warp(now: float) -> None:
     """当前出口还在成功服务时就换线，不必等 403 冲断在途对话。
 
-    有周期样本时按「24h 内成功服务过的段的最短周期」换线；无样本时回退到
+    有周期样本时按「24h 内成功服务过的段的典型周期（中位）」换线；无样本时回退到
     「已服务请求数」。时间判据曾因**自证循环**被弃用：采样写在冷却判断之后，
     换线后 1 秒内的 403 全被 20s 冷却丢弃，样本最小值恒等于冷却值。f68ab66
     起采样先于冷却判断，样本反映真实周期，判据恢复可用。
@@ -1777,11 +2000,14 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
 
 
 def _prewarm_standby_warp(now: float) -> None:
-    """后台预热一条闲置备线，让换线时总有现成的新鲜 IP 可直接切。
+    """后台巡检各条备线：出口疑似脏就重连，直到换出优质 IP。
 
-    WHY 需要：ip_reuse_guard_sec=24h，用过的线的 IP 全在窗口内；不预热的话
-    换线时只有「刚换下、已被补刷」的那一条是新鲜的 —— 实测流量长期在
-    WARP-CF 与 WARP-CF-B 之间往返，C/D/E 几乎轮不到。
+    WHY 需要：ip_reuse_guard_sec=24h，用过的线 IP 全在窗口内；不预热的话换线时
+    只有「刚换下、已被补刷」的那一条是新鲜的 —— 实测流量长期只在 WARP-CF 与
+    WARP-CF-B 之间往返。另一类脏线是 403/429 标记过的地址：它可能从没有过成功
+    流量，只看「窗口内有无成功」会把它当新鲜线跳过，脏 IP 永远刷不掉。
+
+    每轮只启动一条，由并发上限保证同时最多两条在刷。
     """
     global _last_warp_prewarm_ts
     if now - _last_warp_prewarm_ts < _warp()["prewarm_sec"]:
@@ -1799,9 +2025,10 @@ def _prewarm_standby_warp(now: float) -> None:
     active = active_warp_tag()
 
     def _is_fresh(m: dict) -> bool:
-        """该线已知的出口 IP 是否还在窗口外；IP 未知按旧会话处理。"""
+        """该线已知出口 IP 是否优质（未被标记且窗口外）；IP 未知按旧会话处理。"""
         ip = _warp_line_ip(m["tag"])
-        return bool(ip) and not _warp_ip_recently_used(ip, now)
+        return (bool(ip) and not _warp_ip_is_blocked(ip)
+                and not _warp_ip_recently_used(ip, now))
 
     # 已知 IP 仍新鲜的线不用再刷：重启会白换掉一个好会话。
     cands = [m for m in _warp()["members"]
@@ -2802,6 +3029,8 @@ def main():
 
             # ---- 1. 读取错误率 ----
             total, errors, _, consecutive_errors, reject_ratio = get_9router_error_rate()
+            _maybe_init_active_ip(now)
+            _record_active_ip_success(total, errors)
 
             # ---- 1b. 自适应策略切换（带回滞） ----
             error_rate = errors / total if total > 0 else 0
@@ -2866,6 +3095,12 @@ def main():
 
             # ---- 3c0. 双向兜底的反向：停在 proxy 上时，池挂了或 WARP 复活都切回 ----
             _maybe_failback_to_warp(now)
+            # 任一备线出口是脏 IP 就重连换干净地址 —— 与当前在 WARP 还是 proxy 无关。
+            _reclaim_dirty_warp_lines(now)
+
+            # 任一隧道出口疑似脏（403/429 标记或窗口内用过）就重连，直到换出优质
+            # IP；掉在 proxy 池上时也要继续，否则池本身就是脏地址时永远回不来。
+            _prewarm_standby_warp(now)
 
             # ---- 3c. 错误触发 ----
             if opencode_out_on_warp():
@@ -2875,9 +3110,8 @@ def main():
                 # （步骤 3，每 60s）刷新，用它当窗口起点会把爆发期间的 abuse 403
                 # 整段吞掉 —— 实测 15:47~15:52 连续 252 条 403 一次换线都没触发。
                 maybe_reconnect_warp(now)
-                # 主动轮换与备线预热：都只为「不等报错」—— 403 一出现，在途对话已经断了。
+                # 主动轮换只为「不等报错」—— 403 一出现，在途对话已经断了。
                 _maybe_proactively_rotate_warp(now)
-                _prewarm_standby_warp(now)
             else:
                 # 用户要求：切换后只要出现新的错误就立即再切，不受冷却限制。
                 # max_backoff_ts=上次成功切换时刻，天然排除切换前的旧错误，
