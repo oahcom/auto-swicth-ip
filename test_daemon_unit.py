@@ -1151,6 +1151,39 @@ def test_count_warp_blocked_since_other_error_never_triggers_switch(monkeypatch)
     assert got["full_err"] is False, "窗内有 other_err，不算纯出口风暴"
 
 
+def test_count_segment_requests_attributes_by_request_start(monkeypatch):
+    """段内计数按请求开始时刻归属，与 count_warp_blocked_since 同口径。
+
+    9router 在请求结束时才写行，换线又不掐断在途请求（实测 38.4% 的请求
+    生命周期跨越一次换线）。按完成时刻算，上一段的请求会被记进新段，
+    「这条出口服务了多少条」被系统性污染。
+    """
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.execute("CREATE TABLE requestDetails (provider TEXT, status TEXT, timestamp TEXT, data TEXT)")
+    rate = json.dumps({"response": {
+        "error": json.dumps({"error": {"type": "FreeUsageLimitError",
+                                       "message": "Rate limit exceeded. Please try again later."}}),
+        "status": 429}})
+    def row(status, ts, latency_ms, body=None):
+        return ("opencode", status, ts,
+                json.dumps({"status": status, "latency": {"total": latency_ms},
+                            "response": body or {}}))
+    mem.executemany("INSERT INTO requestDetails VALUES (?,?,?,?)", [
+        # 开始于段起点之前、完成于之后：属于上一段，不计
+        row("error", "2026-10-19T07:00:05.000Z", 8000, {"error": rate, "status": 429}),
+        # 开始于段起点之后：属于本段
+        row("success", "2026-10-19T07:00:40.000Z", 1000),
+        row("success", "2026-10-19T07:01:00.000Z", 1000),
+        row("error", "2026-10-19T07:01:10.000Z", 1000, {"error": rate, "status": 429}),
+    ])
+    monkeypatch.setattr(daemon, "_get_db", lambda: mem)
+    cutoff = datetime(2026, 10, 19, 7, 0, 30, tzinfo=timezone.utc).timestamp()
+    ok, blocked = daemon.count_segment_requests(cutoff)
+    assert (ok, blocked) == (2, 1), \
+        f"跨段请求不计入本段，应为 (2, 1)，实际 {(ok, blocked)}"
+
+
 def test_failover_switches_to_standby_and_refreshes_idle(monkeypatch):
     """备线可用时必须换线（不原地重启），并异步刷新被换下的主线上会话。"""
     _warp_env(monkeypatch, WARP_TWO)

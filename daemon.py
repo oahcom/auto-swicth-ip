@@ -1465,16 +1465,21 @@ def count_segment_requests(ts: float) -> tuple[int, int]:
 
     出口级错误只算 403/429：402 与超长与出口无关，算进去会把误切窗口的
     承载量系统性压低（正是用户指出的「只跑了几条不能作为参考」）。
+
+    按请求**开始**时刻归属（`_START_TS_SQL`），不按完成时刻：9router 在请求
+    结束时才写行，换线又不掐断在途请求 —— 实测 38.4% 的请求生命周期跨越一次
+    换线。按完成时刻算，上一段的请求会被记到新 IP 头上，段样本被污染。
     """
     if ts <= 0:
         return 0, 0
     cutoff = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    raw_floor = cutoff
     try:
         with _db_lock:
-            rows = _get_db().execute("""
+            rows = _get_db().execute(f"""
                 SELECT status, data FROM requestDetails
-                WHERE provider = ? AND timestamp > ?
-            """, (OPENCODE_FREE_PROVIDER, cutoff)).fetchall()
+                WHERE provider = ? AND timestamp > ? AND {_START_TS_SQL} > ?
+            """, (OPENCODE_FREE_PROVIDER, raw_floor, float(ts))).fetchall()
     except Exception as e:
         log(f"✗ 统计段内请求失败: {e}")
         return 0, 0
