@@ -522,6 +522,18 @@ def _probe_cache_get(tag: str, ip: str) -> str | None:
         return _WARP_PROBE_SEEN.get((tag, _WARP_PROBE_EPOCH.get(tag, 0), ip))
 
 
+def _probe_cache_verdict(tag: str | None, ip: str | None) -> str | None:
+    """该线本会话对这个 IP 的实测结论；没探过返回 None。
+
+    与 `_probe_cache_get` 同一张台账：探测器写、刷新判据读 —— 探到的 quota
+    必须能反过来驱动「这条线该重启」，否则结论只进不出：线永远不被选中
+    刷新，代次永不前进，台账永远命中「已探过（跳过）」，脏线焊死在原地。
+    """
+    if not tag or not ip:
+        return None
+    return _probe_cache_get(tag, ip)
+
+
 def _probe_cache_put(tag: str, ip: str, verdict: str) -> None:
     with _WARP_REFRESH_LOCK:
         _WARP_PROBE_SEEN[(tag, _WARP_PROBE_EPOCH.get(tag, 0), ip)] = verdict
@@ -562,10 +574,14 @@ def _track_offline_refresh(prev_tag: str | None, new_tag: str | None) -> None:
         _WARP_REFRESH_COUNT.pop(new_tag, None)
 
 
-def _warp_ip_refresh_reason(ip: str | None, now: float) -> str:
+def _warp_ip_refresh_reason(ip: str | None, now: float,
+                            tag: str | None = None) -> str:
     """低质原因的可读短语；健康地址返回空串。与 _warp_ip_needs_refresh 同源。"""
     if not ip:
         return "出口未知"
+    verdict = _probe_cache_verdict(tag, ip)
+    if verdict is not None and verdict != "OK":
+        return f"模型层 {verdict}"
     if _warp_ip_is_blocked(ip, now):
         with _WARP_IP_LOCK:
             entry = _WARP_IP_USED.get(ip) or {}
@@ -1736,7 +1752,8 @@ def _ip_disqualified(ip: str | None, now: float, guard: float) -> bool:
             or _warp_ip_recently_used(ip, now, guard))
 
 
-def _warp_ip_needs_refresh(ip: str | None, now: float) -> bool:
+def _warp_ip_needs_refresh(ip: str | None, now: float,
+                           tag: str | None = None) -> bool:
     """该出口是否低质到该被后台刷掉；IP 未知（None）也视为低质。
 
     模型模式下「低质」只认确定的证据，不用启发式：
@@ -1747,6 +1764,11 @@ def _warp_ip_needs_refresh(ip: str | None, now: float) -> bool:
     原模式沿用复用窗口判定，语义不变。
     """
     if not ip:
+        return True
+    # 本会话实测不通过（quota/err/unreachable）就是「此刻不能服务 opencode」，
+    # 与 blocked 同义：只有重启换会话才可能好转。判据复用已有结论，不额外探测。
+    verdict = _probe_cache_verdict(tag, ip)
+    if verdict is not None and verdict != "OK":
         return True
     if _warp_ip_is_blocked(ip, now):
         return True
@@ -2164,7 +2186,7 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
     t = member["tag"]
     # 调用方可能已算好原因时传进来（脏线守护在清空旧 IP 之前算的）；否则自己推导。
     reason = (reason_hint
-              or _warp_ip_refresh_reason(_warp_line_ip(t), time.time())
+              or _warp_ip_refresh_reason(_warp_line_ip(t), time.time(), t)
               or "主动刷新")
     off = _WARP_OFF_AGE.get(t)
     reason = (f"离渠刷新/{reason}" if off is not None
@@ -2261,7 +2283,7 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
                 ip = warp_egress_ip(member["port"])
             # 探到地址不等于地址优质：被 403/429 标记过、或用过却从没有过
             # 成功流量的线仍是低质，必须换掉。判据与预热、补刷同源。
-            if ip and not _warp_ip_needs_refresh(ip, time.time()):
+            if ip and not _warp_ip_needs_refresh(ip, time.time(), member["tag"]):
                 _set_warp_line_ip(member["tag"], ip)
                 return
             # 探测期间这条线可能已被换线线程切成当前出口：此刻重启会掐断在途
@@ -2288,7 +2310,7 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
                 continue
             try:
                 _t = member["tag"]
-                _why = _warp_ip_refresh_reason(ip, time.time()) or "疑似脏 IP"
+                _why = _warp_ip_refresh_reason(ip, time.time(), member["tag"]) or "疑似脏 IP"
                 log(f"  ↻ {_t} 出口 {ip or '探测失败'} 刷 IP{_warp_refresh_progress(_t)}"
                     f" 原因={_why}")
                 _invalidate_warp_line_ip(member["tag"])
@@ -2333,7 +2355,7 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
         # 「优质」—— 模型模式下原先见 IP 就返回，实测 239 次 ok 全是空转，
         # 脏线一次都没真刷过。
         known = _warp_line_ip(member["tag"])
-        if known and not _warp_ip_needs_refresh(known, time.time()):
+        if known and not _warp_ip_needs_refresh(known, time.time(), member["tag"]):
             _bump_refresh_stat("ok")
             return True
         idle = _wait_warp_idle(member)
@@ -3129,13 +3151,13 @@ def _prewarm_standby_warp(now: float) -> None:
     # 已知 IP 仍优质的线不用再刷：重启会白换掉一个好会话。
     cands = [m for m in _warp()["members"]
              if m["tag"] != active and m["tag"] not in busy
-             and _warp_ip_needs_refresh(_warp_line_ip(m["tag"]), now)]
+             and _warp_ip_needs_refresh(_warp_line_ip(m["tag"]), now, m["tag"])]
     if not cands:
         return
     for m in cands:
         _schedule_idle_refresh(m)
     whys = "; ".join(
-        f"{m['tag']}({_warp_ip_refresh_reason(_warp_line_ip(m['tag']), now) or '未知'})"
+        f"{m['tag']}({_warp_ip_refresh_reason(_warp_line_ip(m['tag']), now, m['tag']) or '未知'})"
         for m in cands)
     log(f"↻ 预热 {len(cands)} 条低质备线: {whys}")
 

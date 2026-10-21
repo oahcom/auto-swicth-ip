@@ -57,6 +57,26 @@ def test_offline_refresh_count_starts_when_leaving_and_resets_on_return(monkeypa
     assert daemon._WARP_REFRESH_COUNT["W1"] == 0
 
 
+def test_quota_verdict_turns_line_into_refresh_candidate(monkeypatch):
+    """探到 quota 的线必须被判为低质并进入预热候选，否则永不重启、代次永不动。
+
+    实测故障：CF-J 缓存恒报「已探过: quota（跳过）」，但 75 分钟无一次重启 ——
+    quota 结论只进台账不出台账，`_warp_ip_needs_refresh` 在模型模式下不认它。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    ip = "2a09:bac5:test::quota-ip"
+    assert daemon._warp_ip_needs_refresh(ip, 1000.0) is False  # 无结论：全新地址不算低质
+    daemon._probe_cache_put("W1", ip, "quota")
+    assert daemon._warp_ip_needs_refresh(ip, 1000.0, "W1") is True, \
+        "本会话实测 quota 必须判为低质"
+    assert "quota" in daemon._warp_ip_refresh_reason(ip, 1000.0, "W1")
+
+    # 会话代次前进后结论作废：同一 IP 重新可探，也不再凭旧结论判低质
+    daemon._bump_probe_epoch("W1")
+    assert daemon._probe_cache_verdict("W1", ip) is None
+    assert daemon._warp_ip_needs_refresh(ip, 1000.0, "W1") is False
+
+
 class ScriptedBytes:
     """按脚本返回 _warp_line_bytes 的值；脚本耗尽后返回 None（模拟查询失败）。
 

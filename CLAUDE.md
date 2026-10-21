@@ -203,6 +203,10 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   **会话粒度而非永久**：`_restart_service(service, tag)` 成功即 `_bump_probe_epoch(tag)`，
   重启后即使拿回同一 IP 也允许再探一次 —— 配额窗口可能已滚动，旧结论不代表新会话。
   只保留当前代次记录，旧代次在写入时清掉。
+  **结论必须回灌为刷新判据**：`_warp_ip_needs_refresh` / `_warp_ip_refresh_reason`
+  接受 `tag`，命中台账的非 OK 结论即判低质。否则结论只进不出 —— 线永远进不了
+  预热/脏线候选，代次永不前进，台账永远命中「已探过（跳过）」，脏线焊死原地。
+  实测 CF-J 因此 75 分钟无一次重启，日志每分钟刷「已探过: quota」。
 - **刷新日志答三问：谁在刷、为什么刷、刷了几次**：每次刷新都带
   `原因=<短语>`（由 `_warp_ip_refresh_reason` 从当前出口推导：`abuse403/rate429 惩罚期`、
   `复用窗口内`、`从无成功流量`）与 `（离渠后第 N 次刷，X min）`。
