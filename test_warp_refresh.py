@@ -171,7 +171,7 @@ def test_retry_loop_refreshes_after_first_busy_round(monkeypatch):
         st["wait"] += 1
         return st["wait"] > 1
 
-    def fake_refresh(member):
+    def fake_refresh(member, **kw):
         st["refresh"] += 1
         return "2a09:bac5:NEW::1"
 
@@ -191,7 +191,7 @@ def test_retry_loop_keeps_trying_while_busy(monkeypatch):
     st = {"wait": 0}
     monkeypatch.setattr(daemon, "_wait_warp_idle",
                         lambda m: (st.__setitem__("wait", st["wait"] + 1), False)[1])
-    monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m: None)
+    monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m, **kw: None)
 
     clock = {"t": 0.0}
 
@@ -434,7 +434,7 @@ def test_retry_loop_restarts_line_whose_ip_never_served(monkeypatch):
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-OTHER")
     refreshed = []
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
-                        lambda m: (refreshed.append(m["tag"]), "new-ip")[1])
+                        lambda m, **kw: (refreshed.append(m["tag"]), "new-ip")[1])
     assert daemon._retry_refresh_idle_warp({"tag": "WARP-CF-C"}) is True
     assert refreshed == ["WARP-CF-C"], f"从没成功过的地址必须被换掉，实际 {refreshed}"
 
@@ -447,7 +447,7 @@ def test_retry_loop_never_restarts_brand_new_ip(monkeypatch):
     monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
     refreshed = []
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
-                        lambda m: (refreshed.append(m["tag"]), "x")[1])
+                        lambda m, **kw: (refreshed.append(m["tag"]), "x")[1])
     assert daemon._retry_refresh_idle_warp({"tag": "WARP-CF-C"}) is True
     assert not refreshed, f"全新地址不应再重启，实际 {refreshed}"
 
@@ -470,7 +470,7 @@ def test_dirty_worker_restarts_flagged_line_in_model_mode(monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_PROBING", set())
     refreshed = []
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
-                        lambda m: (refreshed.append(m["tag"]), "clean-ip")[1])
+                        lambda m, **kw: (refreshed.append(m["tag"]), "clean-ip")[1])
 
     daemon._reclaim_dirty_warp_worker({"tag": "W1", "port": 1080,
                                        "service": "usque-warp.service"})
@@ -548,7 +548,7 @@ def _reconnect_fixture(monkeypatch, test_many, refresh_result=None):
                                        for m, _ in pairs})
     refreshed, scheduled = [], []
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
-                        lambda m: (refreshed.append(m["tag"]), refresh_result)[1])
+                        lambda m, **kw: (refreshed.append(m["tag"]), refresh_result)[1])
     monkeypatch.setattr(daemon, "_schedule_idle_refresh",
                         lambda m: scheduled.append(m["tag"]))
     switched = []

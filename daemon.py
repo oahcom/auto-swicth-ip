@@ -2151,7 +2151,7 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     return ok
 
 
-def _refresh_idle_warp(member: dict) -> str | None:
+def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | None:
     """重启隧道，直到拿到一条可用的出口 IP；失败返回 None。
 
     单次重启可能拿回同一地址（WARP 会话未真正重连），故按 max_attempts 重试。
@@ -2162,7 +2162,10 @@ def _refresh_idle_warp(member: dict) -> str | None:
     「都刷一样」看不出为什么刷，事后无法判断某条线是被 429 拖住还是纯配额耗尽。
     """
     t = member["tag"]
-    reason = _warp_ip_refresh_reason(_warp_line_ip(t), time.time()) or "主动刷新"
+    # 调用方可能已算好原因时传进来（脏线守护在清空旧 IP 之前算的）；否则自己推导。
+    reason = (reason_hint
+              or _warp_ip_refresh_reason(_warp_line_ip(t), time.time())
+              or "主动刷新")
     off = _WARP_OFF_AGE.get(t)
     reason = (f"离渠刷新/{reason}" if off is not None
               else f"预热/{reason}")
@@ -2289,7 +2292,7 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
                 log(f"  ↻ {_t} 出口 {ip or '探测失败'} 刷 IP{_warp_refresh_progress(_t)}"
                     f" 原因={_why}")
                 _invalidate_warp_line_ip(member["tag"])
-                if _refresh_idle_warp(member):
+                if _refresh_idle_warp(member, reason_hint=_why):
                     return
             finally:
                 _release_refresh_slot(member["tag"])

@@ -1064,7 +1064,7 @@ def test_failover_switches_to_standby_and_refreshes_idle(monkeypatch):
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: pytest.fail("换线成功不应重启隧道"))
-    monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m: None)
+    monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m, **kw: None)
     assert daemon.reconnect_warp("test") is True
     assert switched == ["W2"], f"应切到备线 W2, 实际 {switched}"
 
@@ -1440,7 +1440,7 @@ def test_failover_excludes_line_under_refresh(monkeypatch):
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: False)
-    monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m: None)
+    monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m, **kw: None)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
 
@@ -3058,7 +3058,7 @@ def test_reconnect_prefers_never_used_over_recently_used(monkeypatch):
     monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda ip, ts, blocked=False: None)
     monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda *a: None)
-    monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m: "ip-new")
+    monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m, **kw: "ip-new")
 
     daemon.reconnect_warp("abuse403 ×1")
     assert picked == ["W2"], f"应选未用过的 W2，实际 {picked}"
