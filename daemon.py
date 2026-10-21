@@ -559,6 +559,19 @@ def _warp_refresh_progress(tag: str) -> str:
     return f"（离渠后第 {n} 次刷，{(time.time() - off) / 60:.1f}min）"
 
 
+def _warp_refresh_count_note(tag: str) -> str:
+    """模型层日志用：离渠中显示离渠进度，否则显示本会话重启次数（0 次不显示）。
+
+    备线未必当过出口 —— 那类线没有「离渠」起点，`_warp_refresh_progress`
+    返回空串，日志就只剩一句「quota」，看不出它被刷过几次。
+    """
+    prog = _warp_refresh_progress(tag)
+    if prog:
+        return prog
+    n = _WARP_REFRESH_COUNT.get(tag, 0)
+    return f"（本会话重启 {n} 次）" if n else ""
+
+
 def _track_offline_refresh(prev_tag: str | None, new_tag: str | None) -> None:
     """出口变更时维护「离渠刷新」计数。
 
@@ -2144,7 +2157,8 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     cached = _probe_cache_get(tag, ip)
     if cached is not None:
         ok = cached == "OK"
-        log(f"  · {tag} 出口 {ip} 本会话已探过: {cached}（跳过）")
+        log(f"  · {tag} 出口 {ip} 本会话已探过: {cached}（跳过）"
+            f"{_warp_refresh_count_note(tag)}")
         return ok
     try:
         import probe_warp
@@ -2155,7 +2169,8 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         return False
     _probe_cache_put(tag, ip, verdict)
     ok = verdict == "OK"
-    log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}")
+    log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}"
+        f"{_warp_refresh_count_note(tag)}")
     if ok:
         # 实测通过 = 这条地址此刻确实能服务，记进 last_ok_ts。否则同址仍停在
         # 档位 2（从没成功过），后台会把刚验过的线当低质反复重启，白烧配额。
