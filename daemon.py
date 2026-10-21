@@ -393,12 +393,16 @@ def _prune_warp_cycles(cycles, now: float) -> list[dict]:
     return out
 
 
-def _record_warp_cycle(ip: str | None, cycle: float, now: float, ok: int = 0) -> None:
+def _record_warp_cycle(ip: str | None, cycle: float, now: float, ok: int = 0,
+                       blocked: int = 0) -> None:
     """记一条可用周期样本并落盘（只保留 24h）。
 
     cycle == 0 表示「切上去第一条请求就 403/429」（ok=0）。这类样本要留档
     以便日志统计，但**不参与**最小周期计算 —— 24h 实测 80 段里 13 段如此，
     算进去会让最小值恒为 1s，主动轮换变成每 tick 都换。
+
+    ok/blocked 都是**整段累计**（success 条数 / 403+429 条数），不是滑动窗口
+    里的条数：本函数要回答「这条出口一共服务了几条才死」，窗口口径答不了。
     """
     if not ip or cycle < 0:
         return
@@ -413,8 +417,8 @@ def _record_warp_cycle(ip: str | None, cycle: float, now: float, ok: int = 0) ->
         span = max(float(entry["last_ok_ts"]) - float(entry["first_ok_ts"]), 0.0)
     with _WARP_CYCLES_LOCK:
         _WARP_IP_CYCLES.append({"ip": ip, "cycle": float(cycle),
-                                "span": span,
-                                "ended_at": now, "ok": int(ok)})
+                                "span": span, "ended_at": now,
+                                "ok": int(ok), "blocked": int(blocked)})
         _WARP_IP_CYCLES[:] = _prune_warp_cycles(_WARP_IP_CYCLES, now)
         snapshot = list(_WARP_IP_CYCLES)
     _write_json_atomic(_warp_ip_cycles_path(), {"cycles": snapshot})
@@ -765,6 +769,27 @@ def log_health(msg: str):
 
 # ============= 9router 监控 =============
 
+_EGRESS_ERR_MARKERS = ("abusive traffic", "Rate limit exceeded")
+
+
+def _classify_egress_error(body: str | None) -> str | None:
+    """把一条错误归为出口级拦截，返回 'abuse403' / 'rate429' / None。
+
+    WHY 必须区分：只有这两类按出口 IP 判定，换出口即拿到新配额/新信誉。
+    其余错误归因给出口是错的 —— 实测 requestDetails 全表 605 条错误里
+    507 条 429、18 条 "maximum context length"（请求本身太长）、80 条
+    "Endpoint is unavailable"（上游 402，longcat 模型独占 77 条）。后两类
+    与出口无关：108/108 条 402 在 3 秒内由 combo 的下一模型成功兜住。
+    """
+    if not body:
+        return None
+    if "abusive traffic" in body:
+        return "abuse403"
+    if "Rate limit exceeded" in body:
+        return "rate429"
+    return None
+
+
 def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int, list, int, int]:
     """从 SQLite 读最近 N 个 OpenCode Free 请求，
     返回 (total, errors, details_list, consecutive_errors, reject_ratio)
@@ -776,9 +801,13 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int,
     其他免费 provider 不参与切换决策——它们不触发 IP 轮换。
 
     检测策略：两层检测
-    - 窗口检测：最近 RECENT_WINDOW 条的总错误率
-    - 连续检测：从最新条往前数，连续失败的个数（防止 success 稀释 error）
+    - 窗口检测：最近 RECENT_WINDOW 条里**出口级**错误的数量
+    - 连续检测：从最新条往前数，连续出口级失败的个数（防止 success 稀释 error）
     任一超过阈值就触发切换。
+
+    两类错误口径必须与 `count_warp_blocked_since` 一致：只有 403/429 是出口
+    问题。上游 402（"Endpoint is unavailable"）与请求超长（"maximum context
+    length"）都不是 —— 前者实测 108/108 被 combo 的下一模型在 3 秒内兜住。
 
     max_backoff_ts：上次成功切换的 epoch 秒。传入后只统计切换点之后的请求，
     避免新节点刚上线就背切换前旧节点留下的错误（6-16s 内被误拉黑）。
@@ -810,14 +839,25 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int,
 
         recent = [dict(r) for r in rows]
         total = len(recent)
-        errors = sum(1 for r in recent if r.get("status") != "success")
-
+        # errors 只数**出口级**拦截，不是「所有非 success」。WHY：调用方
+        # `_record_active_ip_success` 用 total-errors 当成功数，策略模式用它算
+        # 错误率。把上游 402（longcat 独占 77/80 条，108/108 由 combo 下一模型
+        # 3s 内兜住）和请求超长算进来，等于让一个健康出口的成功流量凭空变少，
+        # 并让策略模式误切压力档。这两类换出口都解决不了。
+        errors = 0
         consecutive_errors = 0
         for r in recent:
-            if r.get("status") != "success":
-                consecutive_errors += 1
-            else:
+            if r.get("status") == "success":
+                continue
+            if not _classify_egress_error(r.get("data")):
+                continue  # other（402/超长）：不计错误、不断连，同 count_warp_blocked_since
+            errors += 1
+        # 连续失败要从**最新一条**往前数：recent 是倒序（新→旧），成功即断。
+        for r in recent:
+            if r.get("status") == "success":
                 break
+            if _classify_egress_error(r.get("data")):
+                consecutive_errors += 1
 
         rejected_403 = reject_errors = 0
         for r in reject_rows:
@@ -833,8 +873,13 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int,
         reject_ratio = rejected_403 / reject_errors if reject_errors else 0.0
 
         if errors > 0:
-            err_models = set(r.get("model", "?") for r in recent if r.get("status") != "success")
-            log(f"  [OpenCode Free] {errors}/{total} 请求错误 | 连续失败={consecutive_errors} | 403占比={reject_ratio:.0%} | 失败模型: {', '.join(sorted(err_models))}")
+            err_models = set(r.get("model", "?") for r in recent
+                             if r.get("status") != "success"
+                             and _classify_egress_error(r.get("data")))
+            other = sum(1 for r in recent if r.get("status") != "success"
+                        and not _classify_egress_error(r.get("data")))
+            tail = f"（另 {other} 条非出口错误不计）" if other else ""
+            log(f"  [OpenCode Free] {errors}/{total} 出口级错误{tail} | 连续失败={consecutive_errors} | 403占比={reject_ratio:.0%} | 失败模型: {', '.join(sorted(err_models))}")
 
         return total, errors, recent, consecutive_errors, reject_ratio
     except Exception as e:
@@ -1315,18 +1360,27 @@ def count_warp_blocked_since(ts: float, limit: int | None = None) -> dict[str, i
     - abuse403：IP 信誉拦截（"abusive traffic from this IP"）
     - rate429：IP 级限流（FreeUsageLimitError "Rate limit exceeded"）
     - ok：窗口内的成功数，供调用方判断当前出口是否还在服务流量
-    - consec_err：窗口内从最新一条往前数连续失败数，0 表示最新一条成功
+    - other_err：与出口无关的失败（上游 402、请求超长），仅供诊断
+    - consec_err：窗口内从最新一条往前数连续**出口级**失败数，0 表示最新一条成功
 
     WHY 429 也算：两者都按出口 IP 判定，换出口即拿到新配额/新信誉。
 
-    WHY 默认窗口与代理侧 `get_9router_error_rate` 对齐（recent_window）：
-    窗口拉长会让一条陈旧的 403 在切换后仍算数，而切换点过滤（ts 之后的才计）
-    本就是为了只看新增错误。回切判据传 limit=200——它要数的是「落池以来累计
-    拦截 ≥5」，受默认窗口 2 限制时最多只能数到 2 条，14:47 落池后 30 分钟里
-    1590 条 429 却永不回切 WARP 的根因即在此（见 _maybe_failback_to_warp）。
+    WHY consec_err/other_err 必须分开：换线判据只能建立在「这个出口有问题」上。
+    实测 605 条错误里 18 条 "maximum context length"（请求本身太长）、80 条
+    "Endpoint is unavailable"（上游 402，longcat 独占 77 条，108/108 由 combo
+    下一模型在 3s 内兜住）。把它们算进连错会让两条无关错误就凑出 full_err，
+    把一条干净的出口切走 —— 换线既不解 402 也不解超长，纯属误切。
+
+    WHY 默认窗口至少 3 条（recent_window=2 不足）：换线门控要 `consec_err ≥ 3`，
+    而连错数最多只能数到窗口长度 —— 2 条窗口下门控恒不成立，`full_err`（整窗
+    全错）就成了唯一放行条件，两条错误就能把干净出口切走。取 max(RECENT_WINDOW, 3)
+    让门控按原意工作；不动 config 数值（recent_window 仍管策略侧窗口）。
+    回切判据传 limit=200——它要数的是「落池以来累计拦截 ≥5」，受默认窗口限制时
+    最多只能数到 2 条，14:47 落池后 30 分钟里 1590 条 429 却永不回切 WARP 的
+    根因即在此（见 _maybe_failback_to_warp）。
     """
     cutoff = float(ts) if ts > 0 else 0.0
-    window = limit if limit is not None else RECENT_WINDOW
+    window = limit if limit is not None else max(int(RECENT_WINDOW), 3)
     # 索引预筛：开始时刻只会早于完成时刻，所以完成时刻早于 cutoff 的行必然不属于
     # 本窗口，可以直接用 idx_rd_provider(provider, timestamp) 挡掉。julianday()
     # 本身用不上索引，但外围下推之后全表只剩下 60 行左右要算。
@@ -1342,32 +1396,40 @@ def count_warp_blocked_since(ts: float, limit: int | None = None) -> dict[str, i
             """, (OPENCODE_FREE_PROVIDER, raw_floor, cutoff, window)).fetchall()
     except Exception as e:
         log(f"✗ 统计 WARP 拦截失败: {e}")
-        return {"abuse403": 0, "rate429": 0, "ok": 0, "consec_err": 0,
-                "full_err": False}
-    counts = {"abuse403": 0, "rate429": 0, "ok": 0, "consec_err": 0,
-              "full_err": False}
+        return {"abuse403": 0, "rate429": 0, "ok": 0, "other_err": 0,
+                "consec_err": 0, "full_err": False}
+    counts = {"abuse403": 0, "rate429": 0, "ok": 0, "other_err": 0,
+              "consec_err": 0, "full_err": False}
+    kinds = []
     for r in rows:
         if r["status"] == "success":
             counts["ok"] += 1
+            kinds.append("ok")
             continue
         # 直接子串匹配即可，无需解析嵌套 JSON：生产行里 error 是**字符串化**的
         # 内层 JSON，其转义引号间的关键词在原始文本中逐字可见。
         # 实测 opencode 全表 1958 行：朴素子串与「解析到 response.error 再匹配」
         # 判定完全一致（0 行差异）。
-        body = r["data"] or ""
-        if "abusive traffic" in body:
-            counts["abuse403"] += 1
-        elif "Rate limit exceeded" in body:
-            counts["rate429"] += 1
-    # rows 按开始时刻倒序：从最新一条往前数连续失败。换线门用的语义是「最近
-    # RECENT_WINDOW 条里连续失败几条」，与回切的累计计数无关——传 limit 的调用
-    # 方（回切）不用 consec_err/full_err，此处仍按查询行集计算，不额外分支。
-    for r in rows:
-        if r["status"] == "success":
+        kind = _classify_egress_error(r["data"])
+        kinds.append(kind or "other")
+        if kind:
+            counts[kind] += 1
+        else:
+            counts["other_err"] += 1
+    # rows 按开始时刻倒序：从最新一条往前数连续**出口级**失败。换线门用的语义是
+    # 「最近 RECENT_WINDOW 条里连续几条说明这个出口不能用了」，与回切的累计计数
+    # 无关——传 limit 的调用方（回切）不用 consec_err/full_err。
+    # other（402/超长）**不截断**也不累加：它既不能证明出口坏了，也不是成功，
+    # 跳过继续往前数才能让一条夹在中间的 402 不把两侧的 429 割断。
+    for kind in kinds:
+        if kind == "ok":
             break
-        counts["consec_err"] += 1
-    # 整窗无一成功：连续失败已确凿，调用方据此绕过冷却立刻换线。
-    counts["full_err"] = len(rows) >= window and counts["ok"] == 0
+        if kind != "other":
+            counts["consec_err"] += 1
+    # 整窗无一成功 **且全窗都是出口级错误**才算风暴。只有 other 错误时不算：
+    # 那说明请求本身或上游模型有问题，换出口解决不了。
+    counts["full_err"] = (len(rows) >= window and counts["ok"] == 0
+                          and counts["other_err"] == 0)
     return counts
 
 
@@ -1392,6 +1454,37 @@ def count_opencode_since(ts: float) -> int:
         log(f"✗ 统计出口配额失败: {e}")
         return 0
     return len(rows)
+
+
+def count_segment_requests(ts: float) -> tuple[int, int]:
+    """起点 ts 之后、opencode 的成功数与出口级错误数（无上限）。
+
+    与 `count_warp_blocked_since` 的区别：那个是**滑动窗口**（看最近几条），
+    这个是**整段累计**（看这条出口从上线到现在服务了多少条）。单 IP 承载量
+    只能用后者统计 —— 窗口只有 2 条，用它算「每个 IP 能跑多少条」恒得 0~1。
+
+    出口级错误只算 403/429：402 与超长与出口无关，算进去会把误切窗口的
+    承载量系统性压低（正是用户指出的「只跑了几条不能作为参考」）。
+    """
+    if ts <= 0:
+        return 0, 0
+    cutoff = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        with _db_lock:
+            rows = _get_db().execute("""
+                SELECT status, data FROM requestDetails
+                WHERE provider = ? AND timestamp > ?
+            """, (OPENCODE_FREE_PROVIDER, cutoff)).fetchall()
+    except Exception as e:
+        log(f"✗ 统计段内请求失败: {e}")
+        return 0, 0
+    ok = blocked = 0
+    for r in rows:
+        if r["status"] == "success":
+            ok += 1
+        elif _classify_egress_error(r["data"]):
+            blocked += 1
+    return ok, blocked
 
 
 def _current_mode() -> tuple[str, str | None]:
@@ -2569,7 +2662,9 @@ def _maybe_failback_to_warp(now: float) -> bool:
     # 默认窗口 recent_window=2 只能数到 2 条，永远凑不满 5 → 14:47 落池后
     # 30 分钟里 1590 条 429 也回不去 WARP。
     since = _proxy_dwell_since or 0
-    blocked = count_warp_blocked_since(since, limit=200) if since else {"abuse403": 0, "rate429": 0}
+    blocked = (count_warp_blocked_since(since, limit=200) if since
+               else {"abuse403": 0, "rate429": 0, "ok": 0, "other_err": 0,
+                     "consec_err": 0, "full_err": False})
     still_limited = (blocked["abuse403"] + blocked["rate429"]
                      >= CFG["intervals"]["proxy_blocked_threshold"])
 
@@ -2978,14 +3073,18 @@ def maybe_reconnect_warp(now: float) -> None:
         if active_ip and _last_warp_switch_ok_ts > 0:
             cycle = now - _last_warp_switch_ok_ts
             if cycle > 0:
-                # 用本段起点（换线生效时刻）统计成功数，不能复用上面的
-                # blocked —— 它的窗口起点是换线**发起**时刻，跨段会算进上一段。
-                _record_warp_cycle(active_ip, cycle, now, ok=fresh.get("ok", 0))
+                # 用**整段累计**的成功数，不能用上面那个滑动窗口的 ok ——
+                # 窗口只有 2 条，ok 恒为 0 或 1：实测 4058 条周期样本里 82%
+                # 记成 ok=0，把「这条线服务过 40 条」误判成「一条没服务过」，
+                # 于是寿命判据的样本被系统性剔除，单 IP 承载量也统计不出来。
+                seg_ok, seg_blocked = count_segment_requests(_last_warp_switch_ok_ts)
+                _record_warp_cycle(active_ip, cycle, now, ok=seg_ok,
+                                   blocked=seg_blocked)
     # 用户规则：最近两条请求都报错仍允许不切，第三条连错才换线。放在采样/标脏
     # 之后 —— 连错 1~2 条时出口已收到 403，仍需把该 IP 标脏、记周期样本，只是
     # 暂不换线。实测 90 次真实触发里这条门控抑制 11 次，其中 3 次窗口内成功 ≥5
-    # （出口还健康，切走就是误切）。`full_err`（整窗 10 条全错）时
-    # consec_err 必 >= 10，不受影响。
+    # （出口还健康，切走就是误切）。`full_err`（整窗都是出口级错误、无一成功）
+    # 时 consec_err 必 >= 窗口长度，不受影响。
     if blocked.get("consec_err", 0) < 3 and not blocked.get("full_err"):
         return
     if now < _warp_cooldown_until and not blocked.get("full_err"):
@@ -4344,9 +4443,12 @@ def main():
             new_rows = wm != last_watermark
             if new_rows:
                 last_watermark = wm
-                total, errors, _, consecutive_errors, reject_ratio = get_9router_error_rate()
+                total, errors, details, consecutive_errors, reject_ratio = get_9router_error_rate()
                 _maybe_init_active_ip(now)
-                _record_active_ip_success(total, errors)
+                # errors 只数出口级拦截，不能拿 total-errors 当成功数（402/超长
+                # 会被误算成成功）。成功数直接数 status，才是这个出口真的served 的流量。
+                ok_count = sum(1 for r in details if r.get("status") == "success")
+                _record_active_ip_success(total, total - ok_count)
 
             # ---- 0. 9router 代理配置检查 (每 60s) ----
             # SQLite 读写，不在热路径上，但也不该让循环等它 —— 丢后台。

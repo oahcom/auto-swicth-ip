@@ -92,30 +92,37 @@ def _isolate_production_files(tmp_path, monkeypatch):
 
 
 # ============= 1. get_9router_error_rate（mock _get_db） =============
-def test_错误率两层检测_窗口与连续():
+def test_错误率两层检测_窗口与连续(monkeypatch):
+    # 窗口是配置项（recent_window），测试必须钉死自己构造的数据条数，
+    # 否则 config 一改就变成「测的是窗口大小」而不是「测的是检测逻辑」。
+    monkeypatch.setattr(daemon, "RECENT_WINDOW", 10)
     schema = "CREATE TABLE requestDetails (provider TEXT, model TEXT, status TEXT, timestamp REAL, data TEXT)"
     mem = sqlite3.connect(":memory:")
     mem.execute(schema)
     mem.row_factory = sqlite3.Row
     now = 1_700_000_000
+    # 错误行必须带出口级关键词：402/超长按设计不计入出口错误（见 _classify_egress_error）
+    e429 = json.dumps({"response": {"status": 429, "error": json.dumps(
+        {"error": {"type": "FreeUsageLimitError",
+                   "message": "Rate limit exceeded. Please try again later."}})}})
     rows = [
         # 最近 10 条：3 errors + 连续 2 失败结尾
-        ("opencode", "mimo", "error", now),          # 连续 1
-        ("opencode", "mimo", "error", now - 1),       # 连续 2
-        ("opencode", "mimo", "success", now - 2),
-        ("opencode", "mimo", "success", now - 3),
-        ("opencode", "mimo", "error", now - 4),       # 第 3 个 error
-        ("opencode", "mimo", "success", now - 5),
-        ("opencode", "mimo", "success", now - 6),
-        ("opencode", "mimo", "success", now - 7),
-        ("opencode", "mimo", "success", now - 8),
-        ("opencode", "mimo", "success", now - 9),
-        ("opencode", "mimo", "success", now - 10),
+        ("opencode", "mimo", "error", now, e429),          # 连续 1
+        ("opencode", "mimo", "error", now - 1, e429),       # 连续 2
+        ("opencode", "mimo", "success", now - 2, None),
+        ("opencode", "mimo", "success", now - 3, None),
+        ("opencode", "mimo", "error", now - 4, e429),       # 第 3 个 error
+        ("opencode", "mimo", "success", now - 5, None),
+        ("opencode", "mimo", "success", now - 6, None),
+        ("opencode", "mimo", "success", now - 7, None),
+        ("opencode", "mimo", "success", now - 8, None),
+        ("opencode", "mimo", "success", now - 9, None),
+        ("opencode", "mimo", "success", now - 10, None),
         # 非 opencode provider：必须被排除
-        ("kiro", "x", "error", now - 0.5),
-        ("nvidia", "x", "error", now - 0.6),
+        ("kiro", "x", "error", now - 0.5, e429),
+        ("nvidia", "x", "error", now - 0.6, e429),
     ]
-    mem.executemany("INSERT INTO requestDetails (provider,model,status,timestamp) VALUES (?,?,?,?)", rows)
+    mem.executemany("INSERT INTO requestDetails (provider,model,status,timestamp,data) VALUES (?,?,?,?,?)", rows)
 
     orig = daemon._get_db
     daemon._get_db = lambda: mem
@@ -129,7 +136,8 @@ def test_错误率两层检测_窗口与连续():
     assert consecutive == 2, f"consecutive 应为 2，实际 {consecutive}"
 
 
-def test_错误率_全成功返回零():
+def test_错误率_全成功返回零(monkeypatch):
+    monkeypatch.setattr(daemon, "RECENT_WINDOW", 10)
     schema = "CREATE TABLE requestDetails (provider TEXT, model TEXT, status TEXT, timestamp REAL, data TEXT)"
     mem = sqlite3.connect(":memory:")
     mem.execute(schema)
@@ -148,25 +156,29 @@ def test_错误率_全成功返回零():
 
 
 
-def test_错误率_切换点过滤_旧节点错误不背锅():
+def test_错误率_切换点过滤_旧节点错误不背锅(monkeypatch):
     """新节点上线后，切换点之前的旧节点错误不应触发拉黑"""
+    monkeypatch.setattr(daemon, "RECENT_WINDOW", 10)
     schema = "CREATE TABLE requestDetails (provider TEXT, model TEXT, status TEXT, timestamp REAL, data TEXT)"
     mem = sqlite3.connect(":memory:")
     mem.execute(schema)
     mem.row_factory = sqlite3.Row
     # 生产表 timestamp 为 ISO TEXT（'2026-10-16T17:33:48.877Z'），fixture 须对齐
     iso = lambda epoch: datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    e429 = json.dumps({"response": {"status": 429, "error": json.dumps(
+        {"error": {"type": "FreeUsageLimitError",
+                   "message": "Rate limit exceeded. Please try again later."}})}})
     switch_ts = 1_700_000_000 - 5  # 5 秒前切换
     rows = [
         # 切换点之后：2 success + 1 error
-        ("opencode", "m", "success", iso(switch_ts + 1)),
-        ("opencode", "m", "success", iso(switch_ts + 2)),
-        ("opencode", "m", "error",   iso(switch_ts + 3)),
+        ("opencode", "m", "success", iso(switch_ts + 1), None),
+        ("opencode", "m", "success", iso(switch_ts + 2), None),
+        ("opencode", "m", "error",   iso(switch_ts + 3), e429),
         # 切换点之前：全 error（旧节点的锅）
-        ("opencode", "m", "error", iso(switch_ts - 1)),
-        ("opencode", "m", "error", iso(switch_ts - 2)),
+        ("opencode", "m", "error", iso(switch_ts - 1), e429),
+        ("opencode", "m", "error", iso(switch_ts - 2), e429),
     ]
-    mem.executemany("INSERT INTO requestDetails (provider,model,status,timestamp) VALUES (?,?,?,?)", rows)
+    mem.executemany("INSERT INTO requestDetails (provider,model,status,timestamp,data) VALUES (?,?,?,?,?)", rows)
     orig = daemon._get_db
     daemon._get_db = lambda: mem
     try:
@@ -180,14 +192,22 @@ def test_错误率_切换点过滤_旧节点错误不背锅():
     finally:
         daemon._get_db = orig
 
-def test_error_rate_counts_403_client_rejections():
+def test_error_rate_counts_403_client_rejections(monkeypatch):
+    monkeypatch.setattr(daemon, "RECENT_WINDOW", 10)
     schema = "CREATE TABLE requestDetails (provider TEXT, model TEXT, status TEXT, timestamp REAL, data TEXT)"
     mem = sqlite3.connect(":memory:")
     mem.execute(schema)
     mem.row_factory = sqlite3.Row
     import json as _json
-    e403 = _json.dumps({"status": "error", "response": {"status": 403, "error": "{}"}})
-    e429 = _json.dumps({"status": "error", "response": {"status": 429, "error": "{}"}})
+    # error 文本必须带出口级关键词：空 "{}" 会被判成 other（402/超长同类），
+    # 按设计不计入出口错误，403 占比统计仍走 response.status，不受影响。
+    e403 = _json.dumps({"status": "error", "response": {
+        "status": 403, "error": _json.dumps(
+            {"error": {"message": "detected abusive traffic from this IP address"}})}})
+    e429 = _json.dumps({"status": "error", "response": {
+        "status": 429, "error": _json.dumps(
+            {"error": {"type": "FreeUsageLimitError",
+                       "message": "Rate limit exceeded. Please try again later."}})}})
     rows = [
         ("opencode", "m", "error", 5, e403),
         ("opencode", "m", "error", 4, e429),
@@ -205,6 +225,37 @@ def test_error_rate_counts_403_client_rejections():
         daemon._get_db = orig
     assert total == 4 and errors == 3, (total, errors)
     assert abs(rejected - 2 / 3) < 1e-9, f"403 占比应为 2/3，实际 {rejected}"
+
+
+def test_error_rate_upstream_402_does_not_count_as_error(monkeypatch):
+    """上游 402 与请求超长不算出口错误，也不打断连续失败的计数。
+
+    旧口径 status != "success" 全算错误：recent_window=2 下一条 402 + 一条
+    超长即凑满整窗全错 → full_err → 立刻换线。换出口解不了这两类错误。
+    """
+    monkeypatch.setattr(daemon, "RECENT_WINDOW", 10)
+    schema = "CREATE TABLE requestDetails (provider TEXT, model TEXT, status TEXT, timestamp REAL, data TEXT)"
+    mem = sqlite3.connect(":memory:")
+    mem.execute(schema)
+    mem.row_factory = sqlite3.Row
+    now = 1_700_000_000
+    e402 = json.dumps({"response": {"status": 402,
+                                    "error": "Endpoint is unavailable"}})
+    toolong = json.dumps({"response": {"error": "maximum context length is 128000 tokens"}})
+    mem.executemany(
+        "INSERT INTO requestDetails (provider,model,status,timestamp,data) VALUES (?,?,?,?,?)",
+        [("opencode", "longcat-2.5-preview-free", "error", now - i, body)
+         for i, body in enumerate((e402, toolong, e402, toolong, e402))],
+    )
+    orig = daemon._get_db
+    daemon._get_db = lambda: mem
+    try:
+        total, errors, _, consecutive, _ = daemon.get_9router_error_rate()
+    finally:
+        daemon._get_db = orig
+    assert total == 5, f"total 应为 5，实际 {total}"
+    assert errors == 0, f"非出口错误不计 errors，实际 {errors}"
+    assert consecutive == 0, f"非出口错误不断连，实际 {consecutive}"
 
 # ============= 2. _update_strategy_mode（纯函数） =============
 def test_策略_normal_to_pressure():
@@ -963,11 +1014,16 @@ def test_count_warp_blocked_since_filters_abuse(monkeypatch):
         "两类拦截分开计数；success 不计入拦截但计入 ok（判断出口是否在服务）"
     assert got["consec_err"] == 0, "窗口内最新一条（07:00:03）是成功，连错为 0"
     assert got["full_err"] is False, "窗口未满且成功数 > 0"
-    assert daemon.count_warp_blocked_since(0)["abuse403"] == 2
+    # 显式给窗口：默认窗口现在至少 3 条（连错门控要数到 3），06:59 那条会落在窗外
+    assert daemon.count_warp_blocked_since(0, limit=10)["abuse403"] == 2
 
 
 def test_count_warp_blocked_since_counts_consecutive_tail(monkeypatch):
-    """连错数从最新一条往前数，停在第一条成功处；成功夹在中间也挡不住尾部计数。"""
+    """连错数从最新一条往前数，停在第一条成功处；成功夹在中间也挡不住尾部计数。
+
+    显式 limit=10：默认窗口已抬到至少 3 条（连错门控要数到 3），本例的
+    「更早的成功仍计入窗内 ok」需要包含那第 4 条成功。
+    """
     mem = sqlite3.connect(":memory:")
     mem.row_factory = sqlite3.Row
     mem.execute("CREATE TABLE requestDetails (provider TEXT, status TEXT, timestamp TEXT, data TEXT)")
@@ -982,9 +1038,10 @@ def test_count_warp_blocked_since_counts_consecutive_tail(monkeypatch):
         ("opencode", "error", "2026-10-19T07:00:04.000Z", rate),
     ])
     monkeypatch.setattr(daemon, "_get_db", lambda: mem)
-    assert daemon.count_warp_blocked_since(0)["consec_err"] == 3, \
+    assert daemon.count_warp_blocked_since(0, limit=10)["consec_err"] == 3, \
         "最新三条连错，中间无成功"
-    assert daemon.count_warp_blocked_since(0)["ok"] == 1, "更早的成功仍计入窗内 ok"
+    assert daemon.count_warp_blocked_since(0, limit=10)["ok"] == 1, \
+        "更早的成功仍计入窗内 ok"
 
 
 def test_count_warp_blocked_since_production_nested_response(monkeypatch):
@@ -1054,6 +1111,44 @@ def test_count_warp_blocked_since_attributes_by_request_start(monkeypatch):
     assert daemon.count_warp_blocked_since(cutoff)["rate429"] == 1, \
         "只统计开始时刻落在窗口内的行，完成时刻在窗口内不算"
 
+
+def test_count_warp_blocked_since_other_error_never_triggers_switch(monkeypatch):
+    """上游 402 / 请求超长是 other_err：不进 full_err，也不截断两侧的连错。
+
+    复刻生产事故形态：recent_window=2 时一次 Endpoint is unavailable + 一次
+    maximum context length 就凑出整窗全错，立刻换线 —— 而换出口既不解 402
+    也不解超长。
+    """
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.execute("CREATE TABLE requestDetails (provider TEXT, status TEXT, timestamp TEXT, data TEXT)")
+    e402 = '{"response":{"status":402,"error":"Endpoint is unavailable"}}'
+    toolong = '{"response":{"error":"maximum context length is 128000 tokens"}}'
+    rate = json.dumps({"response": {
+        "error": json.dumps({"error": {"type": "FreeUsageLimitError",
+                                       "message": "Rate limit exceeded. Please try again later."}}),
+        "status": 429}})
+    # 最新两条：只有 other 错误 —— 旧逻辑下 full_err=True 直接换线
+    mem.executemany("INSERT INTO requestDetails VALUES (?,?,?,?)", [
+        ("opencode", "error", "2026-10-19T07:00:03.000Z", toolong),
+        ("opencode", "error", "2026-10-19T07:00:02.000Z", e402),
+    ])
+    monkeypatch.setattr(daemon, "_get_db", lambda: mem)
+    got = daemon.count_warp_blocked_since(0, limit=3)
+    assert got["full_err"] is False, "整窗只有非出口错误，不构成风暴"
+    assert got["consec_err"] == 0, "other 不计入连错"
+    assert got["other_err"] == 2, "两条 other 都要留在诊断计数里"
+
+    # 402 夹在两条 429 中间：不能把两侧的连错割断
+    mem.execute("DELETE FROM requestDetails")
+    mem.executemany("INSERT INTO requestDetails VALUES (?,?,?,?)", [
+        ("opencode", "error", "2026-10-19T07:00:03.000Z", rate),
+        ("opencode", "error", "2026-10-19T07:00:02.000Z", e402),
+        ("opencode", "error", "2026-10-19T07:00:01.000Z", rate),
+    ])
+    got = daemon.count_warp_blocked_since(0, limit=3)
+    assert got["consec_err"] == 2, "中间的 402 不截断，两条 429 连续计数"
+    assert got["full_err"] is False, "窗内有 other_err，不算纯出口风暴"
 
 
 def test_failover_switches_to_standby_and_refreshes_idle(monkeypatch):
@@ -2613,8 +2708,10 @@ def test_maybe_reconnect_marks_ip_blocked_inside_cooldown(monkeypatch):
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
                         lambda ts: {"abuse403": 1, "rate429": 0, "ok": 3, "consec_err": 1})
     monkeypatch.setattr(daemon, "_record_warp_cycle",
-                        lambda ip, cyc, now, ok=0: daemon._WARP_IP_CYCLES.append(
+                        lambda ip, cyc, now, ok=0, blocked=0: daemon._WARP_IP_CYCLES.append(
                             {"ip": ip, "cycle": cyc, "ended_at": now, "ok": ok}))
+    # 段内成功数改为整段累计查询；本用例只关心采样是否发生，给个固定值。
+    monkeypatch.setattr(daemon, "count_segment_requests", lambda ts: (3, 1))
 
     class T:
         def __init__(self, target=None, args=(), **k): pass
