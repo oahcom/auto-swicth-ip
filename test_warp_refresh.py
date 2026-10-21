@@ -24,7 +24,7 @@ import daemon
 
 
 @pytest.fixture(autouse=True)
-def _isolate_warp_state(monkeypatch):
+def _isolate_warp_state(monkeypatch, tmp_path):
     """_probe_warp_egress 会把探测到的 tag→IP 写进 _WARP_LINE_STATE。
 
     不隔离时别的用例留下的 IP 会让 _retry_refresh_idle_warp 误判「已知新鲜」
@@ -32,8 +32,8 @@ def _isolate_warp_state(monkeypatch):
     """
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
-    # Clash selector 快照同样是进程级缓存，留下会让 active_warp_tag() 跳过真实查询。
-    monkeypatch.setattr(daemon, "_CLASH_SNAP", {})
+    # 模型探测通过会记 last_ok_ts 并落盘，不隔离就写进生产 .warp_ip_used.json。
+    monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(tmp_path / "warp_ip_used.json"))
 
 
 class ScriptedBytes:
@@ -294,3 +294,322 @@ def test_reconnect_now_does_not_read_error_counts():
               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
     assert "count_warp_blocked_since" not in names, \
         f"绕阈值入口不应查错误计数，实际调用: {sorted(names)}"
+
+
+def test_refresh_rejects_line_when_model_probe_fails(monkeypatch):
+    """IP 新鲜但模型层不通（如 429）不得算刷新成功，必须继续重启换地址。
+
+    原模式只验 IP 新鲜度，新拿到的地址必然通过，于是切上去头几条就 429。
+    """
+    monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
+    monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
+    monkeypatch.setattr(daemon.time, "sleep", lambda s: None)
+    monkeypatch.setitem(daemon.CFG["warp"], "max_attempts", 2)
+    ips = iter(["ip-a", "ip-b"])
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: next(ips, "ip-b"))
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+
+    def probe(member, ip):
+        return ip == "ip-b"
+
+    monkeypatch.setattr(daemon, "_warp_model_usable", probe)
+    assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
+                                      "service": "s"}) == "ip-b"
+
+
+def test_refresh_model_check_disabled_keeps_old_mode(monkeypatch):
+    """refresh_model_check=False 恢复原模式：只看 IP 新鲜度，不调探测。"""
+    import probe_warp
+    called = []
+    monkeypatch.setattr(probe_warp, "probe",
+                        lambda port, timeout: (called.append(port), ("OK", 0.1, ""))[1])
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", False)
+    assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-a") is True
+    assert called == [], "原模式下不得发探测请求"
+
+
+def test_model_probe_maps_quota_to_unusable(monkeypatch):
+    """429/配额类判定不得算可用；OK 才算。"""
+    import probe_warp
+    verdict = {"v": "quota"}
+    monkeypatch.setattr(probe_warp, "probe",
+                        lambda port, timeout: (verdict["v"], 0.1, ""))
+    assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip") is False
+    verdict["v"] = "OK"
+    assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip") is True
+
+
+def test_model_mode_ignores_ip_history(monkeypatch):
+    """模型模式下 IP 历史不得否决候选：被标记、窗口内用过都放行，由实测决定。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: True)
+    monkeypatch.setattr(daemon, "_warp_ip_recently_used", lambda ip, now, g=0: True)
+    assert daemon._ip_disqualified("ip-a", time.time(), 86400) is False, \
+        "模型模式下历史不得参与判断"
+
+
+def test_old_mode_still_rejects_by_ip_history(monkeypatch):
+    """原模式保留：被标记或窗口内用过即排除，不依赖任何探测。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", False)
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: True)
+    monkeypatch.setattr(daemon, "_warp_ip_recently_used", lambda ip, now, g=0: False)
+    assert daemon._ip_disqualified("ip-a", time.time(), 86400) is True
+
+
+
+def test_model_mode_needs_refresh_only_for_known_bad_addresses(monkeypatch):
+    """低质判据：被标记过、或用过却没成功过才算脏；全新地址不算。
+
+    「见过 IP 就当新鲜」会让脏线永远不刷；反过来「有 IP 就要刷」会把刚
+    刷出来的干净地址反复重启，白烧配额。两条边界都要钉住。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "flagged": {"ts": 1000.0, "blocked": True,
+                    "blocked_ts_by_kind": {"abuse403": 1000.0}},
+        "never-served": {"ts": 1000.0},
+        "served": {"ts": 1000.0, "last_ok_ts": 1000.0},
+    })
+    now = 1100.0
+    assert daemon._warp_ip_needs_refresh("flagged", now) is True
+    assert daemon._warp_ip_needs_refresh("never-served", now) is True
+    assert daemon._warp_ip_needs_refresh("served", now) is False
+    assert daemon._warp_ip_needs_refresh("brand-new", now) is False, \
+        "从没出现过的地址不是低质，否则刚刷出的线会被反复重启"
+    assert daemon._warp_ip_needs_refresh(None, now) is True, "IP 未知按待刷处理"
+
+
+def test_retry_loop_restarts_line_whose_ip_never_served(monkeypatch):
+    """模型模式下「有地址但从没成功过」必须真刷，不得空转记 ok。
+
+    旧判据只要 known 存在就 return True，实测 239 次 ok 里绝大多数一次
+    重启都没做 —— 批量排队的低质线全部被这个早退吞掉。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {"WARP-CF-C": {"ip": "dead-ip"}})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {"dead-ip": {"ts": 1000.0}})
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-OTHER")
+    refreshed = []
+    monkeypatch.setattr(daemon, "_refresh_idle_warp",
+                        lambda m: (refreshed.append(m["tag"]), "new-ip")[1])
+    assert daemon._retry_refresh_idle_warp({"tag": "WARP-CF-C"}) is True
+    assert refreshed == ["WARP-CF-C"], f"从没成功过的地址必须被换掉，实际 {refreshed}"
+
+
+def test_retry_loop_never_restarts_brand_new_ip(monkeypatch):
+    """刚刷出的全新地址不得再重启一次 —— 那是白烧配额。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {"WARP-CF-C": {"ip": "new-ip"}})
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
+    refreshed = []
+    monkeypatch.setattr(daemon, "_refresh_idle_warp",
+                        lambda m: (refreshed.append(m["tag"]), "x")[1])
+    assert daemon._retry_refresh_idle_warp({"tag": "WARP-CF-C"}) is True
+    assert not refreshed, f"全新地址不应再重启，实际 {refreshed}"
+
+
+def test_dirty_worker_restarts_flagged_line_in_model_mode(monkeypatch):
+    """模型模式下脏线守护探到被标记的地址仍要重连。
+
+    `_ip_disqualified` 在模型模式恒 False，原先的早退让脏线守护从不重启，
+    与预热的低质判据分叉。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: "burned-ip")
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "burned-ip": {"ts": 1000.0, "blocked": True,
+                      "blocked_ts_by_kind": {"rate429": 1000.0}}})
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-OTHER")
+    monkeypatch.setattr(daemon, "warp_line_busy", lambda tag, window=2.0: False)
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    monkeypatch.setattr(daemon, "_WARP_PROBING", set())
+    refreshed = []
+    monkeypatch.setattr(daemon, "_refresh_idle_warp",
+                        lambda m: (refreshed.append(m["tag"]), "clean-ip")[1])
+
+    daemon._reclaim_dirty_warp_worker({"tag": "W1", "port": 1080,
+                                       "service": "usque-warp.service"})
+
+    assert refreshed == ["W1"], f"被标记的出口必须重连，实际 {refreshed}"
+
+
+def test_model_probe_ok_marks_address_served(monkeypatch):
+    """实测通过要把地址记进 last_ok_ts，否则同址停在档位 2 被反复重启。"""
+    import probe_warp
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: ("OK", 0.1, ""))
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {"ip-a": {"ts": 1000.0}})
+    monkeypatch.setattr(time, "time", lambda: 2000.0)
+
+    assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-a") is True
+    assert daemon._WARP_IP_USED["ip-a"]["last_ok_ts"] == 2000.0
+    assert daemon._warp_ip_needs_refresh("ip-a", 2000.0) is False, \
+        "刚验过的地址不得再被判低质"
+
+
+def test_model_mode_selection_trusts_probe_not_history(monkeypatch):
+    """选线也以实测为准：历史标为「烧过」的地址，此刻探测 OK 就该选它。
+
+    若刷新按模型判、选线却仍按历史剔，会形成「刷新通过 → 选线丢弃 → 再刷新」
+    的空转，这正是本条要盯的回归点。
+    """
+    two = [{"tag": "W1", "port": 1080, "service": "s1"},
+           {"tag": "W2", "port": 1081, "service": "s2"}]
+    monkeypatch.setitem(daemon.CFG["warp"], "members", two)
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-w1")
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_cached_warp_standby",
+                        lambda standby, now, guard: [(two[1], "burned-ip")])
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: True)
+    monkeypatch.setattr(daemon, "_warp_ip_recently_used", lambda ip, now, g=0: True)
+    tested = []
+
+    def fake_test_many(pairs):
+        tested.extend(m["tag"] for m, _ in pairs)
+        return {m["tag"]: True for m, _ in pairs}
+
+    monkeypatch.setattr(daemon, "_warp_model_test_many", fake_test_many)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
+    monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a: None)
+    monkeypatch.setattr(daemon, "_set_warp_line_ip", lambda *a: None)
+    monkeypatch.setattr(daemon, "_warp_prefix_rest", lambda ip, now: None)
+
+    assert daemon.reconnect_warp("test") is True
+    assert tested == ["W2"], f"选线必须先实测候选，实际测了 {tested}"
+    assert switched == ["W2"], f"历史被标记但实测通过应选它，实际 {switched}"
+
+
+def _reconnect_fixture(monkeypatch, test_many, refresh_result=None):
+    """搭好 reconnect_warp 的最小环境，返回 (two members, 已切换 tag 列表)。
+
+    test_many: tag 列表 -> {tag: bool}；未列出的 tag 视为通过。
+    refresh_result: _refresh_idle_warp 的返回值（None = 刷不出）。
+    """
+    two = [{"tag": "W1", "port": 1080, "service": "s1"},
+           {"tag": "W2", "port": 1081, "service": "s2"}]
+    monkeypatch.setitem(daemon.CFG["warp"], "members", two)
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-w1")
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_cached_warp_standby",
+                        lambda standby, now, guard: [(two[1], "ip-w2")])
+    monkeypatch.setattr(daemon, "_warp_model_test_many",
+                        lambda pairs: {m["tag"]: test_many([m["tag"]])[m["tag"]]
+                                       for m, _ in pairs})
+    refreshed, scheduled = [], []
+    monkeypatch.setattr(daemon, "_refresh_idle_warp",
+                        lambda m: (refreshed.append(m["tag"]), refresh_result)[1])
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh",
+                        lambda m: scheduled.append(m["tag"]))
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a: None)
+    monkeypatch.setattr(daemon, "_set_warp_line_ip", lambda *a: None)
+    monkeypatch.setattr(daemon, "_warp_prefix_rest", lambda ip, now: None)
+    monkeypatch.setattr(daemon, "_fallback_to_proxy",
+                        lambda *a: switched.append("proxy") or True)
+    return two, switched, refreshed, scheduled
+
+
+def test_model_probe_failure_reconnects_instead_of_falling_to_proxy(monkeypatch):
+    """模型层测不过的备线必须重连换会话 IP，而不是直接落 proxy 池。
+
+    回归点（codex P1）：重连阻塞块原本在实测之前，实测把 probes 清空后直接
+    走到「无可用备线，切轮换池兜底」—— 一条备线都没重启就落池，T-175 退化。
+    """
+    two, switched, refreshed, scheduled = _reconnect_fixture(
+        monkeypatch, lambda tags: {t: False for t in tags}, refresh_result="ip-new")
+    assert daemon.reconnect_warp("test") is True
+    assert refreshed == ["W2"], f"测不过的线必须重连，实际重连 {refreshed}"
+    assert switched == ["W2"], f"重连后应切到新 IP，实际 {switched}"
+
+
+def test_model_probe_failure_after_reconnect_still_falls_to_proxy(monkeypatch):
+    """重连也刷不出可用出口时才落池 —— 兜底顺序不能丢。"""
+    two, switched, refreshed, _ = _reconnect_fixture(
+        monkeypatch, lambda tags: {t: False for t in tags}, refresh_result=None)
+    assert daemon.reconnect_warp("test") is True
+    assert refreshed == ["W2"], f"刷不出也要先试着重连，实际 {refreshed}"
+    assert switched == ["proxy"], f"重连失败才落池，实际 {switched}"
+
+
+def test_failed_lines_are_scheduled_for_background_refresh(monkeypatch):
+    """其余测不过的线要进后台并发补刷 —— 不通过的隧道留着没有意义。"""
+    three = [{"tag": "W1", "port": 1080, "service": "s1"},
+             {"tag": "W2", "port": 1081, "service": "s2"},
+             {"tag": "W3", "port": 1082, "service": "s3"}]
+    two, switched, refreshed, scheduled = _reconnect_fixture(
+        monkeypatch, lambda tags: {t: t != "W2" for t in tags}, refresh_result="ip-new")
+    monkeypatch.setitem(daemon.CFG["warp"], "members", three)
+    monkeypatch.setattr(daemon, "_cached_warp_standby",
+                        lambda standby, now, guard: [(three[1], "ip-b"), (three[2], "ip-c")])
+    assert daemon.reconnect_warp("test") is True
+    assert switched == ["W3"], f"有一条可用就切它，实际 {switched}"
+    # W3 实测通过 → 不必同步重连，直接切它；但测不过的 W2 不能就这么留着，
+    # 必须进后台补刷队列重连换会话 IP。
+    # 换下的 W1 本来就要补刷；关键是测不过的 W2 也必须进队列重连。
+    assert "W2" in scheduled, f"测不过的 W2 必须排队后台重连，实际 {scheduled}"
+
+
+def test_min_gap_does_not_mark_new_exit_blocked(monkeypatch):
+    """生效窗口内的陈旧错误不得把新出口标脏（codex P2）。
+
+    新出口刚上线，上一段的在途请求才报错；若照旧标脏，这条刚验证过的好线
+    会被排除 6~24h，且本段永远采不到真正的结束点。新出口首错延迟 p50=1.6s，
+    所以「生效后还没有一条错误」是区分二者的判据。
+    """
+    marked = []
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-new")
+    monkeypatch.setattr(daemon, "_warp_member", lambda tag: {"tag": tag})
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, blocked=False, kind=None: marked.append(ip))
+    monkeypatch.setattr(daemon, "_record_warp_cycle", lambda *a, **k: None)
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda **k: pytest.fail("陈旧错误不得触发换线"))
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 998.0)   # 2s 前刚生效
+    monkeypatch.setattr(daemon, "_WARP_IP_CYCLES", [])
+    blocked = {"abuse403": 0, "rate429": 3, "ok": 0, "consec_err": 3, "full_err": False}
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: blocked if ts == 0 else {**blocked, "abuse403": 0, "rate429": 0})
+    daemon.maybe_reconnect_warp(1000.0)
+    assert marked == [], f"新出口不得被陈旧错误标脏，实际标了 {marked}"
+
+
+def test_real_error_after_new_exit_is_still_marked(monkeypatch):
+    """新出口自己出错时必须照旧标脏 —— 判据是「生效后有无错误」，不是时间。"""
+    marked = []
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-new")
+    monkeypatch.setattr(daemon, "_warp_member", lambda tag: {"tag": tag})
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, blocked=False, kind=None: marked.append((ip, blocked)))
+    monkeypatch.setattr(daemon, "_record_warp_cycle", lambda *a, **k: None)
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda **k: pytest.fail("生效 2s 内硬闸必须拦住换线"))
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 998.0)
+    monkeypatch.setattr(daemon, "_WARP_IP_CYCLES", [])
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 2, "ok": 0,
+                                    "consec_err": 2, "full_err": False}
+                        if ts == 0 else
+                        {"abuse403": 0, "rate429": 2, "ok": 0,
+                         "consec_err": 2, "full_err": False})
+    daemon.maybe_reconnect_warp(1000.0)
+    assert marked == [("ip-new", True)], f"新出口自己的错误必须标脏，实际 {marked}"
+
+

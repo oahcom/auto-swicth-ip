@@ -922,7 +922,6 @@
 
 **后置条件**
 - 退出 BYPASS 模式。
-- 重置 connectFailCount。
 
 ---
 
@@ -1841,6 +1840,13 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | T-187 | P1 | 满窗 10 条全错 → 绕过冷却立即换线 | `pytest test_daemon_unit.py -k full_error_window` | `count_warp_blocked_since()` 增加 `full_err`（`len(rows) >= RECENT_WINDOW and ok == 0`）。`maybe_reconnect_warp()` 的冷却判断改为 `if now < _warp_cooldown_until and not full_err`。实测 67 次触发里满窗 0 次（429 风暴中总夹杂成功），保留为风暴兜底 |
 | T-188 | P1 | 换线后冷却 5s（原 1s），防「刚换就错」连续触发 | `grep -A1 '"cooldown_ok_sec"' config.py` | 新出口首条错误延迟实测 n=52：p25=0.7s / p50=1.6s / p75=4.5s / p90=10.5s。1s 冷却让 40% 的「刚换就错」在冷却后立刻再换，构成日志里的锯齿。5s 覆盖 79%，且被 T-187 的满窗例外兜底 |
 | T-189 | P0 | `upstream connection lost` 不得触发换线/切节点 | `python3 - <<'EOF'`：查 `requestDetails` 中含该串的行的 `status`；`grep -n "upstream connection lost" daemon.py` | 该文案是 9router SSE 管道（`~/.9router/.next/server/chunks/8895.js`）`m` 变量的初始值，作为末帧注入流中，**不是错误**：实测全表 18 行含该串的记录 `status` 全为 `success`（17 行出现在 `response`、1 行在 `providerResponse`）。`count_warp_blocked_since()` 只按键词 `abusive traffic` / `Rate limit exceeded` 分类、`get_9router_error_rate()` 与既有一切换线判据都以 `status != success` 为准，因此该串在两条链路上都不计入错误、不触发换线。回归方式：出现新的 error 类文案时，先按 `status` 过滤确认它是否真被记为 error，再决定是否要加分类 —— 不要按文案字面加进错误率 |
+| T-190 | P0 | 模型模式：探针通过即视为可用，IP 历史不作判据 | `pytest test_warp_refresh.py -k "model_mode or old_mode"` | `refresh_model_check=True` 时 `_ip_disqualified()` 恒返 False：被 403/429 标记过、在 24h 复用窗口内都用「此刻实测」代替历史推断。依据：实测重启后从没成功过的新地址首条请求照样 429（8/10 线），旧地址过了惩罚期也可复用 —— 历史与事实不一致时以探测为准。原模式（`refresh_model_check=False`）保留整套历史判据，一行开关切回 |
+| T-191 | P0 | 刷新备线必须过模型层探测 | `pytest test_warp_refresh.py -k model_probe` | `_refresh_idle_warp()` 拿到新地址后调 `probe_warp.probe()`，只有 `OK` 才算刷新成功；`quota`/`flagged`/`unreachable`/`err` 都继续重启。原模式只验 IP 新鲜度，新地址必然通过，于是切上去头几条就 429（实测 10 条线 5 条不可用） |
+| T-192 | P0 | 选线也要实测，不能只靠刷新阶段的门 | `pytest test_warp_refresh.py -k selection_trusts_probe` | 12s 探测缓存只验过出口 IP，可能送来一条此刻已 429 的线；`reconnect_warp()` 在选线前对全部候选并发跑 `_warp_model_test_many()`。实测 20:28 一次选线：8 条缓存命中 → 并发实测 → 仅 4 条 OK → 切到其中一条 |
+| T-193 | P1 | 探针与 daemon 同解释器可跑（无 PySocks）、指纹校验覆盖 schema | `/usr/bin/python3.12 probe_warp.py --tag WARP-CF-C`；`python3 probe_warp.py --check-fingerprint` | 走 curl `--socks5-hostname` 而非 python `requests` 的 `socks5h://`：daemon 跑在 `/usr/bin/python3.12`（无 PySocks），用 requests 会立即 `InvalidSchema` 并被误计成 `unreachable`（实测 0.0s 返回）。指纹校验比对 description **与 parameters 两者**（与上游 `isFingerprintDefinition` 对齐）：只比 description 会漏掉 schema 变更，线上探测全 403 而校验仍报「一致」。归一化去空白/引号/逗号（JS 对象字面量与 `json.dumps` 的差别），已反向验证：篡改 `required` 后校验必红 |
+| T-194 | P0 | 模型层测不过的备线必须重连，不得直接落 proxy 池 | `pytest test_warp_refresh.py -k "probe_failure_reconnects or after_reconnect_still_falls"` | 测不过的线与原模式「出口已被标记」同义 —— 都只有重连换会话 IP 才有意义，故并入 `blocked_lines` 走同一条刷新路径。回归点（codex P1）：阻塞块原本在实测之前，实测清空 `probes` 后一条备线都没重启就走向「无可用备线，切轮换池兜底」，T-175 退化；且任何系统性探测故障（缺文件/指纹漂移/curl 失败）都会把全量流量拨到 83 节点池。正确顺序：实测 → 同步重连一条拿本次候选 → 其余后台并发补刷 → 仍无可用才落池 |
+| T-195 | P0 | 生效窗口内的陈旧错误不得把新出口标脏 | `pytest test_warp_refresh.py -k "min_gap_does_not_mark or real_error_after_new_exit"` | 触发→生效 p50=4s，新出口刚上线时上一段的在途请求才报错。旧顺序（先采样/标脏再查 min-gap）会把刚验证过的好出口记成坏地址 6~24h，且 `_record_warp_cycle` 以陈旧首错记段，令 `sampled` 恒真、本段永远采不到真正的结束点（实测 46 次触发里 39 次是这一类）。判据：生效不足 `min_switch_gap_sec` **且** 生效之后一条错误都没有（`count_warp_blocked_since(_last_warp_switch_ok_ts)` 的 403/429 均为 0）→ 跳过标脏与记段。对照组：新出口自己的错误必须照旧标脏，硬闸仍拦住换线 |
+
 
 > 周期数据依据（2026-10-20）：修复前落盘的 18 条样本全部落在 20.0~21.9s —— 那不是 IP 寿命，是 20s 冷却期本身，因为冷却期内出现的 403 根本没被采样（T-167b）。修好采样后实测：样本 min 1.6s / 中位 3.1s，并出现 `ok=1` 的 2.5s 样本（服务成功过随即被烧）。同期按 DB 逐段核对 45 个有流量的换线段：首错延迟中位 1s、16 段首请求即错、30% 零错误、每段成功中位 14 条。v1.15 曾据此回退请求数判据，但那是把「采样缺失」误归因为「时间判据本身错」；采样修复后 v1.17 恢复时间判据（T-167），请求数判据降为无样本时的回退路径（T-168）。
 
@@ -1875,4 +1881,5 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | v1.20 | 2026-10-21 | 错误归属改按请求开始时刻 (T-185)：`count_warp_blocked_since()` 用 `timestamp − latency.total` 与窗口起点比较 —— 9router 在请求结束时才落库、换线不掐断在途请求，旧出口的 429 会带着新时间戳落进新窗口。重放 34 次真实触发，旧逻辑 33 次命中 / 新逻辑 20 次，14 次纯误触发 | - |
 | v1.21 | 2026-10-21 | 换线判据加成功门控与满窗例外 (T-186~T-188)：最近一条成功即不换线（拦下 36/65 次触发），满窗 10 条全错绕过冷却，`cooldown_ok_sec` 1s→5s（新出口首错 p50=1.6s，1s 冷却反而制造锯齿） | - |
 | v1.22 | 2026-10-21 | 换线门控由「最近一条是否成功」改为「连错 ≥3 条」：429 风暴中成功与错误交替，`last_ok` 每行翻转，90 次触发只抑制 1 次（1%）；连错判据抑制 11 次（12%），其中 3 次窗口内成功 ≥5（出口健康）。门控移到采样/标脏之后，保脏 IP 仍被标记。新增 T-189 记录 `upstream connection lost` 属 SSE 末帧注入、`status=success`，不参与任何换线判据 | - |
+| v1.23 | 2026-10-21 | 新增模型层验收模式（`warp.refresh_model_check`，默认开；`False` 回原模式）：刷新与选线都以 `probe_warp.probe()` 实测 `OK` 为唯一判据，IP 历史（403 6h / 429 24h / 24h 复用窗口）在模型模式下不作否决项 (T-190~T-192)。修复卡死链：测不过的备线并入 `blocked_lines` 走同一条重连路径（实测 → 同步重连一条 → 其余后台并发补刷 → 仍无可用才落池），旧顺序会在全测失败时跳过重连直接落 83 节点池 (T-194)。新增 `min_switch_gap_sec`（生效间隔硬闸）并修正采样顺序：生效窗口内且生效后无错误时不再把新出口标脏/记段 (T-195)。指纹校验改比 description+parameters 并对 schema 变更敏感 (T-193) | - |
 

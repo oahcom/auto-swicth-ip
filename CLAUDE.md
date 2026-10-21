@@ -151,25 +151,29 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   （40s）让该线闲下来，等不到则**补刷重试**直到 `ip_refresh_retry_sec`（600s）用完。
   WHY 必须补刷：单次超时就放弃会让这条线永远停在旧地址上 —— 实测 WARP-CF-C 被
   换下 8 次仅刷 2 次，13 次换线里 7 次切回同一个 10 分钟前的地址。
-- **补刷并发上限可配**：`refresh_concurrency`（0 = 不限，等于备线数 - 1，当前出口永不刷）。
-  原写死 2，5 条隧道时够用；扩到 10 条后每条线用一次就脏，按 2/轮刷一轮要 5 个往返，
-  补刷队列永远追不上消耗 —— 10 条线的意义就没了。
+- **补刷并发不限**：`refresh_concurrency`（0 = 不限，等于成员数；正整数则限速）。
+  低质线本就该被刷掉，留着它当换线候选才是真正的损失 —— 并发重启它们不损失任何
+  可用备线。同一 tag 的独占仍由 `_acquire_refresh_slot` 保证，当前出口本身从不被刷。
+  注意旧实现写的是 `int(... or 3)`，把 0 静默变成 3，「0 = 不限」从未生效。
   补刷在重启**之前**先查这条线是否已被切成当前出口（换线线程的快照早于本次调度，
   等空闲的这 40s 内它也可能被切成出口）：是则放弃，留给下次被换下时重新调度 ——
   重启会掐断它正在服务的在途连接（upstream connection lost）。判据必须落在重启前，
   放在本轮开头挡不住「等待期间才变成出口」那一段。
   「闲」的判据是**字节增量**（`warp_line_busy`），不是连接数：活跃线上恒有 7~10
   条连接且从不归零（SSE 长连接 + 连接复用，实测单条存活 936s），按连接数等必然
-  超时。强刷会掐断长命连接 → `upstream connection lost`。
-- **备线预热按 24h 流量门控**：每 `prewarm_sec`(120s) 挑最久没被选过且已知 IP 不新鲜的线
-  后台刷新，但仅当最近 **24 小时**内有 opencode 请求时才做（旧窗口 10 分钟，冷启动/低峰期
-  永不预热）。窗口与 `ip_reuse_guard_sec` 对齐：预热要解决的问题是「24h 内用过的 IP 全不算
-  新鲜」，判断有没有人在用也该看同一量级。
-- **任一隧道疑似脏 IP 就重连，直到换出优质 IP**：巡检把 `blocked` 标记或复用窗口内
-  用过的 IP 都判为脏 —— 不能只看「窗口内有无成功流量」，否则从没成功过的 blocked 地址
-  会被当成新鲜线跳过。换线成功时立即把剩余脏备线排进补刷队列；巡检在落到 proxy 池期间
-  同样运行，否则池本身也是脏地址时永远回不来。同时在刷的上限由
-  `refresh_concurrency`（默认 3）决定，不是写死的两条。
+- **备线预热按 24h 流量门控**：每 `prewarm_sec`(120s) 把所有低质备线**全部**排进补刷队列，
+  仅当最近 **24 小时**内有 opencode 请求时才做（旧窗口 10 分钟，冷启动/低峰期永不预热）。
+  窗口与 `ip_reuse_guard_sec` 对齐：预热要解决的问题是「24h 内用过的 IP 全不算新鲜」，
+  判断有没有人在用也该看同一量级。旧实现每轮只取一条最久没被选中的，实测全库只预热过
+  11 次且集中在两三条线上。
+- **任一隧道疑似脏 IP 就重连，直到换出优质 IP**：低质判据统一为一句
+  `_warp_ip_needs_refresh()`：仍在 403/429 惩罚期，或出现过却从未成功服务过（档位 2）；
+  全新地址不算低质（否则刚刷出的线被反复重启）。预热、补刷、脏线守护三处同源 ——
+  旧实现三处口径各异：预热看 `bool(ip)`、补刷见 IP 就返 ok（实测 239 次 ok 全是空转）、
+  脏线守护用的 `_ip_disqualified` 在模型模式恒 False。换线成功时立即把剩余脏备线排进
+  补刷队列；巡检在落到 proxy 池期间同样运行，否则池本身也是脏地址时永远回不来。
+  全部备线都在重启时本次换线不刷新（等下次错误重试），不落池 —— 否则预热波次会让
+  每次换线都撞上「无候选」而落池。
 - **主动轮换三种判据，`proactive_mode` 切换**：`lifetime`（默认，按实测 IP 可用
   寿命裁切点）、`requests`（服务满 `proactive_after_requests` 条）、`fixed`
   （每 `proactive_fixed_sec` 秒）。非法值按 `lifetime` 处理，不让轮换静默停摆。
@@ -307,11 +311,10 @@ warp.rate429_threshold: 1                      # rate429 触发阈值
 warp.cooldown_ok_sec: 5                        # 换线成功后冷却（full_err 绕过）
 warp.cooldown_fail_sec: 3                      # 换线失败后冷却
 warp.ip_reuse_guard_sec: 86400                 # 出口 IP 复用窗口（24h）
-warp.blocked_guard_sec: 21600                  # 403 恢复期（6h）
+warp.refresh_concurrency: 0                    # 同时真正重启的备线上限（0 = 不限）
 warp.rate429_guard_sec: 86400                  # 429 恢复期（24h）
 warp.proactive_mode: "lifetime"                # 主动轮换判据（lifetime/requests/fixed）
 warp.proxy_fallback_cooldown_sec: 10800        # 落池冷却（3h）
-warp.refresh_concurrency: 3                    # 同时真正重启的备线上限
 warp.probe_cache_ttl_sec: 12                   # 探测缓存 TTL
 warp.fallback_idle_wait_sec: 3                 # 错误路径等备线空闲上限
 # 连错门控不是配置项，是代码常量：consec_err < 3 → 不换线（daemon.py maybe_reconnect_warp）
