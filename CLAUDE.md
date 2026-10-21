@@ -20,7 +20,7 @@ daemon.py
     ← 读 9router SQLite requestDetails（只查 provider="opencode"）
     ← 或经 Clash API 切 selector（pool 节点轮换 / opencode-out 换线）
     → 403/429 各达阈值 1 后，还要连错 ≥3 条才换（consec_err 门控，采样/标脏之后）
-    → 换线冷却 5s；窗口 10 条全错（full_err）时绕过冷却
+    → 换线冷却 5s；整窗全为出口级错误（full_err）时绕过冷却
     → 主动轮换（池）：proactive_mode=lifetime 按实测 IP 寿命裁切点；
       requests 模式回退到每 60 条
     → 自适应策略：normal=延迟优先 / pressure=均匀分散
@@ -69,13 +69,19 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   - `rate429` ≥ `warp.rate429_threshold`（默认 **1**）—— **免费层按 IP 的配额限流**，同样换出口即拿到新配额。
     两者都是 1：任何一条出口级拦截出现即进入换线判定。曾把 429 设为 5（担心频繁重启），
     但实测 22:35~22:38 风暴期每多等一条就是继续失败，而换线冷却只有 5s。
-  - **连错门控：`consec_err` ≥ 3 才真正换线**（窗口 10 条内从最新一条往前数连续失败，
+  - **连错门控：`consec_err` ≥ 3 才真正换线**（窗口内从最新一条往前数连续**出口级**失败，
     停在第一条成功处）。最近两条请求都报错仍不换，第三条连错才换 —— 用户规则
     「刚切线的 10 秒内允许出现 2 次报错而不切线」。门控放在**采样/标脏之后**：
     连错 1~2 条时出口已收到 403，仍要标脏 IP、记周期样本，只是暂不换线。
-    实测 90 次真实触发里抑制 11 次，其中 3 次窗口内成功 ≥5（出口还健康，切走就是误切）。
-    `full_err`（整窗 10 条全错）时 `consec_err` 必 ≥ 10，天然过门控。
-    门控落地后的可复核 36 次：健康窗口（ok≥7）被切 0 次（改前同口径 6/90）。
+  - **窗口至少 3 条**：`count_warp_blocked_since` 取 `max(RECENT_WINDOW, 3)`。config 的
+    `recent_window` 是 2（策略侧口径），2 条窗口下连错数最多数到 2，门控恒不成立，
+    `full_err`（整窗全错）成了唯一放行条件 —— 两条错误就能切走干净出口。
+  - **只认出口级错误**：`abusive traffic`（403 信誉）/ `Rate limit exceeded`（429 配额）。
+    上游 402「Endpoint is unavailable」与「maximum context length」记入 `other_err`：
+    不计错误、不累加连错、**也不截断**连错（夹在两条 429 中间的 402 不能让两侧断开），
+    且整窗只有 other 错误时不构成 `full_err`。判据：换出口解不了这两类，切走纯属白切。
+  - 同一 2000 条真实窗口回放：会换线的评估点 **25% → 13%**。拆开看，改分类贡献
+    25%→19%，抬窗口贡献 25%→20%（两处独立生效）。
   - 实测 16:24 切 WARP 成员后成功率 3.5% → 9.3%（90s 窗口），429 换线确有效。
   - 两类同时达阈值只换一次线，理由串成 `"abuse403 ×N + rate429 ×M"`。
 - **判定不受节点切换时间戳约束**：主循环的主动轮换（每 60s）会刷新 `_last_successful_switch_ts`，若拿它当窗口起点，爆发期间 403 会被整段吞掉（实测 15:47~15:52 共 252 条 403 零换线）。
@@ -122,9 +128,12 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
     （下次换线又当干净地址选回来）、也采不到样本。每段只采一次，判据是本段起点之后
     是否已有 `ended_at >= _last_warp_switch_ok_ts` 的样本，不另设标志位。
   - **样本存 `_WARP_IP_CYCLES` 并落盘**：`.warp_ip_cycles.json`（`WARP_IP_CYCLES_FILE_PATH` 可覆盖，
-    测试隔离），样本 `{ip, cycle, ended_at, ok}` —— 一次 cycle =「某 IP 成为出口 → 该 IP
+    测试隔离），样本 `{ip, cycle, span, ended_at, ok, blocked}` —— 一次 cycle =「某 IP 成为出口 → 该 IP
     首次出现 403/429」，只保留 24h。`_recompute_min_warp_cycle` 每 `min_cycle_recalc_sec`=300s
     重算一次。
+  - **`ok`/`blocked` 是整段累计**（`count_segment_requests`，无窗口上限），不是滑动窗口里的条数。
+    窗口 2 条时 `ok` 恒 0/1，实测 4058 条样本 82% 被记成 `ok=0`，「服务过 40 条」被误判成
+    「一条没服务过」，寿命样本被系统性剔除，**单 IP 承载量统计不出来**。
   - **重启后段起点从 IP 记录恢复**：`_last_warp_switch_ok_ts` 重启即归零，若拿 0 当窗口起点，
     `count_opencode_since` 会把重启前已经服务过的那一段整段算进来（实测重启 70 秒后就报
     「已服务 63 条」并换线）。改用当前出口 IP 在 `.warp_ip_used.json` 里的使用时刻恢复。
@@ -137,7 +146,7 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   600s —— 实测 17:02~17:09 九分钟零换线、1752 条请求全废。换线只要目标出口 IP 新鲜
   就值得做，拉长冷却只会让错误持续积累。5s 的依据：新出口首条错误延迟 p25=0.7s /
   p50=1.6s / p75=4.5s，1s 冷却会让 40% 的「刚换就错」冷却后立刻再触发（日志里的
-  锯齿来源），5s 覆盖 79%。**例外**：窗口 10 条全错（`full_err`）时绕过冷却立刻换。
+  锯齿来源），5s 覆盖 79%。**例外**：整窗全为出口级错误（`full_err`）时绕过冷却立刻换。
 - **落池冷却 `proxy_fallback_cooldown_sec`（默认 3h）**：切到轮换池 `proxy` 后，
   3 小时内即使隧道全挂也不再落池。WHY：proxy 是 83 节点共享池，落池意味着把流量
   交给成功率 3~5% 的兜底资源（INC-002 的失败模式），而 WARP 换一条线只要一次 PUT。
@@ -278,7 +287,9 @@ proxy-global.js 侧（请求级，低延迟）—— 历史存档，文件已不
 
 daemon.py 侧（聚合级，高延迟）—— 唯一的自动换线入口:
   - 触发: 403/429 各达阈值 1 + 窗口连错 ≥3（consec_err 门控）→ 换线
-  - 冷却 5s；整窗 10 条全错（full_err）绕过冷却
+  - 冷却 5s；整窗全错且**全为出口级错误**（full_err）绕过冷却
+  - 非出口错误（上游 402 / 请求超长）计入 other_err，三轮都不参与：不算错误率、
+    不累加连错、不构成 full_err
   - upstream connection lost / context_length_exceeded 等按 status 判定：
     status=success 不计入任何错误判据，绝不因此换线（实测该串 19 行全 success）
   - 403 与 429 一样触发轮换；403 占比仅记录在日志中用于诊断
@@ -303,7 +314,7 @@ daemon.py 侧（聚合级，高延迟）—— 唯一的自动换线入口:
 ```python
 OPENCODE_FREE_PROVIDER = "opencode"            # 9router provider key
 # thresholds
-recent_window: 10                             # 错误判据窗口（条）
+recent_window: 2                              # 策略侧错误率窗口（条）；换线窗口另取 max(此值, 3)
 opencode_min_success_rate: 0.9                 # 错误率 > 10% → 轮换
 pressure_error_rate: 0.3                       # 正常→压力模式阈值
 normal_error_rate: 0.1                         # 压力→正常模式阈值
