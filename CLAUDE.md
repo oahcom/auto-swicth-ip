@@ -205,16 +205,20 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   **只有确认脏了才占用 `_WARP_REFRESHING`** —— 后者会被换线路径当作「不可选」，探测中的
   干净线若也算进去，换线会看到「备线 0 条」直接落 proxy 池（实测踩到）。worker 在重启
   前必须复查该线是否已被切成当前出口，否则会掐断在途连接。
-- **模型层探测每 IP 每会话最多一次**：`probe_warp.probe()` 每次烧掉该出口一格
-  opencode 免费配额，而此前无台账 —— 实测同一 IP 18 分钟内被探 26 次全是 quota，
-  CF-I 20 次、CF-D/E 各 16 次重复探测。台账 `_WARP_PROBE_SEEN[(tag, epoch, ip)]`
-  记录结论，命中即复用（日志 `· 本会话已探过: quota（跳过）`）。
-  **会话粒度而非永久**：`_restart_service(service, tag)` 成功即 `_bump_probe_epoch(tag)`，
-  重启后即使拿回同一 IP 也允许再探一次 —— 配额窗口可能已滚动，旧结论不代表新会话。
-  只保留当前代次记录，旧代次在写入时清掉。
+- **模型层探测按 /64 段记账，TTL 内最多一次**：`probe_warp.probe()` 每次烧掉该出口
+  一格 opencode 免费配额，而此前无台账 —— 实测同一 IP 18 分钟内被探 26 次全是 quota，
+  CF-I 20 次、CF-D/E 各 16 次重复探测。台账 `_WARP_PROBE_SEEN[(tag, /64)]`
+  记录结论，命中即复用（日志 `· 已探过: quota（跳过）`）。
+  **键取段不取 IP**：上游按段记配额，实测已烧段内出现的**新** /128 有 2516 次、
+  OK 仅 5 次（0.2%），与本段见过的 /128 无差别 —— 换 IP 不换配额。重连 97.5%
+  落到别的段，段键不会串味。
+  **TTL 而非会话代次**：代次曾让每次重连都作废全部结论，实测 71% 的探测打在已判
+  quota 的段上、其中 99.1% 结果仍是 quota。`probe_verdict_ttl_sec`=1800 让结论跨重连
+  存活；再往上收益迅速衰减（∞ 只多省 6pp，误伤 OK 从 4 涨到 25）。回放 30h 日志：
+  省 65% 探测、误伤 4 次 OK。
   **结论必须回灌为刷新判据**：`_warp_ip_needs_refresh` / `_warp_ip_refresh_reason`
   接受 `tag`，命中台账的非 OK 结论即判低质。否则结论只进不出 —— 线永远进不了
-  预热/脏线候选，代次永不前进，台账永远命中「已探过（跳过）」，脏线焊死原地。
+  预热/脏线候选，台账永远命中「已探过（跳过）」，脏线焊死原地。
   实测 CF-J 因此 75 分钟无一次重启，日志每分钟刷「已探过: quota」。
 - **刷新日志答三问：谁在刷、为什么刷、刷了几次**：每次刷新都带
   `原因=<短语>`（由 `_warp_ip_refresh_reason` 从当前出口推导：`abuse403/rate429 惩罚期`、
@@ -300,6 +304,34 @@ daemon.py 侧（聚合级，高延迟）—— 唯一的自动换线入口:
   - consecutive_errors 仅写日志，不参与换线决策
 ```
 
+### 9router 侧：`Endpoint is unavailable`（402）处置
+
+**2026-10-22 移除了 `oc/longcat-2.5-preview-free`**（`combos` 表的 `9router_hermes` 5→4 席、
+`oc-low` 6→5 席；备份 `data.sqlite.bak-rmlongcat-20261022-064837`）。改动后 0 次 402、
+0 次 longcat，窗口内 26/26 成功。
+
+移除前的取证（为何它必须走）：
+- 402 **全部**来自 longcat：近 1000 条错误里 `rate429` 573 / `e402` 57 / `ctx` 3，
+  57 条 402 中 57 条是 longcat。
+- 它已经彻底不服务了：`requestDetails` 2000 窗口内 longcat **0/180 成功**；
+  `usageHistory` 按天成功数 10-16→10-21 为 1722/156/109/1303/6/103，最后一次成功
+  2026-10-21T17:01:56Z，随后持续失败。
+- **与请求体大小无关**（不是太长导致）：402 请求体中位 214KB，**低于**成功请求的 328KB。
+- 与出口 IP 无关：402 散射在 29 个不同出口上，且这些出口**全部也出现过 429** ——
+  换 IP 解不了，这正是它被归为 `other_err` 的依据。
+- 9router 的 fallback 是工作的（有它没它都能成）：114 条 402 中 **108 条在 3s 内**
+  由 combo 下一模型成功兜住，兜住率 88%（另一口径 46/52）。所以它不致错，**只是拖慢**：
+  402 耗时中位 2779ms / p75 4653ms / p90 7932ms / max 23172ms，104 条累计 421s，
+  且每个请求都白试一次。
+
+**已知缺陷（未修，随时可复发）**：`open-sse/services/combo.js:393` 算出
+`checkFallbackError` 的 `cooldownMs`（402 规则是 `COOLDOWN.long` = 2 分钟，见
+`errorConfig.js:73`）之后，**只对 502/503/504 生效**（combo.js:400 三个状态才 `await`），
+既不记录也不跳过，402 的冷却等于不存在 —— 实测 402 间隔中位仅 **0.9s**（48 分钟内
+114 条，仅 1 个间隔 ≥115s）。所以对第二个问题「除了移除，要不要让 402 冷却真正生效」
+需要改 combo.js：按 `modelStr` 记 cooldown 并在循环里跳过已冷却的模型。改动在 9router
+源码上，升级会被覆盖。回滚只需把 `oc/longcat-2.5-preview-free` 加回两个 combo。
+
 ## 共享状态
 
 | 资源 | 写入者 | 读取者 | 格式 |
@@ -343,7 +375,8 @@ warp.refresh_concurrency: 0                    # 同时真正重启的备线上�
 warp.rate429_guard_sec: 86400                  # 429 恢复期（24h）
 warp.proactive_mode: "lifetime"                # 主动轮换判据（lifetime/requests/fixed）
 warp.proxy_fallback_cooldown_sec: 10800        # 落池冷却（3h）
-warp.probe_cache_ttl_sec: 12                   # 探测缓存 TTL
+warp.probe_cache_ttl_sec: 12                   # 探测缓存 TTL（出口 IP 新鲜度）
+warp.probe_verdict_ttl_sec: 1800               # 模型层探测结论 TTL（按 /64 段）
 warp.fallback_idle_wait_sec: 3                 # 错误路径等备线空闲上限
 # 连错门控不是配置项，是代码常量：consec_err < 3 → 不换线（daemon.py maybe_reconnect_warp）
 # _DEAD_TTL_STAGES: _generate_ttl_stages() 算法生成（30s→7d），非手写列表
