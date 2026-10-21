@@ -40,7 +40,7 @@ if not get_singbox_secret():
 CFG = {
     "9router": {
         "db_path": "/home/administrator/.9router/db/data.sqlite",
-        "base": "http://127.0.0.1:20128",
+        "base": "http://127.0.0.1:20127",
     },
     "singbox": {
         "clash_api": "http://127.0.0.1:9090",
@@ -70,7 +70,14 @@ CFG = {
         "sub_url": "https://dasho.xn--cp3a08l.com/api/v1/pq/d6b05bf5edc2d676335d0726371868bf",
     },
     "intervals": {
-        "monitor_sec": 2,
+        # 主循环轮询节奏。不是节流 —— 循环体里已经没有阻塞 I/O，错误统计又按
+        # requestDetails 的 rowid 水位线做了增量判断（无新行时一次轮询 ~2µs）。
+        # 留 0.05s 只是让出 CPU：零间隔空转会烧满一个核，GIL 争用反而拖慢
+        # 真正干活的换线线程。
+        "monitor_sec": 0.05,
+        # Clash selector 快照刷新间隔。主循环不再直接请求 Clash API（单次超时
+        # 3s，放在 20Hz 的循环里等于把错误检测钉死），只读这个后台线程的快照。
+        "clash_poll_sec": 0.5,
         "proactive_rotate_sec": 60,
         "cooldown_after_switch_sec": 60,
         # 单节点 429 冷却 60s：除非全体限流，否则池子里总有未冷却节点；
@@ -87,16 +94,19 @@ CFG = {
         "proxy_dead_ratio": 0.5,       # 池黑名单节点占比 ≥N
     },
     "thresholds": {
-        "recent_window": 10,
+        "recent_window": 2,    # 只查最近两条的数据，10条太大可能出现多个切换窗口
         "reject_window": 50,   # 403 客户端拒绝占比的统计窗口（10 条太小，噪声会抖动）
         "opencode_min_success_rate": 0.9,
         "node_test_timeout_ms": 15000,  # 放宽到 15s，避免慢节点误判
         "node_test_url": "https://www.gstatic.com/generate_204",
         "pressure_error_rate": 0.3,   # 429 率超过此阈值 → 切均匀分散
-        "normal_error_rate": 0.1,     # 429 率低于此阈值 → 切回延迟优先
+        # 回滞下沿 0.1 → 0.15：实测 215 次 pressure→normal 恰好停在 10% 边界上，
+        # 与 188 次 normal→pressure(30%) 构成 598 次翻转的抖动 —— 每次翻转都换
+        # 一次选点方式。拉宽到 15% 后 10~15% 区间不再来回穿。
+        "normal_error_rate": 0.15,    # 429 率低于此阈值 → 切回延迟优先
     },
     "bad_nodes": {
-        "ttl_sec": 300,       # 5 minutes - shared by proxy-global.js and daemon
+        "ttl_sec": 300,       # 5 minutes - daemon.py 独占读写（proxy-global.js 已移除）
         "max_ttl_sec": 604800,  # 7 days max TTL (replaces float('inf') permanent blacklist)
     },
     # WARP 主备隧道：members 顺序即优先级，daemon 在被标记时切到另一条，
@@ -110,12 +120,18 @@ CFG = {
             {"tag": "WARP-CF-C", "port": 1082, "service": "usque-warp-c.service"},
             {"tag": "WARP-CF-D", "port": 1083, "service": "usque-warp-d.service"},
             {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
+            {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service"},
+            {"tag": "WARP-CF-G", "port": 1086, "service": "usque-warp-g.service"},
+            {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service"},
+            {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service"},
+            {"tag": "WARP-CF-J", "port": 1089, "service": "usque-warp-j.service"},
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
         # 曾把 429 阈值设为 5（"429 太频繁，单条就换会让隧道反复重启"），
         # 但实测 22:35~22:38 在 429 风暴里每多等一条就是继续失败：
-        # 阈值 5 期间流量全废，而冷却只有 20s，换线成本远低于等待成本。
+        # 阈值 5 期间流量全废，而当时的冷却只有 20s（现为 cooldown_ok_sec=5），
+        # 换线成本远低于等待成本。
         "block_threshold": 1,
         "rate429_threshold": 1,
         # 主动轮换：当前出口服务满 N 条请求就换线，不等 403 —— 报错后的切换
@@ -153,29 +169,54 @@ CFG = {
         # 25.2 / 28.3 / 49.1 分钟的复用间隔真实发生过；900s 窗口下 18:58:05 用过的
         # 2a09:bac5:1efb:281e::3ff:42 在 10.6 分钟后被原样切回，53 秒后即爆发。
         "ip_reuse_guard_sec": 86400,
-        # 被标记（403/429）的 IP 保留多久不出候选池。与 ip_reuse_guard_sec 同量级：
-        # 一个 10 分钟前被烧的地址，不该在下次换线时因"窗口过期"又被选中。
+        # 同一 /64 静置多久算「刚烧过」。只在同档内影响先后（见 _warp_ip_rank）：
+        # opencode 免费额度按出口段计，新 /128 落在刚用过的 /64 里首条请求照样
+        # 429。9router 近 2h 失败流量分组：段静置 <5min 有成功比例 73%（n=41）、
+        # 5-15min 100%（n=21）、>30min 91%（n=35）。
+        "prefix_rest_sec": 300,
+        # 被标记（403/429）的 IP 保留多久不出候选池。不小于两档恢复期里较长
+        # 的那个（24h），否则条目会在惩罚期结束前被清掉、地址被提前放回候选。
         "blocked_ttl_sec": 86400,
         # 选线的分级复用窗口（按触发原因）：
-        #   未用过的地址 > 403 触发时选 3h 内未用过的 > 429 触发时选 24h 内
-        #   未用过的 > 全都不满足时兜底复用最久未用的。
-        # 403 是信誉标记，恢复相对快；429 是配额限流，同一地址回来得太勤
-        # 会立刻再次限流，所以 429 要更长的间隔。
-        "blocked_guard_sec": 10800,   # 3h：403 触发时要求
-        "rate429_guard_sec": 86400,   # 24h：429 触发时要求
+        #   未用过的地址 > 窗口外没用过的（403 为 6h、429 为 24h） > 全都不满足
+        #   时兜底复用最久未用的。
+        # 按 IP 记录被哪类错误烧掉，分别计时：
+        #   abuse403 —— 出口 IP 信誉标记，六小时后刷新；
+        #   rate429 —— 出口 IP 级限流，必须等二十四小时才能再试。
+        # 换线对 403 与 429 都有效，两者都是出口 IP 级拦截。
+        "blocked_guard_sec": 21600,   # 6h：403 恢复期
+        "rate429_guard_sec": 86400,   # 24h：429 恢复期
         # 无可用备线时原地重连的上限次数与退避
         "max_attempts": 3,
         "retry_backoff_sec": [2, 5, 10],
         "ready_timeout_sec": 12,
+        # 刷新路径（重启隧道后）单次出口探测的超时。健康探测仍用 20s：
+        # 已稳定的线偶发 >8s 响应，20s 才够。但刚重启的隧道要么一两秒就通，
+        # 要么根本没起来 —— 02:36 风暴里 95 次刷新失败中 65 次是探测失败，
+        # 单次 32s（12s 等端口 + 20s 探测）把换线线程钉死。
+        "refresh_probe_timeout_sec": 7,
         # 换线后短暂静默让在途请求落定。固定值，不随连续失败放大 ——
         # 只要目标线能拿到窗口外的新鲜 IP，换线就值得做；拉长冷却只会让
         # 错误持续积累（实测 2^n 退避曾在风暴期锁死到 600s，九分钟零换线）。
         # 失败换线后的冷却。403 常在换线后 1~2 秒内出现（实测段周期中位 14s、
         # 最短 <1s），20s 冷却等于让坏出口空转 18s —— 改为 5s，只留出在途请求
         # 落定的时间。并发仍由 _WARP_LOCK 互斥。
+        # 换线成功后至少隔这么久才允许因错误再换。WHY 1s 不够：换上去之后的
+        # 新出口首条错误延迟实测 p25=0.7s / p50=1.6s / p75=4.5s（52 次样本），
+        # 1s 冷却等于让 40% 的「刚换就错」在冷却后立刻再触发一次换线 —— 正是
+        # 日志里「几十条好流量→两条 error→两条好流量」锯齿的来源。5s 覆盖 79%。
+        # 例外：最近 10 条全错时绕过本冷却（见 maybe_reconnect_warp），风暴里
+        # 停在坏出口上的代价远大于多换一次。
         "cooldown_ok_sec": 5,
         # 换线动作本身失败（两条线都不通）时的重试间隔
-        "cooldown_fail_sec": 60,
+        # 失败也压到 3s：60s 的失败冷却会让一次换线失败后整分钟停在坏出口上。
+        # 防雷暴由 `_WARP_LOCK` 的互斥 + `cooldown_fail_sec` 的短退避共同保证，
+        # 不需要 60s 那么长（线只有 5 条，每次都换不同目标）。
+        "cooldown_fail_sec": 3,
+        # WARP 隧道全部不可用时切轮换池的冷却：每 3h 最多切一次。
+        # 实测 2026-10-20 一天落池 80 次，多数是在两个坏出口之间来回弹；
+        # 冷却期内改走原地重连（有几秒断流），不再把流量甩到池上。
+        "proxy_fallback_cooldown_sec": 10800,
         # 换线后多久刷新被换下的闲置线。太短会掐断仍在走它的在途请求
         # （upstream connection lost），太长则赶不上下一次换线（实测标记速度
         # 约 20~30s），届时同步守卫又要多等 7~9s。
@@ -188,6 +229,11 @@ CFG = {
         # 永远停在旧地址上：实测 WARP-CF-C 被换下 8 次，7 次放弃，13 次换线里
         # 7 次切回同一个 10 分钟前的地址。
         "ip_refresh_retry_sec": 600,
+        # 同时**真正重启**的备线上限。排队等空闲的不占名额（它们仍在服务流量）。
+        # 取 3：10 条隧道三轮刷完，任何时刻至少 7 条可服务；调大（比如 9）意味着
+        # 10 条里同时停 9 条，换线候选瞬间归零 —— 这正是不该无脑"提到最高"的原因。
+        # 天花板：这个值必须显著小于成员数，否则并发重启等于自断备线。
+        "refresh_concurrency": 3,
         # 换线时直接采用脏线守护最近一次探测到的出口地址（见
         # `_cached_warp_standby`），把同步探测移出关键路径。TTL 取 12s：
         # 守护节奏是 5s + 单次探测 1.2~7s，一个完整周期仍有余量。
@@ -195,6 +241,10 @@ CFG = {
         # 主动轮换提前量：换线从发起到达生效 p50=2s / p90=7s，等「已服务满
         # 典型寿命」再发起就赶不上（首错延迟 p50=3s），必须提前这个时长。
         "switch_lead_sec": 3.0,
+        # 错误换线路径上等目标备线空闲的上限。补刷路径用的是 idle_wait_sec(40s)，
+        # 但错误路径上每多等一秒，坏出口就多服务一秒失败请求 —— 实测 40s 上限
+        # 把「首错→换线生效」拉到 p90=25s / max=206s。
+        "fallback_idle_wait_sec": 3,
     },
     "log_file": "/home/administrator/dkk-projects/auto-switch-ip/daemon.log",
     "log_format": "%Y-%m-%d %H:%M:%S",

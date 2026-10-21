@@ -103,7 +103,7 @@ echo "=== Process ===" && pgrep -af "sing-box|daemon.py" | grep -v grep | grep -
 
 | 文件 | 用途 |
 |------|------|
-| `~/.9router/proxy-global.js` | 9router 代理补丁 |
+| `~/.9router/db/data.sqlite` settings | 9router 出站代理指向（outboundProxyUrl） |
 | `daemon.py` | 节点轮换守护进程 |
 | `singbox-config.json` | sing-box 配置 |
 | `.bad_nodes.json` | 坏节点共享文件 |

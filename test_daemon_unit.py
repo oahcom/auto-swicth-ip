@@ -37,9 +37,20 @@ def _isolate_production_files(tmp_path, monkeypatch):
     monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(tmp_path / "warp_ip_used.json"))
     # warp_ip_cycles：_record_warp_cycle 会落盘，同样必须隔离。
     monkeypatch.setenv("WARP_IP_CYCLES_FILE_PATH", str(tmp_path / "warp_ip_cycles.json"))
+    # warp_ip_history：_mark_warp_ip_used 会追加历史，不隔离则桩地址写进生产
+    # .warp_ip_history.jsonl —— 该文件永不清理，污染是永久的。
+    monkeypatch.setenv("WARP_IP_HISTORY_FILE_PATH", str(tmp_path / "warp_ip_history.jsonl"))
+    # proxy_fallback：落池成功会落盘，不隔离则测试会写生产文件、且下一次
+    # 测试会读到真实落池时刻而误入冷却。
+    monkeypatch.setenv("WARP_PROXY_FALLBACK_FILE_PATH", str(tmp_path / "proxy_fallback.json"))
+    monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 0.0)
+    monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", False)
     monkeypatch.setattr(daemon, "_WARP_IP_CYCLES", [])
     monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 0.0)
     monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 0.0)
+    # Clash selector 快照是进程级缓存：前一个用例留下的 "now" 会让 active_warp_tag()
+    # 跳过 sing-box 直接命中，而单跑时快照为空、走真实查询 —— 同一用例两种结果。
+    monkeypatch.setattr(daemon, "_CLASH_SNAP", {})
     lg = logging.getLogger("auto-switch-ip")
     saved = lg.handlers[:]
     lg.handlers = []
@@ -422,20 +433,24 @@ def test_restart_singbox_resets_count_on_success():
     orig_alive = daemon.is_singbox_alive
     orig_sleep = daemon.time.sleep
     orig_switch = daemon._switch_warp
-    orig_tag = daemon.active_warp_tag
+    orig_mode = daemon._current_mode
     daemon.subprocess.run = lambda *a, **k: None
     daemon.subprocess.Popen = lambda *a, **k: None
     daemon._set_outbound_proxy = lambda *a, **k: None
     daemon.is_singbox_alive = lambda: True  # 重启后探测成功
     daemon.time.sleep = lambda *a, **k: None
-    # 重启成功后 daemon 会恢复重启前的 WARP 线路（_switch_warp → PUT selector）。
+    # 重启成功后 daemon 会恢复重启前的出口（_switch_warp → PUT selector）。
     # 测试不得写到真实 sing-box，此处打桩。
-    daemon.active_warp_tag = lambda: None
-    daemon._switch_warp = lambda tag: True
+    calls = []
+    daemon._switch_warp = lambda tag: calls.append(tag) or True
+    # 重启前停在轮换池：selector 会回到 default(WARP-CF)，必须切回 proxy，
+    # 否则一次重启就把出口静默从池换成 WARP。
+    daemon._current_mode = lambda: ("proxy", None)
     try:
         ok = daemon.restart_singbox()
         assert ok is True, "重启后探测成功应返回 True"
         assert daemon._RESTART_COUNT == 0, f"成功应清零计数，实际 {daemon._RESTART_COUNT}"
+        assert calls == ["proxy"], f"重启前在池应切回 proxy，实际 {calls}"
     finally:
         daemon.subprocess.run = orig_sub
         daemon.subprocess.Popen = orig_popen
@@ -443,7 +458,46 @@ def test_restart_singbox_resets_count_on_success():
         daemon.is_singbox_alive = orig_alive
         daemon.time.sleep = orig_sleep
         daemon._switch_warp = orig_switch
+        daemon._current_mode = orig_mode
+
+
+def test_probe_active_ip_discards_ip_when_selector_moved_during_probe():
+    """探测期间换线时，旧线的 IP 不能记到新线上。"""
+    orig_egress, orig_tag, orig_member = (
+        daemon.warp_egress_ip, daemon.active_warp_tag, daemon._warp_member)
+    daemon._warp_member = lambda tag: {"tag": tag, "port": 1080}
+    daemon.warp_egress_ip = lambda port, timeout_sec=20.0: "2a09::old"
+    daemon.active_warp_tag = lambda: "WARP-CF-B"   # 探测期间已切走
+    try:
+        assert daemon._probe_active_ip("WARP-CF") is None, "换线后应丢弃旧线的探测结果"
+        daemon.active_warp_tag = lambda: "WARP-CF"  # 未变
+        assert daemon._probe_active_ip("WARP-CF") == "2a09::old", "未换线应采信探测结果"
+    finally:
+        daemon.warp_egress_ip = orig_egress
         daemon.active_warp_tag = orig_tag
+        daemon._warp_member = orig_member
+
+
+def test_restart_singbox_keeps_mode_when_previous_unknown():
+    """查不到重启前模式时不得擅自动 selector —— 看门狗重启前的 sing-box 本来就是死的。"""
+    daemon._restart_lock = threading.Lock()
+    orig = (daemon.subprocess.run, daemon.subprocess.Popen, daemon._set_outbound_proxy,
+            daemon.is_singbox_alive, daemon.time.sleep, daemon._switch_warp, daemon._current_mode)
+    calls = []
+    daemon.subprocess.run = lambda *a, **k: None
+    daemon.subprocess.Popen = lambda *a, **k: None
+    daemon._set_outbound_proxy = lambda *a, **k: None
+    daemon.is_singbox_alive = lambda: True
+    daemon.time.sleep = lambda *a, **k: None
+    daemon._switch_warp = lambda tag: calls.append(tag) or True
+    daemon._current_mode = lambda: ("unknown", None)
+    try:
+        assert daemon.restart_singbox() is True, "重启后探测成功应返回 True"
+        assert calls == [], f"模式未知时不应切 selector，实际切到 {calls}"
+    finally:
+        (daemon.subprocess.run, daemon.subprocess.Popen, daemon._set_outbound_proxy,
+         daemon.is_singbox_alive, daemon.time.sleep, daemon._switch_warp,
+         daemon._current_mode) = orig
 
 
 # ============= 8. get_per_egress_error_rate（出口归属） =============
@@ -629,7 +683,7 @@ def test_warp_failover_not_gated_by_node_switch(monkeypatch):
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": 1, "rate429": 0, "ok": 0})
+                        lambda ts: {"abuse403": 3, "rate429": 0, "ok": 0, "consec_err": 3})
     called = []
 
     class T:
@@ -666,14 +720,14 @@ def test_warp_failover_on_429_respects_higher_threshold(monkeypatch):
 
     # 4 条 429 未达阈值 5，不得换线
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": 0, "rate429": 4, "ok": 0})
+                        lambda ts: {"abuse403": 0, "rate429": 4, "ok": 0, "consec_err": 4})
     daemon.maybe_reconnect_warp(1000.0)
     assert not launched, "429 未达阈值不应换线"
 
     # 5 条 429 达阈值，必须换线，且冷却按 2^n 从 20s 起算
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": 0, "rate429": 5, "ok": 0})
+                        lambda ts: {"abuse403": 0, "rate429": 5, "ok": 0, "consec_err": 5})
     daemon.maybe_reconnect_warp(1000.0)
     assert launched and "rate429" in launched[0], f"429 达阈值须换线, 实际 {launched}"
     assert round(daemon._warp_cooldown_until - 1000.0) == 20
@@ -687,7 +741,7 @@ def test_warp_403_and_429_share_one_failover(monkeypatch):
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     monkeypatch.setattr(daemon, "reconnect_warp", lambda r: True)
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": 1, "rate429": 9, "ok": 0})
+                        lambda ts: {"abuse403": 1, "rate429": 9, "ok": 0, "consec_err": 10})
     launched = []
 
     class T:
@@ -700,6 +754,112 @@ def test_warp_403_and_429_share_one_failover(monkeypatch):
     daemon.maybe_reconnect_warp(1000.0)
     assert len(launched) == 1, f"两类同时达阈值只应换一次线, 实际 {len(launched)}"
     assert "abuse403" in launched[0] and "rate429" in launched[0], launched[0]
+
+
+def test_maybe_reconnect_warp_suppressed_when_newest_row_succeeded(monkeypatch):
+    """最新一条仍成功（连错 0 条）→ 不得换线。
+
+    用户规则：最近两条连错都允许不切，第三条才换；最新一条成功时连错为 0。
+    """
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "block_threshold": 1,
+                         "rate429_threshold": 1, "cooldown_ok_sec": 5})
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 1, "ok": 9,
+                                    "consec_err": 0, "full_err": False})
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda **k: pytest.fail("最新一条是成功，不应换线"))
+    daemon.maybe_reconnect_warp(1000.0)
+    assert daemon._WARP_LOCK.locked() is False, "被门控拦下时不得占用换线锁"
+
+
+def test_maybe_reconnect_warp_allows_two_consecutive_errors(monkeypatch):
+    """连错 2 条仍不切线 —— 用户要求「刚切线的 10 秒内允许出现 2 次报错而不切线」。
+
+    WHY 不看窗口成功数：429 风暴里成功与错误交替，窗口里 9 条成功也可有连错
+    2 条；用户要的是「多给一次机会」而不是「半数以上成功才不切」。
+    """
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "block_threshold": 1,
+                         "rate429_threshold": 1, "cooldown_ok_sec": 5})
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 2, "ok": 8,
+                                    "consec_err": 2, "full_err": False})
+    launched = []
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda **k: pytest.fail("连错 2 条时不得换线"))
+    daemon.maybe_reconnect_warp(1000.0)
+    assert daemon._WARP_LOCK.locked() is False, "被门控拦下时不得占用换线锁"
+
+
+def test_maybe_reconnect_warp_switches_on_third_consecutive_error(monkeypatch):
+    """连错 3 条 → 换线（用户的允许额只有 2 条）。"""
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "block_threshold": 1,
+                         "rate429_threshold": 1, "cooldown_ok_sec": 5})
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 3, "ok": 7,
+                                    "consec_err": 3, "full_err": False})
+    launched = []
+
+    class T:
+        def __init__(self, target=None, args=(), **k): self._a = args
+        def start(self):
+            launched.append(self._a[0])
+            daemon._WARP_LOCK.release()
+
+    monkeypatch.setattr(daemon.threading, "Thread", T)
+    daemon.maybe_reconnect_warp(1000.0)
+    assert launched, "连错 3 条必须换线"
+
+
+def test_maybe_reconnect_warp_full_error_window_bypasses_cooldown(monkeypatch):
+    """最近 10 条 100% 打满 → 无视冷却立刻换线。"""
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "block_threshold": 1,
+                         "rate429_threshold": 1, "cooldown_ok_sec": 5})
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 10, "ok": 0,
+                                    "consec_err": 10, "full_err": True})
+    launched = []
+
+    class T:
+        def __init__(self, target=None, args=(), **k): self._a = args
+        def start(self):
+            launched.append(self._a[0])
+            daemon._WARP_LOCK.release()
+
+    monkeypatch.setattr(daemon.threading, "Thread", T)
+    # 冷却还剩 4s：普通触发会被挡住，满窗风暴必须照换
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 1004.0)
+    daemon.maybe_reconnect_warp(1000.0)
+    assert launched, "满窗 10 条全错时冷却不得阻止换线"
+
+
+def test_maybe_reconnect_warp_respects_cooldown_when_window_not_full(monkeypatch):
+    """冷却期内、窗口未打满 → 不换线（用户要求：切完要有短时间限制）。"""
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "block_threshold": 1,
+                         "rate429_threshold": 1, "cooldown_ok_sec": 5})
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 2, "ok": 8,
+                                    "consec_err": 3, "full_err": False})
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda **k: pytest.fail("冷却期内不得换线"))
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 1004.0)
+    daemon.maybe_reconnect_warp(1000.0)
 
 
 def test_active_warp_tag_maps_selector_now(monkeypatch):
@@ -733,9 +893,34 @@ def test_count_warp_blocked_since_filters_abuse(monkeypatch):
     ])
     monkeypatch.setattr(daemon, "_get_db", lambda: mem)
     cutoff = datetime(2026, 10, 19, 7, 0, 0, tzinfo=timezone.utc).timestamp()
-    assert daemon.count_warp_blocked_since(cutoff) == {"abuse403": 1, "rate429": 1, "ok": 1}, \
+    got = daemon.count_warp_blocked_since(cutoff)
+    assert {k: got[k] for k in ("abuse403", "rate429", "ok")} == \
+        {"abuse403": 1, "rate429": 1, "ok": 1}, \
         "两类拦截分开计数；success 不计入拦截但计入 ok（判断出口是否在服务）"
-    assert daemon.count_warp_blocked_since(0) == {"abuse403": 2, "rate429": 1, "ok": 1}
+    assert got["consec_err"] == 0, "窗口内最新一条（07:00:03）是成功，连错为 0"
+    assert got["full_err"] is False, "窗口未满且成功数 > 0"
+    assert daemon.count_warp_blocked_since(0)["abuse403"] == 2
+
+
+def test_count_warp_blocked_since_counts_consecutive_tail(monkeypatch):
+    """连错数从最新一条往前数，停在第一条成功处；成功夹在中间也挡不住尾部计数。"""
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.execute("CREATE TABLE requestDetails (provider TEXT, status TEXT, timestamp TEXT, data TEXT)")
+    rate = json.dumps({"response": {
+        "error": json.dumps({"error": {"type": "FreeUsageLimitError",
+                                       "message": "Rate limit exceeded. Please try again later."}}),
+        "status": 429}})
+    mem.executemany("INSERT INTO requestDetails VALUES (?,?,?,?)", [
+        ("opencode", "success", "2026-10-19T07:00:01.000Z", '{"response":{"status":"success"}}'),
+        ("opencode", "error", "2026-10-19T07:00:02.000Z", rate),
+        ("opencode", "error", "2026-10-19T07:00:03.000Z", rate),
+        ("opencode", "error", "2026-10-19T07:00:04.000Z", rate),
+    ])
+    monkeypatch.setattr(daemon, "_get_db", lambda: mem)
+    assert daemon.count_warp_blocked_since(0)["consec_err"] == 3, \
+        "最新三条连错，中间无成功"
+    assert daemon.count_warp_blocked_since(0)["ok"] == 1, "更早的成功仍计入窗内 ok"
 
 
 def test_count_warp_blocked_since_production_nested_response(monkeypatch):
@@ -770,15 +955,48 @@ def test_count_warp_blocked_since_production_nested_response(monkeypatch):
         ("opencode", "success", "2026-10-19T19:46:20.000Z", '{"response":{"status":"success"}}'),
     ])
     monkeypatch.setattr(daemon, "_get_db", lambda: mem)
-    assert daemon.count_warp_blocked_since(0) == {"abuse403": 1, "rate429": 1, "ok": 1}, \
+    got = daemon.count_warp_blocked_since(0)
+    assert {k: got[k] for k in ("abuse403", "rate429", "ok")} == \
+        {"abuse403": 1, "rate429": 1, "ok": 1}, \
         "生产嵌套 JSON 形态必须同样计入两类拦截"
+
+
+def test_count_warp_blocked_since_attributes_by_request_start(monkeypatch):
+    """按请求**开始**时刻归属，不按完成时刻。
+
+    9router 在请求结束时才写行，换线又不掐断在途请求（实测 38.4% 的请求生命
+    周期跨越一次换线）。若按完成时刻切窗口，上一出口的 429 会在换线后落进新
+    窗口，再触发一次换线 —— 实测 45% 的触发计数属于这一类。
+    """
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.execute("CREATE TABLE requestDetails (provider TEXT, status TEXT, timestamp TEXT, data TEXT)")
+    def row(status, ts, latency_ms, body=None):
+        data = json.dumps({"status": status, "latency": {"total": latency_ms},
+                           "response": body or {}})
+        return ("opencode", status, ts, data)
+    stale_429 = json.dumps({"error": {"type": "FreeUsageLimitError",
+                                      "message": "Rate limit exceeded. Please try again later."}})
+    mem.executemany("INSERT INTO requestDetails VALUES (?,?,?,?)", [
+        # 完成于窗口内、但开始于窗口之前：属于上一出口，不能计入
+        row("error", "2026-10-19T07:00:06.000Z", 8000, {"error": stale_429, "status": 429}),
+        # 完成于窗口内、开始于窗口之后：属于本出口
+        row("error", "2026-10-19T07:00:07.000Z", 1000, {"error": stale_429, "status": 429}),
+        # 成功同理：开始于窗口之前的成功不算本出口的 ok
+        row("success", "2026-10-19T07:00:05.000Z", 10000),
+    ])
+    monkeypatch.setattr(daemon, "_get_db", lambda: mem)
+    cutoff = datetime(2026, 10, 19, 7, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert daemon.count_warp_blocked_since(cutoff)["rate429"] == 1, \
+        "只统计开始时刻落在窗口内的行，完成时刻在窗口内不算"
+
 
 
 def test_failover_switches_to_standby_and_refreshes_idle(monkeypatch):
     """备线可用时必须换线（不原地重启），并异步刷新被换下的主线上会话。"""
     _warp_env(monkeypatch, WARP_TWO)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: {1080: "1.1.1.1", 1081: "2.2.2.2"}[port])
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {1080: "1.1.1.1", 1081: "2.2.2.2"}[port])
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_restart_service", lambda s: pytest.fail("换线成功不应重启隧道"))
@@ -795,7 +1013,7 @@ def test_failover_skips_dead_standby(monkeypatch):
     """
     _warp_env(monkeypatch, WARP_TWO)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "1.1.1.1" if port == 1080 else None)
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1" if port == 1080 else None)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
@@ -808,13 +1026,57 @@ def test_failover_without_standby_falls_back_to_proxy(monkeypatch):
     """单隧道部署（无备线）切到轮换池 proxy，而非原地重连当前隧道。"""
     _warp_env(monkeypatch, WARP_TWO[:1])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "1.1.1.1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1")
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     assert daemon.reconnect_warp("test") is True
     assert switched == ["proxy"], f"应切 proxy，实际 {switched}"
+
+
+def test_proxy_fallback_respects_cooldown(monkeypatch):
+    """冷却期内不得再落池：其它线都切不过去时退回原地重连。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", True)
+    monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 1000.0)
+    monkeypatch.setattr(daemon, "_port_open", lambda p: False)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    restarted = []
+    monkeypatch.setattr(daemon, "_restart_warp_inplace",
+                        lambda m, ip: restarted.append(m["tag"]) or True)
+    assert daemon._fallback_to_proxy(WARP_TWO[0], "1.1.1.1", 2000.0) is True
+    assert switched == [], f"冷却期内不得切 proxy, 实际 {switched}"
+    assert restarted == ["W1"], f"应原地重连当前线, 实际 {restarted}"
+
+
+def test_proxy_fallback_cooldown_switches_other_warp_line(monkeypatch):
+    """冷却期内改切其它 WARP 成员，且不更新落池计时。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", True)
+    monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 1000.0)
+    monkeypatch.setattr(daemon, "_port_open", lambda p: True)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_restart_warp_inplace",
+                        lambda m, ip: pytest.fail("有可用备线时不应原地重连"))
+    assert daemon._fallback_to_proxy(WARP_TWO[0], "1.1.1.1", 2000.0) is True
+    assert switched == ["W2"], f"冷却期内应切另一条 WARP 线, 实际 {switched}"
+    assert daemon._last_proxy_fallback_ts == 1000.0, "冷却期内的替代切换不得更新落池计时"
+
+
+def test_proxy_fallback_updates_cooldown_after_success(monkeypatch):
+    """冷却通过时切 proxy，落池时刻取切换生效时刻并落盘。"""
+    _warp_env(monkeypatch, WARP_TWO[:1])
+    monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", True)
+    monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 0.0)
+    monkeypatch.setattr(daemon.time, "time", lambda: 5000.0)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    assert daemon._fallback_to_proxy(None, None, 20000.0) is True
+    assert switched == ["proxy"], f"冷却通过应落池, 实际 {switched}"
+    assert daemon._last_proxy_fallback_ts == 5000.0
 
 
 def test_inplace_restart_gives_up_after_max_attempts(monkeypatch):
@@ -825,7 +1087,7 @@ def test_inplace_restart_gives_up_after_max_attempts(monkeypatch):
     """
     calls = []
     _warp_env(monkeypatch, WARP_TWO[:1], max_attempts=3)
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "1.1.1.1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1")
     monkeypatch.setattr(daemon, "_restart_service", lambda s: calls.append(1) or True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     assert daemon._restart_warp_inplace(WARP_TWO[0], "1.1.1.1") is False
@@ -839,7 +1101,7 @@ def test_maybe_reconnect_warp_respects_threshold_and_cooldown(monkeypatch):
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": 2, "rate429": 0, "ok": 0})
+                        lambda ts: {"abuse403": 2, "rate429": 0, "ok": 0, "consec_err": 2})
     monkeypatch.setattr(daemon.threading, "Thread", lambda **k: pytest.fail("未达阈值不应换线"))
     daemon.maybe_reconnect_warp(1000.0)
 
@@ -851,7 +1113,7 @@ def test_maybe_reconnect_warp_respects_threshold_and_cooldown(monkeypatch):
 
     monkeypatch.setattr(daemon.threading, "Thread", T)
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": 3, "rate429": 0, "ok": 0})
+                        lambda ts: {"abuse403": 3, "rate429": 0, "ok": 0, "consec_err": 3})
     monkeypatch.setattr(daemon, "reconnect_warp", lambda r: True)
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     daemon.maybe_reconnect_warp(1000.0)
@@ -878,7 +1140,7 @@ def _reuse_env(monkeypatch, egress: dict, guard: int = 300, now: float = 1000.0)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon.time, "time", lambda: now)
     monkeypatch.setattr(daemon.time, "sleep", lambda s: None)
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: egress[str(port)])
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: egress[str(port)])
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda port, t: True)
     return egress
 
@@ -909,10 +1171,12 @@ def test_record_active_ip_success_creates_missing_entry(monkeypatch):
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "fresh-ip")
     monkeypatch.setattr(daemon, "_last_success_probe", ("fresh-ip", 3))
     monkeypatch.setattr(daemon.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(daemon, "recent_success_ts", lambda n: [990.0])
 
     daemon._record_active_ip_success(total=5, errors=1)   # 成功数 3 → 4
 
-    assert daemon._WARP_IP_USED["fresh-ip"]["last_ok_ts"] == 1000.0
+    assert daemon._WARP_IP_USED["fresh-ip"]["last_ok_ts"] == 990.0
+    assert daemon._WARP_IP_USED["fresh-ip"]["first_ok_ts"] == 990.0
     assert daemon._WARP_IP_USED["fresh-ip"]["blocked"] is False
 
 def test_maybe_init_active_ip_fills_missing_ip(monkeypatch):
@@ -926,7 +1190,7 @@ def test_maybe_init_active_ip_fills_missing_ip(monkeypatch):
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "_warp_member",
                         lambda tag: {"tag": tag, "port": 1080, "service": "s"})
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "probed-ip")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "probed-ip")
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
     monkeypatch.setattr(daemon, "_ACTIVE_IP_INIT_TS", 0.0)
 
@@ -941,7 +1205,7 @@ def test_warp_any_reachable_ignores_blocked_ip(monkeypatch):
     再换两个同段 IP 才恢复 —— 只看连通会让 daemon 反复切回已烧掉的地址。
     """
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "members": WARP_TWO})
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: {"1080": "ip-a", "1081": "ip-b"}[str(port)])
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {"1080": "ip-a", "1081": "ip-b"}[str(port)])
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {
         "ip-a": {"ts": 1000.0, "blocked": True},
         "ip-b": {"ts": 1000.0, "blocked": False},
@@ -959,9 +1223,13 @@ def test_maybe_reconnect_marks_active_ip_as_blocked(monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "burned-ip")
+    # 出口 IP 取自换线时记下的缓存，不在错误路径上现探（warp_egress_ip 走 SOCKS，
+    # 实测 1.2~7s，正好卡在「发现 403 → 起手换线」的最短链路上）。
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "burned-ip")
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: pytest.fail("错误路径不得同步探测出口 IP"))
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": 1, "rate429": 0, "ok": 0})
+                        lambda ts: {"abuse403": 3, "rate429": 0, "ok": 0, "consec_err": 3})
 
     class T:
         def __init__(self, target=None, args=(), **k): pass
@@ -969,8 +1237,10 @@ def test_maybe_reconnect_marks_active_ip_as_blocked(monkeypatch):
 
     monkeypatch.setattr(daemon.threading, "Thread", T)
     daemon.maybe_reconnect_warp(1000.0)
-    assert daemon._WARP_IP_USED.get("burned-ip", {}).get("blocked") is True, \
-        "被 403 拦下的出口 IP 必须记为 blocked"
+    entry = daemon._WARP_IP_USED.get("burned-ip", {})
+    assert entry.get("blocked") is True, "被 403 拦下的出口 IP 必须记为 blocked"
+    assert entry.get("blocked_kind") == "abuse403", \
+        f"须记下是 403 烧的（6h 恢复期），实际 {entry.get('blocked_kind')}"
 
 def test_warp_ip_used_survives_restart(monkeypatch, tmp_path):
     """被标记的 IP 必须跨 daemon 重启保留 —— 22:22 重启后旧 IP 全变"干净"，
@@ -1033,6 +1303,43 @@ def test_warp_failover_skips_refresh_for_fresh_ip(monkeypatch):
     assert "usque-warp-b.service" not in restarted, "新鲜 IP 不该触发备线重启"
     assert switched == ["W2"]
 
+def test_sync_path_refreshes_at_most_one_blocked_line(monkeypatch):
+    """同步换线路径只串行刷新一条脏备线，其余交给后台补刷。
+
+    `_refresh_idle_warp` 单条最坏 3×(12s 等端口 + 探测 + 退避 10s)。串行刷全部
+    脏线时，这段时间流量一直打在已被拦的出口上 —— 实测 02:40:43→02:41:52
+    在三条线上串行刷新失败，造成 69 秒换线空窗，同期错误率 100%。
+    """
+    members = [
+        {"tag": "W0", "port": 1080, "service": "usque-warp.service"},
+        {"tag": "W1", "port": 1081, "service": "usque-warp-b.service"},
+        {"tag": "W2", "port": 1082, "service": "usque-warp-c.service"},
+        {"tag": "W3", "port": 1083, "service": "usque-warp-d.service"},
+    ]
+    # 三条备线的出口全被 429 标记 → blocked_lines 有 3 条
+    egress = _reuse_env(monkeypatch, {"1080": "burn-0", "1081": "burn-1",
+                                      "1082": "burn-2", "1083": "burn-3"}, guard=3600)
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "members": members})
+    for ip in ("burn-0", "burn-1", "burn-2", "burn-3"):
+        daemon._WARP_IP_USED[ip] = {"ts": 990.0, "blocked": True,
+                                    "blocked_kind": "rate429", "blocked_ts": 990.0,
+                                    "last_ok_ts": 990.0}
+    refreshed = []
+    monkeypatch.setattr(daemon, "_refresh_idle_warp",
+                        lambda m: refreshed.append(m["tag"]) or None)
+    scheduled = []
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh",
+                        lambda m: scheduled.append(m["tag"]))
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
+
+    daemon.reconnect_warp("rate429 ×1")
+    assert len(refreshed) == 1, f"同步路径只该刷一条，实际刷了 {refreshed}"
+    assert sorted(scheduled) == sorted(set(
+        ["W1", "W2", "W3"]) - set(refreshed)), \
+        f"其余脏线应交给后台补刷，实际 {scheduled}"
+
+
 def test_warp_failover_skips_target_when_refresh_keeps_stale_ip(monkeypatch):
     """刷新后仍是窗口内用过的地址 → 跳过该备线，改切轮换池 proxy。"""
     egress = _reuse_env(monkeypatch, {"1080": "ip-w1", "1081": "stale-ip"})
@@ -1055,7 +1362,7 @@ def test_failover_excludes_line_under_refresh(monkeypatch):
     _warp_env(monkeypatch, WARP_TWO + [{"tag": "W3", "port": 1082,
                                         "service": "usque-warp-c.service"}])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: {
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {
         1080: "ip-w1", 1081: "ip-w2-stale", 1082: "ip-w3-fresh"}[port])
     monkeypatch.setattr(daemon, "_WARP_IP_USED",
                         {"ip-w1": {"ts": 1000.0, "blocked": False},
@@ -1087,7 +1394,7 @@ def test_reconnect_warp_refreshes_blocked_standby_before_fallback(monkeypatch):
     probes = []
     restarted = []
 
-    def _probe(port):
+    def _probe(port, timeout_sec=20.0):
         probes.append(port)
         if port == 1081 and restarted:
             return "ip-w2-new"              # 重启后换出全新会话 IP
@@ -1120,7 +1427,7 @@ def test_reconnect_warp_prefers_longest_unselected_fresh_line(monkeypatch):
     _warp_env(monkeypatch, WARP_TWO + [
         {"tag": "W3", "port": 1082, "service": "usque-warp-c.service"}])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: {
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {
         1080: "ip-w1", 1081: "ip-w2", 1082: "ip-w3"}[port])
     monkeypatch.setattr(daemon.time, "time", lambda: 100_000.0)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
@@ -1198,7 +1505,7 @@ def test_reconnect_warp_records_switch_effective_time(monkeypatch):
     _warp_env(monkeypatch, WARP_TWO)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip",
-                        lambda port: {1080: "ip-w1", 1081: "ip-w2"}[port])
+                        lambda port, timeout_sec=20.0: {1080: "ip-w1", 1081: "ip-w2"}[port])
     monkeypatch.setattr(daemon.time, "time", lambda: 7_000_000.0)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
@@ -1307,7 +1614,7 @@ def test_reconnect_warp_schedules_refresh_for_blocked_standbys(monkeypatch):
     _warp_env(monkeypatch, WARP_TWO + [{"tag": "W3", "port": 1082,
                                         "service": "usque-warp-c.service"}])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: {
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {
         1080: "ip-w1", 1081: "burned-b", 1082: "clean-c"}[port])
     monkeypatch.setattr(daemon.time, "time", lambda: 100_000.0)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {
@@ -1335,6 +1642,7 @@ def test_dirty_janitor_reclaims_all_non_active_lines(monkeypatch):
                                         "service": "usque-warp-c.service"}])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W2")
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    monkeypatch.setattr(daemon, "_WARP_REFRESH_PENDING", set())
     launched = []
 
     class T:
@@ -1353,7 +1661,7 @@ def test_dirty_janitor_reclaims_all_non_active_lines(monkeypatch):
 def test_dirty_worker_aborts_when_member_becomes_active(monkeypatch):
     """探测期间这条线被切成当前出口 → 放弃重连，不得重启。"""
     _warp_env(monkeypatch, WARP_TWO)
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "burned-ip")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "burned-ip")
     monkeypatch.setattr(daemon, "_WARP_IP_USED",
                         {"burned-ip": {"ts": 1000.0, "blocked": True}})
     monkeypatch.setattr(daemon.time, "time", lambda: 1000.0)
@@ -1370,19 +1678,60 @@ def test_dirty_worker_aborts_when_member_becomes_active(monkeypatch):
     assert not restarted, f"已成当前出口的线不得重启，实际 {restarted}"
 
 
+def test_dirty_worker_waits_for_idle_before_restart(monkeypatch):
+    """脏线仍在传数据时不得重启 —— 重启会掐断在途 SSE（upstream connection lost）。
+
+    错误路径（同步刷新）会等 3s 后改刷别的线；脏线守护没有别的线可换，
+    就下一轮再试。旧实现拿到名额直接重启，实测 02:44 换线后 19 秒把
+    CF/B/C 全部重启，正好掐在刚被换下、仍在传流的连接上。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "burned-ip")
+    monkeypatch.setattr(daemon, "_WARP_IP_USED",
+                        {"burned-ip": {"ts": 1000.0, "blocked": True}})
+    monkeypatch.setattr(daemon.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W2")
+    monkeypatch.setitem(daemon.CFG["warp"], "ip_refresh_retry_sec", 0)
+    restarted = []
+    monkeypatch.setattr(daemon, "_restart_service",
+                        lambda s: restarted.append(s) or True)
+    monkeypatch.setattr(daemon, "warp_line_busy", lambda tag, window=2.0: True)
+
+    daemon._reclaim_dirty_warp_worker({"tag": "W1", "port": 1080,
+                                       "service": "usque-warp.service"})
+
+    assert not restarted, f"仍在传数据的线不得重启，实际 {restarted}"
+    assert "W1" not in daemon._WARP_REFRESHING, "提前退出也必须释放名额"
+
+
+def test_acquire_refresh_slot_is_exclusive_per_tag(monkeypatch):
+    """同一 tag 二次获取必须失败 —— 否则两条线程同时刷同一条隧道。
+
+    实测 WARP-CF-C 02:31:49~02:32:03 出现 #1#1#2#2#3：两个刷新循环各跑
+    一遍重启，白烧一次「疑似脏 IP」探测。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    assert daemon._acquire_refresh_slot("W1") is True
+    assert daemon._acquire_refresh_slot("W1") is False, "同一 tag 不得重入"
+    assert daemon._acquire_refresh_slot("W2") is True
+    daemon._release_refresh_slot("W1")
+    assert daemon._acquire_refresh_slot("W1") is True
+
+
 def test_egress_label_shows_warp_with_ip(monkeypatch):
     """走 WARP 时标签须带 tag 与出口 IP —— 排查第一步是知道流量走哪条路。"""
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "members": WARP_TWO})
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W2")
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5::1")
-    assert daemon._egress_label("some-node") == "W2(2a09:bac5::1)"
+    assert daemon._egress_label("some-node") == "WARP:W2(2a09:bac5::1)"
 
 
 def test_egress_label_shows_proxy_when_on_pool(monkeypatch):
     """停在轮换池时标签须显示 proxy 与节点名。"""
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: None)
-    assert daemon._egress_label("pq.aws50.yydjc.top:443-vl") == "proxy(pq.aws50.yydjc.top:443-vl)"
-    assert daemon._egress_label(None) == "proxy(?)"
+    assert daemon._egress_label("pq.aws50.yydjc.top:443-vl") == "PROXY:pq.aws50.yydjc.top:443-vl"
+    assert daemon._egress_label(None) == "PROXY:?"
 
 
 def test_egress_label_unknown_ip_marked(monkeypatch):
@@ -1392,8 +1741,46 @@ def test_egress_label_unknown_ip_marked(monkeypatch):
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
     monkeypatch.setattr(daemon, "warp_egress_ip",
                         lambda p: pytest.fail("日志标签不得触发 SOCKS 探测"))
-    assert daemon._egress_label() == "W1(?)"
+    assert daemon._egress_label() == "WARP:W1(?)"
 
+
+def test_current_mode_distinguishes_unknown_from_pool(monkeypatch):
+    """查不到 ≠ 在轮换池：前者返回 unknown，避免重启时把 WARP 静默换成池。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setattr(daemon, "singbox_api", lambda *a, **kw: (0, None))
+    monkeypatch.setattr(daemon, "_clash_snapshot", lambda sel: None)
+    assert daemon._current_mode() == ("unknown", None), "无直查也无快照应为 unknown"
+
+    # 看门狗重启前 sing-box 已死：退回快照里的最后已知模式
+    monkeypatch.setattr(daemon, "_clash_snapshot", lambda sel: {"now": "W1"})
+    assert daemon._current_mode() == ("warp", "W1"), "查不到时应退回快照的已知模式"
+    monkeypatch.setattr(daemon, "_clash_snapshot", lambda sel: {"now": "proxy"})
+    assert daemon._current_mode() == ("proxy", None), "快照停在池应判为 pool"
+
+
+def test_switch_warp_logs_mode_transition_only(monkeypatch):
+    """模式切换（warp<->proxy）必须留日志，同模式内换线（W1->W2）不得刷屏。
+
+    before 走直查，所以 stub singbox_api 的 GET 返回的 "now" 就是当前生效的 selector。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    logs = []
+    state = {"now": "W1"}
+    monkeypatch.setattr(daemon, "log", logs.append)
+    monkeypatch.setattr(daemon, "_publish_clash_snapshot", lambda *a, **kw: None)
+    monkeypatch.setattr(daemon, "singbox_api",
+                        lambda *a, method="GET", **kw: (200, {"now": state["now"]}))
+
+    daemon._switch_warp("W2")
+    assert not logs, f"同模式内换线不该产生模式日志，实际 {logs}"
+
+    state["now"] = "proxy"
+    daemon._switch_warp("W1")
+    assert len(logs) == 1 and "proxy -> warp" in logs[0], f"实际 {logs}"
+
+    state["now"] = "W1"
+    daemon._switch_warp("proxy")
+    assert len(logs) == 2 and "warp -> proxy" in logs[1], f"实际 {logs}"
 
 def test_warp_failover_refreshes_blocked_line_instead_of_proxy(monkeypatch):
     """备线出口全被标记 → 刷新一条拿新 IP 再切，不直接落 proxy 池。
@@ -1417,7 +1804,7 @@ def test_warp_failover_refreshes_blocked_line_instead_of_proxy(monkeypatch):
             egress["1082"] = "new-c"
         return True
 
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: egress[str(port)])
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: egress[str(port)])
     monkeypatch.setattr(daemon, "_restart_service", _restart)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {
         "ip-w1": {"ts": 1000.0, "blocked": True},
@@ -1438,7 +1825,7 @@ def test_warp_failover_falls_back_when_blocked_refresh_fails(monkeypatch):
     monkeypatch.setattr(daemon.time, "time", lambda: 1000.0)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     monkeypatch.setattr(daemon, "warp_egress_ip",
-                        lambda port: {1080: "ip-w1", 1081: "ip-w2"}[port])
+                        lambda port, timeout_sec=20.0: {1080: "ip-w1", 1081: "ip-w2"}[port])
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {
         "ip-w1": {"ts": 999.0, "blocked": True},
         "ip-w2": {"ts": 999.0, "blocked": True},
@@ -1458,7 +1845,7 @@ def test_warp_failover_uses_unblocked_line_when_mixed(monkeypatch):
     """
     _warp_env(monkeypatch, WARP_TWO)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: {
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {
         "1080": "burned-a", "1081": "clean-b"}[str(port)])
     # 当前时间 = 100_000s，clean-b 使用于 1000s → 已过 99000s ≈ 27.5h > 24h
     monkeypatch.setattr(daemon.time, "time", lambda: 100_000.0)
@@ -1510,10 +1897,10 @@ def test_proxy_pool_health_ignores_warp_members(monkeypatch):
 def test_warp_any_reachable(monkeypatch):
     """三条隧道任一能出 IP 即可用。"""
     monkeypatch.setattr(daemon, "warp_egress_ip",
-                        lambda port: "2a09::1" if port == 1082 else None)
+                        lambda port, timeout_sec=20.0: "2a09::1" if port == 1082 else None)
     assert daemon._warp_any_reachable() is True
 
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: None)
     assert daemon._warp_any_reachable() is False
 
 
@@ -1522,8 +1909,11 @@ def _failback_env(monkeypatch, *, healthy, blocked=(0, 0), dead=0, nodes=80,
     """搭好 _maybe_failback_to_warp 的最小环境，返回被记录的切回 reason 列表。"""
     monkeypatch.setattr(daemon, "opencode_out_on_warp", lambda: False)
     monkeypatch.setattr(daemon, "_proxy_pool_healthy", lambda **kw: healthy)
+    # limit=None 是回切调用点的签名：回切要数「落池以来累计」，不受
+    # recent_window=2 限制（旧桩不收 limit → 10 个回切用例全 TypeError）。
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": blocked[0], "rate429": blocked[1]})
+                        lambda ts, limit=None: {"abuse403": blocked[0],
+                                                "rate429": blocked[1]})
     pool = [f"n{i}" for i in range(nodes)]
     monkeypatch.setattr(daemon, "_pool_nodes", lambda: pool)
     # 黑名单必须是池内节点，否则占比恒为 0
@@ -1650,7 +2040,7 @@ def test_switch_stamps_ip_with_actual_switch_time(monkeypatch):
     """
     _warp_env(monkeypatch, WARP_TWO)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: {
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {
         1080: "ip-w1", 1081: "ip-w2"}[port])
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
@@ -1724,12 +2114,19 @@ def test_warp_ip_records_served_sec_on_first_block(monkeypatch):
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "ip_reuse_guard_sec": 86400})
     ip = "2a09:bac5:1efa:1173::1bd:e7"
     daemon._mark_warp_ip_used(ip, 1_000.0)
-    daemon._mark_warp_ip_used(ip, 1_064.0, blocked=True)
+    daemon._mark_warp_ip_used(ip, 1_064.0, blocked=True, kind="abuse403")
     entry = daemon._WARP_IP_USED[ip]
     assert entry["served_sec"] == 64.0, f"存活时长应为 64s，实际 {entry.get('served_sec')}"
     assert entry["blocked_ts"] == 1_064.0
-    daemon._mark_warp_ip_used(ip, 2_000.0, blocked=True)
+    assert entry["blocked_kind"] == "abuse403"
+    assert entry["blocked_ts_by_kind"] == {"abuse403": 1_064.0}
+    # 同一轮里再被 429 烧：两类各自计时、并存，展示字段仍取最早的一类
+    daemon._mark_warp_ip_used(ip, 2_000.0, blocked=True, kind="rate429")
     assert entry["served_sec"] == 64.0, "重复标记不得用更晚的时间覆盖首次存活时长"
+    assert entry["blocked_ts"] == 1_064.0, "展示字段保留最早的惩罚起点"
+    assert entry["blocked_kind"] == "abuse403", "展示字段保留最早的 kind"
+    assert entry["blocked_ts_by_kind"] == {"abuse403": 1_064.0, "rate429": 2_000.0}, \
+        f"两类惩罚须各自留档，实际 {entry['blocked_ts_by_kind']}"
 
 
 def test_retry_refresh_skips_restart_when_already_fresh(monkeypatch):
@@ -1820,7 +2217,7 @@ def test_reconnect_warp_picks_longest_rest_when_none_fresh(monkeypatch):
                                              "ip_reuse_guard_sec": 86400})
     now = 1_000_000.0
     egress.update({"1080": "ip-w1", "1081": "ip-w2", "1082": "ip-w3"})
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: egress[str(port)])
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: egress[str(port)])
     # 三条都在 24h 窗口内；W3 休息最久，W2 次之，W1 最新
     # 三条都在 24h 内成功过（窗口内），W3 最久未成功 → 应选它
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {
@@ -1869,6 +2266,43 @@ def test_cached_standby_skips_probe_when_fresh(monkeypatch):
     assert probed == [], "缓存新鲜时不得同步探测"
 
 
+def test_cached_standby_keeps_all_candidates_not_just_first(monkeypatch):
+    """缓存命中时每条可用备线都要进候选池，不能只取第一条。
+
+    旧实现 `m, ip = fast[0]` 把其余备线全丢了：哪条被选中纯看缓存排序，
+    其余的一律报「备线 1 条」。隧道从 5 条扩到 10 条后这条代价被放大 ——
+    缓存里有 10 条新鲜线，选线却只看到 1 条，候选耗尽就直接落 proxy 池。
+    """
+    egress = _reuse_env(monkeypatch, {"1080": "ip-w1", "1081": "ip-b", "1082": "ip-c"})
+    members = [
+        {"tag": "W1", "port": 1080, "service": "s1"},
+        {"tag": "W2", "port": 1081, "service": "s2"},
+        {"tag": "W3", "port": 1082, "service": "s3"},
+    ]
+    monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "members": members})
+    now = 1000.0
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {
+        "W2": {"ip": "ip-b", "ip_ts": now - 2},
+        "W3": {"ip": "ip-c", "ip_ts": now - 2},
+    })
+    monkeypatch.setattr(daemon, "_port_open", lambda p: True)
+    monkeypatch.setattr(daemon, "_probe_warp_egress",
+                        lambda ms: egress)  # 不应被调用
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
+
+    # 直接盯选线日志里的「备线 N 条」：这是候选池大小，唯一能区分
+    # 「只取 fast[0]」（N=1）与「全部收下」（N=2）的观测点。
+    lines = []
+    monkeypatch.setattr(daemon, "log", lambda msg: lines.append(msg))
+
+    assert daemon.reconnect_warp("test") is True
+    assert len(switched) == 1, "一次换线只切一条"
+    sel = [l for l in lines if "选线:" in l]
+    assert sel and "备线 2 条" in sel[0], f"候选池应有 2 条，实际日志: {sel}"
+
+
 def test_cached_standby_rejects_stale_blocked_and_closed_port(monkeypatch):
     """缓存过期、出口已被标记、端口不在监听时都不得采信。"""
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "probe_cache_ttl_sec": 12})
@@ -1890,21 +2324,24 @@ def test_cached_standby_rejects_stale_blocked_and_closed_port(monkeypatch):
 
 def test_proactive_rotation_leads_by_switch_cost(monkeypatch):
     """主动轮换必须提前 switch_lead_sec 发起，否则新线在旧线到寿之后才生效。"""
-    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 20.0)
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 40.0)
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 100.0)
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
     monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
     monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 1e12)
+    # 地板换成 0：本用例验的是「按样本值提前」，地板是另一条不变量
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_FLOOR_SEC", 0.0)
     calls = []
     monkeypatch.setattr(daemon, "_reconnect_warp_now",
                         lambda reason, now, ignore_cooldown=False: calls.append(reason) or True)
 
-    # 寿命 20s − 换线提前量 3s = 17s；已服务 16s 还不该动，17s 必须动
-    daemon._maybe_proactively_rotate_warp(116.0)
+    # 寿命 40s − 换线提前量 3s = 37s；已服务 36s 还不该动，37s 必须动
+    daemon._maybe_proactively_rotate_warp(136.0)
     assert calls == [], "未到提前量就换线等于把地址寿命提前烧掉"
     daemon._last_proactive_warp_check = 0.0
-    daemon._maybe_proactively_rotate_warp(117.0)
+    daemon._maybe_proactively_rotate_warp(137.0)
+
     assert len(calls) == 1 and "换线耗时" in calls[0]
 
 
@@ -1930,15 +2367,19 @@ def test_recompute_cycle_excludes_zero_ok_zero():
     拉向 0。取值用中位而非最小：最小值由最倒霉的一条线决定（实测 98 条
     样本 min 0.1s / 中位 20.2s），按最小值换线等于每几秒切一次。
     """
+    daemon._WARP_MIN_CYCLE_SEC = 0.0
+    # 地板换成 0：本用例验的是中位选择，地板是另一条不变量（见
+    # test_recompute_ignores_zero_spans 之后的常量本身）
+    floor = daemon._WARP_MIN_CYCLE_FLOOR_SEC
     daemon._WARP_IP_CYCLES = [
-        {"ip": "a", "cycle": 15.0, "ended_at": time.time() - 100, "ok": 1},
+        {"ip": "a", "cycle": 35.0, "ended_at": time.time() - 100, "ok": 1},
         {"ip": "b", "cycle": 0.0, "ended_at": time.time() - 200, "ok": 0},  # 首错即废
-        {"ip": "c", "cycle": 17.0, "ended_at": time.time() - 250, "ok": 1},
-        {"ip": "d", "cycle": 20.0, "ended_at": time.time() - 300, "ok": 1},
+        {"ip": "c", "cycle": 37.0, "ended_at": time.time() - 250, "ok": 1},
+        {"ip": "d", "cycle": 40.0, "ended_at": time.time() - 300, "ok": 1},
     ]
     res = daemon._recompute_min_warp_cycle(time.time())
-    assert res == 17.0, f"应取可用样本中位数 17，实际 {res}"
-    assert daemon._WARP_MIN_CYCLE_SEC == 17.0
+    assert res == max(37.0, floor), f"应取可用样本中位数 37（地板 {floor}），实际 {res}"
+    assert daemon._WARP_MIN_CYCLE_SEC == max(37.0, floor)
 
 
 def test_recompute_prefers_span_over_cycle():
@@ -1949,13 +2390,54 @@ def test_recompute_prefers_span_over_cycle():
     每个 IP 只用掉不到三成就被扔掉。
     """
     daemon._WARP_IP_CYCLES = [
-        {"ip": "a", "cycle": 2.0, "span": 12.0, "ended_at": time.time() - 100, "ok": 1},
-        {"ip": "b", "cycle": 3.0, "span": 14.0, "ended_at": time.time() - 150, "ok": 1},
-        {"ip": "c", "cycle": 3.0, "span": 16.0, "ended_at": time.time() - 200, "ok": 1},
+        {"ip": "a", "cycle": 2.0, "span": 82.0, "ended_at": time.time() - 100, "ok": 1},
+        {"ip": "b", "cycle": 3.0, "span": 84.0, "ended_at": time.time() - 150, "ok": 1},
+        {"ip": "c", "cycle": 3.0, "span": 86.0, "ended_at": time.time() - 200, "ok": 1},
         {"ip": "d", "cycle": 1.0, "span": None, "ended_at": time.time() - 300, "ok": 1},
     ]
     res = daemon._recompute_min_warp_cycle(time.time())
-    assert res == 14.0, f"应取 span 中位 14，实际 {res}"
+    assert res == 84.0, f"应取 span 中位 84，实际 {res}"
+
+
+def test_error_switch_resets_proactive_timer(monkeypatch):
+    """错误触发的换线生效后，主动轮换的计时必须重新开始。
+
+    WHY：两种换线不能交错。旧实现只有 reconnect_warp 成功切 WARP 才更新
+    `_last_warp_switch_ok_ts`，`_fallback_to_proxy` 与 `_restart_warp_inplace`
+    这两条错误路径都不更新 —— 刚落池或刚原地重连，主动轮换仍按上一段的
+    已服务时长算账，立刻再切一次（实测 00:12:00 落池，22s 后就报 27s≥27s）。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda ip, ts, **k: None)
+    monkeypatch.setattr(daemon.time, "time", lambda: 5000.0)
+
+    assert daemon._fallback_to_proxy({"tag": "W1"}, "ip-w1", 4000.0) is True
+    assert daemon._last_warp_switch_ok_ts == 5000.0, \
+        "落池即本段结束，主动轮换计时必须重置为落池时刻"
+
+def test_recompute_ignores_zero_spans():
+    """span==0 表示「这段只有一条成功，测不出跨度」，不是「寿命 0 秒」。
+
+    算进去会让中位塌到 0，判据退化成固定下限 —— 实测 89 条样本里 80 条如此，
+    日志打出「中位 0.0s → 生效 30s」，等于没在跟随线上实际情况。
+    样本值须高于 _WARP_MIN_CYCLE_FLOOR_SEC，否则被地板顶掉测不到本函数的输出。
+    """
+    daemon._WARP_MIN_CYCLE_SEC = 0.0
+    now = time.time()
+    floor = daemon._WARP_MIN_CYCLE_FLOOR_SEC
+    daemon._WARP_IP_CYCLES = [
+        {"ip": f"zero{i}", "cycle": 20.0, "span": 0.0, "ended_at": now - 10, "ok": 1}
+        for i in range(20)
+    ] + [
+        {"ip": "a", "cycle": 90.0, "span": floor + 6, "ended_at": now - 20, "ok": 1},
+        {"ip": "b", "cycle": 90.0, "span": floor + 9, "ended_at": now - 30, "ok": 1},
+    ]
+    res = daemon._recompute_min_warp_cycle(now)
+    assert res == floor + 9, f"零跨度样本须排除，中位应是 {floor + 9}，实际 {res}"
 
 
 def test_recompute_min_cycle_empty_when_no_usable():
@@ -1995,9 +2477,9 @@ def test_maybe_reconnect_marks_ip_blocked_inside_cooldown(monkeypatch):
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 5000.0)   # 仍在冷却
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "fresh-ip")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "fresh-ip")
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
-                        lambda ts: {"abuse403": 1, "rate429": 0, "ok": 3})
+                        lambda ts: {"abuse403": 1, "rate429": 0, "ok": 3, "consec_err": 1})
     monkeypatch.setattr(daemon, "_record_warp_cycle",
                         lambda ip, cyc, now, ok=0: daemon._WARP_IP_CYCLES.append(
                             {"ip": ip, "cycle": cyc, "ended_at": now, "ok": ok}))
@@ -2030,14 +2512,15 @@ def test_proactive_rotate_uses_min_cycle_sample(monkeypatch):
                         {**daemon.CFG["warp"], "proactive_after_requests": 999,
                          "min_cycle_recalc_sec": 1,
                          "cooldown_ok_sec": 20})
+    # 地板换成 0：本用例验的是「用样本值而不是地板」，否则 40s 样本被顶到地板
+    monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_FLOOR_SEC", 0.0)
     monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 9999.0)   # 冷却中也要能触发
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 1000.0)
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
-    # 寿命下限 13s 高于这里给的样本值 10s，所以样本必须是 span 且高于下限，
-    # 否则生效值被下限顶到 13 而不是样本值。
+    # 样本必须高于寿命下限（30s），否则生效值被下限顶到 30 而不是样本值。
     monkeypatch.setattr(daemon, "_WARP_IP_CYCLES",
-                        [{"ip": "seed", "cycle": 20.0, "span": 20.0,
+                        [{"ip": "seed", "cycle": 40.0, "span": 40.0,
                           "ended_at": 1000.0, "ok": 1}])
     monkeypatch.setattr(daemon, "_WARP_MIN_CYCLE_SEC", 0.0)
     monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 0.0)
@@ -2049,12 +2532,12 @@ def test_proactive_rotate_uses_min_cycle_sample(monkeypatch):
                         lambda reason, now, ignore_cooldown=False:
                         fired.append((reason, ignore_cooldown)) or True)
 
-    daemon._maybe_proactively_rotate_warp(1003.0)   # 3s < 17s 触发点
+    daemon._maybe_proactively_rotate_warp(1003.0)   # 3s < 37s 触发点
     assert not fired, "周期未到不得换线"
-    assert daemon._WARP_MIN_CYCLE_SEC == 20.0
+    assert daemon._WARP_MIN_CYCLE_SEC == max(40.0, daemon._WARP_MIN_CYCLE_FLOOR_SEC)
 
     monkeypatch.setattr(daemon, "_last_proactive_warp_check", 0.0)
-    daemon._maybe_proactively_rotate_warp(1100.0)   # 100s ≥ 17s
+    daemon._maybe_proactively_rotate_warp(1100.0)   # 100s ≥ 37s
     assert len(fired) == 1, f"应按寿命判据换线，实际 {fired}"
     assert "周期" in fired[0][0]
     assert fired[0][1] is True, "时间判据必须绕开成功换线后的 20s 冷却"
@@ -2260,7 +2743,10 @@ def test_proactive_rotate_recovers_segment_start_after_restart(monkeypatch):
     monkeypatch.setattr(daemon, "_last_cycle_recalc_ts", 0.0)
     monkeypatch.setattr(daemon, "_WARP_IP_CYCLES", [])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "ip-w1")
+    # 段起点从 `_ACTIVE_WARP_IP` 查 IP 表恢复，不走 SOCKS 现探（主循环不得阻塞）。
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-w1")
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: pytest.fail("主循环不得同步探测出口 IP"))
     monkeypatch.setattr(daemon, "_WARP_IP_USED",
                         {"ip-w1": {"ts": 1000.0, "blocked": False}})
     seen = []
@@ -2277,14 +2763,132 @@ def test_proactive_rotate_recovers_segment_start_after_restart(monkeypatch):
 
 
 def test_guard_window_depends_on_trigger_reason():
-    """403 用 3h 窗口，429 用 24h 窗口，其它触发用默认窗口。"""
+    """403 用 6h 窗口、429 用 24h 窗口，其它触发用默认窗口。"""
     w = daemon._warp()
     assert daemon._warp_guard_for_reason("abuse403 ×1") == w["blocked_guard_sec"]
     assert daemon._warp_guard_for_reason("rate429 ×3") == w["rate429_guard_sec"]
     assert daemon._warp_guard_for_reason("主动轮换 已服务 60 条") == w["ip_reuse_guard_sec"]
-    # 两者同时命中时按 403 处理（更保守的信誉标记优先）
+    # 两者同时命中时按 403 处理（403 恢复期短，但信誉标记更严格、优先）
     assert daemon._warp_guard_for_reason("abuse403 ×1 + rate429 ×2") == w["blocked_guard_sec"]
-    assert w["blocked_guard_sec"] < w["rate429_guard_sec"], "403 窗口应短于 429"
+    # 403 六小时刷新、429 二十四小时刷新：403 窗口必须严格短于 429
+    assert w["blocked_guard_sec"] < w["rate429_guard_sec"], "403 窗口应严格短于 429"
+    assert w["blocked_guard_sec"] == 6 * 3600, "403 恢复期应为 6h"
+    assert w["rate429_guard_sec"] == 24 * 3600, "429 恢复期应为 24h"
+
+
+def test_blocked_ip_recovers_after_6h_for_403_and_24h_for_429(monkeypatch):
+    """惩罚期按 blocked_kind 分别计时：403 六小时、429 二十四小时。
+
+    403 是出口 IP 信誉标记，休息满 6h 即可再试；429 是出口 IP 级限流，必须
+    等 24h。kind 缺失的旧记录按 24h 保守处理。
+    """
+    now = 1_000_000.0
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    monkeypatch.setattr(daemon, "_append_warp_ip_history",
+                        lambda *a, **k: None)
+    daemon._mark_warp_ip_used("ip-403", now, blocked=True, kind="abuse403")
+    daemon._mark_warp_ip_used("ip-429", now, blocked=True, kind="rate429")
+    daemon._mark_warp_ip_used("ip-legacy", now, blocked=True)   # 无 kind 的旧记录
+    assert daemon._WARP_IP_USED["ip-403"]["blocked_kind"] == "abuse403"
+    assert daemon._WARP_IP_USED["ip-429"]["blocked_kind"] == "rate429"
+
+    h = 3600
+    # 403：6h 内仍挡，6h 后放行
+    assert daemon._warp_ip_is_blocked("ip-403", now + 5 * h + 59 * 60) is True
+    assert daemon._warp_ip_is_blocked("ip-403", now + 6 * h + 60) is False
+    # 429：6h 后仍挡、23h59m 后仍挡、24h 后放行
+    assert daemon._warp_ip_is_blocked("ip-429", now + 6 * h + 60) is True
+    assert daemon._warp_ip_is_blocked("ip-429", now + 24 * h - 60) is True
+    assert daemon._warp_ip_is_blocked("ip-429", now + 24 * h + 60) is False
+    # 旧记录没有 kind → 按 24h 保守处理
+    assert daemon._warp_ip_is_blocked("ip-legacy", now + 6 * h + 60) is True
+    assert daemon._warp_ip_is_blocked("ip-legacy", now + 24 * h + 60) is False
+    # 未标记 / 空 IP 一律 False
+    daemon._mark_warp_ip_used("ip-clean", now)
+    assert daemon._warp_ip_is_blocked("ip-clean", now) is False
+    assert daemon._warp_ip_is_blocked(None) is False
+
+
+def test_403_then_429_blocks_until_later_expiry(monkeypatch):
+    """先 403 后 429 的 IP 按晚的那条解禁，不被 429 的标记改回 6h 窗口。
+
+    只留单个 (kind, start) 时，后一次 429 会覆盖前一次 403 的起点，于是这条
+    地址按 6h 解禁，比规则要求的 24h 早 18 小时回到候选池。用户规则「按多的来」。
+    """
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    daemon._mark_warp_ip_used("ip-y", now, blocked=True, kind="abuse403")
+    daemon._mark_warp_ip_used("ip-y", now + 2 * h, blocked=True, kind="rate429")
+    entry = daemon._WARP_IP_USED["ip-y"]
+    assert entry["blocked_ts_by_kind"] == {"abuse403": now, "rate429": now + 2 * h}
+    # 403 那条在 T+6h 到期，但 429 那条要到 T+2h+24h
+    assert daemon._warp_ip_is_blocked("ip-y", now + 8 * h) is True, \
+        "403 虽已满 6h，429 的 24h 仍未到期，须继续挡住"
+    assert daemon._warp_ip_is_blocked("ip-y", now + 2 * h + 24 * h + 60) is False
+    # 从没成功过的地址 recently_used 恒 False（它只看成功流量），由 is_blocked 兜住
+    assert daemon._warp_ip_recently_used("ip-y", now + 8 * h) is False
+    # 成功服务过再被两类烧掉：窗口取最长的 24h，8h 后仍算「刚用过」
+    entry["last_ok_ts"] = now
+    assert daemon._warp_ip_recently_used("ip-y", now + 8 * h) is True, \
+        "有 429 标记时窗口须取 24h，不能按 403 的 6h 提前放行"
+    assert daemon._warp_ip_recently_used("ip-y", now + 25 * h) is False
+
+
+def test_reburned_after_recovery_starts_new_penalty(monkeypatch):
+    """惩罚期过后再被烧 → 新一轮计时，不得沿用旧 blocked_ts 判成「已恢复」。
+
+    否则一个恢复过一次的地址以后再被 429 烧掉会立刻被放行，24h 限流形同虚设。
+    同一轮内的重复标记仍保留最早的 kind 与 blocked_ts（见上一个用例）。
+    """
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    daemon._mark_warp_ip_used("ip-x", now, blocked=True, kind="abuse403")
+    assert daemon._warp_ip_is_blocked("ip-x", now + 6 * h + 60) is False, "6h 后应已恢复"
+
+    daemon._mark_warp_ip_used("ip-x", now + 7 * h, blocked=True, kind="rate429")
+    entry = daemon._WARP_IP_USED["ip-x"]
+    assert entry["blocked_kind"] == "rate429", "新一轮按本次错误类型计时"
+    assert entry["blocked_ts"] == now + 7 * h, "新一轮起点为本次标记时刻"
+    assert daemon._warp_ip_is_blocked("ip-x", now + 8 * h) is True, "应在新的 24h 惩罚期内"
+
+
+def test_expired_block_becomes_secondary_tier(monkeypatch):
+    """过了惩罚期的 IP 降级为「次级优质」，重新进入候选；未过期的仍被排除。
+
+    403 标记、7 小时前成功过 → 惩罚期已过，档位 1（次级优质），
+    _warp_ip_recently_used 不再按 blocked 窗口排除它。
+    同样条件下 429 标记仍在 24h 惩罚期内 → 被排除。
+    """
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setitem(daemon.CFG, "warp", {
+        **daemon.CFG["warp"], "blocked_guard_sec": 6 * h,
+        "rate429_guard_sec": 24 * h, "ip_reuse_guard_sec": 24 * h})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "ip-403": {"ts": now - 7 * h, "blocked": True, "blocked_kind": "abuse403",
+                   "blocked_ts": now - 8 * h, "last_ok_ts": now - 7 * h},
+        "ip-429": {"ts": now - 7 * h, "blocked": True, "blocked_kind": "rate429",
+                   "blocked_ts": now - 7 * h, "last_ok_ts": now - 7 * h},
+    })
+    # 403：惩罚期已过 → 档 1 次级优质，且不算「窗口内用过」
+    assert daemon._warp_ip_is_blocked("ip-403", now) is False
+    assert daemon._warp_ip_rank("ip-403", now, 24 * h)[0] == 1, "应为次级优质（档 1）"
+    assert daemon._warp_ip_recently_used("ip-403", now) is False, "已过 6h 窗口，应可复用"
+    # 429：24h 惩罚期内 → 仍被排除
+    assert daemon._warp_ip_is_blocked("ip-429", now) is True
+    assert daemon._warp_ip_recently_used("ip-429", now) is True, "仍在 24h 窗口内"
+    # 未被标记、但 7h 前成功过：沿用调用方的默认窗口（24h）→ 仍算最近用过
+    monkeypatch.setattr(daemon, "_WARP_IP_USED",
+                        {"plain": {"ts": now - 7 * h, "blocked": False,
+                                   "last_ok_ts": now - 7 * h}})
+    assert daemon._warp_ip_recently_used("plain", now) is True
 
 
 def test_warp_ip_never_used_distinguishes_from_old_records(monkeypatch):
@@ -2305,17 +2909,17 @@ def test_reconnect_prefers_never_used_over_recently_used(monkeypatch):
     """选线时未用过的地址优先于「窗口外但用过」的地址。"""
     _warp_env(monkeypatch, WARP_TWO)
     monkeypatch.setitem(daemon.CFG, "warp", {
-        **daemon.CFG["warp"], "blocked_guard_sec": 10800,
+        **daemon.CFG["warp"], "blocked_guard_sec": 21600,
         "rate429_guard_sec": 86400, "ip_reuse_guard_sec": 86400})
     now = 100000.0
-    # W1: 用过且在 3h 内；W2: 从没用过
+    # W1: 用过且在 24h 窗口内；W2: 从没用过
     monkeypatch.setattr(daemon, "_WARP_IP_USED",
                         {"ip-old": {"ts": now - 600, "blocked": False}})
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: None)   # 在 proxy 上
     monkeypatch.setattr(daemon, "_probe_warp_egress",
                         lambda members: {"W1": "ip-old", "W2": "ip-new"})
     monkeypatch.setattr(daemon, "warp_egress_ip",
-                        lambda port: {"1080": "ip-old", "1081": "ip-new"}.get(str(port)))
+                        lambda port, timeout_sec=20.0: {"1080": "ip-old", "1081": "ip-new"}.get(str(port)))
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
     picked = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: picked.append(tag) or True)
@@ -2363,6 +2967,8 @@ def test_record_active_ip_success_uses_window_delta(monkeypatch):
     monkeypatch.setattr(daemon, "_last_success_probe", None)
     monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
     monkeypatch.setattr(daemon.time, "time", lambda: now)
+    # 成功时刻取自请求自己的 timestamp（r 新→旧），不是读库时刻
+    monkeypatch.setattr(daemon, "recent_success_ts", lambda n: [now - 4.0, now - 9.0][:n])
 
     daemon._record_active_ip_success(10, 4)      # 基线：ok=6
     assert daemon._WARP_IP_USED["ip-a"]["last_ok_ts"] is None, "首轮只建基线"
@@ -2370,7 +2976,9 @@ def test_record_active_ip_success_uses_window_delta(monkeypatch):
     assert daemon._WARP_IP_USED["ip-a"]["last_ok_ts"] is None, \
         "窗口里那条旧成功不能反复算作新成功"
     daemon._record_active_ip_success(10, 3)      # ok 6→7
-    assert daemon._WARP_IP_USED["ip-a"]["last_ok_ts"] == now, "新增成功应刷新 last_ok_ts"
+    assert daemon._WARP_IP_USED["ip-a"]["last_ok_ts"] == now - 4.0, \
+        "新增成功应把 last_ok_ts 推进到请求自己的时间戳"
+    assert daemon._WARP_IP_USED["ip-a"]["first_ok_ts"] == now - 4.0, "首个成功即段起点"
 
     # 换线到新出口：窗口里的成功大多来自旧出口，不能算到新 IP 头上
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-b")
@@ -2382,12 +2990,40 @@ def test_record_active_ip_success_uses_window_delta(monkeypatch):
         "换线后第一轮只重建基线，不能凭旧出口的成功给新 IP 记一笔"
 
 
-def test_warp_ip_rank_orders_unseen_before_no_success_before_ok(monkeypatch):
-    """选线三档：从没用过 > 有成功但已久 > 从没成功过。
+def test_record_active_ip_success_uses_request_timestamps(monkeypatch):
+    """跨度用请求自己的 timestamp，不能用读库时刻。
 
-    第 2 档必须排在第 3 档前面：一个「切上去就 403、从没服务成功过」的地址
-    （实测 350 条记录里 97 条）不该被当成新鲜地址直接切，但也不是首选 ——
-    它比真正没见过的地址更可疑。第 3 档按距上次成功的时长倒序，越久越优先。
+    9router 每 5s 批量落库（或攒满 20 条），一批成功在同一个 tick 才可见。
+    旧实现拿 `time.time()` 记 last_ok_ts：一个活 7s 的出口整段只被打点 1~2 次，
+    first_ok_ts == last_ok_ts，span 恒为 0 —— 实测 89 条样本里 80 条如此，
+    中位被顶成 0，寿命判据退化成固定下限 30s。用请求时间戳复算中位 6.9s。
+    """
+    now = 100000.0
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-a")
+    # 条目必须带 ts：first_ok_ts 比 ts 还旧说明是上一个 stint 留下的（同址
+    # 出窗口后被再次选中），会触发重置 —— 这里 ts 早于成功时刻，属同一段。
+    monkeypatch.setattr(daemon, "_WARP_IP_USED",
+                        {"ip-a": {"ts": now - 100, "blocked": False}})
+    monkeypatch.setattr(daemon, "_last_success_probe", ("ip-a", 6))
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon.time, "time", lambda: now)
+    # 一批落库的 3 条成功，请求时刻相隔 4s —— 同一 tick 被看到，但时刻不同
+    monkeypatch.setattr(daemon, "recent_success_ts", lambda n: [now - 2.0, now - 4.0, now - 6.0])
+
+    daemon._record_active_ip_success(10, 1)   # ok 6→9，新增 3 条
+
+    e = daemon._WARP_IP_USED["ip-a"]
+    assert e["first_ok_ts"] == now - 6.0, "段起点应是这批里最早那条请求的时刻"
+    assert e["last_ok_ts"] == now - 2.0, "段终点应是这批里最晚那条请求的时刻"
+    assert e["last_ok_ts"] - e["first_ok_ts"] == 4.0, "同批落库也要能算出真实跨度"
+
+
+def test_warp_ip_rank_orders_unseen_before_ok_before_no_success(monkeypatch):
+    """选线三档：从没用过 > 有成功记录 > 从没成功过。
+
+    第 1 档必须排在第 2 档前面：有成功记录的地址已验证能服务，优于「切上去
+    就 403、从没服务成功过」的地址（实测 350 条记录里 97 条）。第 1 档内部
+    按距上次成功的时长倒序，越久越优先。
     """
     now = 100000.0
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {
@@ -2401,10 +3037,166 @@ def test_warp_ip_rank_orders_unseen_before_no_success_before_ok(monkeypatch):
     ranks = {ip: daemon._warp_ip_rank(ip, now, 86400)
              for ip in ("brand-new", "burned-no-ok", "old-ok", "recent-ok")}
     assert ranks["brand-new"][0] == 0, "没见过的地址应第 0 档"
-    assert ranks["burned-no-ok"][0] == 1, "没成功过的地址应第 1 档"
-    assert ranks["old-ok"][0] == 2 and ranks["recent-ok"][0] == 2
-    # 第 2 档内部：越久没成功越优先（排序值越小，因为调用方用 min()）
-    assert ranks["old-ok"][1] < ranks["recent-ok"][1]
-    # 整体排序：brand-new < burned-no-ok < old-ok < recent-ok
+    assert ranks["old-ok"][0] == 1 and ranks["recent-ok"][0] == 1
+    assert ranks["burned-no-ok"][0] == 2, "没成功过的地址应第 2 档"
+    # 第 1 档内部：越久没成功越优先（排序值越小，因为调用方用 min()）
+    assert ranks["old-ok"][2] < ranks["recent-ok"][2]
+    # 整体排序：brand-new < old-ok < recent-ok < burned-no-ok
     ordered = sorted(ranks, key=lambda ip: ranks[ip])
-    assert ordered == ["brand-new", "burned-no-ok", "old-ok", "recent-ok"], ordered
+    assert ordered == ["brand-new", "old-ok", "recent-ok", "burned-no-ok"], ordered
+
+
+def test_warp_ip_rank_prefers_unseen_ip_from_rested_prefix(monkeypatch):
+    """同档内避开刚烧过的 /64：新 /128 落在热段里首条请求照样 429。
+
+    9router 近 2h 失败流量按段静置分组：<5min 有成功比例 73%（n=41），
+    5-15min 100%（n=21）。档位仍是主判据，段静置只排同档内先后。
+    """
+    now = 100000.0
+    hot_used = "2a09:bac5:1f05:1250::1"
+    hot_new = "2a09:bac5:1f05:1250::2"
+    cool_used = "2a09:bac5:1eff:1846::1"
+    cool_new = "2a09:bac5:1eff:1846::2"
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        hot_used: {"ts": now - 60},
+        cool_used: {"ts": now - 3600},
+    })
+    monkeypatch.setitem(daemon.CFG["warp"], "prefix_rest_sec", 300)
+    hot_rank = daemon._warp_ip_rank(hot_new, now, 86400)
+    cool_rank = daemon._warp_ip_rank(cool_new, now, 86400)
+    assert hot_rank[0] == cool_rank[0] == 0, "两者都是没见过的新地址"
+    assert hot_rank > cool_rank, "热段里的新地址应排在静置段之后"
+
+
+def test_rd_watermark_tracks_max_rowid_not_timestamp(monkeypatch):
+    """水位线用 max(rowid)：timestamp 由 9router 客户端写入，与插入序不同步。
+
+    实测 439/2000 行 timestamp 与 rowid 反序。若拿 timestamp 当水位线，
+    一条迟到写入的旧时间戳行会被判成「没有新数据」，它带来的 403 就被整段
+    跳过。rowid 单调，且 9router 的清理是 `DELETE ... ORDER BY timestamp ASC`
+    （删最旧），max(rowid) 不会因此回落。
+    """
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.execute("CREATE TABLE requestDetails (provider TEXT, status TEXT, timestamp TEXT, data TEXT)")
+    mem.executemany("INSERT INTO requestDetails VALUES (?,?,?,?)", [
+        ("opencode", "success", "2026-10-19T07:00:03.000Z", "{}"),
+        ("opencode", "error",   "2026-10-19T07:00:01.000Z", "{}"),   # 迟到的旧时间戳
+    ])
+    monkeypatch.setattr(daemon, "_get_db", lambda: mem)
+
+    assert daemon._rd_watermark() == 2, "水位线应取 max(rowid)，与 timestamp 顺序无关"
+    # 清理最旧两行不影响水位线：删的是低 rowid 端
+    mem.execute("DELETE FROM requestDetails WHERE rowid = 1")
+    assert daemon._rd_watermark() == 2, "删旧行不得让水位线回落（否则会重判已处理的数据）"
+    mem.execute("INSERT INTO requestDetails VALUES (?,?,?,?)",
+                ("opencode", "error", "2026-10-19T07:00:09.000Z", "{}"))
+    assert daemon._rd_watermark() == 3, "新行必须抬高水位线"
+
+
+def test_submit_once_skips_reentry_until_task_finishes(monkeypatch):
+    """同名后台任务不许重入：上一轮没回来时再发，只会排出一串读同一份过时现场的工作。
+
+    主循环 20Hz 调用 `_submit_once`，而池探测最长 15s —— 没有这个闸门，
+    一次探测期间会堆出 300 个线程。
+    """
+    release = threading.Event()
+    started = []
+    done = threading.Event()
+
+    def slow():
+        started.append(1)
+        release.wait(2)
+        done.set()
+
+    try:
+        assert daemon._submit_once("t-reentry", slow) is True
+        assert daemon._submit_once("t-reentry", slow) is False, "运行中的同名任务应被跳过"
+        release.set()
+        assert done.wait(2)
+        # 上一轮结束后必须能再次启动，否则这个 key 被永久锁死
+        release.set()
+        for _ in range(50):
+            if daemon._submit_once("t-reentry", lambda: None):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("任务结束后同名 key 未释放")
+    finally:
+        release.set()
+    assert len(started) == 1, f"重入被挡时只应执行一次，实际 {len(started)} 次"
+
+
+def test_publish_clash_snapshot_keeps_selectors_apart(monkeypatch):
+    """`proxy`（轮换池）与 `opencode-out`（WARP 出口）是两个 selector，快照不得混用。
+
+    混用一个槽会让池轮换的 `now`（某个节点名）被 `active_warp_tag()` 读到，
+    判定成「opencode 不在 WARP 上」，WARP 换线路径整条失效。
+    """
+    monkeypatch.setattr(daemon, "_CLASH_SNAP", {})
+    monkeypatch.setitem(daemon.CFG, "singbox", {**daemon.CFG["singbox"], "selector": "proxy"})
+    monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "selector": "opencode-out"})
+
+    daemon._publish_clash_snapshot("proxy", {"all": ["n1", "n2"], "now": "n1"})
+    daemon._publish_clash_snapshot("opencode-out", {"all": ["WARP-CF", "proxy"], "now": "WARP-CF"})
+
+    assert daemon._pool_snapshot() == (["n1", "n2"], "n1")
+    # 换线只写 now 时不得把 all 清空（刷新线程和换线线程谁先到都可能）
+    daemon._publish_clash_snapshot("opencode-out", {"now": "WARP-CF-B"})
+    snap = daemon._clash_snapshot("opencode-out")
+    assert snap["now"] == "WARP-CF-B"
+    assert snap["all"] == ["WARP-CF", "proxy"], "只写 now 不应清掉 all"
+    assert daemon.active_warp_tag() == "WARP-CF-B"
+
+
+# ============= 24. 出口 IP 历史池（只追加、永不清理） =============
+def test_ip_history_counts_reconnects_and_last_ts(monkeypatch, tmp_path):
+    """同一 IP 多次被选为出口 → uses = 重连次数，last_ts 取最大值。
+
+    last_ts 不能取「最后写入的那行」：并发换线线程的写入顺序不保证与时间
+    顺序一致，按读取顺序覆盖会让「上次连接时间」倒退。
+    """
+    hist = tmp_path / "history.jsonl"
+    monkeypatch.setenv("WARP_IP_HISTORY_FILE_PATH", str(hist))
+    for t, b in ((1000.0, 0), (1200.0, 1), (1100.0, 0)):
+        daemon._append_warp_ip_history("ip-a", t, bool(b))
+    daemon._append_warp_ip_history("ip-b", 900.0, False)
+    # kind 可选：带标记时写 k，未带标记/旧读取方的行不受影响
+    daemon._append_warp_ip_history("ip-a", 1300.0, True, "rate429")
+    daemon._append_warp_ip_history("ip-c", 1300.0, True, "abuse403")
+    assert json.loads(hist.read_text(encoding="utf-8").splitlines()[-1])["k"] == "403"
+    assert json.loads(hist.read_text(encoding="utf-8").splitlines()[-2])["k"] == "429"
+    with open(hist, "a", encoding="utf-8") as f:      # 坏行不得毁掉整体统计
+        f.write("{not json\n")
+
+    stats = daemon._warp_ip_history_stats(str(hist))
+    assert stats["ip-a"]["uses"] == 4, "uses 即重连次数"
+    assert stats["ip-a"]["last_ts"] == 1300.0, "last_ts 取最大而非最后一次写入"
+    assert stats["ip-a"]["last_blocked_ts"] == 1300.0
+    assert stats["ip-b"] == {"uses": 1, "last_ts": 900.0, "last_blocked_ts": None}
+    assert daemon._warp_ip_history_stats(str(tmp_path / "missing.jsonl")) == {}, \
+        "文件不存在返回空，不抛异常"
+
+
+def test_ip_history_survives_hot_table_cleanup(monkeypatch, tmp_path):
+    """热表按窗口清理后，历史记录必须仍在 —— 锁住「永不刷新」这条语义。
+
+    热表是选线用的滑动窗口（必须清理，否则每次换线全量重写整年数据）；
+    历史是只追加日志，两者生命周期不同，不能因为热表清理而丢历史。
+    """
+    hist = tmp_path / "history.jsonl"
+    monkeypatch.setenv("WARP_IP_HISTORY_FILE_PATH", str(hist))
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "ip_reuse_guard_sec": 300,
+                         "blocked_guard_sec": 300, "rate429_guard_sec": 300,
+                         "blocked_ttl_sec": 300})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+
+    daemon._mark_warp_ip_used("old-ip", 1000.0)
+    daemon._mark_warp_ip_used("new-ip", 2000.0)       # old-ip 已出 300s 窗口
+
+    assert "old-ip" not in daemon._WARP_IP_USED, "热表须按窗口清理"
+    stats = daemon._warp_ip_history_stats()
+    assert stats["old-ip"]["uses"] == 1, "热表清理不得带走历史"
+    assert stats["old-ip"]["last_ts"] == 1000.0
+    assert stats["new-ip"]["uses"] == 1

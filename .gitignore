@@ -18,3 +18,6 @@ singbox-config.json.tmp
 .warp_ip_used.json
 .daemon.lock
 .warp_ip_cycles.json
+.warp_ip_history.jsonl
+.warp_proxy_fallback.json
+

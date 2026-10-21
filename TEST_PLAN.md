@@ -2,10 +2,17 @@
 
 > 文档版本: v1.3
 > 最后更新: 2026-10-16
-> 测试对象: 9router proxy-global.js + daemon 代理自动切换系统
+> 测试对象: 9router (custom-server.js) + daemon 代理自动切换系统
 > 订阅链路与轮换健康的验证资产见 §10（`test_subscription_parse.py` / `verify_rotation.py`）
 
 > ⚠ 文档漂移提示（2026-08-22）：第 9 节 `switch-proxy.py` / `proxy_pool.py` 验证用例（T-091~T-098）依赖的模块已在 Round 1 删除（无生产调用方）。其覆盖点已并入 `daemon.py` 与新增 `test_daemon_unit.py` 的确定性单测。第 9 节保留为历史归档，不再执行。
+
+> ⚠ 文档漂移提示（2026-10-21）：`~/.9router/proxy-global.js` 与 `bootstrap-undici.js` 已不存在，
+> 9router 进程无 NODE_OPTIONS，出站改由 `data.sqlite.settings.outboundProxyUrl=http://127.0.0.1:7890`
+> 直连 sing-box。凡以 `proxy-global` 为被测对象的用例（T-001~T-006、T-018~T-026、T-028、T-030、
+> T-050、T-051、T-064~T-072）**保留为历史归档，不再执行**；其现行等价覆盖点：
+> 请求级重试由 9router 自身负责（无本地重试层），换线判据全部落在 `daemon.py`
+> （见 T-181~T-189 与 `test_daemon_unit.py` / `test_warp_refresh.py`）。
 
 ---
 
@@ -17,7 +24,7 @@
 
 | 模块 | 覆盖组件 | 测试点数 |
 |------|----------|----------|
-| 代理链路 (proxy-chain) | proxy-global.js CONNECT 隧道、NO_PROXY、SQLite 配置加载、secret 管理 | T-001~T-006, T-071~T-072 |
+| 代理链路 (proxy-chain) ⚠历史归档 | proxy-global.js CONNECT 隧道、NO_PROXY、SQLite 配置加载、secret 管理 | T-001~T-006, T-071~T-072 |
 | 错误检测 (error-detection) | daemon get_9router_error_rate、窗口统计、冷却期 | T-007~T-012 |
 | 节点轮换 (node-rotation) | P2C 选择算法、去重、候选筛选、计数管理 | T-013~T-017 |
 | 重试机制 (retry-mechanism) | HTTP 429/5xx、空 body、SSE 空流/error chunk、网络错误、重试耗尽 | T-018~T-026 |
@@ -34,11 +41,11 @@
 
 ### 1.2 测试目标
 
-1. 验证代理链路端到端完整工作，请求经 9router -> proxy-global.js -> sing-box -> 出口节点的每个环节无误。
+1. 验证代理链路端到端完整工作，请求经 9router(:20127) -> sing-box:7890 -> 出口节点的每个环节无误。（历史版本经 proxy-global.js，该层已移除）
 2. 验证错误检测窗口准确计算错误率，并在阈值达标时触发节点切换。
 3. 验证节点轮换算法（P2C、同 IP 去重、候选不足回退）按预期工作。
 4. 验证所有重试条件（429、5xx、空 body、SSE 空流/error chunk、网络错误）均触发节点切换 + 重试，耗尽后返回 502。
-5. 验证 daemon 和 proxy-global.js 通过 bad_nodes.json 共享状态，包含 TOCTOU 防护。
+5. 验证 daemon 独占读写 bad_nodes.json 的 TOCTOU 防护。（历史版本由 daemon 与 proxy-global.js 共享）
 6. 验证节点健康管理（延迟测试、死节点 TTL 指数退避、保底机制）。
 7. 验证 sing-box watchdog 在崩溃后自动重启，重启次数上限后降级到 fallback 代理。
 8. 验证 BYPASS 模式在 CONNECT 连续失败 3 次后进入，恢复后自动退出。
@@ -54,7 +61,7 @@
 | 项目 | 要求 |
 |------|------|
 | 操作系统 | Linux（WSL2 或原生 Ubuntu 22.04+） |
-| Node.js | v18+（proxy-global.js 运行环境） |
+| Node.js | v18+（仅历史归档的 proxy-global.js 用例需要） |
 | Python | 3.10+（daemon 运行环境） |
 | sing-box | 最新稳定版（Clash API 兼容） |
 | 9router | 正常运行 |
@@ -65,11 +72,10 @@
 
 | 服务 | 端口 | 用途 |
 |------|------|------|
-| 9router | 20128 | 模型路由 API |
+| 9router | 20127 | 模型路由 API |
 | sing-box Clash API | 9090 | 代理管理 REST API |
-| sing-box mixed port | 7890 | SOCKS5/HTTP 混合代理 |
-| proxy-global.js | 动态 | 请求转发 CONNECT 隧道 |
-| mock HTTP 服务器 | 18443（测试） | 模拟目标 API（因 proxy-global.js CONNECT 隧道透传，mock 只需 HTTP） |
+| sing-box mixed port | 7890 | SOCKS5/HTTP 混合代理（9router 的 outboundProxyUrl 指向这里） |
+| mock HTTP 服务器 | 18443（测试） | 模拟目标 API（走 sing-box mixed，mock 只需 HTTP） |
 | fallback 代理 okz | 6696 | 降级目标 |
 | 9router data.sqlite | - | provider 错误记录读/写 |
 
@@ -84,16 +90,16 @@
 | jq | JSON 解析 |
 | parallel | 并发请求测试 |
 | pkill / fuser | 进程管理 |
-| node | proxy-global.js 单元测试执行 |
+| node | 历史归档的 proxy-global.js 单元测试（现行回归不依赖） |
 
 ### 2.4 配置文件/路径
 
 | 文件 | 用途 |
 |------|------|
-| `~/.hermes/9router/config/data.sqlite` | 9router 持久化数据 |
-| `~/.hermes/9router/config/singbox-config.json` | sing-box 运行时配置 |
+| `~/.9router/db/data.sqlite` | 9router 持久化数据（requestDetails / settings） |
+| `singbox-config.json` | sing-box 运行时配置（本项目根目录，make_config 生成） |
 | `~/.singbox_secret` | sing-box 认证密钥（mode 600） |
-| `.bad_nodes.json` | daemon 与 proxy-global 共享的坏节点列表 |
+| `.bad_nodes.json` | daemon 独占读写的坏节点列表（proxy-global.js 已移除，无第二读取者） |
 | `singbox.log` | sing-box 运行日志 |
 | `config.yaml` | 9router 配置（绝对禁止 yaml.dump 重写） |
 
@@ -359,7 +365,7 @@
 **测试步骤**
 1. 通过 9router API 发送 AI 客户端请求：
    ```bash
-   curl -X POST http://localhost:20128/v1/chat/completions \
+   curl -X POST http://localhost:20127/v1/chat/completions \
      -H "Content-Type: application/json" \
      -d '{"model":"test-model","messages":[{"role":"user","content":"hello"}]}'
    ```
@@ -1129,7 +1135,7 @@
 
 阶段 4: 共享状态同步
   T-027 -> T-028 -> T-029
-  daemon 写 bad_nodes -> proxy-global 读取
+  daemon 写 bad_nodes -> daemon 自读（proxy-global 读取者已移除）
 
 阶段 5: 节点健康管理
   T-032 -> T-033 -> T-035 -> T-036
@@ -1160,16 +1166,17 @@
 
 ```bash
 # ── 基础环境确认 ──
-curl -s -o /dev/null -w "%{http_code}" http://localhost:20128/health
+curl -s -o /dev/null -w "%{http_code}" http://localhost:20127/v1/models
 curl -s -o /dev/null -w "%{http_code}" http://localhost:9090/proxies
 nc -z 127.0.0.1 7890 && echo "PORT_7890_OPEN"
 
-# ── proxy-global.js 状态 ──
-pgrep -f proxy-global.js > /dev/null && echo "PROXY_GLOBAL_RUNNING"
+# ── 9router 进程（无 NODE_OPTIONS / 无 proxy-global.js 注入）──
+pgrep -af "custom-server.js" | head -2
+tr '\0' '\n' < /proc/$(pgrep -f custom-server.js | head -1)/environ | grep -c NODE_OPTIONS
 
-# ── 9router 配置 ──
-sqlite3 ~/.hermes/9router/config/data.sqlite \
-  "SELECT key, value FROM settings WHERE key IN ('outboundProxyUrl','outboundProxyEnabled');"
+# ── 9router 出站代理指向 7890 ──
+sqlite3 ~/.9router/db/data.sqlite \
+  "SELECT json_extract(data,'\$.outboundProxyEnabled'), json_extract(data,'\$.outboundProxyUrl') FROM settings WHERE id=1;"
 
 # ── sing-box secret ──
 stat -c "%a %n" ~/.singbox_secret
@@ -1229,7 +1236,7 @@ pkill sing-box && sleep 2 && sing-box run -c singbox-config.json &
 | 场景 | 注入方法 | 预期行为 | 关联测试点 |
 |------|----------|----------|-----------|
 | sing-box SIGKILL | `pkill -9 sing-box` | watchdog 检测 + restart | T-057 |
-| proxy-global 崩溃 | `pkill -f proxy-global.js` | 9router 请求失败（人工干预恢复） | - |
+| 9router 崩溃 | `pkill -f custom-server.js` | 全部模型请求失败，需人工拉起 | - |
 | daemon 崩溃 | `pkill -f daemon.py` | 9router 继续用最后状态运行 | - |
 | 订阅解析器失败 | `chmod -x parse_subscription.py` | catch 异常，记录日志 | T-049 |
 | 批量节点不可达 | 所有节点端口被 iptables DROP | batch_test_nodes 全部标记 dead | T-062 |
@@ -1239,7 +1246,7 @@ pkill sing-box && sleep 2 && sing-box run -c singbox-config.json &
 | 场景 | 注入方法 | 预期行为 | 关联测试点 |
 |------|----------|----------|-----------|
 | 并发 retry | `seq 5 \| parallel -j5 curl ...` | 各 retry 序列独立隔离 | T-050 |
-| 并发节点切换 | daemon + proxy 同时 PUT /proxies/proxy | 幂等，不返回 4xx/5xx | T-051 |
+| 并发节点切换 | 两个 daemon 线程同时 PUT /proxies/proxy | 幂等，不返回 4xx/5xx | T-051 |
 | 并发 SQLite 读 | `seq 20 \| parallel -j20 python3 -c "..."` | RLock 重入安全 | T-052 |
 | 并发 triggerNodeSwitch | 同时 3 个请求触发切换 | _switching 去重，只切换一次 | T-025 |
 
@@ -1253,7 +1260,7 @@ pkill sing-box && sleep 2 && sing-box run -c singbox-config.json &
 # ── P0 快速验证（~5 分钟）──
 
 # 1. 代理链路可用
-curl -s -o /dev/null -w "%{http_code}" http://localhost:20128/v1/chat/completions \
+curl -s -o /dev/null -w "%{http_code}" http://localhost:20127/v1/chat/completions \
   -X POST -H "Content-Type: application/json" \
   -d '{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":1}'
 
@@ -1545,7 +1552,7 @@ server.listen(18443, () => {
 ```bash
 #!/bin/bash
 # Usage: ./concurrent_test.sh <url> <count>
-URL=${1:-http://localhost:20128/v1/chat/completions}
+URL=${1:-http://localhost:20127/v1/chat/completions}
 COUNT=${2:-5}
 
 for i in $(seq 1 $COUNT); do
@@ -1732,7 +1739,7 @@ python3 verify_rotation.py --samples 30   # 加大逐节点采样
 |----|------|--------|----------|
 | T-107 | 7890 + 9090 监听，sing-box 进程存活 | P0 | `[1]` 段前 3 项 |
 | T-108 | 7890 全协议可用：HTTP / HTTPS / CONNECT 隧道 / DNS over / 大文件 | P0 | `[1]` 段 curl 组 |
-| T-109 | 9router 网关 (`:20128/v1/models`) 可达 | P0 | `[1]` 段末项 |
+| T-109 | 9router 网关 (`:20127/v1/models`) 可达 | P0 | `[1]` 段末项 |
 | T-110 | 连续强制切换节点，出口 IP 互不相同 | P0 | `[2]` 段切换采样 |
 | T-111 | 逐节点出口 IP 唯一率 >80%（IP 去重有效） | P1 | `[2]` 段采样（`--quick` 跳过） |
 | T-112 | 切换合理性：轮换间隔中位数 ≈ `proactive_rotate_sec`、切换目标不含死节点、策略模式已判定、daemon 无异常 | P0 | `[3]` 段 |
@@ -1788,6 +1795,10 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | T-144 | P0 | 停在 proxy 时可切回 WARP | `python3 -c "import daemon; daemon.reconnect_warp('手动验证')"` | 切回 WARP 前日志 `当前在轮换池 proxy，尝试切回 WARP 隧道`；成功后 `active_warp_tag()` 非空 |
 | T-145 | P1 | 测试不得写真实 sing-box | `pytest test_daemon_unit.py -q`（fixture 含写操作防线） | 漏 stub 时 `AssertionError: 测试试图写真实 sing-box`，而非静默翻转生产 selector（实测发生过） |
 | T-146 | P1 | 测试文件可被 pytest 收集 | `pytest test_warp_refresh.py --collect-only -q \| tail -1` | 收集到 15 个用例。函数式 `main()`+`check()` 写法 pytest 收集不到，`no tests ran` 仍退出 0 —— 假成功 |
+| T-181 | P0 | 健康行标出当前是 WARP 还是轮换池 | `tail -50 daemon.log \| grep 出口=` | 前缀为 `WARP:<tag>(<ip>)` 或 `PROXY:<节点名>`，不再是无前缀的裸 tag |
+| T-182 | P0 | 模式切换必须留日志 | `pytest test_daemon_unit.py -k switch_warp_logs_mode` + `grep '⇄ 出口模式切换' daemon.log` | warp↔proxy 切换打 `⇄ 出口模式切换: a -> b（x -> y）`；同模式内换线（W1→W2）**不**打 |
+| T-183 | P1 | `asip` 隧道清单与 config.py 同源 | `asip warp status \| grep -c '^  :1'` | 条数等于 `config.py` 中 `WARP-CF*` 条目数（当前 10），不再硬编码 5 条 |
+| T-184 | P1 | `asip` 跟踪日志轮转 | 轮转后跑 `asip s` | 用 `tail -F`（按文件名重开）；`tail -f` 过 `daemon.log`→`.1` 后停在旧 inode，实测不再输出 |
 | T-147 | P0 | 补刷中的线不得被选为换线目标 | `pytest test_daemon_unit.py -k excludes_line_under_refresh` | 该线在 `_WARP_REFRESHING` 时跳过；切到其他空闲新鲜线。补刷窗口 60→600s 后撞上概率显著上升 |
 | T-148 | P0 | 出口 IP 复用窗口生效（事故复现对照） | `grep "✓ WARP 换线成功" daemon.log` 后统计同一 IP 的相邻使用间隔 | 900s 内不得出现重复地址。**旧代码实测**：`2a09:bac5:1efa:183c::26a:bf` 在 21:10:15/21:18:16/21:27:50/21:38:38 连续三次切回（间隔 8.0/9.6/10.8min），同期 opencode abuse403 365+102 条、成功率 12%→57% |
 | T-149 | P0 | proxy 池健康探测（双向兜底反向） | `pytest test_daemon_unit.py -k "proxy_pool or failback"` | 采样 3 节点有 1 个通=健康；全失败=不可用；查询失败=None；WARP 成员不参与探测 |
@@ -1823,6 +1834,13 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | T-180 | P0 | IP 寿命口径为「首条成功→末条成功」 | `pytest test_daemon_unit.py -k "recompute_prefers_span"` | 新增 `first_ok_ts`，`_record_warp_cycle` 同时记 `span`；重算优先用 span 中位，旧样本无 span 才回退 cycle。WHY：cycle(换上去→首次报错) 中位 2s，真实可用跨度中位 14s，按 cycle 定切点每 IP 只用掉三成 |
 | T-178 | P0 | 脏线巡检为常驻守护线程且不占用换线候选 | `pytest test_daemon_unit.py -k "dirty_janitor or dirty_worker"` | `_dirty_line_janitor` 无周期闸门（`while True` + 5s 防打爆），非当前出口的线全被巡检覆盖。探测阶段只占 `_WARP_PROBING`，**确认脏后才占 `_WARP_REFRESHING`**：后者会让换线路径把该线当「不可选」，探测中的干净线若也占进去，换线会看到「备线 0 条」直接落 proxy（实测重启后 17s 踩到）。worker 在重启前复查该线是否已变当前出口，变了就放弃，否则掐断在途连接 |
 | T-177 | P1 | 当前出口 IP 补探与成功流量打点 | `pytest test_daemon_unit.py -k "init_active_ip or record_active_ip_success"` | 启动探测失败时后台补探 `_ACTIVE_WARP_IP`（30s 最多一次）；当前出口没有记录时补建条目再写 `last_ok_ts`，否则选线日志恒为「有成功记录 0 条」 |
+| T-185 | P0 | 错误归属按请求**开始**时刻，不按完成时刻 | `pytest test_daemon_unit.py -k attributes_by_request_start` | 9router 在请求结束时才写 `requestDetails` 行（`requestDetailsRepo.js:102`），而换线用 `interrupt_exist_connections=false` 不掐在途请求；延迟 p50 8.8s / p90 27.9s 与换线间隔 p50 8s 同量级。实测 2000 行里 38.4% 的请求生命周期跨越一次换线，按完成时刻归属会把上一出口的 429 算成新出口的错。窗口起点改为 `timestamp − latency.total`（`_START_TS_SQL`）。重放 34 次真实触发：旧逻辑 33 次命中、新逻辑 20 次，14 次是纯误触发 —— 这些全是「切上去即报错」的 1 条 429，重新归属后该出口根本没收到过错误 |
+
+
+| T-186 | P0 | 连错 ≤2 条 → 不换线（连错门控） | `pytest test_daemon_unit.py -k "consecutive_errors or third_consecutive"` | `count_warp_blocked_since()` 增加 `consec_err`（从窗口最新一条往前数、停在第一条成功处的连续失败数）。`maybe_reconnect_warp()` 在阈值命中且**采样/标脏之后**、冷却判断之前拦截 `consec_err < 3`：用户规则「刚切线的 10 秒内允许出现 2 次报错而不切线」。门控必须放在采样之后 —— 连错 1~2 条时出口已收到 403，该 IP 仍须标脏并记周期样本，只是暂不换线。实测 90 次真实触发中该门控抑制 11 次（12%），其中 3 次窗口内成功 ≥5（出口明显健康，换掉即误切）。旧实现看 `last_ok`（窗口最新一条是否成功）：在 429 风暴中成功与错误交替，该判据每行翻转，90 次触发里只抑制 1 次（1%），拦不住误切 |
+| T-187 | P1 | 满窗 10 条全错 → 绕过冷却立即换线 | `pytest test_daemon_unit.py -k full_error_window` | `count_warp_blocked_since()` 增加 `full_err`（`len(rows) >= RECENT_WINDOW and ok == 0`）。`maybe_reconnect_warp()` 的冷却判断改为 `if now < _warp_cooldown_until and not full_err`。实测 67 次触发里满窗 0 次（429 风暴中总夹杂成功），保留为风暴兜底 |
+| T-188 | P1 | 换线后冷却 5s（原 1s），防「刚换就错」连续触发 | `grep -A1 '"cooldown_ok_sec"' config.py` | 新出口首条错误延迟实测 n=52：p25=0.7s / p50=1.6s / p75=4.5s / p90=10.5s。1s 冷却让 40% 的「刚换就错」在冷却后立刻再换，构成日志里的锯齿。5s 覆盖 79%，且被 T-187 的满窗例外兜底 |
+| T-189 | P0 | `upstream connection lost` 不得触发换线/切节点 | `python3 - <<'EOF'`：查 `requestDetails` 中含该串的行的 `status`；`grep -n "upstream connection lost" daemon.py` | 该文案是 9router SSE 管道（`~/.9router/.next/server/chunks/8895.js`）`m` 变量的初始值，作为末帧注入流中，**不是错误**：实测全表 18 行含该串的记录 `status` 全为 `success`（17 行出现在 `response`、1 行在 `providerResponse`）。`count_warp_blocked_since()` 只按键词 `abusive traffic` / `Rate limit exceeded` 分类、`get_9router_error_rate()` 与既有一切换线判据都以 `status != success` 为准，因此该串在两条链路上都不计入错误、不触发换线。回归方式：出现新的 error 类文案时，先按 `status` 过滤确认它是否真被记为 error，再决定是否要加分类 —— 不要按文案字面加进错误率 |
 
 > 周期数据依据（2026-10-20）：修复前落盘的 18 条样本全部落在 20.0~21.9s —— 那不是 IP 寿命，是 20s 冷却期本身，因为冷却期内出现的 403 根本没被采样（T-167b）。修好采样后实测：样本 min 1.6s / 中位 3.1s，并出现 `ok=1` 的 2.5s 样本（服务成功过随即被烧）。同期按 DB 逐段核对 45 个有流量的换线段：首错延迟中位 1s、16 段首请求即错、30% 零错误、每段成功中位 14 条。v1.15 曾据此回退请求数判据，但那是把「采样缺失」误归因为「时间判据本身错」；采样修复后 v1.17 恢复时间判据（T-167），请求数判据降为无样本时的回退路径（T-168）。
 
@@ -1853,3 +1871,8 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | v1.16 | 2026-10-20 | 补刷并发收口：`_WARP_REFRESH_LOCK` 改 RLock 解开 `_prewarm_standby_warp` → `_schedule_idle_refresh` 的自我死锁 (T-174)；守卫移到重启前，补上「等空闲期间被切成出口」这一段 (T-172)；两份记录改原子落盘且失败记日志 (T-173)。测试侧修 flaky：补刷用例打桩 `active_warp_tag`，不再依赖线上此刻哪条线在服务 | codex review |
 | v1.17 | 2026-10-20 | 恢复周期时间判据 (T-166/T-167)：v1.15 的回退建立在采样缺失之上，修复后该理由不成立。有样本时按「典型周期（中位，下限 5s）」换线并绕开成功换线后的冷却，上次换线失败仍守 `cooldown_fail_sec`；无样本才回退请求数 (T-168)。周期取中位而非最小值：最小值由最倒霉的一条线决定（实测 min 0.1s / 中位 17.6s），会退化成每几秒切一次。同时段起点在重启后从 `.warp_ip_used.json` 恢复，避免把重启前的流量算进新段 | - |
 | v1.18 | 2026-10-20 | 修 WARP 兜底死循环：备线出口被标记时不再跳过，改为刷新换会话 IP (T-175)；任一隧道疑似脏 IP 就重连到换出优质 IP（预热补 `blocked` 判据 + 换线后立即排补刷 + 落池期间继续巡检，T-176）；补 `_ACTIVE_WARP_IP` 启动补探与当前出口成功流量打点 (T-177)；脏线巡检由周期任务改为常驻守护线程（`_WARP_PROBING`/`_WARP_REFRESHING` 分离，T-178） | - |
+| v1.19 | 2026-10-21 | 出口模式可观测：健康行加 `WARP:`/`PROXY:` 前缀 (T-181)，warp↔proxy 切换由 `_switch_warp` 统一打 `⇄ 出口模式切换` (T-182)，同模式内换线不刷屏；`asip` 隧道清单改从 `config.py` 解析（原硬编码 5 条，实际 10 条，T-183）、跟随日志改 `tail -F` 以跨轮转 (T-184)、`jlog` 修 `journalctl` 单元参数与用户单元噪声、`s`/`e` 过滤器重定 | - |
+| v1.20 | 2026-10-21 | 错误归属改按请求开始时刻 (T-185)：`count_warp_blocked_since()` 用 `timestamp − latency.total` 与窗口起点比较 —— 9router 在请求结束时才落库、换线不掐断在途请求，旧出口的 429 会带着新时间戳落进新窗口。重放 34 次真实触发，旧逻辑 33 次命中 / 新逻辑 20 次，14 次纯误触发 | - |
+| v1.21 | 2026-10-21 | 换线判据加成功门控与满窗例外 (T-186~T-188)：最近一条成功即不换线（拦下 36/65 次触发），满窗 10 条全错绕过冷却，`cooldown_ok_sec` 1s→5s（新出口首错 p50=1.6s，1s 冷却反而制造锯齿） | - |
+| v1.22 | 2026-10-21 | 换线门控由「最近一条是否成功」改为「连错 ≥3 条」：429 风暴中成功与错误交替，`last_ok` 每行翻转，90 次触发只抑制 1 次（1%）；连错判据抑制 11 次（12%），其中 3 次窗口内成功 ≥5（出口健康）。门控移到采样/标脏之后，保脏 IP 仍被标记。新增 T-189 记录 `upstream connection lost` 属 SSE 末帧注入、`status=success`，不参与任何换线判据 | - |
+

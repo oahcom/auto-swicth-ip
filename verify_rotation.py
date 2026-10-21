@@ -147,7 +147,7 @@ def verify_port():
     check("大文件传输经 7890 正常", size.startswith("200"), size)
 
     code = curl(["-o", "/dev/null", "-w", "%{http_code}",
-                 "http://127.0.0.1:20128/v1/models"], timeout=8)
+                 "http://127.0.0.1:20127/v1/models"], timeout=8)
     check("9router 网关可达", code == "200", f"HTTP {code}")
 
 

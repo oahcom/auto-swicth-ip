@@ -32,6 +32,8 @@ def _isolate_warp_state(monkeypatch):
     """
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    # Clash selector 快照同样是进程级缓存，留下会让 active_warp_tag() 跳过真实查询。
+    monkeypatch.setattr(daemon, "_CLASH_SNAP", {})
 
 
 class ScriptedBytes:
@@ -231,7 +233,9 @@ def test_failback_is_wired_into_main_loop():
     防止重构时把它删掉而所有函数级测试依然全绿。
     """
     src = open('daemon.py', encoding='utf-8').read()
-    assert "_maybe_failback_to_warp(now)" in src, "主循环未调用反向兜底"
+    # 主循环只许调 _bg 版：`_maybe_failback_to_warp` 要探整池健康（最慢 15s），
+    # 在循环里同步调等于把错误检测钉死 15s。
+    assert "_maybe_failback_to_warp_bg(now)" in src, "主循环未调用反向兜底"
 
 
 def test_proxy_fallback_is_wired_into_reconnect():

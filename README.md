@@ -6,12 +6,12 @@
 
 9router 通过 `outboundProxyUrl` 配置上游代理（默认指向 okz:6696）。okz 提供多个 hysteria2/anytls/trojan 节点，每次手动切代理可换出口 IP，但 opencode free 等 provider 看到 IP 不变就会限流（402 MONTHLY_REQUEST_COUNT）。
 
-本项目**完全接管 9router 的 outbound 代理**：拉 okz 订阅、用 sing-box 当代理池、daemon 主动轮换节点，每 30 秒切一次 IP，opencode 永远看到不同 IP → 永远不限流。
+本项目**完全接管 9router 的 outbound 代理**：拉 okz 订阅、用 sing-box 当代理池、daemon 主动轮换节点（opencode 出口走 WARP 隧道，按实测 IP 寿命换线），opencode 尽量看到不同 IP → 尽量不限流。
 
 ## 架构
 
 ```
-[openclaw/opencode/etc]  →  9router:20128  →  sing-box:7890  →  60× anytls nodes  →  Internet
+[openclaw/opencode/etc]  →  9router:20127  →  sing-box:7890  →  83 节点池 + 10 WARP  →  Internet
                                        ↑                                ↑
                               outboundProxyUrl = 7890              订阅拉取
                                        ↑
@@ -60,25 +60,29 @@ curl -x http://127.0.0.1:7890 https://api.ipify.org  # 应返回非本地 IP
 
 ## 配置
 
-`daemon.py` 顶部 CFG dict:
-- `proactive_rotate_sec`: 主动轮换间隔（默认 30s = 30 秒）
-- `recent_window`: 错误检测看最近 N 条（默认 5 条）
-- `opencode_min_success_rate`: 低于这个成功率触发切代理（默认 0.9 = 90%）
+`config.py` 的 CFG dict（与 daemon.py 共用），常用项：
+- `thresholds.recent_window`: 错误判据窗口（默认 10 条）
+- `thresholds.opencode_min_success_rate`: 错误率 > (1-该值) 触发轮换（默认 0.9 = 90%）
+- `warp.block_threshold` / `warp.rate429_threshold`: 403/429 触发阈值（均 1）
+- `warp.cooldown_ok_sec`: 换线成功后冷却（5s，满窗全错绕过）
+- `warp.ip_reuse_guard_sec`: 出口 IP 复用窗口（86400 = 24h）
 
 ## 工作原理
 
-**主动轮换**（每 30 秒）：
-- daemon 调 sing-box clash API `PUT /proxies/proxy` 切换到下一个 anytls 节点
+**opencode 出口（WARP 主备换线）**：
+- daemon 读 9router SQLite requestDetails（provider="opencode"）
+- 403（abusive traffic）/429（Rate limit exceeded）各达阈值 1，且窗口内连错 ≥3 条
+  → `PUT /proxies/opencode-out` 切到另一条 WARP 隧道（在途请求不断）
+- 主动轮换按实测 IP 寿命（proactive_mode=lifetime），不等出错就换
+
+**轮换池（非 opencode 流量）**：
+- daemon 每 60s 调 Clash API `PUT /proxies/proxy` 切换池节点
 - 9router 下次出站请求自动走新节点（无需重启 9router）
 
-**错误检测**（被动应急）：
-- daemon 调 9router `/api/usage/request-details` 看最近 20 条
-- opencode 失败率 > 50% → 立即切代理（不等 5 分钟）
-
 **安全特性**：
-- 跳过"最近用过的 10 个节点"避免连续切到慢的
-- 失败节点加入 fail_set（不重试）
-- 节点不够时退路：跳过 fail_set → 跳过 recent_used → 报错
+- 出口 IP 记录落盘 `.warp_ip_used.json`，24h 内用过的地址不复用
+- 403/429 标脏的 IP 按 6h/24h 恢复期挡在候选池外
+- 所有 WARP 不可用时兜底落 proxy 池（3h 冷却防来回弹）
 
 ## 网络要求
 

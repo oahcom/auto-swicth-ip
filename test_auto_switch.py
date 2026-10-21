@@ -279,7 +279,7 @@ def test_10_9router_e2e():
             "print(hashlib.sha256((m+'***'+c).encode()).hexdigest()[:16])"
         ], capture_output=True, text=True, timeout=5)
         token = cli_token_req.stdout.strip()
-        r = requests.post("http://127.0.0.1:20128/v1/chat/completions",
+        r = requests.post("http://127.0.0.1:20127/v1/chat/completions",
                           headers={"Content-Type": "application/json",
                                    "Authorization": f"Bearer {token}"},
                           json={"model": "9router_hermes",
