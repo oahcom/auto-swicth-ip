@@ -196,6 +196,19 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   **只有确认脏了才占用 `_WARP_REFRESHING`** —— 后者会被换线路径当作「不可选」，探测中的
   干净线若也算进去，换线会看到「备线 0 条」直接落 proxy 池（实测踩到）。worker 在重启
   前必须复查该线是否已被切成当前出口，否则会掐断在途连接。
+- **模型层探测每 IP 每会话最多一次**：`probe_warp.probe()` 每次烧掉该出口一格
+  opencode 免费配额，而此前无台账 —— 实测同一 IP 18 分钟内被探 26 次全是 quota，
+  CF-I 20 次、CF-D/E 各 16 次重复探测。台账 `_WARP_PROBE_SEEN[(tag, epoch, ip)]`
+  记录结论，命中即复用（日志 `· 本会话已探过: quota（跳过）`）。
+  **会话粒度而非永久**：`_restart_service(service, tag)` 成功即 `_bump_probe_epoch(tag)`，
+  重启后即使拿回同一 IP 也允许再探一次 —— 配额窗口可能已滚动，旧结论不代表新会话。
+  只保留当前代次记录，旧代次在写入时清掉。
+- **刷新日志答三问：谁在刷、为什么刷、刷了几次**：每次刷新都带
+  `原因=<短语>`（由 `_warp_ip_refresh_reason` 从当前出口推导：`abuse403/rate429 惩罚期`、
+  `复用窗口内`、`从无成功流量`）与 `（离渠后第 N 次刷，X min）`。
+  计数语义：某线被换下成为备线时 `_WARP_OFF_AGE` 起算、计数归零；每次真正重启 +1；
+  切回成为当前出口即结束清零，下次离渠重新从 0 数。`_track_offline_refresh` 挂在
+  `_switch_warp` 的出口变更处（唯一变更点），轮换池同样触发离渠。
 - sing-box 重启会把 selector 重置为 default（主线），`restart_singbox()` 会记住并恢复重启前的线路。
 
 **部署约束（勿改）**：sing-box 由 daemon 用 `Popen(start_new_session=True)` 拉起，进程仍属于

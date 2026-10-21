@@ -51,6 +51,12 @@ def _isolate_production_files(tmp_path, monkeypatch):
     # Clash selector 快照是进程级缓存：前一个用例留下的 "now" 会让 active_warp_tag()
     # 跳过 sing-box 直接命中，而单跑时快照为空、走真实查询 —— 同一用例两种结果。
     monkeypatch.setattr(daemon, "_CLASH_SNAP", {})
+    # 探测台账与离渠计数是进程级全局：不隔离则前一个用例的探测结论会
+    # 挡住下一个用例的真实探测（被当成已探过而跳过），离渠计数也会跨用例累积。
+    monkeypatch.setattr(daemon, "_WARP_PROBE_EPOCH", {})
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {})
+    monkeypatch.setattr(daemon, "_WARP_REFRESH_COUNT", {})
     # 模型层探测会真实发请求（每次烧一格出口配额），默认放行；需要验它的
     # 用例自行重新打桩。
     monkeypatch.setattr(daemon, "_warp_model_usable", lambda m, ip: True)
@@ -1057,7 +1063,7 @@ def test_failover_switches_to_standby_and_refreshes_idle(monkeypatch):
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {1080: "1.1.1.1", 1081: "2.2.2.2"}[port])
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: pytest.fail("换线成功不应重启隧道"))
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: pytest.fail("换线成功不应重启隧道"))
     monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m: None)
     assert daemon.reconnect_warp("test") is True
     assert switched == ["W2"], f"应切到备线 W2, 实际 {switched}"
@@ -1074,7 +1080,7 @@ def test_failover_skips_dead_standby(monkeypatch):
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1" if port == 1080 else None)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: False)
     assert daemon.reconnect_warp("test") is True
     assert switched == ["proxy"], f"应切轮换池 proxy，实际 {switched}"
@@ -1087,7 +1093,7 @@ def test_failover_without_standby_falls_back_to_proxy(monkeypatch):
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1")
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     assert daemon.reconnect_warp("test") is True
     assert switched == ["proxy"], f"应切 proxy，实际 {switched}"
@@ -1146,7 +1152,7 @@ def test_inplace_restart_gives_up_after_max_attempts(monkeypatch):
     calls = []
     _warp_env(monkeypatch, WARP_TWO[:1], max_attempts=3)
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1")
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: calls.append(1) or True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: calls.append(1) or True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     assert daemon._restart_warp_inplace(WARP_TWO[0], "1.1.1.1") is False
     assert len(calls) == 3, f"重启次数应受 max_attempts 限制, 实际 {len(calls)}"
@@ -1333,7 +1339,7 @@ def test_warp_failover_refreshes_target_ip_before_switch(monkeypatch):
     daemon._WARP_IP_USED["stale-ip"] = {"ts": 900.0, "blocked": False, "last_ok_ts": 900.0}
     refreshed = []
 
-    def fake_restart(service):
+    def fake_restart(service, tag=None):
         if service == "usque-warp-b.service":
             egress["1081"] = "fresh-ip"        # 重启换会话 IP
             refreshed.append(service)
@@ -1358,7 +1364,7 @@ def test_warp_failover_skips_refresh_for_fresh_ip(monkeypatch):
     egress = _reuse_env(monkeypatch, {"1080": "ip-w1", "1081": "clean-ip"})
     restarted = []
     monkeypatch.setattr(daemon, "_restart_service",
-                        lambda service: restarted.append(service) or True)
+                        lambda service, tag=None: restarted.append(service) or True)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
 
@@ -1407,7 +1413,7 @@ def test_warp_failover_skips_target_when_refresh_keeps_stale_ip(monkeypatch):
     """刷新后仍是窗口内用过的地址 → 跳过该备线，改切轮换池 proxy。"""
     egress = _reuse_env(monkeypatch, {"1080": "ip-w1", "1081": "stale-ip"})
     daemon._WARP_IP_USED["stale-ip"] = {"ts": 900.0, "blocked": False, "last_ok_ts": 900.0}
-    monkeypatch.setattr(daemon, "_restart_service", lambda service: True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda service, tag=None: True)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
 
@@ -1431,7 +1437,7 @@ def test_failover_excludes_line_under_refresh(monkeypatch):
                         {"ip-w1": {"ts": 1000.0, "blocked": False},
                          "ip-w2-stale": {"ts": 900.0, "blocked": False}})
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", {"W2"})   # W2 正在补刷
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: False)
     monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m: None)
@@ -1469,7 +1475,7 @@ def test_reconnect_warp_refreshes_blocked_standby_before_fallback(monkeypatch):
         "ip-w2": {"ts": 999.0, "blocked": True},
     })
     monkeypatch.setattr(daemon, "_restart_service",
-                        lambda s: restarted.append(s) or True)
+                        lambda s, tag=None: restarted.append(s) or True)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
 
@@ -1503,7 +1509,7 @@ def test_reconnect_warp_prefers_longest_unselected_fresh_line(monkeypatch):
         "W2": {"sel": 50_000.0, "ip": "ip-w2"},
         "W3": {"sel": 10_000.0, "ip": "ip-w3"},
     })
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
 
@@ -1795,7 +1801,7 @@ def test_dirty_worker_aborts_when_member_becomes_active(monkeypatch):
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     restarted = []
     monkeypatch.setattr(daemon, "_restart_service",
-                        lambda s: restarted.append(s) or True)
+                        lambda s, tag=None: restarted.append(s) or True)
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
 
     daemon._reclaim_dirty_warp_worker({"tag": "W1", "port": 1080,
@@ -1820,7 +1826,7 @@ def test_dirty_worker_waits_for_idle_before_restart(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "ip_refresh_retry_sec", 0)
     restarted = []
     monkeypatch.setattr(daemon, "_restart_service",
-                        lambda s: restarted.append(s) or True)
+                        lambda s, tag=None: restarted.append(s) or True)
     monkeypatch.setattr(daemon, "warp_line_busy", lambda tag, window=2.0: True)
 
     daemon._reclaim_dirty_warp_worker({"tag": "W1", "port": 1080,
@@ -1922,7 +1928,7 @@ def test_warp_failover_refreshes_blocked_line_instead_of_proxy(monkeypatch):
     egress = {"1080": "ip-w1", "1081": "burned-b", "1082": "burned-c"}
     restarted = []
 
-    def _restart(service):
+    def _restart(service, tag=None):
         restarted.append(service)
         if "warp-b" in service:
             egress["1081"] = "new-b"        # 重启换出全新会话 IP
@@ -1956,7 +1962,7 @@ def test_warp_failover_falls_back_when_blocked_refresh_fails(monkeypatch):
         "ip-w1": {"ts": 999.0, "blocked": True},
         "ip-w2": {"ts": 999.0, "blocked": True},
     })
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
 
@@ -1979,7 +1985,7 @@ def test_warp_failover_uses_unblocked_line_when_mixed(monkeypatch):
         "burned-a": {"ts": 100_000.0, "blocked": True},
         "clean-b": {"ts": 1000.0, "blocked": False},   # 24h+ 前用过，直接可切
     })
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
 

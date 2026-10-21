@@ -32,8 +32,29 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    # 探测台账是进程级全局：不隔离则前一个用例探过的 IP 在本用例被当成
+    # 「本会话已探过」而跳过真实探测，台账相关断言全落空。
+    monkeypatch.setattr(daemon, "_WARP_PROBE_EPOCH", {})
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
     # 模型探测通过会记 last_ok_ts 并落盘，不隔离就写进生产 .warp_ip_used.json。
     monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(tmp_path / "warp_ip_used.json"))
+
+
+def test_offline_refresh_count_starts_when_leaving_and_resets_on_return(monkeypatch):
+    """离渠计数语义：被换下才起算，切回（成为出口）即清零。"""
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {})
+    monkeypatch.setattr(daemon, "_WARP_REFRESH_COUNT", {})
+    daemon._track_offline_refresh("W1", "W2")          # W1 离渠
+    assert "W1" in daemon._WARP_OFF_AGE
+    daemon._WARP_REFRESH_COUNT["W1"] = 3               # 期间重启 3 次
+    assert "第 3 次刷" in daemon._warp_refresh_progress("W1")
+    daemon._track_offline_refresh("W2", "W1")          # W1 切回
+    assert "W1" not in daemon._WARP_OFF_AGE
+    assert daemon._warp_refresh_progress("W1") == ""
+    # 切到轮换池（new_tag=None）同样让被换下的线进入离渠态
+    daemon._track_offline_refresh("W1", None)
+    assert "W1" in daemon._WARP_OFF_AGE
+    assert daemon._WARP_REFRESH_COUNT["W1"] == 0
 
 
 class ScriptedBytes:
@@ -301,7 +322,7 @@ def test_refresh_rejects_line_when_model_probe_fails(monkeypatch):
 
     原模式只验 IP 新鲜度，新拿到的地址必然通过，于是切上去头几条就 429。
     """
-    monkeypatch.setattr(daemon, "_restart_service", lambda s: True)
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     monkeypatch.setattr(daemon.time, "sleep", lambda s: None)
     monkeypatch.setitem(daemon.CFG["warp"], "max_attempts", 2)
@@ -330,14 +351,33 @@ def test_refresh_model_check_disabled_keeps_old_mode(monkeypatch):
 
 
 def test_model_probe_maps_quota_to_unusable(monkeypatch):
-    """429/配额类判定不得算可用；OK 才算。"""
+    """429/配额类判定不得算可用；OK 才算（换一条线，避开每会话每 IP 只探一次）。"""
     import probe_warp
     verdict = {"v": "quota"}
     monkeypatch.setattr(probe_warp, "probe",
                         lambda port, timeout: (verdict["v"], 0.1, ""))
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip") is False
     verdict["v"] = "OK"
-    assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip") is True
+    assert daemon._warp_model_usable({"tag": "W2", "port": 1081}, "ip2") is True
+
+
+def test_probe_runs_at_most_once_per_ip_per_session(monkeypatch):
+    """同一会话同一 IP 只探一次，避免重复烧配额；重启隧道后允许再探。"""
+    import probe_warp
+    calls = []
+    monkeypatch.setattr(probe_warp, "probe",
+                        lambda port, timeout: (calls.append(port), ("quota", 0.1, ""))[1])
+    m = {"tag": "W1", "port": 1080}
+    assert daemon._warp_model_usable(m, "ip") is False
+    assert daemon._warp_model_usable(m, "ip") is False
+    assert len(calls) == 1, f"同会话同 IP 只应探 1 次，实际 {len(calls)}"
+
+    daemon._bump_probe_epoch("W1")
+    assert daemon._warp_model_usable(m, "ip") is False
+    assert len(calls) == 2, f"重启后同 IP 应允许再探，实际 {len(calls)}"
+
+    assert daemon._warp_model_usable(m, "ip-other") is False
+    assert len(calls) == 3, f"新 IP 应各探一次，实际 {len(calls)}"
 
 
 def test_model_mode_ignores_ip_history(monkeypatch):

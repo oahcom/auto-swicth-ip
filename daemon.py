@@ -498,6 +498,85 @@ def _refresh_concurrency() -> int:
     return cap if cap > 0 else max(len(_warp()["members"]), 1)
 
 
+# ============= 模型层探测台账：每个 IP 每会话最多探一次 =============
+# opencode 免费层按出口段限流，一次 probe() 就烧掉一格配额。此前无任何记录：
+# 同一 IP 在每轮换线的并发实测与每次脏线守护里被反复探测 —— 实测
+# 2a09:bac5:1ef9:281e::3ff:64 在 18 分钟内被探 26 次，全是 quota，纯浪费。
+#
+# 判据是**会话粒度**而非永久：隧道重启后即使拿回同一 IP 也允许再探一次 ——
+# 配额窗口可能已滚动，旧结论不代表新会话能给 opencode 服务。故键里带代次，
+# 重启即在 `_restart_service` 里 +1，旧记录自然作废。
+_WARP_PROBE_EPOCH: dict[str, int] = {}
+_WARP_PROBE_SEEN: dict[tuple[str, int, str], str] = {}  # → verdict
+
+
+def _bump_probe_epoch(tag: str) -> None:
+    """隧道重启：该线换了一轮会话，探测结论作废。"""
+    with _WARP_REFRESH_LOCK:
+        _WARP_PROBE_EPOCH[tag] = _WARP_PROBE_EPOCH.get(tag, 0) + 1
+
+
+def _probe_cache_get(tag: str, ip: str) -> str | None:
+    """本会话已探过这个 IP 就复用结论，返回 None 表示该探。"""
+    with _WARP_REFRESH_LOCK:
+        return _WARP_PROBE_SEEN.get((tag, _WARP_PROBE_EPOCH.get(tag, 0), ip))
+
+
+def _probe_cache_put(tag: str, ip: str, verdict: str) -> None:
+    with _WARP_REFRESH_LOCK:
+        _WARP_PROBE_SEEN[(tag, _WARP_PROBE_EPOCH.get(tag, 0), ip)] = verdict
+        # 只保留当前代次：上一轮会话的记录永远不会再命中，留着纯占内存。
+        cur = _WARP_PROBE_EPOCH.get(tag, 0)
+        for k in [k for k in _WARP_PROBE_SEEN if k[0] == tag and k[1] != cur]:
+            del _WARP_PROBE_SEEN[k]
+
+
+# 每条线「离开主渠道」的时刻与此后累计的隧道重启次数。刷新日志据此回答
+# 用户要的三件事：谁在刷、为什么刷、刷了几次 —— 计数从上次离开主渠道起算，
+# 切回主渠道即清零（语义由用户指定）。
+_WARP_OFF_AGE: dict[str, float] = {}
+_WARP_REFRESH_COUNT: dict[str, int] = {}
+
+
+def _warp_refresh_progress(tag: str) -> str:
+    """刷新进度短语；该线不在「离渠刷新」中则返回空串。"""
+    off = _WARP_OFF_AGE.get(tag)
+    if off is None:
+        return ""
+    n = _WARP_REFRESH_COUNT.get(tag, 0)
+    return f"（离渠后第 {n} 次刷，{(time.time() - off) / 60:.1f}min）"
+
+
+def _track_offline_refresh(prev_tag: str | None, new_tag: str | None) -> None:
+    """出口变更时维护「离渠刷新」计数。
+
+    prev_tag 被换下 → 记为离渠起点、计数归零；new_tag 重新成为出口 → 结束
+    这一轮（计数清零）。两条线同时成立时按序处理，互不干扰。
+    """
+    now = time.time()
+    if prev_tag and prev_tag != new_tag:
+        _WARP_OFF_AGE[prev_tag] = now
+        _WARP_REFRESH_COUNT[prev_tag] = 0
+    if new_tag:
+        _WARP_OFF_AGE.pop(new_tag, None)
+        _WARP_REFRESH_COUNT.pop(new_tag, None)
+
+
+def _warp_ip_refresh_reason(ip: str | None, now: float) -> str:
+    """低质原因的可读短语；健康地址返回空串。与 _warp_ip_needs_refresh 同源。"""
+    if not ip:
+        return "出口未知"
+    if _warp_ip_is_blocked(ip, now):
+        with _WARP_IP_LOCK:
+            entry = _WARP_IP_USED.get(ip) or {}
+        return f"{entry.get('blocked_kind') or 'blocked'} 惩罚期"
+    if _ip_history_is_truth():
+        return "复用窗口内" if _warp_ip_recently_used(ip, now) else ""
+    return ("从无成功流量"
+            if _warp_ip_rank(ip, now, _warp()["ip_reuse_guard_sec"])[0] == 2
+            else "")
+
+
 def _acquire_refresh_slot(tag: str) -> bool:
     """重启前占一个并发名额；拿不到返回 False（调用方让出，等下一轮）。
 
@@ -1328,10 +1407,13 @@ def _switch_warp(tag: str) -> bool:
         bl = before[1] or ("轮换池" if before[0] == "proxy" else "未知")
         log(f"⇄ 出口模式切换: {before[0]} -> {after[0]}"
             f"（{bl} -> {after[1] or '轮换池'}）")
+    # 用户口径：刷新次数从「离开主渠道」起算到 OK。切到别处即开始计时，
+    # 切回这条线（成为当前出口）即结束并把计数清零 —— 下次离渠重新从 0 数。
+    _track_offline_refresh(before[1], after[1] if after[0] == "warp" else None)
     return True
 
 
-def _restart_service(service: str) -> bool:
+def _restart_service(service: str, tag: str | None = None) -> bool:
     try:
         r = subprocess.run(
             ["systemctl", "--user", "restart", service],
@@ -1339,6 +1421,11 @@ def _restart_service(service: str) -> bool:
         )
         if r.returncode != 0:
             log(f"✗ 重启 {service} 失败: {r.stderr.strip()[:200]}")
+        elif tag:
+            # 重启成功 = 换了一轮隧道会话：探测结论作废，同一 IP 允许再探一次。
+            _bump_probe_epoch(tag)
+            # 用户口径：刷了几次从「离开主渠道」起算，每次真正重启算一次。
+            _WARP_REFRESH_COUNT[tag] = _WARP_REFRESH_COUNT.get(tag, 0) + 1
         return r.returncode == 0
     except Exception as e:
         log(f"✗ 重启 {service} 异常: {e}")
@@ -2019,25 +2106,34 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
             del _WARP_IP_USED[k]
     _save_warp_ip_used()
 
-
 def _warp_model_usable(member: dict, ip: str) -> bool:
     """刷新后的模型层验收：这条线此刻能否真正服务 opencode 免费层。
 
     原模式（refresh_model_check=False）只看 IP 新鲜度。探测与 CLI
     `probe_warp.py` 共用同一份指纹定义；每次探测消耗该出口一格配额。
+
+    每个 IP 每会话只探一次：同一结论重复探测只是白烧配额（实测 26 次同一
+    IP 全是 quota）。台账按「tag + 会话代次」键控，重启隧道后自动作废。
     """
     w = _warp()
     if not w.get("refresh_model_check", True):
         return True
+    tag = member["tag"]
+    cached = _probe_cache_get(tag, ip)
+    if cached is not None:
+        ok = cached == "OK"
+        log(f"  · {tag} 出口 {ip} 本会话已探过: {cached}（跳过）")
+        return ok
     try:
         import probe_warp
         verdict = probe_warp.probe(member["port"],
                                    w.get("refresh_model_timeout_sec", 15))[0]
     except Exception as e:
-        log(f"  ✗ {member['tag']} 模型探测异常: {e}")
+        log(f"  ✗ {tag} 模型探测异常: {e}")
         return False
+    _probe_cache_put(tag, ip, verdict)
     ok = verdict == "OK"
-    log(f"  {'✓' if ok else '✗'} {member['tag']} 出口 {ip} 模型层: {verdict}")
+    log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}")
     if ok:
         # 实测通过 = 这条地址此刻确实能服务，记进 last_ok_ts。否则同址仍停在
         # 档位 2（从没成功过），后台会把刚验过的线当低质反复重启，白烧配额。
@@ -2061,12 +2157,20 @@ def _refresh_idle_warp(member: dict) -> str | None:
     单次重启可能拿回同一地址（WARP 会话未真正重连），故按 max_attempts 重试。
     「可用」的定义随模式变：模型模式看实测探测，原模式看窗口内未使用过。
     调用方要么据此跳过这条线，要么（闲置线）留给下次切回前的校验再刷新。
+
+    刷新原因由该线当前出口的低质类型推导（与 `_warp_ip_needs_refresh` 同源）：
+    「都刷一样」看不出为什么刷，事后无法判断某条线是被 429 拖住还是纯配额耗尽。
     """
+    t = member["tag"]
+    reason = _warp_ip_refresh_reason(_warp_line_ip(t), time.time()) or "主动刷新"
+    off = _WARP_OFF_AGE.get(t)
+    reason = (f"离渠刷新/{reason}" if off is not None
+              else f"预热/{reason}")
     backoff = _warp()["retry_backoff_sec"]
     for attempt in range(1, _warp()["max_attempts"] + 1):
         _invalidate_warp_line_ip(member["tag"])  # 重启后旧地址必然失效
         try:
-            ok = (_restart_service(member["service"])
+            ok = (_restart_service(member["service"], member["tag"])
                   and _wait_port_ready(member["port"], _warp()["ready_timeout_sec"]))
         except Exception as e:
             log(f"  ✗ {member['tag']} 刷新异常: {e}")
@@ -2079,11 +2183,14 @@ def _refresh_idle_warp(member: dict) -> str | None:
             # 原模式里当判据。见 _ip_history_is_truth。
             now = time.time()
             if not ip:
-                log(f"  ✗ {member['tag']} 刷新 #{attempt} 出口探测失败")
+                log(f"  ✗ {t} 刷新 #{attempt}{_warp_refresh_progress(t)}"
+                    f" 原因={reason} 出口探测失败")
             elif _ip_disqualified(ip, now, _warp()["ip_reuse_guard_sec"]):
-                log(f"  ✗ {member['tag']} 刷新 #{attempt} 出口仍在复用窗口内: {ip}")
+                log(f"  ✗ {t} 刷新 #{attempt}{_warp_refresh_progress(t)}"
+                    f" 原因={reason} 出口仍在复用窗口内: {ip}")
             elif _warp_model_usable(member, ip):
-                log(f"  ↻ {member['tag']} 会话已刷新: {ip}")
+                log(f"  ✓ {t} 刷新成功{_warp_refresh_progress(t)}"
+                    f" 原因={reason} 新出口 {ip}")
                 _set_warp_line_ip(member["tag"], ip)
                 return ip
         else:
@@ -2177,7 +2284,10 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
                 time.sleep(_warp()["refresh_delay_sec"])
                 continue
             try:
-                log(f"  ↻ {member['tag']} 出口 {ip or '探测失败'} 疑似脏 IP，重连换线")
+                _t = member["tag"]
+                _why = _warp_ip_refresh_reason(ip, time.time()) or "疑似脏 IP"
+                log(f"  ↻ {_t} 出口 {ip or '探测失败'} 刷 IP{_warp_refresh_progress(_t)}"
+                    f" 原因={_why}")
                 _invalidate_warp_line_ip(member["tag"])
                 if _refresh_idle_warp(member):
                     return
@@ -2511,7 +2621,7 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
     for attempt in range(1, _warp()["max_attempts"] + 1):
         log(f"  ↻ {member['tag']} 原地重连 #{attempt}")
         _invalidate_warp_line_ip(member["tag"])
-        ok = (_restart_service(member["service"])
+        ok = (_restart_service(member["service"], member["tag"])
               and _wait_port_ready(member["port"], _warp()["ready_timeout_sec"]))
         if ok:
             new_ip = warp_egress_ip(member["port"],
@@ -2601,7 +2711,7 @@ def reconnect_warp(reason: str) -> bool:
             ip = probed.get(m["tag"])
             if not ip:
                 log(f"  ↻ 备线 {m['tag']} 不通，先拉起")
-                if not (_restart_service(m["service"])
+                if not (_restart_service(m["service"], m["tag"])
                         and _wait_port_ready(m["port"], _warp()["ready_timeout_sec"])):
                     log(f"  ✗ 备线 {m['tag']} 未就绪，跳过")
                     continue
@@ -3021,7 +3131,10 @@ def _prewarm_standby_warp(now: float) -> None:
         return
     for m in cands:
         _schedule_idle_refresh(m)
-    log(f"↻ 预热 {len(cands)} 条低质备线: {', '.join(m['tag'] for m in cands)}")
+    whys = "; ".join(
+        f"{m['tag']}({_warp_ip_refresh_reason(_warp_line_ip(m['tag']), now) or '未知'})"
+        for m in cands)
+    log(f"↻ 预热 {len(cands)} 条低质备线: {whys}")
 
 
 
