@@ -4327,7 +4327,8 @@ def main():
     log(f"  IP去重: 同出口IP保留调用次数最低的节点")
     log(f"  调用计数: 仅统计成功调用, 429轮换不计入")
     log(f"  interrupt_exist_connections: false (不杀现有连接)")
-    log("  错误触发: 上次成功切换后出现任意 1 条新错误即立即再切")
+    log(f"  错误触发: 出口级拦截(403≥{_warp()['block_threshold']}/429≥{_warp()['rate429_threshold']})"
+        f" 且连续≥3条才切；上游 402/请求超长不计")
     log("=" * 50)
 
     # 初始化 node_info 表
