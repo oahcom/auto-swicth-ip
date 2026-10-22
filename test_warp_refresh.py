@@ -8,6 +8,7 @@
 
 运行: python3 -m pytest test_warp_refresh.py -v
 """
+import os
 import sys
 import time
 
@@ -45,6 +46,12 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     # 历史是只追加文件且永不清理：`_mark_warp_ip_used` 顺手写它，不隔离则桩地址
     # 永久留在生产 .warp_ip_history.jsonl（已实测写进 10 条假记录）。
     monkeypatch.setenv("WARP_IP_HISTORY_FILE_PATH", str(tmp_path / "warp_ip_history.jsonl"))
+    # 落池时刻同样落盘：不隔离时任何走到 _fallback_to_proxy 的用例都会把「刚落池」
+    # 写进生产目录，下一次跑就命中 3h 冷却、改走盲切分支 —— 断言看似通过，其实是
+    # 上一次运行留下的状态在替它作答（实测同一目录连跑两次结论相反）。
+    monkeypatch.setenv("WARP_PROXY_FALLBACK_FILE_PATH", str(tmp_path / "proxy_fallback.json"))
+    monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 0.0)
+    monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", False)
     # 换线三件套是裸全局，`reconnect_warp` 直接赋值、不经 monkeypatch：
     # 不在这里兜住，本文件跑完后它们停在 time.time() 量级，随后导入
     # test_daemon_unit 的换线用例用假时钟 now=1000 就把「生效间隔硬闸」
@@ -993,6 +1000,45 @@ def test_failed_lines_are_scheduled_for_background_refresh(monkeypatch):
     # 必须进后台补刷队列重连换会话 IP。
     # 换下的 W1 本来就要补刷；关键是测不过的 W2 也必须进队列重连。
     assert "W2" in scheduled, f"测不过的 W2 必须排队后台重连，实际 {scheduled}"
+
+
+def test_proxy_fallback_state_is_isolated_from_production():
+    """落池时刻必须写到临时目录，不得落在生产仓库。
+
+    这条是上面 `_isolate_warp_state` 的自检：隔离漏了的时候，任何走到
+    `_fallback_to_proxy` 的用例都会把「刚落池」写进生产目录，届时**下一次**
+    运行的结论由上一次运行的残留决定（实测同目录连跑两次结论相反，17s vs 0.06s）。
+    """
+    prod = os.path.join(os.path.dirname(os.path.abspath(daemon.__file__)),
+                        ".warp_proxy_fallback.json")
+    assert os.path.abspath(daemon._proxy_fallback_path()) != prod, \
+        "落池时刻路径未隔离，测试会写进生产仓库"
+
+
+def test_model_mode_excludes_blocked_ip_before_probing(monkeypatch):
+    """惩罚期内的出口必须在模型探测**之前**排除，不得先探一格配额再否决。
+
+    脏 IP 设计的意义是省配额：探过再丢等于每一格都付了学费。所以被标记的备线
+    直接进刷新队列换新会话 IP，模型探测只打在刷新出来的新地址上。实测 7 个烧毁
+    段里 648 个 /128 被逐个探测、608 个（94%）判 quota，全是本该提前挡住的。
+    """
+    two, switched, refreshed, _ = _reconnect_fixture(
+        monkeypatch, lambda tags: {t: True for t in tags}, refresh_result="ip-new")
+    probed = []
+
+    def fake_test_many(pairs):
+        probed.extend(ip for _, ip in pairs)
+        return {m["tag"]: True for m, _ in pairs}
+
+    monkeypatch.setattr(daemon, "_cached_warp_standby", lambda standby, now, guard: [])
+    monkeypatch.setattr(daemon, "_probe_warp_egress",
+                        lambda standby: {m["tag"]: "burned-ip" for m in standby})
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: ip == "burned-ip")
+    monkeypatch.setattr(daemon, "_warp_model_test_many", fake_test_many)
+    assert daemon.reconnect_warp("test") is True
+    assert "burned-ip" not in probed, f"惩罚期地址不得进入模型探测，实际探了 {probed}"
+    assert refreshed == ["W2"], f"被标记的线应直接重连换会话 IP，实际 {refreshed}"
+    assert switched == ["W2"], f"重连后应切过去，实际 {switched}"
 
 
 def test_min_gap_does_not_mark_new_exit_blocked(monkeypatch):

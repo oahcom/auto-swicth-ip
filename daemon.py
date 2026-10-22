@@ -3247,10 +3247,11 @@ def reconnect_warp(reason: str) -> bool:
             if not ip:
                 log(f"  ✗ 备线 {m['tag']} 探测失败，跳过")
                 continue
-            # 原模式下只把「被标记」的线排进刷新队列：窗口内用过但没被标记
-            # 的线要继续留在 probes 里，走下面的「全部不新鲜 → 兜底选休息最久」
-            # 分支。模型模式下历史不参与判断，这里整段不生效。
-            if _ip_history_is_truth() and _warp_ip_is_blocked(ip, now):
+            # 惩罚期两个模式都排除，且必须在探测**之前**：脏 IP 挡在入池前才省得
+            # 下一轮白烧一格配额，探完再否决等于每格配额都付了学费。复用窗口则只
+            # 在原模式生效 —— 窗口内用过但没被标记的线要继续留在 probes 里，走下面
+            # 的「全部不新鲜 → 兜底选休息最久」分支；模型模式由实测决定。
+            if _warp_ip_is_blocked(ip, now):
                 # 被标记 ≠ 永久不可用：每条隧道同一时刻只有一个出口 IP，重启才会换
                 # 会话。全跳过会让候选池恒为 0（403 风暴几秒就能烧完全部备线），
                 # 流量被甩到同样被限流的 proxy 池 —— 19:16 的兜底死循环即由此而来。
@@ -3324,7 +3325,12 @@ def reconnect_warp(reason: str) -> bool:
     #   3) 都不满足时兜底复用最久未用的（见下面 elif probes 分支）。
     # 第 1 级单列是因为「从没用过」和「用过但已久」在 _warp_ip_last_ts 上都
     # 可能返回很小的值，混在一起排序会让刚清理掉的旧地址冒充新地址。
-    usable = [p for p in probes if not _ip_disqualified(p[1], now, guard)]
+    # 模型模式下 probes 里只剩刚实测通过的候选，历史不得再否决它们：惩罚期已在
+    # 入池前生效（缓存路径 / 探测循环 / 刷新路径都查过），这里再拿旧台账复查一遍
+    # 就是把「证据比事实旧」重新引入 —— 实测 OK 的地址被上一段的标记抹掉，候选
+    # 全丢、白落一次轮换池（池有 3h 冷却）。原模式照旧按历史过滤。
+    usable = (probes if not _ip_history_is_truth()
+              else [p for p in probes if not _ip_disqualified(p[1], now, guard)])
     if _ip_history_is_truth():
         n_new = sum(1 for p in probes if _warp_ip_never_used(p[1]))
         n_ok = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 1)

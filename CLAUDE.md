@@ -242,6 +242,18 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
     `_warp_ip_is_blocked` 在两个模式下都是硬否决 —— 那是「这个地址确实被拦过」的
     确定事实。旁路它等于让脏 IP 设计在模型模式下整体失效：实测 7 个烧毁段里
     648 个 /128 被逐个探测、608 个（94%）判 quota，全是本该在探测前就挡住的。
+  - **惩罚期排除必须发生在探测之前，探测之后的观测不再被旧台账复查 (T-222)**：
+    两处调用点语义不同 —— `reconnect_warp` 的探测循环里查（挡在烧配额之前，两模式
+    都生效，**不要**再挂 `_ip_history_is_truth()` 前置），而选线末尾的 `usable`
+    在模型模式下**不再**用 `_ip_disqualified` 过滤 —— 那里的 `probes` 已经是刚实测
+    通过的候选，再拿旧台账复查就是用上一段的标记推翻本刻的观测：实测 OK 的地址被
+    丢、`probes` 清空、走兜底分支落轮换池（3h 冷却）。原模式照旧按历史过滤。
+  - **测试必须隔离落池时刻文件**（`WARP_PROXY_FALLBACK_FILE_PATH`）：`_fallback_to_proxy`
+    会把「刚落池」写盘，未隔离时任何走到该分支的用例都会把状态写进生产仓库目录，
+    于是**下一次**运行的结论由上一次运行的残留决定（实测同一目录连跑两次：17.02s
+    失败 / 0.06s 通过，第二次是靠 3h 冷却走盲切分支才「通过」的假象）。fixture 里
+    还要重置 `_last_proxy_fallback_ts` / `_proxy_fallback_ts_loaded` —— 它们是
+    进程级全局，只读一次。
   - **模型层判 quota/flagged 必须落进 blocked 台账**（`_MODEL_VERDICT_BLOCK_KIND`）：
     `quota` 就是生产侧的 `rate429`（同一个 FreeUsageLimitError），`flagged` 就是
     `abuse403`（abusive traffic），只是观测来源从生产流量换成了主动探测。只记探测
