@@ -10,10 +10,39 @@ import time
 
 # ============= 配置常量 =============
 SECRET_FILE = "/home/administrator/.singbox_secret"
+# 局域网代理认证，内容一行 `username:password`（mode 600，gitignored）。
+# 文件不存在 = 不生成 LAN 入站：无认证的 mixed 入站等于开放中继。
+LAN_AUTH_FILE = "/home/administrator/.singbox_lan_auth"
 
 # Module-level cache for secret + mtime
 _SINGBOX_SECRET: str = ""
 _SINGBOX_SECRET_MTIME: float = 0
+
+
+def get_lan_auth() -> tuple[str, str] | None:
+    """局域网入站的 (username, password)；不可用时返回 None。
+
+    刻意不做 mtime 缓存：调用方只有订阅刷新（每小时一次），缓存省不下什么，
+    却会让改密码后要等一轮刷新才生效。缺失或格式非法一律 None —— 让调用方
+    跳过整个入站，而不是退化成无认证监听。
+    """
+    try:
+        st = os.stat(LAN_AUTH_FILE)
+        if st.st_mode & 0o077:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ {LAN_AUTH_FILE} 权限过宽 "
+                  f"({oct(st.st_mode & 0o777)})，同网段任何用户可读取", file=sys.stderr)
+        with open(LAN_AUTH_FILE) as f:
+            username, _, password = f.read().strip().partition(":")
+        if not username or not password:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ {LAN_AUTH_FILE} 格式应为 "
+                  f"username:password，当前内容无法解析", file=sys.stderr)
+            return None
+        return username, password
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✗ 读取局域网认证失败: {e}", file=sys.stderr)
+        return None
 
 def get_singbox_secret() -> str:
     """Get sing-box secret with mtime-based auto-refresh."""
@@ -51,6 +80,13 @@ CFG = {
         "startup_grace_sec": 10,  # 增加到 10s，给 sing-box 更多初始化时间
         "max_restart_attempts": 3,
         "mixed_port": 7890,
+        # 局域网入站：0 = 不生成（默认关闭）。开启后另起一个 mixed 入站监听
+        # 0.0.0.0，与环回口互不影响 —— 环回口给 9router/daemon，局域网口给
+        # 手机/其他机器，前者永远不需要认证，后者必须有。
+        "lan_port": 7891,
+        # 允许来源网段。sing-box 自身按来源 IP 拒掉网段外连接（route 层 reject），
+        # 免得这个入站被当成可从任何地方拨入的开放代理。
+        "lan_cidrs": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
     },
     "okz": {
         "proxy_url": "http://127.0.0.1:6696",

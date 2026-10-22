@@ -11,7 +11,7 @@ Claude Code / AI Client
     │ （旧实现靠 NODE_OPTIONS 注入 proxy-global.js 做 MITM；
     │   该文件已不存在，进程环境里也没有 NODE_OPTIONS）
     ↓
-sing-box (mixed inbound :7890, Clash API :9090 Bearer auth)
+sing-box (mixed inbound :7890 环回 / :7891 局域网, Clash API :9090 Bearer auth)
     ├── route: domain_suffix ["opencode.ai"] → selector opencode-out
     │   → 10 条 WARP 隧道 + proxy 池兜底（见下节）
     └── final: proxy → 83 节点轮换池（实测：54 anytls + 27 vless + 1 trojan + 1 direct）
@@ -35,6 +35,43 @@ daemon.py
     → 线程池优雅关闭：wait=True + 10s timeout
     → SQLite 连接优雅关闭：atexit 关闭 WAL checkpoint
 ```
+
+## 局域网入站（:7891）
+
+给同网段的手机/其他机器用的第二个 mixed 入站。**与环回口分成两个入站，而不是把一个口改成
+`0.0.0.0`**：环回口服务 9router 与 daemon，它们不该被要求认证；局域网口必须认证。单个入站
+无法按来源决定要不要认证。
+
+```
+127.0.0.1:7890  mixed-in   无认证   9router / daemon / 本机 curl
+0.0.0.0:7891    mixed-lan  users    手机、其他机器（HTTP 407 → 需 Proxy-Authorization）
+```
+
+三层约束，缺一层都会变成开放中继：
+
+| 层 | 实现 | 失效后果 |
+|----|------|----------|
+| 认证 | 入站 `users`（`~/.singbox_lan_auth`，`username:password`，600） | 任何拿到端口的人都能用 |
+| 来源 | route 规则 **第 0 条** `logical and [inbound=mixed-lan, source_ip_cidr 私网 invert] → reject` | 可被公网拨入 |
+| 主机 | Windows 防火墙 `RemoteAddress=LocalSubnet`（TCP 7891） | 网段外可达 |
+
+**失败即关闭**：认证文件缺失/格式非法 ⇒ 不生成 `mixed-lan` 入站，且不生成引用该 tag 的
+来源规则（悬空规则能过 `sing-box check`，是纯垃圾）。改端口/认证后必须重建配置**并重启
+sing-box** —— 改文件不重载无效。
+
+来源规则必须是 route 第一条：排在 `sniff`/`resolve` 之后，判据就不再是纯来源地址。
+验证方法看**有没有 outbound 行**（不是看客户端收到什么）：被 reject 的连接日志里只有
+`inbound/mixed[mixed-lan]`，没有任何 `outbound/...`；被放行的才有。
+
+被拦时客户端看到的是 502 而非 403 —— sing-box 用连接关闭表达 reject，curl 报
+`CONNECT tunnel failed, response 502`。排障别把它当上游故障。
+
+```bash
+# 局域网设备用法
+http_proxy=http://lan:<password>@<主机IP>:7891 curl https://api.github.com/zen
+```
+
+9router（:20127）本来就在 `*:20127` 监听且按请求校验 API key，无需改代码；只需防火墙放行。
 
 ## WARP 专用出口（opencode）
 
@@ -105,7 +142,8 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   `max_attempts`（3）次，重试间隔 `retry_backoff_sec`（2/5/10s）。
 - **主动轮换两种判据，`proactive_mode` 二选一（互斥，只有一个生效）**：`requests`（**当前生效**，
   当前出口上**成功的 dsv4 调用**累计满 `proactive_after_dsv4_ok`=150 格）与 `fixed`
-  （每 `proactive_fixed_sec`=60s）。非法值按 `fixed` 处理，不让轮换静默停摆。
+  （每 `proactive_fixed_sec`=60s）。配置只能是 `fixed`/`requests`；导入时会校验，
+  其他值（含遗留的 `lifetime`）直接 `SystemExit` 退出，不再静默回退。
   互斥由分支末的 `return` 保证：两个判据叠加时，fixed 到点那次换线会把 requests 的配额
   计数一起清零，150 格永远跑不到（回归用例 `test_proactive_modes_are_mutually_exclusive`）。
   - **WHY 不用时间轴**：实测按 60s 切走的 204 个主动段，到点时已用掉 dsv4 中位
@@ -135,7 +173,32 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
     上次换线失败时 `_warp_cooldown_until` 是 `cooldown_fail_sec`(3s)，那是防隧道
     雷暴的，不绕。并发始终由 `_WARP_LOCK` 保证。
 
-  - **错误触发的换线与主动轮换不得交错**：任一条错误路径换线生效后，主动轮换的计时起点
+- **429 文案换过版本，分类器必须同时认两版 (T-197)**：免费层现版文案是
+  `Free usage limit reached. Subscribe to OpenCode Go...`（type 仍
+  `FreeUsageLimitError`），旧版是 `Rate limit exceeded`。只认旧文案时实测最近
+  2000 条错误里 1751 条 429 全被判成「非出口级错误」→ `consec_err` 恒 0 →
+  **87% 错误率下也永不换线**（生产宕机 2026-10-22 13:45，daemon 重启后落到
+  proxy 池不自救）。两个文案都留，`_classify_egress_error` 是所有换线判据的
+  唯一入口。
+- **选线必须按出口 IP 去重 (T-198)**：重连竞态会让两条隧道指向同一会话 IP，
+  两条都进候选池等于「换了隧道但 IP 没变」当换线 —— 切过去照样 429。
+  `_cached_warp_standby` 排序后按 IP 去重，只留最优的一条。
+- **启动时必须校验当前出口是否可用 (T-199)**：sing-box 重启后 selector 复位到
+  配置 default（主隧道 WARP-CF），它可能正处 429 惩罚期或被模型层判 quota。
+  `main()` 启动即调 `_validate_startup_egress()`：低质则立刻换线，不校验就等于
+  「重启后先白烧一段 IP，等第一条 429 才纠正」（实测 13:45 重启后 WARP-CF
+  立即 429 ×3 才被换走）。换线是异步线程，校验后不得复探 `active_warp_tag()`
+  —— 读到的是旧线，白等 20s 还会把低质 IP 写回去。
+- **刷新路径的「探测失败」必须复探一次 (T-200)**：短预算（`refresh_probe_timeout_sec`=7s）
+  的本意是「刚重启的隧道要么立刻通、要么没起来」，但漏了**首探冷**：实测
+  `usque-warp-20` 重启后端口 0.12s 就绪，7s 预算首探 7.01s 到点 rc=28，紧接着同预算
+  的探测 1.68s 就返回。旧实现只探一次，这种隧道被记成失败 → 重启同一条线 → 还是冷的
+  → 循环：实测 14:58 单分钟 60 次 `systemd Started`；「刷新 #3 失败 → 同线再重启」
+  实测 135 次，间隔 65s 的最多（38 次）—— 正是 3 次重启 + 2/5/10 退避的固定节奏。
+  全库共 748 条「出口探测失败」。
+  `_probe_refresh_egress()` 先短探、失败再用 `ready_timeout_sec` 复探一次；仍失败才是
+  真不通。刷新与原地重连两条路径都必须走它，不要再直接调 `warp_egress_ip`。
+- **错误触发的换线与主动轮换不得交错**：任一条错误路径换线生效后，主动轮换的计时起点
     都要重置（`_last_warp_switch_ok_ts`）。旧实现只更新 `reconnect_warp` 的切 WARP 路径，
     `_fallback_to_proxy`（落池）与 `_restart_warp_inplace`（原地重连）都不更新 —— 刚落池
     或刚原地重连，主动轮换仍按上一段的已服务时长算账，立刻再切一次（实测 00:12:00 落池，
@@ -225,7 +288,7 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   每次换线都撞上「无候选」而落池。
 - **`lifetime` 已整模式移除**（连同 `_WARP_MIN_CYCLE_SEC` / `_recompute_min_warp_cycle` /
   地板 60s / `min_cycle_recalc_sec`）：它测的是请求间隔而非 IP 寿命，生效值恒被地板
-  顶住，等于一个测不准的固定 60s。旧配置写 `lifetime` 会静默回退 `fixed`。
+  顶住，等于一个测不准的固定 60s。`lifetime` 不再作为配置值接受；导入时会 `SystemExit`。
 - **换线耗时靠探测缓存压到 ~0**：脏线守护每 ~5s 已经探过每条非当前出口的线，
   `_cached_warp_standby` 直接采信 12s 内的结果，命中即跳过同步探测。实测换线
   p50 2s→0s、p90 7s→0s（命中率 32/33）。**探测阶段不能占用 `_WARP_REFRESHING`**，
@@ -435,6 +498,9 @@ proxy_blocked_threshold: 5                     # 落池后仍被拦截 N 条 →
 proxy_dead_ratio: 0.5                          # 黑名单节点占比 ≥N → 回切 WARP
 node_health_sec: 300                           # 健康检查间隔 (5min)
 singbox.max_restart_attempts: 3                # 最大重启次数
+singbox.mixed_port: 7890                       # 环回 mixed 入站（无认证）
+singbox.lan_port: 7891                         # 局域网 mixed 入站（0=关闭，需认证文件）
+singbox.lan_cidrs: [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12]  # 局域网入站允许来源
 bad_nodes.ttl_sec: 300                         # bad node TTL (5min)
 # warp（换线核心，勿凭旧记忆猜值）
 warp.block_threshold: 1                        # abuse403 触发阈值
@@ -531,7 +597,7 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `.egress_log.jsonl` | 动态 | 出口节点归属日志（每次成功切换 append (ts,node)，供 per-egress 错误率归因）|
 | `asi-selfcheck.timer` | — | systemd 用户定时器：每 10min 触发 asi-selfcheck.service 跑巡检引擎 |
 | `test_daemon_unit.py` | 3177 | 确定性单测（无网络，150 个用例：错误率/策略/评分/坏节点/看门狗/WARP 换线门控）|
-| `test_subscription_parse.py` | 425 | 订阅解析回归单测（无网络，覆盖 vless/trojan transport/单源失败/rc 检查）|
+| `test_subscription_parse.py` | 522 | 订阅解析回归单测（无网络，覆盖 vless/trojan transport/单源失败/rc 检查/局域网入站与来源守卫）|
 | `test_warp_refresh.py` | 296 | WARP 刷新/换线门控单测（22 个用例）|
 | `verify_rotation.py` | 345 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），`--quick` 约 20s |
 

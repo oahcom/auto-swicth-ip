@@ -1762,6 +1762,54 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 顺序：改 token → `python3 -m pytest test_subscription_parse.py` → 重启 daemon →
 `python3 verify_rotation.py` → 确认节点池已换（比对出口 IP 与旧池不同）。
 
+## 10A. 局域网入站（T-127~T-134）
+
+背景：把代理和 9router 开放给同网段的手机/其他机器。核心风险不是「能不能连」，而是
+「会不会变成谁都能用的开放中继」，所以测试重点在**失败即关闭**与**来源限制**。
+
+| ID | 描述 | 优先级 | 验证方法 |
+|----|------|--------|----------|
+| T-127 | 无认证文件时不生成 `mixed-lan` 入站 | P0 | `test_lan_inbound_absent_without_auth_file` |
+| T-128 | 无认证文件时**不生成**引用 `mixed-lan` 的来源规则（悬空规则能过 `check`，是纯垃圾） | P0 | 同上，断言 route 无 `logical+inbound` 规则 |
+| T-129 | 有认证文件时生成 `0.0.0.0:<lan_port>` + `users` 入站 | P0 | `test_lan_inbound_present_with_auth_file` |
+| T-130 | `lan_port=0` 时完全不建局域网入站 | P1 | `test_lan_inbound_skipped_when_port_zero` |
+| T-131 | 来源规则对非私网来源 reject，且排在 route 第一条 | P0 | `test_lan_guard_rejects_non_private_source` |
+| T-132 | `lan_port=0` 时不生成来源规则 | P1 | `test_lan_guard_absent_when_port_zero` |
+| T-133 | 带局域网入站的配置通过 `sing-box check` | P0 | `test_lan_inbound_passes_singbox_check` |
+| T-134 | 认证文件格式非法（缺 `:`／空用户名／空密码）→ `get_lan_auth()` 返回 None | P0 | `test_get_lan_auth_rejects_malformed` |
+
+**手工端到端验证**（单元测试盖不到真实网络行为，每次改入站/防火墙后必做）：
+
+```bash
+LAN=$(cat ~/.singbox_lan_auth); IP=<本机局域网IP>
+# 1) 无认证 → 407        2) 错密码 → 407        3) 正确 → 204/200
+curl -s -o /dev/null -w '%{http_code}\n' -x http://$IP:7891 http://www.gstatic.com/generate_204
+curl -s -o /dev/null -w '%{http_code}\n' -x http://lan:wrong@$IP:7891 http://www.gstatic.com/generate_204
+curl -s -o /dev/null -w '%{http_code}\n' -x http://$LAN@$IP:7891 https://api.github.com/zen
+
+# 4) 来源限制：环回源进 7891 必须被丢。
+#    判据看日志有没有 outbound 行，不要看客户端状态码 —— reject 也回 502。
+curl -s -o /dev/null -x http://$LAN@127.0.0.1:7891 http://www.gstatic.com/generate_204
+grep mixed-lan singbox.log | tail -4   # 被拒的连接只有 inbound 行，没有 outbound/
+```
+
+**易踩的三个坑**：
+
+- `502` 有两种来源：节点不通（日志有 `outbound/...` + `i/o timeout`）与来源被拒（日志只有
+  `inbound`）。只看 curl 返回码会把 guard 生效误判为故障。
+- 改完配置**必须重启 sing-box**；`daemon.restart_singbox()` 是生产路径，直接改文件不重载。
+- `refresh_subscription()` 在「节点数骤降」护栏下会拒绝覆盖配置。LAN 入站与节点列表正交，
+  此时应就地注入入站（复用 `_build_inbounds` / `_build_lan_guard`），不要为准入而剥离护栏。
+
+9router 侧无需改代码（已监听 `*:20127` 并按请求校验 API key），只需防火墙放行：
+
+```powershell
+New-NetFirewallRule -DisplayName '9router LAN (TCP 20127)' -Direction Inbound -Action Allow `
+  -Protocol TCP -LocalPort 20127 -RemoteAddress LocalSubnet -Profile Private,Public
+New-NetFirewallRule -DisplayName 'auto-switch-ip LAN proxy (TCP 7891)' -Direction Inbound -Action Allow `
+  -Protocol TCP -LocalPort 7891 -RemoteAddress LocalSubnet -Profile Private,Public
+```
+
 ## 11. WARP 专用出口（opencode）
 
 背景：opencode 免费层的 403 有两种文案——`abusive traffic from this IP` 是 IP 信誉拦截（9router 命中的就是这种），`only be used from within OpenCode` 是客户端指纹（裸 curl 必现，换 IP 无效）。因此出口换成 WARP 后即可恢复。
@@ -1844,6 +1892,10 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | T-189 | P0 | `upstream connection lost` 不得触发换线/切节点 | `python3 - <<'EOF'`：查 `requestDetails` 中含该串的行的 `status`；`grep -n "upstream connection lost" daemon.py` | 该文案是 9router SSE 管道（`~/.9router/.next/server/chunks/8895.js`）`m` 变量的初始值，作为末帧注入流中，**不是错误**：实测全表 18 行含该串的记录 `status` 全为 `success`（17 行出现在 `response`、1 行在 `providerResponse`）。`count_warp_blocked_since()` 只按键词 `abusive traffic` / `Rate limit exceeded` 分类、`get_9router_error_rate()` 与既有一切换线判据都以 `status != success` 为准，因此该串在两条链路上都不计入错误、不触发换线。回归方式：出现新的 error 类文案时，先按 `status` 过滤确认它是否真被记为 error，再决定是否要加分类 —— 不要按文案字面加进错误率 |
 | T-190 | P0 | 模型模式：探针通过即视为可用，IP 历史不作判据 | `pytest test_warp_refresh.py -k "model_mode or old_mode"` | `refresh_model_check=True` 时 `_ip_disqualified()` 恒返 False：被 403/429 标记过、在 24h 复用窗口内都用「此刻实测」代替历史推断。依据：实测重启后从没成功过的新地址首条请求照样 429（8/10 线），旧地址过了惩罚期也可复用 —— 历史与事实不一致时以探测为准。原模式（`refresh_model_check=False`）保留整套历史判据，一行开关切回 |
 | T-191 | P0 | 刷新备线必须过模型层探测 | `pytest test_warp_refresh.py -k model_probe` | `_refresh_idle_warp()` 拿到新地址后调 `probe_warp.probe()`，只有 `OK` 才算刷新成功；`quota`/`flagged`/`unreachable`/`err` 都继续重启。原模式只验 IP 新鲜度，新地址必然通过，于是切上去头几条就 429（实测 10 条线 5 条不可用） |
+| T-197 | P0 | 429 文案换版必须仍判为出口级错误 | `pytest test_daemon_unit.py -k classify_egress` | 免费层 429 现版文案是 `Free usage limit reached. Subscribe to OpenCode Go...`（type 仍 `FreeUsageLimitError`），旧版是 `Rate limit exceeded`。只认旧文案时实测最近 2000 条错误里 1751 条 429 全被判成「非出口级错误」→ `consec_err` 恒 0 → 87% 错误率下也永不换线（生产宕机 2026-10-22 13:45，daemon 重启后落 proxy 池不自救）。两个文案都留，分类器对 4 类样本：现版 429 / 旧版 429 → `rate429`，`abusive traffic` → `abuse403`，请求超长 → `None` |
+| T-198 | P0 | 同一 IP 被多条隧道持有时只留一条候选 | `pytest test_daemon_unit.py -k dedups_same_ip` | 重连竞态会让两条隧道指向同一会话 IP；两条都进候选池等于「换了隧道但 IP 没变」当换线 —— 切过去照样 429。`_cached_warp_standby` 排序后按 IP 去重，只留最优的一条（已排序，首条即最优）。实测 20 条隧道当前 20 个唯一 IP，无重复，但那是运气不是约束 |
+| T-199 | P0 | 启动时当前出口低质必须立即换线 | `pytest test_daemon_unit.py -k startup_` | sing-box 重启后 selector 复位到配置 default（主隧道 WARP-CF），它可能正处 429 惩罚期或被模型层判 quota。不校验就等于「重启后先白烧一段 IP，等第一条 429 才纠正」—— 实测 2026-10-22 13:45 重启后 WARP-CF 立即 429 ×3 才被换走。`main()` 启动即校验 `_warp_ip_needs_refresh`，低质则 `_reconnect_warp_now("启动校验 当前出口低质")`。健康出口不得被动（对照用例）。校验体抽成 `_validate_startup_egress()`：用例原先复刻分支逻辑，main 里删掉整段仍会通过（codex P3）。换线是异步线程，校验后不得复探 `active_warp_tag()`（读到旧线 + 白等 20s） |
+| T-200 | P0 | 刷新路径探测超时必须复探一次 | `pytest test_daemon_unit.py -k probe_refresh_egress` | 短预算 7s 只覆盖「隧道没起来」，漏了「首探冷」：实测 `usque-warp-20` 重启后端口 0.12s 就绪，7s 预算首探 7.01s 到点 rc=28，紧接着同预算探测 1.68s 就返回 —— 隧道是好的。旧实现单次探测失败即记 attempt 失败 → 重启同一条线 → 还是冷的 → 循环：实测 14:58 单分钟 60 次 `systemd Started`，「刷新 #3 失败 → 同线再重启」实测 135 次，间隔以 65s 为最多（38 次，即 3 次重启 + 2/5/10 退避的固定节奏），全库共 748 条「出口探测失败」。`_probe_refresh_egress()` 先短探、失败再用 `ready_timeout_sec` 复探一次；首探成功不得重探（每次探测都走出口配额）；两次都失败才返回 None。三个用例：慢隧道复探成功 / 两次都败返回 None / 首探成功只探一次 |
 | T-192 | P0 | 选线也要实测，不能只靠刷新阶段的门 | `pytest test_warp_refresh.py -k selection_trusts_probe` | 12s 探测缓存只验过出口 IP，可能送来一条此刻已 429 的线；`reconnect_warp()` 在选线前对全部候选并发跑 `_warp_model_test_many()`。实测 20:28 一次选线：8 条缓存命中 → 并发实测 → 仅 4 条 OK → 切到其中一条 |
 | T-193 | P1 | 探针与 daemon 同解释器可跑（无 PySocks）、指纹校验覆盖 schema | `/usr/bin/python3.12 probe_warp.py --tag WARP-CF-C`；`python3 probe_warp.py --check-fingerprint` | 走 curl `--socks5-hostname` 而非 python `requests` 的 `socks5h://`：daemon 跑在 `/usr/bin/python3.12`（无 PySocks），用 requests 会立即 `InvalidSchema` 并被误计成 `unreachable`（实测 0.0s 返回）。指纹校验比对 description **与 parameters 两者**（与上游 `isFingerprintDefinition` 对齐）：只比 description 会漏掉 schema 变更，线上探测全 403 而校验仍报「一致」。归一化去空白/引号/逗号（JS 对象字面量与 `json.dumps` 的差别），已反向验证：篡改 `required` 后校验必红 |
 | T-194 | P0 | 模型层测不过的备线必须重连，不得直接落 proxy 池 | `pytest test_warp_refresh.py -k "probe_failure_reconnects or after_reconnect_still_falls"` | 测不过的线与原模式「出口已被标记」同义 —— 都只有重连换会话 IP 才有意义，故并入 `blocked_lines` 走同一条刷新路径。回归点（codex P1）：阻塞块原本在实测之前，实测清空 `probes` 后一条备线都没重启就走向「无可用备线，切轮换池兜底」，T-175 退化；且任何系统性探测故障（缺文件/指纹漂移/curl 失败）都会把全量流量拨到 83 节点池。正确顺序：实测 → 同步重连一条拿本次候选 → 其余后台并发补刷 → 仍无可用才落池 |
@@ -1888,4 +1940,6 @@ grep -rn 'okz/sub?token=' *.py *.sh *.ps1   # 应恰好 3 处
 | v1.24 | 2026-10-22 | 模型层探测台账改为按 /128 键控，TTL 按结论持久性分档（`quota`/`flagged` 6h、其余 2min），废除会话代次：同一地址的重复探测省 67.1%（30h 回放），脏地址结论跨重连存活 (T-196) | codex review |
 | v1.25 | 2026-10-22 | 主动轮换收敛为两种判据并**删除 `lifetime`** (T-179)：连同 `_WARP_MIN_CYCLE_SEC` / `_recompute_min_warp_cycle` / 60s 地板 / `min_cycle_recalc_sec` 一并移除 —— 段跨度跟的是请求间隔（中位 3.8s vs 请求 p50 6.5s），生效值恒被地板顶住。`requests` 判据从「服务满 N 条请求」改为「成功用掉 N 格 dsv4 配额」并新增 `count_dsv4_ok_since`（走 `idx_uh_ts`，`usageHistory` 而非 2000 行滚动的 `requestDetails`）(T-160/T-168)；阈值 60→**100**，依据 204 个主动段 dsv4 中位 113.5（右删失下界）(T-168)。`fixed` 保持 60s 并设为默认。测试删 8 个 lifetime/重算用例，新增 3 个 `count_dsv4_ok_since` 用例 |
 | v1.26 | 2026-10-22 | codex review P1 修复：`warp_line_busy` 默认窗 12s 会落到错误换线路径（逐候选 12s，最坏 ~120s），新增 `_ERROR_PATH_BUSY_WINDOW_SEC`=2s 并在 `reconnect_warp` 兜底分支与 `_wait_warp_idle` 显式传入 (T-141b)；12s 只留给后台补刷/脏线守护 | codex review |
+| v1.27 | 2026-10-22 | **修生产宕机**：429 文案换版致分类器全漏 (T-197) —— 免费层现版文案 `Free usage limit reached`，旧代码只认 `Rate limit exceeded`，实测最近 2000 条错误里 1751 条 429 全被判成非出口级错误 → `consec_err` 恒 0 → 87% 错误率下永不换线。加 IP 去重 (T-198) 与启动时低质出口校验 (T-199)。二轮 codex：修 dedup 用例未走 monkeypatch 污染 `test_warp_refresh` 4 例 (P1)、兜底选线冷却判据写反致优先挑冷却线 (P2)、启动用例复刻分支体不覆盖 main (P3) | codex review |
+| v1.28 | 2026-10-22 | 修刷新风暴 (T-200)：刷新路径探测超时后不再直接判失败 —— 实测 20 条隧道用 25s 预算全部可通，而 7s 预算下 6/20 超时（p50 3.0s / p90 8.9s / max 13.3s）；重启后首探冷实测 7.01s rc=28、紧接着 1.68s 返回。旧行为：单次超时→重启同线→再超时，14:58 单分钟 60 次 systemd Started、全库 748 条探测失败、「刷新 #3 失败→同线重启」135 次中 38 次间隔 65s（最多）。新增 `_probe_refresh_egress()`（短探 + `ready_timeout_sec` 复探一次），刷新与原地重连两路接入；首探成功不重探 | - |
 

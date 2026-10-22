@@ -423,3 +423,100 @@ def test_stderr_reason_picks_exception_line():
     s = "Traceback:\n  File x\nNameError: boom\ntrailing warning"
     assert daemon._stderr_reason(s) == "NameError: boom"
     assert daemon._stderr_reason("") == "no stderr"
+
+# ============= 8. 局域网入站（7891） =============
+def _lan_nodes():
+    return [ps.parse_trojan("trojan://pw@a.example.com:443#t")]
+
+def test_lan_inbound_absent_without_auth_file(monkeypatch, tmp_path):
+    """缺认证文件时不建局域网入站 —— 无认证的 0.0.0.0 监听等于开放代理。
+
+    同时不得留下悬空的来源护栏：那条 reject 规则按 inbound tag 匹配，入站都
+    没生成时它永远不命中，是纯垃圾（sing-box check 也不会报）。
+    """
+    import config
+    monkeypatch.setattr(config, "LAN_AUTH_FILE", str(tmp_path / "missing"))
+    cfg = ps.make_config(_lan_nodes(), listen_port=7890, clash_port=9090)
+    assert len(cfg["inbounds"]) == 1, f"不应有 LAN 入站: {cfg['inbounds']}"
+    assert cfg["inbounds"][0]["listen"] == "127.0.0.1"
+    assert not [r for r in cfg["route"]["rules"] if r.get("action") == "reject"], \
+        f"入站未生成时不该有来源护栏: {cfg['route']['rules']}"
+
+def test_lan_inbound_present_with_auth_file(monkeypatch, tmp_path):
+    """认证文件齐备时，LAN 入站必须 0.0.0.0 + users，且与环回口分立。"""
+    import config
+    auth = tmp_path / "auth"
+    auth.write_text("lanuser:testpass")
+    monkeypatch.setattr(config, "LAN_AUTH_FILE", str(auth))
+    cfg = ps.make_config(_lan_nodes(), listen_port=7890, clash_port=9090)
+    lan = [i for i in cfg["inbounds"] if i.get("listen") == "0.0.0.0"]
+    assert len(lan) == 1, f"缺少 LAN 入站: {cfg['inbounds']}"
+    assert lan[0]["listen_port"] == config.CFG["singbox"]["lan_port"]
+    assert lan[0]["users"] == [{"username": "lanuser", "password": "testpass"}]
+    # 环回口不得被改动或要求认证
+    loop = [i for i in cfg["inbounds"] if i["listen"] == "127.0.0.1"]
+    assert len(loop) == 1 and "users" not in loop[0], f"环回入站不应变化: {loop}"
+
+def test_lan_inbound_skipped_when_port_zero(monkeypatch, tmp_path):
+    """lan_port=0 显式关闭，即使认证文件存在也不建。"""
+    import config
+    auth = tmp_path / "auth"
+    auth.write_text("lanuser:testpass")
+    monkeypatch.setattr(config, "LAN_AUTH_FILE", str(auth))
+    monkeypatch.setitem(config.CFG["singbox"], "lan_port", 0)
+    cfg = ps.make_config(_lan_nodes(), listen_port=7890, clash_port=9090)
+    assert all(i["listen"] != "0.0.0.0" for i in cfg["inbounds"]), cfg["inbounds"]
+
+def test_lan_guard_rejects_non_private_source(monkeypatch, tmp_path):
+    """来源不在私网段时 reject，且规则必须排在 sniff 之前。"""
+    import config
+    auth = tmp_path / "auth"
+    auth.write_text("u:p")
+    monkeypatch.setattr(config, "LAN_AUTH_FILE", str(auth))
+    cfg = ps.make_config(_lan_nodes(), listen_port=7890, clash_port=9090)
+    rules = cfg["route"]["rules"]
+    guard = [r for r in rules if r.get("action") == "reject"]
+    assert len(guard) == 1, f"缺少来源护栏: {rules}"
+    assert rules.index(guard[0]) < next(i for i, r in enumerate(rules)
+                                        if r.get("action") == "sniff"), "护栏必须先于 sniff"
+    g = guard[0]
+    assert g["type"] == "logical" and g["mode"] == "and"
+    inbound_rule = g["rules"][0]
+    cidr_rule = g["rules"][1]
+    assert ps.LAN_INBOUND_TAG in inbound_rule["inbound"]
+    assert cidr_rule["invert"] is True
+    assert set(cidr_rule["source_ip_cidr"]) >= {"192.168.0.0/16", "10.0.0.0/8"}
+
+def test_lan_guard_absent_when_port_zero(monkeypatch):
+    """关着端口时不该有悬空的 reject 规则引用不存在的入站。"""
+    import config
+    monkeypatch.setitem(config.CFG["singbox"], "lan_port", 0)
+    cfg = ps.make_config(_lan_nodes(), listen_port=7890, clash_port=9090)
+    assert not [r for r in cfg["route"]["rules"] if r.get("action") == "reject"], cfg["route"]["rules"]
+
+def test_lan_inbound_passes_singbox_check(monkeypatch, tmp_path):
+    """端到端：带 LAN 入站 + 护栏的配置必须通过 sing-box check。"""
+    import config
+    auth = tmp_path / "auth"
+    auth.write_text("lanuser:testpass")
+    monkeypatch.setattr(config, "LAN_AUTH_FILE", str(auth))
+    cfg_file = tmp_path / "cfg.json"
+    cfg_file.write_text(__import__("json").dumps(
+        ps.make_config(_lan_nodes(), listen_port=7890, clash_port=9090)))
+    binary = daemon.CFG["singbox"]["binary"]
+    r = subprocess.run([binary, "check", "-c", str(cfg_file)],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, f"sing-box check 失败: {r.stderr.strip()[:300]}"
+
+def test_get_lan_auth_rejects_malformed(tmp_path, monkeypatch):
+    """空串、无冒号、空口令都应返回 None，而不是造出半截凭据。"""
+    import config
+    for content in ("", "nopassword", ":onlypass", "onlyuser:"):
+        f = tmp_path / "auth"
+        f.write_text(content)
+        monkeypatch.setattr(config, "LAN_AUTH_FILE", str(f))
+        assert config.get_lan_auth() is None, f"格式非法应判 None: {content!r}"
+    f2 = tmp_path / "auth2"
+    f2.write_text("user:pa:ss")
+    monkeypatch.setattr(config, "LAN_AUTH_FILE", str(f2))
+    assert config.get_lan_auth() == ("user", "pa:ss"), "口令允许含冒号，首个冒号分隔"

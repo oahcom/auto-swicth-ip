@@ -9,7 +9,10 @@ import sys
 import os
 from pathlib import Path
 
-from config import CFG, get_singbox_secret
+import config
+from config import CFG, get_lan_auth, get_singbox_secret
+
+LAN_INBOUND_TAG = "mixed-lan"
 
 _OKZ_SUB_URL = os.environ.get("OKZ_SUB_URL")
 
@@ -484,6 +487,60 @@ def _load_warp_outbounds() -> list[dict]:
 
 
 
+def _build_inbounds(listen_port: int) -> list[dict]:
+    """环回入站（必有）+ 局域网入站（配了端口且有认证时才建）。
+
+    分成两个入站而非把一个入站改监听 0.0.0.0：环回口给 9router 与 daemon，
+    它们不该需要认证；局域网口给同网段的手机/其他机器，必须有认证。
+    单入站做不到「按来源决定要不要认证」。
+    """
+    inbounds = [{
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": "127.0.0.1",
+        "listen_port": listen_port,
+    }]
+    lan_port = CFG["singbox"].get("lan_port", 0)
+    if not lan_port:
+        return inbounds
+    auth = get_lan_auth()
+    if not auth:
+        print(f"  LAN 入站跳过：{config.LAN_AUTH_FILE} 缺失或格式非法（应为 username:password）；"
+              f"不建无认证的局域网监听", file=sys.stderr)
+        return inbounds
+    username, password = auth
+    inbounds.append({
+        "type": "mixed",
+        "tag": LAN_INBOUND_TAG,
+        "listen": "0.0.0.0",
+        "listen_port": lan_port,
+        "users": [{"username": username, "password": password}],
+    })
+    return inbounds
+
+
+def _build_lan_guard(inbounds: list[dict]) -> list[dict]:
+    """把局域网入站的来源限制在私网段，其余一律 reject。
+
+    sing-box 没有 inbound 级的 allowed_cidr 字段，只能在 route 层拦。放在路由
+    规则最前面 —— 一旦被后面的 resolve/sniff 处理过，判据就不再是纯来源地址。
+
+    判据取自实际建出的入站而非配置里的端口：端口开着但认证文件缺失时入站不会
+    生成，此时还留一条引用该 tag 的规则就是悬空规则（check 不报错，纯垃圾）。
+    """
+    if not any(i["tag"] == LAN_INBOUND_TAG for i in inbounds):
+        return []
+    return [{
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+            {"inbound": [LAN_INBOUND_TAG]},
+            {"source_ip_cidr": CFG["singbox"]["lan_cidrs"], "invert": True},
+        ],
+        "action": "reject",
+    }]
+
+
 def make_config(nodes: list[dict], listen_port: int = 0,
                 clash_port: int = 0, clash_secret: str = "",
                 include_h2: bool = False) -> dict:
@@ -510,17 +567,11 @@ def make_config(nodes: list[dict], listen_port: int = 0,
     warps = [w for w in _load_warp_outbounds() if w["tag"] not in node_tags]
     outbounds = nodes[:] + warps
     outbounds.append({"type": "direct", "tag": "direct"})
+    inbounds = _build_inbounds(listen_port)
 
     return {
         "log": {"level": "info", "timestamp": True},
-        "inbounds": [
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": listen_port,
-            },
-        ],
+        "inbounds": inbounds,
         "outbounds": outbounds + [
             {
                 "type": "selector",
@@ -563,6 +614,8 @@ def make_config(nodes: list[dict], listen_port: int = 0,
         },
         "route": {
             "rules": [
+                # 必须最先：来源判据要看到原始地址，不能被 sniff/resolve 影响
+                *_build_lan_guard(inbounds),
                 {"action": "sniff"},
                 # 必须先于 resolve：resolve 后 destination 变为 IP，domain 规则不再命中
                 *([{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"}] if warps else []),
@@ -645,4 +698,11 @@ if __name__ == "__main__":
         print(f"  - {n['tag']:50s} {n['type']:10s} {n['server']}:{n['server_port']}")
     print(f"total usable nodes: {len(nodes)}")
     print(f"clash API: 127.0.0.1:{args.clash_port}")
-    print(f"mixed port: 0.0.0.0:{args.port}")
+    print(f"mixed port: 127.0.0.1:{args.port}（仅环回）")
+    # 局域网入站是否建出由认证文件决定，不看配置端口：打印嘴边要讲实际结果，
+    # 否则「日志说要开」和「实际没开」会让人去查防火墙
+    lan_port = CFG["singbox"].get("lan_port", 0)
+    if lan_port and get_lan_auth():
+        print(f"mixed port: 0.0.0.0:{lan_port}（局域网，需认证）")
+    elif lan_port:
+        print(f"mixed port: 局域网入站未启用（认证文件 {config.LAN_AUTH_FILE} 缺失/非法）")
