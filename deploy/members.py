@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""把 config.py 的 warp.members 渲染成 shell 可读的行：tag port service dir flag。
+
+dir 由端口推导：1080 → usque，1081 → usque2 … 1099 → usque20（与现有部署一致）。
+这样新增隧道只改 config.py 一处，单元与注册目录自动跟上。
+flag 是 usque 的地址族开关（-6 = IPv6 MASQUE，否则空）。
+"""
+import json
+import os
+import sys
+
+PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT)
+from config import CFG  # noqa: E402
+
+
+def write_warp_outbound(path: str) -> None:
+    """生成 .warp/warp-outbound.json（gitignored，parse_subscription 的唯一数据源）。
+
+    全新 clone 时该文件不存在 → 生成的 sing-box 配置里没有 WARP 出口 →
+    `opencode-out` selector 整个缺失，daemon 所有换线都打空。所以这是部署必需步骤。
+    """
+    host = CFG["warp"]["socks_host"]
+    data = [{"type": "socks", "tag": m["tag"], "server": host,
+             "server_port": m["port"], "version": "5"} for m in CFG["warp"]["members"]]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--write-warp-outbound":
+        out = os.path.join(PROJECT, ".warp", "warp-outbound.json")
+        write_warp_outbound(out)
+        print(out)
+    else:
+        for m in CFG["warp"]["members"]:
+            n = m["port"] - 1079
+            print(m["tag"], m["port"], m["service"],
+                  "usque" if n == 1 else f"usque{n}", "-6" if m.get("ipv6") else "-")

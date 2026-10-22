@@ -21,9 +21,13 @@ STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 PROJECT_DIR = STATE_FILE.parent
 _BAD_NODES_FILE = PROJECT_DIR / ".bad_nodes.json"
 # 复用 daemon 的 bad-node 过期常量（单源真值），避免魔表。
+# 日志路径同样取自 config（ASIP_LOG_FILE 可覆盖），不写死目录。
+_LOG_FILE = str(PROJECT_DIR / "daemon.log")
 try:
     sys.path.insert(0, str(PROJECT_DIR))
     from config import BAD_NODES_TTL as _BAD_NODES_TTL
+    from config import CFG as _CFG
+    _LOG_FILE = _CFG["log_file"]
 except Exception:
     _BAD_NODES_TTL = 300
 
@@ -153,7 +157,7 @@ def run_check(name, context, state=None):
 
         elif name == "bypass_events":
             out = subprocess.run(
-                ["grep", "-a", "BYPASS\\|bypass", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
+                ["grep", "-a", "BYPASS\\|bypass", _LOG_FILE],
                 capture_output=True, text=True, timeout=5
             )
             count = len([l for l in out.stdout.splitlines() if today in l and ("enabled" in l.lower() or "BYPASS" in l.upper())][-10:])
@@ -162,7 +166,7 @@ def run_check(name, context, state=None):
         elif name == "bounded_pool_pressure":
             # Check if _BoundedPool ever logged queue full warning
             out = subprocess.run(
-                ["grep", "-a", "pool.*满\\|queue.*full", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
+                ["grep", "-a", "pool.*满\\|queue.*full", _LOG_FILE],
                 capture_output=True, text=True, timeout=5
             )
             count = len([l for l in out.stdout.splitlines() if today in l])
@@ -170,7 +174,7 @@ def run_check(name, context, state=None):
 
         elif name == "node_switch_distribution":
             out = subprocess.run(
-                ["bash", "-c", "grep -a '切' /home/administrator/dkk-projects/auto-switch-ip/daemon.log 2>/dev/null | grep -v '冷却\\|fallback\\|okz\\|标记死节点' | tail -50 | grep -oP '(?<=-> ).*?(?= |$)' | sort | uniq -c | sort -rn | head -10"],
+                ["bash", "-c", f"grep -a '切' {_LOG_FILE} 2>/dev/null | grep -v '冷却\\|fallback\\|okz\\|标记死节点' | tail -50 | grep -oP '(?<=-> ).*?(?= |$)' | sort | uniq -c | sort -rn | head -10"],
                 capture_output=True, text=True, timeout=10
             )
             dist = out.stdout.strip()
@@ -204,7 +208,7 @@ def run_check(name, context, state=None):
         elif name == "upstream_failure_rate":
             # Check recent upstream connect failures in upstream
             out = subprocess.run(
-                ["grep", "-a", "upstream connect fail", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
+                ["grep", "-a", "upstream connect fail", _LOG_FILE],
                 capture_output=True, text=True, timeout=5
             )
             lines = [l for l in out.stdout.splitlines() if today in l][-20:]  # last 20 today
@@ -213,7 +217,7 @@ def run_check(name, context, state=None):
         elif name == "repeat_failure_nodes":
             """Detect nodes that repeatedly die (>3× in last 10 cycles)."""
             out = subprocess.run(
-                ["grep", "-a", "死", "/home/administrator/dkk-projects/auto-switch-ip/daemon.log"],
+                ["grep", "-a", "死", _LOG_FILE],
                 capture_output=True, text=True, timeout=5
             )
             nodes = Counter()

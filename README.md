@@ -28,34 +28,76 @@
 
 ## 安装
 
+### 0. 前置条件
+
+- Linux x86_64（WSL2 可用），systemd 用户实例（`systemctl --user`），Python ≥ 3.10
+- 二进制由 `./deploy/fetch-binaries.sh` 自动获取并校验（详见 §0.1），无需手工下载
+- Python 依赖：`python3 -m pip install -r requirements.txt`
+- 9router 已在本机运行（`~/.9router/db/data.sqlite` 存在），或用 `NINE_ROUTER_DB_PATH` 指过去
+- WSL2 需 mirrored 网络模式（Windows 侧 `.wslconfig` 里 `networkingMode=Mirrored`），
+  否则 Windows 的 127.0.0.1 到不了 WSL 内的 7890
+
+订阅地址、路径都可覆盖：`cp .env.example .env` 后改，脚本与 systemd 单元都会读。
+
+### 0.1 二进制获取
+
 ```bash
-# 1. 生成 config（订阅地址见 config.py CFG["okz"]["sub_url"]）
-python3 parse_subscription.py                      # 用 OKZ_SUB_URL 环境变量
-# 或显式指定：
-python3 parse_subscription.py --urls "<订阅URL>" [更多源...]
+./deploy/fetch-binaries.sh            # 缺什么补什么；已存在且架构正确则跳过
+./deploy/fetch-binaries.sh --force    # 全部重下
+BIN_MIRROR=https://your-mirror ./deploy/fetch-binaries.sh   # GitHub release 不可达时
+```
 
-# 2. 启动 sing-box（先确认 config 已生成）
-./sing-box run -c singbox-config.json &
+下载按 **官方 release 的 sha256** 校验（版本与哈希钉在脚本的 `SHA256_ALL` 表里），
+不符即拒绝落盘。架构自动识别：amd64 / arm64。`install.sh` 检测到二进制缺失或
+ELF 架构不符时会自动调用它——所以从 arm64 机器 clone（仓库内是 amd64 构建）也能用。
 
-# 3. 改 9router 出口代理为 7890
+`.warp/usque/usque` 必须是**真实文件**，不能是链接：其余 `.warp/usqueN/` 里的
+`usque` 都指向它。脚本建链接时已排除主目录自身（`usque*/` 会匹配到 `usque/`，
+把真二进制换成指向自己的链接 → 20 条隧道全部 `ELOOP`）。
+
+### 1. 一键部署（推荐）
+
+```bash
+./deploy/install.sh          # 生成密钥 + 注册 20 条隧道 + 写 systemd 单元 + 启用
+```
+
+单元内容全部由 `config.py` 的 `warp.members` 推导，clone 到任何目录、任何用户都能跑，
+不需要手改 20 个 unit 文件。改了 `members` 之后：
+
+```bash
+./deploy/install.sh --units-only   # 只重生成单元，不重启
+```
+
+纯手动启动（不走 systemd）可用 `./start-auto-switch-ip.sh`。
+
+### 2. 把 9router 出口指到 7890
+
+`deploy/install.sh` 不碰 9router 的库。首次部署需要这一步（之后由 daemon 自行维护）：
+
+```bash
 python3 -c "
-import sqlite3, json
-con = sqlite3.connect('/home/administrator/.9router/db/data.sqlite')
-cur = con.cursor()
+import sqlite3, json, os
+db = os.environ.get('NINE_ROUTER_DB_PATH') or os.path.expanduser('~/.9router/db/data.sqlite')
+con = sqlite3.connect(db); cur = con.cursor()
 cur.execute('SELECT data FROM settings WHERE id=1')
 s = json.loads(cur.fetchone()[0])
 s['outboundProxyUrl'] = 'http://127.0.0.1:7890'
 cur.execute('UPDATE settings SET data = ? WHERE id=1', (json.dumps(s),))
-con.commit()
-con.close()
-print('done')
+con.commit(); con.close(); print('done')
 "
 
-# 4. 启动 daemon
-python3 daemon.py &
-
-# 5. 验证
+# 3. 验证
 curl -x http://127.0.0.1:7890 https://api.ipify.org  # 应返回非本地 IP
+```
+
+### 3. 检查部署
+
+```bash
+python3 -m pytest test_portability.py -q          # 路径/单元可移植性
+python3 -m pytest test_daemon_unit.py test_subscription_parse.py test_warp_refresh.py -q
+systemctl --user status auto-switch-ip.service
+curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
+     http://127.0.0.1:9090/proxies/opencode-out | head -c 200
 ```
 
 ## 配置

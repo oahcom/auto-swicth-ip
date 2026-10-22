@@ -14,7 +14,6 @@ from config import CFG, get_lan_auth, get_singbox_secret
 
 LAN_INBOUND_TAG = "mixed-lan"
 
-_OKZ_SUB_URL = os.environ.get("OKZ_SUB_URL")
 
 # ============= 解析订阅 =============
 def fetch_and_decode_sub(url: str) -> list[str]:
@@ -650,8 +649,12 @@ if __name__ == "__main__":
     ap.add_argument("--filter", default="", help="substring filter node name (case-insensitive)")
     args = ap.parse_args()
 
-    # 无参数时回退到 OKZ_SUB_URL 环境变量（README 的引导命令依赖此路径）
-    sub_urls = args.urls or ([args.url] if args.url else []) or ([_OKZ_SUB_URL] if _OKZ_SUB_URL else [])
+    # 无参数时回退到 CFG 里的全部订阅源（与 daemon 的每小时刷新同一份清单，
+    # 每项都可用环境变量覆盖）。README 的首装命令依赖此路径。
+    sub_urls = args.urls or ([args.url] if args.url else []) or [
+        u for u in (CFG.get(k, {}).get("sub_url", "")
+                    for k in ("okz", "hd23n", "dasho", "dasho_alt")) if u
+    ]
     if not sub_urls:
         print("ERROR: no subscription URLs provided (use --urls or --url)", file=sys.stderr)
         sys.exit(1)

@@ -1,0 +1,6 @@
+# 运行期依赖（系统 python3 即可，无需 venv）
+requests>=2.31
+urllib3>=2.0
+PyYAML>=6.0
+# 测试期
+pytest>=8.0

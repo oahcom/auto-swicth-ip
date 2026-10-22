@@ -1915,6 +1915,33 @@ New-NetFirewallRule -DisplayName 'auto-switch-ip LAN proxy (TCP 7891)' -Directio
 1. `domain_suffix` 写 `opencode.ai`，写 `.opencode.ai` 匹配不到裸域；
 2. 出站规则必须排在 `action: resolve` 之前，resolve 后 destination 变成 IP，domain 规则不再命中。
 
+## 12. 可移植性与部署（T-212~T-215）
+
+背景：此前所有路径写死 `/home/administrator/...`，23 个 systemd 单元只存在于本机
+`~/.config/systemd/user/`（不入库），换用户/换目录/换机器即失效。目标：clone 到任意
+目录、任意用户，跑 `./deploy/install.sh` 即可部署。
+
+| ID | 级别 | 测试点 | 方法 | 预期 |
+|----|------|--------|------|------|
+| T-212 | P0 | 项目内路径随仓库走 | `pytest test_portability.py -k resolve_inside_repo` | `binary`/`config_file`/`log_file` 均在 `PROJECT_DIR` 下；副本目录 + `HOME=/tmp/fakehome` 时仍指向副本 |
+| T-213 | P0 | 运行期文件无硬编码家目录 | `pytest test_portability.py -k hardcoded_home` | `config.py`/`daemon.py`/`parse_subscription.py`/`probe_warp.py`/`self_evolve_checkpoint.py`/两个脚本中 `/home/<user>` 出现 0 次 |
+| T-214 | P0 | 隧道成员可部署且单元全覆盖 | `pytest test_portability.py -k deployable`、`-k renders_every_member` | tag/port/service 各自唯一；`deploy/members.py` 输出行数 == `members` 长度，且地址族开关逐条一致 |
+| T-215 | P1 | 单元生成与现网一致（地址族不退化） | `SYSTEMD_DIR=$(mktemp -d) ./deploy/install.sh --units-only`，比对 `ExecStart` | 1080/1081/1082/1087/1088 含 `-6`，其余不含；目录与端口按 1080→`usque`、1081→`usque2` … 1099→`usque20` |
+| T-216 | P0 | `.env` 的 `$HOME/x` 两条启动路径同解 | `pytest test_portability.py -k expands_home`（`NINE_ROUTER_DB_PATH='$HOME/...'`） | 解析结果中无 `$`，且以真实家目录开头。**实测 systemd `EnvironmentFile` 不展开 `$HOME`，原样传入**（`journalctl` 显示 `VAL=$HOME/.some/path`），而 start 脚本 `source` 会展开 —— 展开必须落在 `_env_path`，否则同一份 `.env` 两种结果 |
+| T-217 | P0 | 符号链接不得覆盖主二进制 | `pytest test_portability.py -k links_main_usque` | `install.sh` 创建 `.warp/usqueN/usque` 时必须排除 `usque/` 自身。`for d in .warp/usque*/` **包含主目录**，实测沙箱内执行后 `cat .warp/usque/usque` → `Too many levels of symbolic links`，20 条隧道全部 ELOOP |
+| T-218 | P1 | 单元解释器不跟调用者 PATH 走 | `pytest test_portability.py -k pins_interpreter` | `PYBIN="${PYTHON:-/usr/bin/python3}"`；首版用 `command -v python3`，在 conda shell 里生成 `ExecStart=.../miniforge3/bin/python3`，与现网 `/usr/bin/env python3` 不一致且换 shell 即变 |
+| T-219 | P2 | 隧道注册失败必须让部署返回非零 | 人工：断网跑 `./deploy/install.sh` | 收集失败条数，末尾以非零退出。首版只打 `⚠` 继续 `enable`，注册失败的单元会立即退出并无脑重启，而部署看起来是成功的 |
+
+补充（自对抗审查记录）：并发会话改 `daemon.py` 期间，`test_warp_refresh.py` 有 2 例瞬时失败 —— 失败跑在 20:44，而 `daemon.py` 的 mtime 是 20:46，即跑的是半截改动；修复落盘后两次复跑均 **284 passed**。教训：混跑结果异常时先看被测文件 mtime 是否晚于测试启动时刻。
+
+补充（无自动用例，部署时人工核对）：
+
+- `.warp/warp-outbound.json` 缺失时 `install.sh` 自动从 `config.py` 重建；重建后
+  `parse_subscription` 产出的配置里必须有 `opencode-out` 与 20 条 `WARP-CF*`。
+- `install.sh` 的前置检查要报出缺失的 `sing-box` / `.warp/usque/usque` / Python 依赖，
+  而不是让单元静默起不来。
+- 密钥文件已存在时不得覆盖（覆盖会让正在跑的 sing-box 掉线）。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
@@ -1955,3 +1982,6 @@ New-NetFirewallRule -DisplayName 'auto-switch-ip LAN proxy (TCP 7891)' -Directio
 | v1.31 | 2026-10-22 | 模型探测不可用时的降级路径 (T-210)：整批探测**全部** `unreachable` 即判定探测通道失明 120s，期间 `_ip_history_is_truth()` 返回真、退回三档 + 复用窗口历史判据，并停止发探测（省配额）。实测依据：`daemon.log` 今日 2345 批探测中 13 批为整批 ≥3 条全 `unreachable`（最高 17/17），其中 16:50:18 那批 17 条同一秒全灭、重启换 IP 后 16:50:50~52 全部 OK —— 17 次隧道重启与配额全是白烧。判据必须是「整批」：单条 `unreachable` 是该出口真实瞬态，TTL 仍 2min。变异验证：删掉 `_ip_history_is_truth` 里的 `or _warp_probe_blind()` 后 `test_blind_channel_falls_back_to_ip_history` 必红 | T-210 |
 | v1.36 | 2026-10-22 | 地址被标脏即作废其全部探测结论 (T-221)：`_mark_warp_ip_used(blocked=True)` 后调 `_probe_cache_forget(ip)`，按 IP 跨线全清。实测依据：829 次换线里 170 次（20.5%）同一 IP 在 ≤120s 内被重新选中且 170/170 回到同一条线，其中 158 次（92.9%）所依据的 OK 早于标脏时刻 —— 旧证据把已烧地址重新认证成可用。控制变量排除混杂：缓存 OK 与实测 OK 各自组内，首用/复用的段寿命差 ≤10pp（缓存 7s vs 6s、实测 95s vs 60s），差异主要在**证据来源**（缓存 61~71% 的段 ≤10s 就死，实测只有 25%），不是「新地址 vs 旧地址」。变异验证：`_probe_cache_forget` 打成空操作后 verdict 回 `OK`，用例转红 | - |
 | v1.37 | 2026-10-22 | codex P2：在途探测晚回来会重新写回已作废的结论。`_probe_cache_forget` 只删已有条目，而 `_warp_model_usable` 的探测要 1.4~8.7s，期间地址被烧掉后那次 `_probe_cache_put` 照样把标脏前起手的 OK 补进台账、还更新 `last_ok_ts` 把已烧地址认证成「刚成功过」。加墓碑 `_PROBE_BLOCKED_AT[ip]` + `_probe_cache_put(started_at=)` 拒收；`_warp_model_usable` 收拒收信号后不记 `last_ok_ts` 并判该线不可用。变异验证：忽略 `started_at` 后 put 回 True、verdict 回 `OK`，用例转红 | codex review |
+| v1.33 | 2026-10-22 | 可移植性与部署 (T-212~T-215)：路径改为项目内相对 `config.py`、项目外以 `pwd` 家目录为基准 + 环境变量覆盖（订阅地址与 7 个路径键），删掉全部 `/home/administrator` 硬编码；新增 `deploy/install.sh` + `deploy/members.py`，由 `CFG["warp"]["members"]` 推导 23 个 systemd 单元（含 20 条隧道与地址族开关 `ipv6`）；`.warp/warp-outbound.json` 缺失时自动重建 —— 它被 gitignore 却是 WARP 出口的唯一依据，缺了全部换线打空；`parse_subscription.py` 无参数时回退到 CFG 全部订阅源（原来只认 `OKZ_SUB_URL`）；新增 `requirements.txt` / `.env.example` / `test_portability.py`。验证：`test_daemon_unit` + `test_subscription_parse` + `test_warp_refresh` + `test_portability` 共 **277 passed**（31.06s）；副本目录 + 假 HOME 下路径仍指向副本 | - |
+| v1.34 | 2026-10-22 | 自对抗审查补 5 项 (T-216~T-219)：**3 项是上一轮我自己引入的 P0** —— ①`_env_path` 不展开，而 systemd `EnvironmentFile` 实测不展开 `$HOME`（`journalctl` 里原样是 `$HOME/.some/path`），start 脚本 source 却展开，同一份 `.env` 两条路径两种结果 → 展开移进 `_env_path`；②README 的 `for d in .warp/usque*/` 匹配到主目录自身，沙箱实测把唯一二进制换成自指链接（`Too many levels of symbolic links`），20 条隧道全灭 → `install.sh` 建链接时排除 `usque/` 并加「主二进制不得是链接」前置检查；③`PYBIN` 用 `command -v python3`，conda shell 下生成 `miniforge3/bin/python3`，与现网 `/usr/bin/env python3` 不符且换 shell 就变 → 钉死 `/usr/bin/python3`（`PYTHON=` 可覆盖）。另两项：README 自述「仓库不含二进制」但 `sing-box` 实际被 git 跟踪（57MB）→ 更正为「usque 需自备、sing-box 随仓库」；`parse_subscription.py` 无参回退此前只认 `OKZ_SUB_URL`，与 Q1 记的「四条订阅源」不符 → 复核为已覆盖并写进用例。变异验证：撤掉展开 → T-216 红；去掉 `[ "$dir" = "usque" ]` 排除 → T-217 红；恢复后 `test_portability.py` 7 passed，四文件混跑 **284 passed** | 自对抗 |
+| v1.35 | 2026-10-22 | 补 T-219 落地：首版隧道注册失败只打 `⚠` 仍继续 `enable`，注册失败的单元启动即退出并无脑重启，而部署退出码为 0（假成功）。改为计数并在末尾非零退出；同时在 `--units-only` 的检查里加「主二进制存在且不是链接」 | 自对抗 |

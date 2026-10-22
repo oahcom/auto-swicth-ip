@@ -176,7 +176,9 @@ def check_fingerprint() -> int:
     """冻结的定义是否仍与 9router 源码逐字一致。源码升级后这里会先红。"""
     import os
     import re
-    src = "/home/administrator/.9router/open-sse/utils/opencodeFingerprint.js"
+    src = os.environ.get("OPENCODE_FINGERPRINT_JS") or os.path.join(
+        os.path.dirname(CFG["9router"]["db_path"]), "..", "open-sse/utils/opencodeFingerprint.js")
+    src = os.path.normpath(src)
     if not os.path.exists(src):
         print(f"✗ 未找到 9router 源码: {src}")
         return 1

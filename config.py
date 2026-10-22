@@ -5,14 +5,29 @@ daemon.py imports from this module.
 """
 
 import os
+import pwd
 import sys
 import time
 
-# ============= 配置常量 =============
-SECRET_FILE = "/home/administrator/.singbox_secret"
+# ============= 路径解析 =============
+# 项目内文件一律相对本文件定位（clone 到任何目录都能跑）；项目外的（9router、
+# secret）以家目录为基准 + 环境变量覆盖。不要写死 /home/<user>：`sudo -u` 启动时
+# HOME 可能仍是 /root，所以用 pwd 数据库里本用户的家目录而不是 ~。
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+HOME_DIR = pwd.getpwuid(os.getuid()).pw_dir
+
+
+def _env_path(name: str, default: str) -> str:
+    # 必须展开：`.env` 由 start 脚本 source（shell 展开）与 systemd 单元
+    # EnvironmentFile 读取（**不展开**，实测 `$HOME/x` 原样传入）。不在这里
+    # 统一展开，同一份 .env 在两条启动路径下会得到不同结果。
+    return os.path.expanduser(os.path.expandvars(os.environ.get(name) or default))
+
+
+SECRET_FILE = _env_path("SINGBOX_SECRET_FILE_PATH", os.path.join(HOME_DIR, ".singbox_secret"))
 # 局域网代理认证，内容一行 `username:password`（mode 600，gitignored）。
 # 文件不存在 = 不生成 LAN 入站：无认证的 mixed 入站等于开放中继。
-LAN_AUTH_FILE = "/home/administrator/.singbox_lan_auth"
+LAN_AUTH_FILE = _env_path("SINGBOX_LAN_AUTH_FILE_PATH", os.path.join(HOME_DIR, ".singbox_lan_auth"))
 
 # Module-level cache for secret + mtime
 _SINGBOX_SECRET: str = ""
@@ -68,15 +83,15 @@ if not get_singbox_secret():
 
 CFG = {
     "9router": {
-        "db_path": "/home/administrator/.9router/db/data.sqlite",
+        "db_path": _env_path("NINE_ROUTER_DB_PATH", os.path.join(HOME_DIR, ".9router/db/data.sqlite")),
         "base": "http://127.0.0.1:20127",
     },
     "singbox": {
         "clash_api": "http://127.0.0.1:9090",
         "secret": "",  # 运行时通过 get_singbox_secret() 刷新, 此处留空占位
         "selector": "proxy",
-        "binary": "/home/administrator/dkk-projects/auto-switch-ip/sing-box",
-        "config_file": "/home/administrator/dkk-projects/auto-switch-ip/singbox-config.json",
+        "binary": _env_path("SINGBOX_BINARY", os.path.join(PROJECT_DIR, "sing-box")),
+        "config_file": _env_path("SINGBOX_CONFIG", os.path.join(PROJECT_DIR, "singbox-config.json")),
         "startup_grace_sec": 10,  # 增加到 10s，给 sing-box 更多初始化时间
         "max_restart_attempts": 3,
         "mixed_port": 7890,
@@ -88,22 +103,25 @@ CFG = {
         # 免得这个入站被当成可从任何地方拨入的开放代理。
         "lan_cidrs": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
     },
+    # 订阅地址含账户 token，全部可用环境变量覆盖（换用户/换订阅源不必改代码）。
+    # 默认值保留是为了本机开箱即用；部署到别人的机器时设在 environ 或 systemd
+    # EnvironmentFile 里，别提交自己的 token。
     "okz": {
         "proxy_url": "http://127.0.0.1:6696",
         "name": "okz",
-        "sub_url": "https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=aa0f63eb1e9a65d23fcae0dcc8a867ab",
+        "sub_url": _env_path("OKZ_SUB_URL", "https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=aa0f63eb1e9a65d23fcae0dcc8a867ab"),
     },
     "hd23n": {
         "name": "hd.23n.club",
-        "sub_url": "http://hd.23n.club/api/v1/client/subscribe?token=5b4815ade93497224153e0bb0ae60cc6",
+        "sub_url": _env_path("HD23N_SUB_URL", "http://hd.23n.club/api/v1/client/subscribe?token=5b4815ade93497224153e0bb0ae60cc6"),
     },
     "dasho": {
         "name": "dasho.pqjc.site",
-        "sub_url": "https://dasho.pqjc.site/api/v1/pq/d6b05bf5edc2d676335d0726371868bf",
+        "sub_url": _env_path("DASHO_SUB_URL", "https://dasho.pqjc.site/api/v1/pq/d6b05bf5edc2d676335d0726371868bf"),
     },
     "dasho_alt": {
         "name": "dasho.xn--cp3a08l.com",
-        "sub_url": "https://dasho.xn--cp3a08l.com/api/v1/pq/d6b05bf5edc2d676335d0726371868bf",
+        "sub_url": _env_path("DASHO_ALT_SUB_URL", "https://dasho.xn--cp3a08l.com/api/v1/pq/d6b05bf5edc2d676335d0726371868bf"),
     },
     "intervals": {
         # 主循环轮询节奏。不是节流 —— 循环体里已经没有阻塞 I/O，错误统计又按
@@ -150,16 +168,19 @@ CFG = {
     "warp": {
         "selector": "opencode-out",
         "socks_host": "127.0.0.1",
+        # ipv6=True → 隧道用 `usque socks -6`（MASQUE over IPv6，出口落在 SJC）；
+        # 其余走 v4（出口 LAX）。这不是装饰：换协议版本即换出口地理位置，
+        # 部署脚本据此生成 systemd ExecStart，别删。
         "members": [
-            {"tag": "WARP-CF", "port": 1080, "service": "usque-warp.service"},
-            {"tag": "WARP-CF-B", "port": 1081, "service": "usque-warp-b.service"},
-            {"tag": "WARP-CF-C", "port": 1082, "service": "usque-warp-c.service"},
+            {"tag": "WARP-CF", "port": 1080, "service": "usque-warp.service", "ipv6": True},
+            {"tag": "WARP-CF-B", "port": 1081, "service": "usque-warp-b.service", "ipv6": True},
+            {"tag": "WARP-CF-C", "port": 1082, "service": "usque-warp-c.service", "ipv6": True},
             {"tag": "WARP-CF-D", "port": 1083, "service": "usque-warp-d.service"},
             {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
             {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service"},
             {"tag": "WARP-CF-G", "port": 1086, "service": "usque-warp-g.service"},
-            {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service"},
-            {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service"},
+            {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service", "ipv6": True},
+            {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service", "ipv6": True},
             {"tag": "WARP-CF-J", "port": 1089, "service": "usque-warp-j.service"},
             # 2026-10-22 扩到 20 条。WHY：扩容前的实测是在排空并发上打满的 ——
             # 换线间隔 p50 8s（高频时 1.8 次/分钟），被切下的线排空 p50 68s /
@@ -352,7 +373,7 @@ CFG = {
         # 把「首错→换线生效」拉到 p90=25s / max=206s。
         "fallback_idle_wait_sec": 3,
     },
-    "log_file": "/home/administrator/dkk-projects/auto-switch-ip/daemon.log",
+    "log_file": _env_path("ASIP_LOG_FILE", os.path.join(PROJECT_DIR, "daemon.log")),
     "log_format": "%Y-%m-%d %H:%M:%S",
 }
 

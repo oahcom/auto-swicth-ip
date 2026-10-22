@@ -17,7 +17,9 @@ CLASH_API = "http://127.0.0.1:9090"
 from config import get_singbox_secret
 OKZ_PROXY = "http://127.0.0.1:6696"
 SINGBOX_PROXY = "http://127.0.0.1:" + os.environ.get("SINGBOX_PORT", "7890")
-NROUTER_DB = "/home/administrator/.9router/db/data.sqlite"
+NROUTER_DB = os.environ.get("NINE_ROUTER_DB_PATH") or os.path.join(
+    os.path.expanduser("~"), ".9router/db/data.sqlite")
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 TEST_URL = "https://www.gstatic.com/generate_204"
 IP_CHECK_URL = "https://api.ipify.org"
 
@@ -239,10 +241,10 @@ def test_9_daemon_log_has_rotations():
     print("\n[测试 9] Daemon 切换历史")
     try:
         # 读 daemon.log（daemon 主日志：切换、健康检查、心跳）
-        with open("/home/administrator/dkk-projects/auto-switch-ip/daemon.log", "r") as f:
+        with open(os.path.join(PROJECT_DIR, "daemon.log"), "r") as f:
             daemon_lines = f.read()
         # 读 singbox.log（sing-box 启动/重启日志）
-        with open("/home/administrator/dkk-projects/auto-switch-ip/singbox.log", "r") as f:
+        with open(os.path.join(PROJECT_DIR, "singbox.log"), "r") as f:
             singbox_lines = f.read()
 
         # daemon.log 模式：
@@ -273,9 +275,9 @@ def test_10_9router_e2e():
         s = json.loads(c.execute('SELECT data FROM settings WHERE id=1').fetchone()[0])
         cli_token_req = subprocess.run([
             "python3", "-c",
-            "import hashlib; "
-            "m=open('/home/administrator/.9router/machine-id').read().strip(); "
-            "c=open('/home/administrator/.9router/auth/cli-secret').read().strip(); "
+            "import hashlib, os; "
+            "m=open(os.path.expanduser('~/.9router/machine-id')).read().strip(); "
+            "c=open(os.path.expanduser('~/.9router/auth/cli-secret')).read().strip(); "
             "print(hashlib.sha256((m+'***'+c).encode()).hexdigest()[:16])"
         ], capture_output=True, text=True, timeout=5)
         token = cli_token_req.stdout.strip()

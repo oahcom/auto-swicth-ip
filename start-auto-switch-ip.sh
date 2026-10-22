@@ -1,14 +1,17 @@
 #!/bin/bash
-# WSL2 启动时自动拉起 sing-box + auto-switch-ip daemon
-# proxy_429 已由 proxy-global.js 替代（9router 进程内 429 重试 + BYPASS）
+# 拉起 sing-box + auto-switch-ip daemon（WSL2 启动钩子；systemd 托管时不走这里）
+# proxy_429 已由 9router 进程内重试替代（原 proxy-global.js 已移除）
 set -euo pipefail
 
-SINGBOX="/home/administrator/dkk-projects/auto-switch-ip/sing-box"
-CONFIG="/home/administrator/dkk-projects/auto-switch-ip/singbox-config.json"
-DAEMON="/home/administrator/dkk-projects/auto-switch-ip/daemon.py"
-LOG_DIR="/home/administrator/dkk-projects/auto-switch-ip"
+# 自身定位，不写死安装目录：脚本在项目根，clone 到哪都能用。
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SINGBOX="$DIR/sing-box"
+CONFIG="${SINGBOX_CONFIG:-$DIR/singbox-config.json}"
+DAEMON="$DIR/daemon.py"
 
-export OKZ_SUB_URL="https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=aa0f63eb1e9a65d23fcae0dcc8a867ab"
+# 订阅地址走环境变量（token 不入库）。批量启动时由调用方 export，
+# 或放在 $DIR/.env（gitignored）里。
+if [ -f "$DIR/.env" ]; then set -a; . "$DIR/.env"; set +a; fi
 
 # Wait for networking
 for i in $(seq 1 15); do
@@ -21,7 +24,7 @@ done
 # 先生成（配置不入库，全新 clone / 误删即此状态）
 if [ ! -f "$CONFIG" ]; then
     echo "config missing, generating from subscription..."
-    python3 "$LOG_DIR/parse_subscription.py" --out "$CONFIG" \
+    python3 "$DIR/parse_subscription.py" --out "$CONFIG" \
         || echo "WARN: config generation failed; daemon will retry on startup" >&2
 fi
 
@@ -29,18 +32,18 @@ if ! pgrep -f "sing-box run" >/dev/null; then
     if [ ! -f "$CONFIG" ]; then
         echo "ERROR: $CONFIG absent and could not be generated; skipping sing-box" >&2
     else
-        nohup "$SINGBOX" run -c "$CONFIG" > "$LOG_DIR/singbox.log" 2>&1 &
+        nohup "$SINGBOX" run -c "$CONFIG" > "$DIR/singbox.log" 2>&1 &
         sleep 1
         if kill -0 $! 2>/dev/null; then
             echo "started sing-box PID $!"
         else
-            echo "ERROR: sing-box exited immediately; see $LOG_DIR/singbox.log" >&2
+            echo "ERROR: sing-box exited immediately; see $DIR/singbox.log" >&2
         fi
     fi
 fi
 
 # Start daemon if not running
 if ! pgrep -f "daemon.py" >/dev/null; then
-    nohup python3 "$DAEMON" > "$LOG_DIR/daemon.out" 2>&1 &
+    nohup python3 "$DAEMON" > "$DIR/daemon.out" 2>&1 &
     echo "started daemon PID $!"
 fi

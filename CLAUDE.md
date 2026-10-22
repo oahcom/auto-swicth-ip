@@ -674,6 +674,64 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `test_subscription_parse.py` | 522 | 订阅解析回归单测（无网络，覆盖 vless/trojan transport/单源失败/rc 检查/局域网入站与来源守卫）|
 | `test_warp_refresh.py` | 296 | WARP 刷新/换线门控单测（22 个用例）|
 | `verify_rotation.py` | 345 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），`--quick` 约 20s |
+| `deploy/install.sh` | — | 部署脚本：生成密钥 + 注册 20 条隧道 + 由 config.py 推导并写入 23 个 systemd 单元 + enable |
+| `deploy/members.py` | — | 把 `CFG["warp"]["members"]` 渲染成 `tag port service dir family`，供 install.sh 用 |
+| `test_portability.py` | — | 可移植性回归（4 例）：路径不越出仓库、运行期文件无硬编码家目录、成员可部署、单元渲染全覆盖 |
+| `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
+
+## 部署与可移植性（2026-10-22）
+
+**问题**：此前所有路径写死 `/home/administrator/...`，systemd 单元只存在于本机的
+`~/.config/systemd/user/`（不入库），换用户/换目录/换机器直接失效。
+
+**现在**：
+
+| 类别 | 规则 | 覆盖方式 |
+|------|------|----------|
+| 项目内文件 | 相对 `config.py` 自身定位 | `PROJECT_DIR`，无环境变量也正确 |
+| 项目外文件 | 家目录为基准 | `pwd.getpwuid(os.getuid()).pw_dir`（不用 `~`：`sudo -u` 时 HOME 可能是 /root） |
+| 订阅地址 | 环境变量优先 | `OKZ_SUB_URL` / `HD23N_SUB_URL` / `DASHO_SUB_URL` / `DASHO_ALT_SUB_URL` |
+| 路径覆盖 | 环境变量优先 | `NINE_ROUTER_DB_PATH` / `SINGBOX_SECRET_FILE_PATH` / `SINGBOX_LAN_AUTH_FILE_PATH` / `SINGBOX_BINARY` / `SINGBOX_CONFIG` / `ASIP_LOG_FILE` / `OPENCODE_FINGERPRINT_JS` |
+
+`.env`（gitignored，模板见 `.env.example`）同时被 `start-auto-switch-ip.sh` 与
+`auto-switch-ip.service` 的 `EnvironmentFile=-` 读取。
+
+**部署单元由代码推导，不手写**：`deploy/install.sh` 从 `config.py` 的
+`warp.members` 生成 20 条隧道单元 + `auto-switch-ip.service` + `asi-selfcheck.{service,timer}`。
+单元名必须与 `members[].service` 一致，否则 daemon 的 `systemctl restart` 打空。
+改 `members` 后跑 `./deploy/install.sh --units-only` 重生成（不重启）。
+
+**`members[].ipv6`**：`True` → 期望走 `usque socks -6`（MASQUE over IPv6，出口 SJC），
+其余走 v4（出口 LAX）。这不是装饰 —— 换协议版本即换出口地理位置，实测 5 条 `-6` 线
+不可省。
+
+**但 `ipv6` 只是「期望」，不是「必须」（`deploy/usque-launch.sh`）**：单元不再直接
+`exec usque`，而是经启动包装脚本，由它在启动瞬间用 `ip -6 route get 2606:4700:103::2`
+判断本机能不能路由到 Cloudflare 的 v6 端点，不能就自动降级走 v4。判定按路由而不按握手：
+没有 v6 默认路由时内核在 sendmsg 就失败，usque 仍每秒重试一次。
+
+WHY 必须在单元层判：地址族是 usque 的进程启动参数，运行中改不了；而 daemon 每次刷线
+都 restart 单元，于是判一次就跟着网络变化自动纠正，`daemon.py` 不必知道 `ipv6` 字段
+（它至今零处引用）。实测 2026-10-22 20:00~21:15 WSL 侧无 v6 路由（eth1 `accept_ra=0`，
+手机热点不上 v6），5 条 `-6` 线 30 分钟内被拉起 44~57 次、零次成功，daemon 日志
+5 分钟 92 条「出口探测失败」里 91 条来自这 5 条。加包装后同一批线 21:16 起
+立即连通（各拿到出口 IP），失败归零。
+
+诊断：`journalctl --user -u 'usque-warp*' | grep usque-launch` 每行给出
+`期望=-6 实走=v4` 或 `实走=v6` —— 这是事后判断某条线当时走哪个族的唯一依据。
+
+**`.warp/warp-outbound.json` 必须存在**：它被 gitignore（内含隧道结构），
+却是 `parse_subscription` 生成 WARP 出口的唯一依据。缺了它 → 配置里没有
+`opencode-out` selector → daemon 所有换线都打空。`deploy/members.py
+--write-warp-outbound` 从 `config.py` 重建它，install.sh 在缺失时自动调用。
+
+**仓库不含两个外部二进制**（`sing-box`、`.warp/usque/usque`）：前者是 Linux x64
+二进制（1.13.0），后者是第三方 MASQUE 客户端。`install.sh` 前置检查会报缺哪个。
+`.warp/usqueN/usque` 是指向 `../usque/usque` 的符号链接，clone 后需重建
+（`deploy/install.sh` 的注册步骤会创建目录，注册时需先建好符号链接）。
+
+**`parse_subscription.py` 无参数时回退到 `config.py` 的全部订阅源**（原来只认
+`OKZ_SUB_URL` 环境变量），与 daemon 每小时刷新同一份清单。
 
 ## provider 多样性约束（2026-07-08 确认）
 
