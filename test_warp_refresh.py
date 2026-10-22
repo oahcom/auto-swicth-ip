@@ -33,11 +33,19 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     # 探测台账是进程级全局：不隔离则前一个用例探过的 IP 在本用例被当成
-    # 「本会话已探过」而跳过真实探测，台账相关断言全落空。
-    monkeypatch.setattr(daemon, "_WARP_PROBE_EPOCH", {})
+    # 「TTL 内已探过」而跳过真实探测，台账相关断言全落空。
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
     # 模型探测通过会记 last_ok_ts 并落盘，不隔离就写进生产 .warp_ip_used.json。
     monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(tmp_path / "warp_ip_used.json"))
+    # 换线三件套是裸全局，`reconnect_warp` 直接赋值、不经 monkeypatch：
+    # 不在这里兜住，本文件跑完后它们停在 time.time() 量级，随后导入
+    # test_daemon_unit 的换线用例用假时钟 now=1000 就把「生效间隔硬闸」
+    # (now - switch_ok < min_switch_gap_sec) 恒判成立，5 个用例静默全挂。
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 0.0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0.0)
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0.0)
+    # 换线成功会起一个 20s 后真调 systemctl 的补刷线程，monkeypatch 撤了它照跑。
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
 
 
 def test_offline_refresh_count_starts_when_leaving_and_resets_on_return(monkeypatch):
@@ -58,28 +66,89 @@ def test_offline_refresh_count_starts_when_leaving_and_resets_on_return(monkeypa
 
 
 def test_quota_verdict_turns_line_into_refresh_candidate(monkeypatch):
-    """探到 quota 的线必须被判为低质并进入预热候选，否则永不重启、代次永不动。
+    """探到 quota 的线必须被判为低质并进入预热候选，否则永不重启。
 
     实测故障：CF-J 缓存恒报「已探过: quota（跳过）」，但 75 分钟无一次重启 ——
     quota 结论只进台账不出台账，`_warp_ip_needs_refresh` 在模型模式下不认它。
     """
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
-    ip = "2a09:bac5:test::quota-ip"
+    ip = "2a09:bac5:1ef9:281e::1"
     assert daemon._warp_ip_needs_refresh(ip, 1000.0) is False  # 无结论：全新地址不算低质
-    daemon._probe_cache_put("W1", ip, "quota")
-    assert daemon._warp_ip_needs_refresh(ip, 1000.0, "W1") is True, \
-        "本会话实测 quota 必须判为低质"
-    assert "quota" in daemon._warp_ip_refresh_reason(ip, 1000.0, "W1")
+    daemon._probe_cache_put("W1", ip, "quota", now=1000.0)
+    assert daemon._probe_cache_verdict("W1", ip, 1001.0) == "quota"
+    assert daemon._warp_ip_needs_refresh(ip, 1001.0, "W1") is True, \
+        "本线实测 quota 必须判为低质"
+    assert "quota" in daemon._warp_ip_refresh_reason(ip, 1001.0, "W1")
 
-    # 会话代次前进后结论作废：同一 IP 重新可探，也不再凭旧结论判低质
-    daemon._bump_probe_epoch("W1")
-    assert daemon._probe_cache_verdict("W1", ip) is None
-    assert daemon._warp_ip_needs_refresh(ip, 1000.0, "W1") is False
+    # 长 TTL 过后结论作废：同一地址重新可探，也不再凭旧结论判低质
+    assert daemon._probe_cache_verdict("W1", ip, 1000.0 + 21601) is None
+    assert daemon._warp_ip_needs_refresh(ip, 1000.0 + 21601, "W1") is False
+
+
+def test_probe_cache_never_bleeds_across_ips_in_same_segment(monkeypatch):
+    """台账按 /128 键控：同段别的 IP 不得沾光，无论正向还是负向。
+
+    依据控制变量后的实测：已烧段里的**全新** /128 只有 0.0% OK（n=2469），
+    但未烧段里的全新 /128 也只有 2.0% OK（n=152）—— 段不是充分条件，
+    判死的是那个地址自己，所以段级聚合既会误杀也会误放。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_transient_ttl_sec", 120)
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_persistent_ttl_sec", 21600)
+    ip1 = "2a09:bac5:1ef9:281e::1"
+    ip2 = "2a09:bac5:1ef9:281e::ffff"   # 同段别的 IP
+    ip3 = "2a09:bac5:aaaa:bbbb::1"      # 异段
+
+    daemon._probe_cache_put("W1", ip1, "quota", now=1000.0)
+    assert daemon._probe_cache_verdict("W1", ip1, 1001.0) == "quota"
+    assert daemon._probe_cache_verdict("W1", ip2, 1001.0) is None, \
+        "同段别的地址没被实测过，不能判死"
+    assert daemon._probe_cache_verdict("W1", ip3, 1001.0) is None
+    assert daemon._probe_cache_verdict("W2", ip1, 1001.0) is None, "按线隔离"
+
+    daemon._probe_cache_put("W1", ip2, "OK", now=2000.0)
+    assert daemon._probe_cache_verdict("W1", ip2, 2001.0) == "OK"
+    assert daemon._probe_cache_verdict("W1", ip1, 2001.0) == "quota", \
+        "别的 IP 的 OK 不能给已判死的地址平反"
+
+
+def test_probe_cache_ttl_by_persistence_not_by_polarity(monkeypatch):
+    """TTL 按**结论持久性**分档，不按好坏：quota/flagged 6h，其余（含 err）2min。
+
+    探测侧故障（err/unreachable）不是地址的长期状态：日志实测同一地址 err 后
+    66s 就 OK。给它们长 TTL 等于一次探测抖动锁死健康线 6h（重连已不作废台账）。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_transient_ttl_sec", 120)
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_persistent_ttl_sec", 21600)
+    ok_ip = "2a09:bac5:1ef9:281e::1"
+    quota_ip = "2a09:bac5:1ef9:281e::2"
+    err_ip = "2a09:bac5:1ef9:281e::3"
+    daemon._probe_cache_put("W1", ok_ip, "OK", now=1000.0)
+    daemon._probe_cache_put("W1", quota_ip, "quota", now=1000.0)
+    daemon._probe_cache_put("W1", err_ip, "err", now=1000.0)
+    # 瞬时档
+    assert daemon._probe_cache_verdict("W1", ok_ip, 1120.0) == "OK"      # 边界内
+    assert daemon._probe_cache_verdict("W1", ok_ip, 1121.0) is None      # 过期
+    assert daemon._probe_cache_verdict("W1", err_ip, 1121.0) is None, \
+        "探测侧故障不得按地址持久结论缓存 6h"
+    # 持久档
+    assert daemon._probe_cache_verdict("W1", quota_ip, 22599.0) == "quota"
+    assert daemon._probe_cache_verdict("W1", quota_ip, 22601.0) is None
+
+
+def test_probe_cache_reprobe_overwrites_verdict(monkeypatch):
+    """同一地址重新实测覆盖旧结论（OK 复现率仅 43~95%，不可长期采信）。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_transient_ttl_sec", 120)
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_persistent_ttl_sec", 21600)
+    ip = "2a09:bac5:1ef9:281e::1"
+    daemon._probe_cache_put("W1", ip, "OK", now=1000.0)
+    daemon._probe_cache_put("W1", ip, "quota", now=1100.0)
+    assert daemon._probe_cache_verdict("W1", ip, 1101.0) == "quota"
 
 
 class ScriptedBytes:
-    """按脚本返回 _warp_line_bytes 的值；脚本耗尽后返回 None（模拟查询失败）。
+    """按脚本返回 _warp_line_stats 的 (字节, 等首字节数)；耗尽后返回 None。
 
+    只写数字时按「无等待连接」处理，让原先只关心字节的用例保持原义。
     末值不重复投递 —— 重复会让「恒忙」被误读成「闲」。
     """
 
@@ -153,6 +222,18 @@ def test_line_busy_when_request_awaits_first_byte(monkeypatch):
     assert daemon.warp_line_busy("WARP-CF") is True
 
 
+def test_line_busy_when_young_conn_has_bytes_but_stalled(monkeypatch):
+    """连接已收过数据（download>0）但正处静默期 → 仍须判忙。
+
+    12:22 实测：WARP-CF-H 被重启时线上 4 条连接各收 ~1MB、年龄 94~116s，
+    12s 窗口内零增长。旧判据要求 download==0 才计入等待连接，这 4 条全部
+    漏检，重启把它们掐断 —— 客户端收到的正是 upstream connection lost。
+    """
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([(5_000_000, 4), (5_000_000, 4)]))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    assert daemon.warp_line_busy("WARP-CF-H") is True
+
+
 def test_line_idle_despite_long_lived_idle_connections(monkeypatch):
     """连接数不是判据：长寿空闲连接不得把线钉死在「忙」上。
 
@@ -215,7 +296,7 @@ def test_retry_loop_refreshes_after_first_busy_round(monkeypatch):
     """首轮忙不该终止补刷 —— 这正是 19:00:04 丢失刷新的根因。"""
     st = {"wait": 0, "refresh": 0}
 
-    def fake_wait(member):
+    def fake_wait(member, **kw):
         st["wait"] += 1
         return st["wait"] > 1
 
@@ -238,7 +319,7 @@ def test_retry_loop_keeps_trying_while_busy(monkeypatch):
     """恒忙时必须重试多次，而非一次即弃。"""
     st = {"wait": 0}
     monkeypatch.setattr(daemon, "_wait_warp_idle",
-                        lambda m: (st.__setitem__("wait", st["wait"] + 1), False)[1])
+                        lambda m, **kw: (st.__setitem__("wait", st["wait"] + 1), False)[1])
     monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m, **kw: None)
 
     clock = {"t": 0.0}
@@ -255,7 +336,7 @@ def test_retry_loop_keeps_trying_while_busy(monkeypatch):
 def test_retry_loop_keeps_trying_when_refresh_yields_no_fresh_ip(monkeypatch):
     """空闲但刷不出新鲜地址时也要继续重试。"""
     st = {"refresh": 0}
-    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
+    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m, **kw: True)
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
                         lambda m: (st.__setitem__("refresh", st["refresh"] + 1), None)[1])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-OTHER")
@@ -279,7 +360,7 @@ def test_retry_loop_aborts_when_member_becomes_active(monkeypatch):
     放在循环开头挡不住「等空闲的 40s 内才变成出口」那一段。
     """
     st = {"refresh": 0}
-    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
+    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m, **kw: True)
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
                         lambda m: (st.__setitem__("refresh", st["refresh"] + 1), True)[1])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-C")
@@ -409,23 +490,23 @@ def test_model_probe_maps_quota_to_unusable(monkeypatch):
     assert daemon._warp_model_usable({"tag": "W2", "port": 1081}, "ip2") is True
 
 
-def test_probe_runs_at_most_once_per_ip_per_session(monkeypatch):
-    """同一会话同一 IP 只探一次，避免重复烧配额；重启隧道后允许再探。"""
+def test_probe_runs_at_most_once_per_address_within_ttl(monkeypatch):
+    """同一 /128 在 TTL 内只探一次（避免重复烧配额）；换地址必须重探。"""
     import probe_warp
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_persistent_ttl_sec", 21600)
     calls = []
     monkeypatch.setattr(probe_warp, "probe",
                         lambda port, timeout: (calls.append(port), ("quota", 0.1, ""))[1])
     m = {"tag": "W1", "port": 1080}
-    assert daemon._warp_model_usable(m, "ip") is False
-    assert daemon._warp_model_usable(m, "ip") is False
-    assert len(calls) == 1, f"同会话同 IP 只应探 1 次，实际 {len(calls)}"
+    assert daemon._warp_model_usable(m, "2a09:bac5:1ef9:281e::1") is False
+    assert daemon._warp_model_usable(m, "2a09:bac5:1ef9:281e::1") is False
+    assert len(calls) == 1, f"同一地址同 TTL 只应探 1 次，实际 {len(calls)}"
 
-    daemon._bump_probe_epoch("W1")
-    assert daemon._warp_model_usable(m, "ip") is False
-    assert len(calls) == 2, f"重启后同 IP 应允许再探，实际 {len(calls)}"
+    assert daemon._warp_model_usable(m, "2a09:bac5:1ef9:281e::2") is False
+    assert len(calls) == 2, f"同段别的地址没实测过，必须自己探，实际 {len(calls)}"
 
-    assert daemon._warp_model_usable(m, "ip-other") is False
-    assert len(calls) == 3, f"新 IP 应各探一次，实际 {len(calls)}"
+    assert daemon._warp_model_usable(m, "2a09:bac5:aaaa:bbbb::1") is False
+    assert len(calls) == 3, f"异段地址同样各探一次，实际 {len(calls)}"
 
 
 def test_model_mode_ignores_ip_history(monkeypatch):
@@ -478,7 +559,7 @@ def test_retry_loop_restarts_line_whose_ip_never_served(monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {"WARP-CF-C": {"ip": "dead-ip"}})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {"dead-ip": {"ts": 1000.0}})
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
-    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
+    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m, **kw: True)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-OTHER")
     refreshed = []
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
@@ -492,7 +573,7 @@ def test_retry_loop_never_restarts_brand_new_ip(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {"WARP-CF-C": {"ip": "new-ip"}})
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
-    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: True)
+    monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m, **kw: True)
     refreshed = []
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
                         lambda m, **kw: (refreshed.append(m["tag"]), "x")[1])
@@ -701,3 +782,34 @@ def test_real_error_after_new_exit_is_still_marked(monkeypatch):
     assert marked == [("ip-new", True)], f"新出口自己的错误必须标脏，实际 {marked}"
 
 
+
+
+def test_busy_window_covers_measured_sse_silence():
+    """判闲窗口必须长于实物流式响应的 token 间隔。
+
+    实测（N=30 连接，100s 采样，2026-10-22）两次字节增长之间的静默：
+    p50=7s / p90=9.1s / max=10.1s。窗口 2s 时一半以上的采样落在静默期，
+    把仍在传流的线判成空闲并立即重启 —— 9router 报 upstream connection lost。
+    """
+    assert C.CFG["warp"]["busy_window_sec"] >= 10.1, "窗口须覆盖实测最长 token 静默"
+
+
+def test_reclaim_worker_leaves_busy_line_alone(monkeypatch):
+    """线还在传数据时，脏线守护必须让出而不是重启它。
+
+    旧实现 while 循环 600s 内反复重启（实测 26min 内 661 次 systemd Started），
+    每次都掐断在途 SSE。让出后应登记冷却，避免守护每 5s 重派一次探测。
+    """
+    monkeypatch.setattr(daemon, "_WARP_BUSY_UNTIL", {})
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda *a, **k: "2a09:bac5::1")
+    monkeypatch.setattr(daemon, "_warp_ip_needs_refresh", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: None)
+    monkeypatch.setattr(daemon, "warp_line_busy", lambda tag, window=None: True)
+    restarted = []
+    monkeypatch.setattr(daemon, "_refresh_idle_warp",
+                        lambda m, reason_hint=None: restarted.append(m) or "x")
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    member = {"tag": "WARP-CF-B", "port": 1081, "service": "usque-warp-b"}
+    daemon._reclaim_dirty_warp_worker(member)
+    assert restarted == [], "在途线上不允许重启"
+    assert daemon._WARP_BUSY_UNTIL.get("WARP-CF-B", 0) > time.time() - 1

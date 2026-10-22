@@ -134,21 +134,36 @@ CFG = {
         # 换线成本远低于等待成本。
         "block_threshold": 1,
         "rate429_threshold": 1,
-        # 主动轮换：当前出口服务满 N 条请求就换线，不等 403 —— 报错后的切换
-        # 已经冲断了在途对话。
-        # 取 60：实测 61 段（初错后自动换线）里 30% 零错误、每段成功中位 14 条，
-        # 说明多数出口在按请求数换掉之前还能继续服务；按 20 条换线等于把可用
-        # 地址提前烧掉，而 IP 池只有 67 个 /64，复用过的成功率 57.7% vs 新的
-        # 80.8%、最热两个前缀仅 32%/24%。60 ≈ 中位成功数的 4 倍，也让两次
-        # 错误触发换线之间的正常流量能跑完。
-        "proactive_after_requests": 60,
-        # 主动轮换判据三选一：
-        #   lifetime — 按实测 IP 可用寿命（首条成功→末条成功，中位 14s）减
-        #              换线耗时裁定切点，跟随线上实际情况漂移；
-        #   requests — 当前出口服务满 proactive_after_requests 条就换；
-        #   fixed    — 无论流量快慢，每 proactive_fixed_sec 秒换一次。
-        "proactive_mode": "lifetime",
+        # 主动轮换判据二选一（互斥，只有选中的那个生效）：
+        #   fixed    — 无论流量快慢，每 proactive_fixed_sec 秒换一次；
+        #   requests — 当前出口上成功的 dsv4 调用累计满 proactive_after_dsv4_ok
+        #              就换（数的是配额格数，不是请求条数）。
+        # 时间判据的缺陷：实测主动段（60s 到点切走）dsv4 成功中位 113.5 /
+        # p90 175 —— 60s 上限本身就在扔掉还没用完的配额，说明容量不是时间的
+        # 函数。而 429 段的存活中位仅 6s，同样不是时间的函数。两个分布都不随
+        # 时钟走，任何固定周期都只能在「切早了浪费地址」和「切晚了吃 429」
+        # 之间瞎猜；按已用配额切才和配额扣减同源，流量大小自动适应。
+        # 当前生效：requests（按成功 dsv4 调用数换线）。切回 fixed 只需改这一行。
+        "proactive_mode": "requests",
         "proactive_fixed_sec": 60,
+        # requests 模式数哪个模型的配额。配额按模型扣，别的模型成功不占这格。
+        "proactive_quota_model": "deepseek-v4.1-flash-free",
+        # requests 模式的切换阈值，单位是**成功的** dsv4 调用数（配额格）。
+        # 2026-10-22 10:20~11:52 在 fixed 模式下回放「到达 T 格就切」，结论是
+        # T=100 仅 13% 段可达、T=150 仅 3% —— **这组数字不可用来定 requests 阈值**：
+        # 那些段在 60s 被主动切走（205 段里中位段长 61s），150 格根本来不及跑，
+        # 是右删失而不是地址跑不动。
+        # 直连实测（12:21 切到 requests 后的若干段，12:23~12:33）：
+        #   12:23:05→12:25:23  138s 跑到 150 格 → 配额换线
+        #   12:25:28→12:27:53   86 格处撞 rate429 ×3 → 错误换线
+        #   12:27:57→12:30:44  167s 跑到 151 格 → 配额换线
+        #   12:30:49→12:32:45  116s 跑到 151 格 → 配额换线
+        # 5 段里 3 段跑满、1 段先被限流、1 段进行中；跑满时每段约 2~2.8 分钟。
+        # 所以本模式确实会按配额触发（不是旧注释说的「多数时段不触发」），
+        # 效果是把健康段拉到约 2 分钟，快限流的段仍由 429 兜底接管。
+        # 若观察到 429 占比上升，把本值调小（每段随之变短）；调大更省地址，
+        # 但更多段会在半途吃 429。
+        "proactive_after_dsv4_ok": 150,
         # 备线「可服务性」探针：暂未实现。曾尝试经目标隧道的 SOCKS 直接向
         # opencode 发最小请求，但免费层的客户端指纹校验无法通过 —— 试过
         # /zen/v1 与 /inference/v1 两个端点、v1/v2 两种 UA、cli/desktop 两种
@@ -159,9 +174,6 @@ CFG = {
         # 每隔多久预热一条闲置备线（重启它换会话 IP）。ip_reuse_guard_sec=24h，
         # 不预热的话换线时只有刚补刷的一条是新鲜的，流量会在两条线间往返。
         "prewarm_sec": 120,
-        # 最小可用周期重算间隔：每 300s 采一次 24h 内 cycle>0 的样本最小值，
-        # 驱动主动轮换时间判据。无样本时回退到 proactive_after_requests。
-        "min_cycle_recalc_sec": 300,
         # 换线前校验目标线的出口 IP：窗口内用过的地址必须先刷新会话再切。
         # 429/403 都按出口 IP 判定，切回一个还在限流窗口里的地址等于没换。
         # 86400s（24h）：opencode 对同一个出口 IP 的 403/429 记忆很长，实测出口
@@ -237,12 +249,15 @@ CFG = {
         # 刷新前等待该线闲下来的上限，超出则等下一轮（强刷会掐断长命连接
         # → upstream connection lost）。判"闲"看字节是否还在增长，不看连接数：
         # 活跃线上恒有 7~10 条连接且从不归零，按连接数等必然超时。
-        "idle_wait_sec": 40,
+        # 取 90：排空路径的观察窗是 30s（_DRAIN_BUSY_WINDOW_SEC），40s 只够
+        # 判一次，判忙就直接超时放弃；90s 能判三次，给在途流真正结束的机会。
+        "idle_wait_sec": 90,
         # 判"闲"的字节观察窗（秒）。实测流式 SSE 的两次 token 之间会静默
         # p50=7s / p90=9.1s / max=10.1s（N=30 连接 100s 采样），而旧值 2s
         # 让一半以上的采样落在静默期里 → 把仍在传流的线判成空闲 → 立即重启
         # → 9router 注入 upstream connection lost。取 12s 覆盖实测 max。
-        # 代价：判定一次要 12s，只在后台补刷路径上付，不影响换线响应。
+        # 代价：判定一次要 12s。只给后台补刷/脏线守护付，不影响换线响应 ——
+        # 错误换线路径显式传 `_ERROR_PATH_BUSY_WINDOW_SEC`(2s)，见 daemon.py。
         "busy_window_sec": 12.0,
         # 被换下的线等不到空闲时反复重试的总时长。单次超时就放弃会让这条线
         # 永远停在旧地址上：实测 WARP-CF-C 被换下 8 次，7 次放弃，13 次换线里
@@ -257,8 +272,18 @@ CFG = {
         # `_cached_warp_standby`），把同步探测移出关键路径。TTL 取 12s：
         # 守护节奏是 5s + 单次探测 1.2~7s，一个完整周期仍有余量。
         "probe_cache_ttl_sec": 12,
-        # 主动轮换提前量：换线从发起到达生效 p50=2s / p90=7s，等「已服务满
-        # 典型寿命」再发起就赶不上（首错延迟 p50=3s），必须提前这个时长。
+        # 模型层探测结论（`_WARP_PROBE_SEEN`）的保留时长，按结论的持久性分两档：
+        #   - 持久（quota/flagged）：地址自身的配额/信誉结论。重探同一 /128 有
+        #     99.2% 仍 quota（30h 内仅 1 次恢复、间隔 56min），留 6h —— 与生产
+        #     403 惩罚期同量级。
+        #   - 瞬时（OK/unreachable/err）：OK 复现率衰减极快（<10s 97.9% → ≥1h
+        #     43.2%，N=10113），unreachable/err 更是探测侧故障（日志实测同一地址
+        #     err 后 66s 即 OK）—— 这一档只留 2min。
+        "probe_transient_ttl_sec": 120,
+        "probe_persistent_ttl_sec": 21600,
+        # fixed 模式的提前量：换线从发起到达生效 p50=2s / p90=7s，等满
+        # proactive_fixed_sec 再发起就赶不上节律，必须提前这个时长。
+        # requests 模式不用它：配额是离散格数，没有「生效延迟」可提前。
         "switch_lead_sec": 3.0,
         # 错误换线路径上等目标备线空闲的上限。补刷路径用的是 idle_wait_sec(40s)，
         # 但错误路径上每多等一秒，坏出口就多服务一秒失败请求 —— 实测 40s 上限
@@ -281,6 +306,15 @@ BAD_NODES_MAX_TTL = CFG["bad_nodes"]["max_ttl_sec"]
 LOG_FORMAT = CFG["log_format"]
 RECENT_WINDOW = CFG["thresholds"]["recent_window"]
 REJECT_WINDOW = CFG["thresholds"]["reject_window"]
+
+# ============= 启动校验 =============
+# requests 模式整个判据就是「数哪个模型的成功调用」。键写错时 daemon 不该
+# 带着一条永不触发的判据上线 —— 导入即炸，比线上静默不换线好查得多。
+_w = CFG["warp"]
+if _w.get("proactive_mode") not in ("fixed", "requests"):
+    raise SystemExit(f"✗ warp.proactive_mode 只能是 fixed/requests，实际 {_w.get('proactive_mode')!r}")
+if _w["proactive_mode"] == "requests" and not _w.get("proactive_quota_model"):
+    raise SystemExit("✗ warp.proactive_quota_model 未配置，requests 模式无法计数")
 
 # ============= FREE_PROVIDERS 常量 =============
 # OPENCODE_FREE_PROVIDER: 9router providerStrategies 中的 key = "opencode"

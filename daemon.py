@@ -214,14 +214,15 @@ _ACTIVE_WARP_IP: str | None = None
 _WARP_LINE_STATE: dict[str, dict] = {}
 _WARP_LINE_LOCK = threading.Lock()   # 主循环 / 换线线程 / 补刷线程三方读写
 _last_proactive_warp_check: float = 0  # 主动轮换判据的上次查询时刻
+# 健康摘要里展示的主动轮换进度。由判决函数写入，避免摘要再查一次库，
+# 也保证日志显示的就是判据当时看到的数。
+_proactive_progress: str = "-"
 _last_warp_prewarm_ts: float = 0      # 上次预热备线的时刻
 # 出口 IP 可用周期样本：每段 = 换线生效 → 首次被 403/429 判不可用。
 # {"ip", "cycle", "ended_at", "ok"}，只保留 24h。落盘跨重启保留。
 _WARP_IP_CYCLES: list[dict] = []
 _WARP_CYCLES_LOCK = threading.Lock()
 _WARP_IP_CYCLES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".warp_ip_cycles.json")
-_WARP_MIN_CYCLE_SEC: float = 0.0   # 0 = 无样本，回退到按请求数主动轮换
-_last_cycle_recalc_ts: float = 0
 
 
 def _warp_ip_used_path() -> str:
@@ -424,58 +425,6 @@ def _record_warp_cycle(ip: str | None, cycle: float, now: float, ok: int = 0,
     _write_json_atomic(_warp_ip_cycles_path(), {"cycles": snapshot})
 
 
-# 主动轮换的寿命下限（秒）。
-# WHY 60s：30s 一轮时，67% 的线到点仍没出现过 403（换线起算 10/20/30s 的
-# 累积 403 = 18%/24%/33%）—— 这些还是健康的线，到点就扔等于白烧地址。
-# 换线本身也有代价：从健康线主动切走的 39 次里，新 IP 首条请求 8% 直接 403。
-# 30s 档按 IP 年龄拆开是 0-15s 77%、15-30s 94%，线是越用越顺而不是越用越脏。
-# 上限不确定：现在这个地板让 >30s 的样本根本采不到（30-45s 只有 13 条），
-# 所以先抬到 60s 拿数据，而不是直接猜 90s —— 下一轮重算就能看到真实中位。
-_WARP_MIN_CYCLE_FLOOR_SEC = 60.0
-
-
-def _recompute_min_warp_cycle(now: float) -> float:
-    """重算 24h 内「成功服务过 ≥1 条后出错」的段的**典型**周期，返回生效值。
-
-    取中位而非最小（原因见函数体内的注释）。只统计 cycle > 0 且 ok > 0 的
-    样本：cycle=0 是「切上去第一条请求就错」，不反映可用寿命。
-    无样本返回 0（调用方回退到按请求数轮换）。
-    """
-    global _WARP_MIN_CYCLE_SEC
-    with _WARP_CYCLES_LOCK:
-        recent = _prune_warp_cycles(_WARP_IP_CYCLES, now)
-        usable = [c for c in recent
-                  if float(c["cycle"]) > 0 and int(c.get("ok", 0) or 0) > 0]
-    total = len(recent)
-    dropped = total - len(usable)
-    # 优先用 span（首条成功→末条成功）。旧样本没有 span，回退到 cycle 只是为了
-    # 不让样本断档 —— 它系统性偏短（中位 2s vs 真实 14s），只作过渡。
-    # span==0 的样本排除：段里只有一条成功时跨度必然为 0，那不是「寿命 0 秒」，
-    # 而是**测不出来**。把它们算进去会让中位塌到 0（实测 80/89 条如此），
-    # 判据退化成固定下限，等于没在跟随线上的实际情况。
-    spans = [float(c["span"]) for c in usable
-             if c.get("span") is not None and float(c["span"]) > 0]
-    if spans:
-        vals, src = sorted(spans), "span"
-    elif usable:
-        vals, src = sorted(float(c["cycle"]) for c in usable), "cycle"
-    else:
-        _WARP_MIN_CYCLE_SEC = 0.0
-        log(f"↻ 最小可用周期重算: 无可用样本（24h {total} 条，首错即废 {dropped} 条已排除），"
-            f"主动轮换回退到按请求数")
-        return 0.0
-    # 用中位而非最小值：最小值由「最倒霉的那一条线」决定 —— 24h 窗口里只要
-    # 出现一条成功服务 1 条后就死的段，最小值就塌到 0.1s 级，主动轮换变成
-    # 每几秒换一次。中位才代表「一条线典型能服务多久」。
-    median = vals[len(vals) // 2]
-    effective = max(median, _WARP_MIN_CYCLE_FLOOR_SEC)
-    _WARP_MIN_CYCLE_SEC = effective
-    log(f"↻ 典型可用寿命重算({src}): 中位 {median:.1f}s（min {vals[0]:.1f}s / "
-        f"p25 {vals[len(vals)//4]:.1f}s / p75 {vals[3*len(vals)//4]:.1f}s，"
-        f"可用样本 {len(vals)} 条，首错即废 {dropped} 条已排除）→ 生效 {effective:.0f}s")
-    return effective
-
-
 _WARP_REFRESH_LOCK = threading.RLock()
 # 补刷分两段，必须拆成两个集合 —— 混在一起是候选池饿死的根因。
 #   排队段（PENDING）：等连接自然结束，最长 ip_refresh_retry_sec(600s)。这期间
@@ -502,49 +451,79 @@ def _refresh_concurrency() -> int:
     return cap if cap > 0 else max(len(_warp()["members"]), 1)
 
 
-# ============= 模型层探测台账：每个 IP 每会话最多探一次 =============
-# opencode 免费层按出口段限流，一次 probe() 就烧掉一格配额。此前无任何记录：
-# 同一 IP 在每轮换线的并发实测与每次脏线守护里被反复探测 —— 实测
-# 2a09:bac5:1ef9:281e::3ff:64 在 18 分钟内被探 26 次，全是 quota，纯浪费。
+# ============= 模型层探测台账：按 /128 记，TTL 按结论持久性分两档 =============
+# opencode 免费层一次 probe() 就烧掉一格配额。此前无任何记录：同一 IP 在每轮换线
+# 的并发实测与每次脏线守护里被反复探测 —— 实测 18 分钟内被探 26 次，全是 quota。
 #
-# 判据是**会话粒度**而非永久：隧道重启后即使拿回同一 IP 也允许再探一次 ——
-# 配额窗口可能已滚动，旧结论不代表新会话能给 opencode 服务。故键里带代次，
-# 重启即在 `_restart_service` 里 +1，旧记录自然作废。
-_WARP_PROBE_EPOCH: dict[str, int] = {}
-_WARP_PROBE_SEEN: dict[tuple[str, int, str], str] = {}  # → verdict
+# 键一律 /128，不按 /64 段聚合：段内其他 IP 的信息量不足以判死。控制变量后
+# （排除「日志里没探过但生产流量用过」的 IP）：
+#   已烧段里的**全新** /128   n=2469  OK=0   (0.0%)
+#   未烧段里的**全新** /128   n=152   OK=3   (2.0%)   ← 决定性的反例
+# 段本身不是充分条件；真正判死的是那个地址自己。
+#
+# TTL 按结论的**持久性**分两档，不是按好坏分：
+#   地址级持久（quota / flagged）：重探同一 /128 有 99.2% 仍 quota，30h 内只出现
+#     过 1 次恢复（间隔 56min）—— 留 6h，与生产 403 惩罚期同量级。
+#   其余（OK / unreachable / err）：OK 的重探复现率 <10s 97.9% → <1h 76.5% →
+#     ≥1h 43.2%；unreachable 与 err 更是探测侧的瞬时故障（日志实测同一地址 err
+#     后 66s 就 OK）—— 这一档只留 2min。
+# 后三个若套用长 TTL，一次探测抖动就把健康线路锁死 6h：重连已不作废台账，
+# 期间 `_warp_model_usable` 一直跳过实测返回 False，刷新守卫还会反复重启它。
+#
+# 这是「脏 IP 预检查」的探测侧采样，与 `_WARP_IP_USED` 的生产侧采样是同一个概念
+# （地址在某时刻不可用，随时间恢复），区别只在观测来源。两者合并留待后续 ——
+# 先解决当前重复探测。
+_WARP_PROBE_SEEN: dict[tuple[str, str], tuple[str, float]] = {}
+
+# 只有这两个是地址自身给出的持久结论；探测侧故障不代表地址的长期状态。
+_WARP_PROBE_PERSISTENT = frozenset({"quota", "flagged"})
 
 
-def _bump_probe_epoch(tag: str) -> None:
-    """隧道重启：该线换了一轮会话，探测结论作废。"""
+def _probe_ttl(verdict: str) -> float:
+    w = _warp()
+    if verdict in _WARP_PROBE_PERSISTENT:
+        return float(w.get("probe_persistent_ttl_sec", 21600))
+    return float(w.get("probe_transient_ttl_sec", 120))
+
+
+def _probe_cache_get(tag: str, ip: str, now: float | None = None) -> str | None:
+    """这条线在 TTL 内探过这个地址就复用结论，None 表示该探。"""
+    if now is None:
+        now = time.time()
     with _WARP_REFRESH_LOCK:
-        _WARP_PROBE_EPOCH[tag] = _WARP_PROBE_EPOCH.get(tag, 0) + 1
+        hit = _WARP_PROBE_SEEN.get((tag, ip))
+        if hit is None:
+            return None
+        verdict, ts = hit
+        if now - ts > _probe_ttl(verdict):
+            del _WARP_PROBE_SEEN[(tag, ip)]
+            return None
+        return verdict
 
 
-def _probe_cache_get(tag: str, ip: str) -> str | None:
-    """本会话已探过这个 IP 就复用结论，返回 None 表示该探。"""
-    with _WARP_REFRESH_LOCK:
-        return _WARP_PROBE_SEEN.get((tag, _WARP_PROBE_EPOCH.get(tag, 0), ip))
-
-
-def _probe_cache_verdict(tag: str | None, ip: str | None) -> str | None:
-    """该线本会话对这个 IP 的实测结论；没探过返回 None。
+def _probe_cache_verdict(tag: str | None, ip: str | None,
+                         now: float | None = None) -> str | None:
+    """该线对这个地址的实测结论；没探过或已过期返回 None。
 
     与 `_probe_cache_get` 同一张台账：探测器写、刷新判据读 —— 探到的 quota
     必须能反过来驱动「这条线该重启」，否则结论只进不出：线永远不被选中
-    刷新，代次永不前进，台账永远命中「已探过（跳过）」，脏线焊死在原地。
+    刷新，台账永远命中「已探过（跳过）」，脏线焊死在原地。
     """
     if not tag or not ip:
         return None
-    return _probe_cache_get(tag, ip)
+    return _probe_cache_get(tag, ip, now)
 
 
-def _probe_cache_put(tag: str, ip: str, verdict: str) -> None:
+def _probe_cache_put(tag: str, ip: str, verdict: str,
+                     now: float | None = None) -> None:
+    if now is None:
+        now = time.time()
     with _WARP_REFRESH_LOCK:
-        _WARP_PROBE_SEEN[(tag, _WARP_PROBE_EPOCH.get(tag, 0), ip)] = verdict
-        # 只保留当前代次：上一轮会话的记录永远不会再命中，留着纯占内存。
-        cur = _WARP_PROBE_EPOCH.get(tag, 0)
-        for k in [k for k in _WARP_PROBE_SEEN if k[0] == tag and k[1] != cur]:
-            del _WARP_PROBE_SEEN[k]
+        _WARP_PROBE_SEEN[(tag, ip)] = (verdict, now)
+        # 按各自 TTL 清：命中同一 key 时上面已覆盖，这里只清别的地址。
+        for k, (v, ts) in list(_WARP_PROBE_SEEN.items()):
+            if now - ts > _probe_ttl(v):
+                del _WARP_PROBE_SEEN[k]
 
 
 # 每条线「离开主渠道」的时刻与此后累计的隧道重启次数。刷新日志据此回答
@@ -596,7 +575,7 @@ def _warp_ip_refresh_reason(ip: str | None, now: float,
     """低质原因的可读短语；健康地址返回空串。与 _warp_ip_needs_refresh 同源。"""
     if not ip:
         return "出口未知"
-    verdict = _probe_cache_verdict(tag, ip)
+    verdict = _probe_cache_verdict(tag, ip, now)
     if verdict is not None and verdict != "OK":
         return f"模型层 {verdict}"
     if _warp_ip_is_blocked(ip, now):
@@ -1496,6 +1475,47 @@ def count_segment_requests(ts: float) -> tuple[int, int]:
     return ok, blocked
 
 
+def count_dsv4_ok_since(ts: float) -> int:
+    """ts 之后 deepseek-v4.1-flash-free 的**成功**调用数，即已消耗的配额格数。
+
+    WHY 用 usageHistory 而不是 requestDetails：后者只有 2000 行滚动窗口，实测
+    22.7 分钟就写满，60 秒窗口在高峰期会被截断；且它按完成时刻写，在途请求漏计。
+
+    WHY 数成功而不是数请求：配额按成功的 dsv4 调用扣，429 不是请求条数的函数。
+    按失败的请求数计数会把「被拒的请求」也算成消耗，429 风暴里反而切得更勤。
+
+    WHY 强制走 idx_uh_ts：指定的 provider/model 组合先过滤要扫 18 万行（实测
+    250ms），而本函数在主循环里每 5 秒调一次。走时间索引后 0.1ms。
+
+    ponytail: 窗口起点是段起点，不按出口 IP 拆窗 —— 同一窗口内若发生换线，
+    旧出口的消耗也会算进新出口。上限是单段内换线次数（实测主动段 60s 只切
+    一次、429 段切完即重建窗口），偏差 <10 格（阈值 150 的 7%）。升级路径：
+    usageHistory 没有出口 IP 列，要拆窗得 JOIN `.warp_ip_history.jsonl`。
+    """
+    if ts <= 0:
+        return 0
+    # cutoff 必须和 rows 同形（毫秒 + Z）：列里 100% 是 '...SS.mmmZ'（实测
+    # 226211/226211），比较是字符串比较。写成 '...SS' 时，同一秒内任意
+    # '.001Z'~'.999Z' 都 > 它（'25.' 按字符串大于 '25'），段起点那一秒里
+    # 换线**之前**的调用会被算进新段 —— 方向是多算，且日志看不出来。
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    cutoff = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    try:
+        with _db_lock:
+            row = _get_db().execute(
+                """SELECT count(*) FROM usageHistory INDEXED BY idx_uh_ts
+                   WHERE timestamp > ? AND provider = ? AND model = ?
+                     AND status = 'ok'""",
+                (cutoff, OPENCODE_FREE_PROVIDER,
+                 _warp()["proactive_quota_model"])).fetchone()
+    except sqlite3.Error as e:
+        # 只吞数据库错误。配置键缺失（KeyError）是编程错误，吞掉会让 requests
+        # 模式永久返回 0 —— 换线判据静默失效，日志之外无从察觉。
+        log(f"✗ 统计 dsv4 成功数失败: {e}")
+        return 0
+    return int(row[0] if row else 0)
+
+
 def _current_mode() -> tuple[str, str | None]:
     """(模式, 当前 tag)：warp / proxy / unknown。
 
@@ -1553,8 +1573,6 @@ def _restart_service(service: str, tag: str | None = None) -> bool:
         if r.returncode != 0:
             log(f"✗ 重启 {service} 失败: {r.stderr.strip()[:200]}")
         elif tag:
-            # 重启成功 = 换了一轮隧道会话：探测结论作废，同一 IP 允许再探一次。
-            _bump_probe_epoch(tag)
             # 用户口径：刷了几次从「离开主渠道」起算，每次真正重启算一次。
             _WARP_REFRESH_COUNT[tag] = _WARP_REFRESH_COUNT.get(tag, 0) + 1
         return r.returncode == 0
@@ -1574,21 +1592,22 @@ def _wait_port_ready(port: int, timeout_sec: float) -> bool:
     return False
 
 
-# 判「等首字节」的连接年龄上限。首 token 延迟实测 p50=1.7s / p90=52.6s /
-# max=532.7s（N=83）；取 120s 覆盖 p90 且留一倍余量。上限是必要的：一条卡死
-# 的连接若永远 download=0，没有它就会把整条线钉死在「忙」上，补刷再也等不到。
+# 判「请求可能仍在进行」的连接年龄上限。首 token 延迟实测 p50=1.7s / p90=52.6s /
+# max=532.7s（N=83）；取 120s 覆盖 p90 且留一倍余量。上限是必要的：9router 会复用
+# 连接，实测活跃线上有年龄中位 476s 的长期连接，没有它就会把整条线钉死在「忙」上。
 _FIRST_BYTE_WAIT_MAX_SEC = 120.0
 
 
 def _warp_line_stats(tag: str) -> tuple[int, int] | None:
-    """该 tag 上的 (累计字节, 等首字节的请求数)；查询失败返回 None。
+    """该 tag 上的 (累计字节, 年龄在上限内的连接数)；查询失败返回 None。
 
     两个值来自同一次 Clash 查询：判闲要连查两次，拆成两个函数就得付两次
     往返，而这是 5s 一次的守护热路径。
 
-    「等首字节」= download 为 0 且连接年龄在 `_FIRST_BYTE_WAIT_MAX_SEC` 内。
-    这类连接此刻不传任何字节，但与空闲线有本质区别：掐断它，客户端拿到的就是
-    upstream connection lost —— 请求已发出，一个 token 都还没回来。
+    「可能仍在进行」= 连接年龄在 `_FIRST_BYTE_WAIT_MAX_SEC` 内。**不要求
+    download==0**：旧判据加了这条件，把「已收到部分 token、正等下一个」的
+    连接全部漏掉 —— 12:22 实测被重启掐断的 4 条连接各已收 ~1MB、年龄
+    94~116s，12s 窗口内零增长，恰好同时命中两个漏洞。
     """
     try:
         r = subprocess.run(
@@ -1605,8 +1624,6 @@ def _warp_line_stats(tag: str) -> tuple[int, int] | None:
     now = time.time()
     waiting = 0
     for c in mine:
-        if (c.get("download") or 0) > 0:
-            continue
         try:
             started = datetime.fromisoformat(c["start"]).timestamp()
         except Exception:
@@ -1629,6 +1646,16 @@ def _warp_line_bytes(tag: str) -> int | None:
 # 既有默认，这里把它显式化，不再依赖参数默认值。
 _ERROR_PATH_BUSY_WINDOW_SEC = 2.0
 
+# 被切下的主渠道排空时的判闲观察窗。必须比 12s 长得多：流式响应在 token
+# 之间会静默，实测 p99=8.1s / max=16.1s（N=1460），12s 窗口有 0.3% 落在
+# 静默里；而 12:25 实测 4 条各收 ~1MB、年龄 94~116s 的连接在 12s 零增长后
+# 被重启掐断。取 30s：覆盖静默分布的 max 并留近一倍余量。
+#
+# WHY 只有这条路径付长窗：候选线的重启不需要窗口（它不在服务流量，等端口
+# 就绪即可），错误换线路径每多等一秒坏出口就多服务一秒失败请求。只有
+# 「刚被切下、仍在排空在途请求」的线才既需要等、又等得起。
+_DRAIN_BUSY_WINDOW_SEC = 30.0
+
 
 def warp_line_busy(tag: str, window: float | None = None) -> bool | None:
     """该线此刻是否仍在服务请求；查不到返回 None（调用方保守处理）。
@@ -1639,17 +1666,19 @@ def warp_line_busy(tag: str, window: float | None = None) -> bool | None:
 
     两个判据是**或**关系：
       1. 字节增量 —— 有连接正在传数据；
-      2. 该线上有请求在等首字节 —— 已发出、一个 token 都还没回来。
+      2. 该线上有年龄在 `_FIRST_BYTE_WAIT_MAX_SEC` 内的连接 —— 请求还在生命周期里。
 
-    WHY 判据 2 不可省：流式响应在首 token 之前完全不传字节，首 token 延迟实测
-    p50=1.7s / p90=52.6s / max=532.7s（N=83）。只看字节增量时，一条正在等首
-    token 的线看起来和空闲线一模一样，被判空闲后立刻重启；客户端为此收到的是
-    upstream connection lost —— 请求已发出，什么都没等到。实测重启前该线上
-    仍有此类连接的有 13%。
+    WHY 判据 2 不可省：流式响应会长时间零字节。stall 实测覆盖两种形态：
+      a) 首 token 之前完全不传（TTFT p50=1.7s / p90=52.6s / max=532.7s，N=83）；
+      b) 收到部分 token 后等下一个（12:22 实测被重启掐断的 4 条连接已各收
+         ~1MB、年龄 94~116s，但 12s 窗口内零增长）。
+    只看字节增量时两者都与空闲线无异，判闲后重启，客户端收到 upstream
+    connection lost。旧判据只抓 (a)（要求 download==0），(b) 全部漏检。
 
-    WHY 判据 2 不能用「连接数 > 0」：活跃线上恒有 7~10 条连接且从不归零（SSE
-    长连接 + 9router 连接复用，单条实测存活 936s），按连接数判忙会让这些线永远
-    刷不到新鲜 IP。只有「download 为 0 且年龄在上限内」才说明请求还在等首字节。
+    WHY 判据 2 不能退化成「连接数 > 0」：9router 复用连接，实测活跃线上有年龄
+    中位 476s 的长期连接（WARP-CF 90 个采样里 58 个有连接、最小年龄全是 476s+）。
+    按连接数判忙会让这些线永远刷不到新鲜 IP。用年龄上限把它们排除，只留
+    「建立不久、请求可能仍在进行」的那部分。
     """
     if window is None:
         window = float(_warp().get("busy_window_sec", 12.0))
@@ -1936,9 +1965,9 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
     """
     if not ip:
         return True
-    # 本会话实测不通过（quota/err/unreachable）就是「此刻不能服务 opencode」，
+    # 本线实测不通过（quota/err/unreachable）就是「此刻不能服务 opencode」，
     # 与 blocked 同义：只有重启换会话才可能好转。判据复用已有结论，不额外探测。
-    verdict = _probe_cache_verdict(tag, ip)
+    verdict = _probe_cache_verdict(tag, ip, now)
     if verdict is not None and verdict != "OK":
         return True
     if _warp_ip_is_blocked(ip, now):
@@ -2305,8 +2334,8 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     原模式（refresh_model_check=False）只看 IP 新鲜度。探测与 CLI
     `probe_warp.py` 共用同一份指纹定义；每次探测消耗该出口一格配额。
 
-    每个 IP 每会话只探一次：同一结论重复探测只是白烧配额（实测 26 次同一
-    IP 全是 quota）。台账按「tag + 会话代次」键控，重启隧道后自动作废。
+    同一地址在 TTL 内只探一次：重复探测同一结论只是白烧配额（实测 26 次同一
+    IP 全是 quota）。台账按「tag + /128」键控，TTL 按结论持久性分档。
     """
     w = _warp()
     if not w.get("refresh_model_check", True):
@@ -2315,7 +2344,7 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     cached = _probe_cache_get(tag, ip)
     if cached is not None:
         ok = cached == "OK"
-        log(f"  · {tag} 出口 {ip} 本会话已探过: {cached}（跳过）"
+        log(f"  · {tag} 出口 {ip} TTL 内已探过: {cached}（跳过）"
             f"{_warp_refresh_count_note(tag)}")
         return ok
     try:
@@ -2536,7 +2565,7 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
         if known and not _warp_ip_needs_refresh(known, time.time(), member["tag"]):
             _bump_refresh_stat("ok")
             return True
-        idle = _wait_warp_idle(member)
+        idle = _wait_warp_idle(member, window=_DRAIN_BUSY_WINDOW_SEC)
         # 判在重启之前而不是本轮开头：换线线程的快照可能早于本次调度，等空闲的这
         # 40s 内这条线也可能被切成当前出口。此刻重启它就是掐断正在服务的在途连接
         # （upstream connection lost）；它下次被换下时 reconnect_warp 会重新调度
@@ -3019,10 +3048,11 @@ def reconnect_warp(reason: str) -> bool:
         # 这里用的是错误轮换路径上的短等待，不是补刷的 idle_wait_sec(40s)：
         # 这条路径上每多等一秒，坏出口就多服务一秒失败请求。实测 40s 上限把
         # 「首错→换线生效」拉到 p90=25s / max=206s。
-        if warp_line_busy(m["tag"]) and not _wait_warp_idle(
-                m, timeout_sec=_warp().get("fallback_idle_wait_sec", 3)):
+        if warp_line_busy(m["tag"], _ERROR_PATH_BUSY_WINDOW_SEC) and not _wait_warp_idle(
+                m, timeout_sec=_warp().get("fallback_idle_wait_sec", 3),
+                window=_ERROR_PATH_BUSY_WINDOW_SEC):
             idle = next(((x, v) for x, v in probes[1:]
-                         if warp_line_busy(x["tag"]) is False), None)
+                         if warp_line_busy(x["tag"], _ERROR_PATH_BUSY_WINDOW_SEC) is False), None)
             if not idle:
                 log("  ⚠ 备线均在服务在途连接，强刷会掐断，切轮换池兜底")
                 return _fallback_to_proxy(active, old_ip, now)
@@ -3201,57 +3231,50 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) 
 
 
 def _proactive_mode() -> str:
-    """主动轮换判据：lifetime（寿命）/ requests（请求数）/ fixed（固定秒数）。"""
-    mode = str(_warp().get("proactive_mode", "lifetime")).lower()
-    if mode not in ("lifetime", "requests", "fixed"):
-        return "lifetime"
+    """主动轮换判据：fixed（固定秒数）/ requests（成功的 dsv4 调用数）。
+
+    两者**互斥**，只有 `proactive_mode` 选中的那个生效。
+
+    `lifetime` 已移除：段跨度（首条成功→末条成功）跟的是**请求间隔**而不是
+    IP 寿命 —— 实测中位 3.8s，而请求本身 p50 6.5s。生效值恒被 60s 地板顶住，
+    等于一个测不准的固定 60s。死因是 429 按成功调用扣配额，与时钟无关。
+    """
+    mode = str(_warp().get("proactive_mode", "fixed")).lower()
+    if mode not in ("requests", "fixed"):
+        return "fixed"
     return mode
 
 
-def _proactive_lead() -> float:
-    """主动轮换的触发点：典型寿命减去换线耗时。
-
-    换线从发起到新线承载流量还要 switch_lead_sec（缓存命中时 ~0s，退化为
-    探测时 2~7s）。等「已服务满寿命」再起手，新线在旧线到寿之后才生效。
-    下限 1s 只是防同一 tick 内反复起手；寿命本身已由 `_WARP_MIN_CYCLE_FLOOR_SEC`
-    兜底，这里不能再套一次那个下限，否则提前量会被吃掉。
-    """
-    target = max(_WARP_MIN_CYCLE_SEC, _WARP_MIN_CYCLE_FLOOR_SEC)
-    return max(target - _warp().get("switch_lead_sec", 3.0), 1.0)
-
-
 def _maybe_proactively_rotate_warp(now: float) -> None:
-    """当前出口还在成功服务时就换线，不必等 403 冲断在途对话。
+    """当前出口还在成功服务时就换线，不必等 429 冲断在途对话。
 
-    有周期样本时按「24h 内成功服务过的段的典型周期（中位）」换线；无样本时回退到
-    「已服务请求数」。时间判据曾因**自证循环**被弃用：采样写在冷却判断之后，
-    换线后 1 秒内的 403 全被 20s 冷却丢弃，样本最小值恒等于冷却值。f68ab66
-    起采样先于冷却判断，样本反映真实周期，判据恢复可用。
+    两种判据由 `proactive_mode` 二选一（互斥）：
+      fixed    — 按固定秒数，不看流量；
+      requests — 按当前出口上**成功的** dsv4 调用（配额格数）。
 
-    周期下限 5s 短于 cooldown_ok_sec(20s)，受冷却就永远等不到触发，故成功换线后
-    的 cooldown 绕过（并发仍由 `_WARP_LOCK` 保证）；换线失败后的冷却不绕，
-    那是防隧道雷暴的。请求数回退路径保持受冷却约束。
+    时间判据的缺陷：实测主动段（60s 到点切走）dsv4 成功中位 113.5 / p90 175
+    —— 60s 上限本身就在扔掉还没用完的配额；而 429 段存活中位仅 6s。两个分布
+    都不随时钟走，固定周期只能靠猜。配额判据与配额扣减同源，流量自适应。
+
+    成功换线后绕过 cooldown_ok：阈值可能短于它，受冷却就永远等不到触发
+    （并发仍由 `_WARP_LOCK` 保证）；换线失败后的冷却不绕，那是防隧道雷暴的。
 
     """
-    global _last_proactive_warp_check, _last_cycle_recalc_ts
+    global _last_proactive_warp_check, _proactive_progress
     # 计数要查 SQLite，5s 一次足够：配额以秒级速度消耗，多查无益。
     # fixed 模式的判据是纯时长，不查库，但同样只需秒级精度。
     if now - _last_proactive_warp_check < 5:
         return
     _last_proactive_warp_check = now
     mode = _proactive_mode()
-    # 周期样本重算（按时间判断，不查库）。fixed 模式不看样本，跳过省一次计算。
-    if mode != "fixed" and now - _last_cycle_recalc_ts >= _warp()["min_cycle_recalc_sec"]:
-        _last_cycle_recalc_ts = now
-        _recompute_min_warp_cycle(now)
     # 用「换线生效时刻」而非「发起时刻」：发起早于生效数秒，期间旧出口仍在
     # 服务流量，用发起时刻会把旧线的消耗算进新线配额。
     # 两者都为 0 表示本次启动后还没换过线。此时**不要**直接返回后从零计数：
     # service 重启后 `_last_warp_switch_ok_ts` 归零，若拿 0 当窗口起点，
-    # `count_opencode_since` 会把重启前已经服务过的那一段整段算进来 ——
-    # 实测 16:31:08 重启、16:32:18（70 秒后）就报「已服务 63 条」并换线，
-    # 而那条线实际只服务了几条。改用该出口 IP 在 `.warp_ip_used.json` 里的
-    # 使用时刻恢复段起点，跨重启仍然正确。
+    # 配额计数会把重启前已经服务过的那一段整段算进来 —— 实测 16:31:08 重启、
+    # 16:32:18（70 秒后）就报「已服务 63 条」并换线，而那条线实际只服务了
+    # 几条。改用该出口 IP 在 `.warp_ip_used.json` 里的使用时刻恢复段起点，
+    # 跨重启仍然正确。
     start = _last_warp_switch_ok_ts or _last_warp_reconnect_ts
     if start <= 0:
         # 内存变量重启即归零，但 sing-box 的 selector 不变 —— 用已知的出口 IP
@@ -3263,46 +3286,29 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
             entry = _WARP_IP_USED.get(ip) if ip else None
         start = float(entry.get("ts") or 0) if isinstance(entry, dict) else 0.0
         if start <= 0:
+            _proactive_progress = "起点未知"
             return
-    elapsed = now - start
 
     if mode == "fixed":
+        elapsed = now - start
         target = float(_warp()["proactive_fixed_sec"])
+        lead = float(_warp().get("switch_lead_sec", 3.0))
+        threshold = max(target - lead, 1.0)
+        _proactive_progress = f"fixed {elapsed:.0f}/{threshold:.0f}s"
         # 固定时长不看样本：运维要求「无论流量快慢每 N 秒换一次」时用。
-        if elapsed >= max(target - _warp().get("switch_lead_sec", 3.0), 1.0):
+        if elapsed >= threshold:
             _reconnect_warp_now(
-                f"主动轮换 固定 {elapsed:.0f}s ≥ {target:.0f}s − 换线耗时",
+                f"主动轮换 固定 {elapsed:.0f}s ≥ {threshold:.0f}s"
+                f"（{target:.0f}s − 提前量 {lead:.0f}s）",
                 now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
         return
 
-    if mode == "requests":
-        if now < _warp_cooldown_until:
-            return
-        n = count_opencode_since(start)
-        if n >= _warp()["proactive_after_requests"]:
-            _reconnect_warp_now(f"主动轮换 已服务 {n} 条", now)
-        return
-
-    # mode == "lifetime"：按实测寿命裁定切点
-    if _WARP_MIN_CYCLE_SEC <= 0:
-        # 尚无寿命样本：退回请求数判据，否则冷启动期永不主动轮换。
-        if now < _warp_cooldown_until:
-            return
-        n = count_opencode_since(start)
-        if n >= _warp()["proactive_after_requests"]:
-            _reconnect_warp_now(f"主动轮换 已服务 {n} 条（暂无寿命样本）", now)
-        return
-    # 换线生效后还要再花 switch_lead_sec 才真正把流量挪走（探测+切 selector）。
-    # 拿「已服务时长 ≥ 典型寿命」当判据等于让旧线多跑一个换线耗时 —— 实测
-    # 换线 p50=2s / p90=7s，而首错延迟 p50=3s，赶不上。提前这个量发起，
-    # 让新线在旧线到寿时已经就位。
-    if elapsed >= _proactive_lead():
-        # 只绕 cooldown_ok：上次换线失败时 `_warp_cooldown_until` 是
-        # cooldown_fail_sec，那是防隧道雷暴的，不能绕。
-        lead = _proactive_lead()
+    n = count_dsv4_ok_since(start)
+    target = int(_warp()["proactive_after_dsv4_ok"])
+    _proactive_progress = f"requests {n}/{target}格"
+    if n >= target:
         _reconnect_warp_now(
-            f"主动轮换 周期 {elapsed:.0f}s ≥ {lead:.0f}s"
-            f"（寿命 {_WARP_MIN_CYCLE_SEC:.0f}s − 换线耗时）",
+            f"主动轮换 已用配额 {n} 格 dsv4 ≥ {target}",
             now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
 
 
@@ -4433,7 +4439,7 @@ def main():
 
     global _RESTART_COUNT, _NODE_CALL_RESET_TS, _last_wal_checkpoint, _strategy_mode
     global _health_check_future, _health_check_nodes, _health_check_current
-    global _last_warp_reconnect_ts
+    global _last_warp_reconnect_ts, _proactive_progress
     with _RESTART_LOCK:
         _RESTART_COUNT = 0
     _NODE_CALL_RESET_TS = time.time()
@@ -4576,6 +4582,10 @@ def main():
             # 两套兜底互相打架。回 WARP 只有一条路：`_maybe_failback_to_warp`。
             if opencode_out_on_warp():
                 _maybe_proactively_rotate_warp(now)
+            else:
+                # 落在池上时本判据不适用于 WARP 出口；留着上一段的数字会让
+                # 摘要看起来像「配额在涨」，实际根本没在计。
+                _proactive_progress = "不适用(池)"
 
             # ---- 3. 主动轮换轮换池（只在 opencode 落在池上时才有意义） ----
             if (not opencode_out_on_warp()
@@ -4647,6 +4657,7 @@ def main():
                        f"err>{(err_threshold*100):.0f}%→切"
                        f"冷却至={time.strftime('%H:%M:%S', time.localtime(cool_until)) if cool_until>now else '-'}"
                        f" dead={dead_count} cool={cool_count} 策略={_strategy_mode}"
+                       f" 轮换={_proactive_progress}"
                        f" singbox={'🟢' if rc_display==0 else '🔴'}")
 
         except KeyboardInterrupt:
