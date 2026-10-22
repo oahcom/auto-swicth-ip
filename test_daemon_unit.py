@@ -404,6 +404,24 @@ def test_is_singbox_alive_api_ok_port_ok_returns_true():
 
 
 # ---- 连续失败门控：单次抖动不得重启 ----
+class _FakeTime:
+    """可推进的假时钟，同时接管 `time.sleep`。
+
+    `_probe_refresh_egress` 现在是「探测→睡 1s→再探测」的轮询，用真时钟要么
+    真睡几十秒、要么让截止时间永不前进。睡眠同步推进 `current`，于是轮询次数
+    也成了确定性的事实。
+    """
+
+    def __init__(self, start: float = 0.0, step_on_sleep: float = 8.0):
+        self.current = start
+        self.step_on_sleep = step_on_sleep
+
+    def time(self) -> float:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.current += max(seconds, self.step_on_sleep)
+
 def _stub_probe(monkeypatch, results):
     """把 is_singbox_alive 换成按脚本返回，并抹掉重试等待。"""
     seq = list(results)
@@ -3655,37 +3673,43 @@ def test_startup_keeps_egress_when_unknown(monkeypatch):
     assert calls == [], "出口未知时不得触发启动换线"
 
 
-def test_probe_refresh_egress_retries_slow_tunnel(monkeypatch):
-    """首探超时但隧道是热的，必须用长预算再探一次，而不是判成失败。
+def test_probe_refresh_egress_polls_until_tunnel_warms(monkeypatch):
+    """首探超时的隧道要轮询到真通，而不是两次预算后判死。
 
-    实测 WARP-CF-20 重启后端口 0.12s 就绪，7s 预算首探却在 7.01s rc=28，
-    紧接着同预算的探测 1.68s 就返回。旧实现只探一次，这种「首探冷」被记成
-    探测失败 → 重启同一条线 → 还是冷的 → 循环（14:58 单分钟 60 次重启）。
+    实测同一批生产 device 配置、无守护进程干扰下，从进程启动到出口可用是
+    5.0/7.6/7.8/7.9/7.9/8.3s；而复刻原「7s 再 12s」两次探测的对照里 6 条有
+    5 条首探超时、靠第二探才拿到。首探预算压在可用时间中位数上等于抛硬币，
+    抛输就重启、计时归零，隧道永远停在冷启动段。
     """
     calls = []
 
     def fake(port, timeout_sec=20.0):
         calls.append(timeout_sec)
-        return None if len(calls) == 1 else "2a09:bac5::1"
+        return "2a09:bac5::1" if len(calls) >= 3 else None
 
     monkeypatch.setattr(daemon, "warp_egress_ip", fake)
+    monkeypatch.setattr(daemon, "time", _FakeTime())
     monkeypatch.setattr(daemon, "_warp", lambda: {"refresh_probe_timeout_sec": 7,
-                                                  "ready_timeout_sec": 12})
+                                                  "ready_timeout_sec": 12,
+                                                  "max_attempts": 3})
 
     assert daemon._probe_refresh_egress(1080) == "2a09:bac5::1"
-    assert calls == [7, 12], f"应先用短预算、超时后再给一次余量，实际 {calls}"
+    assert calls == [7, 7, 7], f"每次都用短预算轮询，实际 {calls}"
 
 
-def test_probe_refresh_egress_gives_up_when_both_fail(monkeypatch):
-    """两次都不通就是真不通，必须返回 None 交给调用方重启重试。"""
+def test_probe_refresh_egress_gives_up_after_deadline(monkeypatch):
+    """轮询也有上限：到点还不通就是真不通，返回 None 交调用方重启。"""
     calls = []
     monkeypatch.setattr(daemon, "warp_egress_ip",
                         lambda port, timeout_sec=20.0: calls.append(timeout_sec))
+    monkeypatch.setattr(daemon, "time", _FakeTime())
     monkeypatch.setattr(daemon, "_warp", lambda: {"refresh_probe_timeout_sec": 7,
-                                                  "ready_timeout_sec": 12})
+                                                  "ready_timeout_sec": 12,
+                                                  "max_attempts": 3})
 
     assert daemon._probe_refresh_egress(1080) is None
-    assert calls == [7, 12], f"失败路径也只能探两次，实际 {calls}"
+    # 上限 36s，每轮+睡眠推进 8s → 最多 5 次；多探几次也比过早判死强
+    assert 2 <= len(calls) <= 6, f"轮询次数应受截止时间约束，实际 {len(calls)}"
 
 
 def test_probe_refresh_egress_skips_retry_on_success(monkeypatch):
@@ -3693,8 +3717,10 @@ def test_probe_refresh_egress_skips_retry_on_success(monkeypatch):
     calls = []
     monkeypatch.setattr(daemon, "warp_egress_ip",
                         lambda port, timeout_sec=20.0: calls.append(timeout_sec) or "1.1.1.1")
+    monkeypatch.setattr(daemon, "time", _FakeTime())
     monkeypatch.setattr(daemon, "_warp", lambda: {"refresh_probe_timeout_sec": 7,
-                                                  "ready_timeout_sec": 12})
+                                                  "ready_timeout_sec": 12,
+                                                  "max_attempts": 3})
 
     assert daemon._probe_refresh_egress(1080) == "1.1.1.1"
     assert calls == [7], f"首探成功不得重探，实际 {calls}"
