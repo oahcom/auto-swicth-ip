@@ -3329,6 +3329,9 @@ def reconnect_warp(reason: str) -> bool:
     # 入池前生效（缓存路径 / 探测循环 / 刷新路径都查过），这里再拿旧台账复查一遍
     # 就是把「证据比事实旧」重新引入 —— 实测 OK 的地址被上一段的标记抹掉，候选
     # 全丢、白落一次轮换池（池有 3h 冷却）。原模式照旧按历史过滤。
+    # ponytail: 探测到选中之间（1.4~8.7s）被生产流量标脏的地址仍会被选上。那是
+    # 事实变了、证据没变，由下一条 403/429 触发换线兜住；要彻底消除得在选中
+    # 瞬间再查一次惩罚期，代价是每条候选一次台账读取 —— 量级小，但收益同样小。
     usable = (probes if not _ip_history_is_truth()
               else [p for p in probes if not _ip_disqualified(p[1], now, guard)])
     if _ip_history_is_truth():
