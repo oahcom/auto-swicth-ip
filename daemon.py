@@ -634,6 +634,10 @@ def _release_refresh_slot(tag: str) -> None:
 # 脏线守护的探测中集合。探测不占用 _WARP_REFRESHING —— 那条集合会被换线路径
 # 当作「不可选」，探测中的干净线若也算进去，换线会看到「备线 0 条」直接落池。
 _WARP_PROBING: set[str] = set()
+# 本轮因「仍在传数据」让出的线 → 冷却截止时刻。没有它守护每 5s 就会重派一次
+# 探测线程（每次 2 次出口探测 ≈ 2~14s），把活线当靶子反复打；冷却让节奏回到
+# 一条线最多每 refresh_delay_sec 被探一次。
+_WARP_BUSY_UNTIL: dict[str, float] = {}
 _last_proxy_pool_check: float = 0  # 上次探测轮换池可用性的 epoch 秒（双向兜底）
 _proxy_dwell_since: float = 0  # 落到轮换池的时刻；0 = 现不在 proxy 上
 # 上次落池的 epoch 秒，「每 3h 最多切一次」的冷却依据。落盘跨重启保留：
@@ -1596,7 +1600,16 @@ def warp_line_busy(tag: str, window: float = 2.0) -> bool | None:
 
     用两次快照的字节增量判活跃：只要还有一条连接在传数据，总量就会增长。
     连接被关闭时总量回落，同样说明该线已闲下来。
+
+    WHY 窗口是 12s 而不是 2s：流式 SSE 的两次 token 之间会静默
+    p50=7s / p90=9.1s / max=10.1s（N=30 连接 100s 实测）。2s 窗口有一半
+    以上采样落在静默期里，把仍在传流的线判成空闲 → 立即重启 → 掐断在途
+    请求 → 9router 注入 upstream connection lost。这正是「每次切渠道都报
+    错」的直接成因：换线后被换下的线 20s 就开始补刷，撞上的多是自己尾部
+    仍在静默排字的 SSE。
     """
+    if window is None:
+        window = float(_warp().get("busy_window_sec", 12.0))
     b0 = _warp_line_bytes(tag)
     if b0 is None:
         return None
@@ -2353,7 +2366,8 @@ def _reclaim_dirty_pass() -> None:
             # 排队中等空闲的线（PENDING）仍可用，不该挡掉探测：它随时可能被
             # 换线选中，届时 `_retry_refresh_idle_warp` 会因「已选为当前出口」退出。
             if (m["tag"] in _WARP_REFRESHING or m["tag"] in _WARP_REFRESH_PENDING
-                    or m["tag"] in _WARP_PROBING):
+                    or m["tag"] in _WARP_PROBING
+                    or time.time() < _WARP_BUSY_UNTIL.get(m["tag"], 0)):
                 continue
             _WARP_PROBING.add(m["tag"])
         threading.Thread(target=_reclaim_dirty_warp_worker, args=(m,),
@@ -2416,8 +2430,12 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
             # 正好掐在刚被换下、仍在传流的连接上。
             # 判在抢名额之前：探测要 2s，占着名额会让换线路径误报「名额已满」。
             if warp_line_busy(member["tag"]) is not False:
-                time.sleep(_warp()["refresh_delay_sec"])
-                continue
+                # 等不到空闲就退出本轮，不再死循环重试：这条线仍在服务流量，
+                # 重试只是把探测烧在活线上，且 600s 内会重启几十次（实测
+                # 26min 内 10 条隧道共 661 次 systemd Started，WARP-CF-F
+                # 每 19s 一次）。冷却 refresh_delay_sec 后守护会重新调度。
+                _WARP_BUSY_UNTIL[member["tag"]] = time.time() + _warp()["refresh_delay_sec"]
+                return
             if not _acquire_refresh_slot(member["tag"]):
                 time.sleep(_warp()["refresh_delay_sec"])
                 continue
