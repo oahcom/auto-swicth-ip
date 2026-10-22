@@ -398,6 +398,45 @@ def test_is_singbox_alive_api_ok_port_ok_returns_true():
         _sock.create_connection = orig_conn
 
 
+# ---- 连续失败门控：单次抖动不得重启 ----
+def _stub_probe(monkeypatch, results):
+    """把 is_singbox_alive 换成按脚本返回，并抹掉重试等待。"""
+    seq = list(results)
+    monkeypatch.setattr(daemon, "is_singbox_alive", lambda: seq.pop(0))
+    monkeypatch.setattr(daemon, "_PROBE_RETRY_GAP_SEC", 0)
+    return seq
+
+
+def test_probe_survives_single_negative(monkeypatch):
+    """单次探测失败不算死：第二次就通了必须存活，不许重启。"""
+    _stub_probe(monkeypatch, [False, True])
+    assert daemon._probe_singbox_with_retry() is True
+
+
+def test_probe_dies_only_after_three_consecutive_failures(monkeypatch):
+    _stub_probe(monkeypatch, [False, False, False, True])
+    assert daemon._probe_singbox_with_retry() is False
+
+
+def test_watchdog_does_not_restart_on_one_blip(monkeypatch):
+    """红线：服务探测必须 3 次连续失败才标 down（单次超时不算）。"""
+    _stub_probe(monkeypatch, [False, True])
+    restarts = []
+    monkeypatch.setattr(daemon, "restart_singbox", lambda: restarts.append(1) or True)
+    daemon._RESTART_COUNT = 0
+    daemon._singbox_watchdog()
+    assert restarts == [], "单次探测抖动触发了 sing-box 重启"
+
+
+def test_watchdog_restarts_after_three_consecutive_failures(monkeypatch):
+    _stub_probe(monkeypatch, [False, False, False])
+    restarts = []
+    monkeypatch.setattr(daemon, "restart_singbox", lambda: restarts.append(1) or True)
+    daemon._RESTART_COUNT = 0
+    daemon._singbox_watchdog()
+    assert restarts == [1]
+
+
 def test_restart_singbox_refuses_concurrent_reentry():
     daemon._restart_lock = threading.Lock()
     daemon._RESTART_COUNT = 0

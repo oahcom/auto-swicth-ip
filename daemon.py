@@ -4050,7 +4050,7 @@ def is_singbox_alive() -> bool:
     if code != 200:
         pids = _singbox_pids()
         if pids:
-            log(f"⚠ Clash API 不通但进程还在 (PID={pids})，触发 watchdog 重启")
+            log(f"⚠ Clash API 不通但进程还在 (PID={pids})")
         return False
 
     if time.time() >= deadline:
@@ -4062,10 +4062,35 @@ def is_singbox_alive() -> bool:
         sock = socket.create_connection(("127.0.0.1", MIXED_PORT), timeout=min(2, deadline - time.time() + 0.5))
         sock.close()
     except (ConnectionRefusedError, OSError, TimeoutError):
-        log(f"⚠ Clash API 正常但代理端口 {MIXED_PORT} 不通，触发 watchdog 重启")
+        log(f"⚠ Clash API 正常但代理端口 {MIXED_PORT} 不通")
         return False
 
     return True
+
+
+# 判死前必须连续失败的次数。核心红线「服务探测必须 3 次连续失败才标 down」：
+# 单次超时就重启 sing-box，等于用一次网络抖动换一次全量在途 SSE 中断
+# （客户端看到 upstream connection lost）。实测 12:57:43 重启成功、33 秒后
+# 又因一次探测失败再重启一次；16:37:18 那次同一秒打了两条重启日志。
+_PROBE_FAIL_STREAK = 3
+# 就地重试的间隔。**不能靠 watchdog 的 30s 周期凑次数** —— 三次跨 60~90s，
+# 真死了的 sing-box 要多服务一分半的失败请求。4s 总预算内分三次，单次仍
+# 保持 2s 上限，与原来的探测强度一致。
+_PROBE_RETRY_GAP_SEC = 1.5
+
+
+def _probe_singbox_with_retry() -> bool:
+    """连续 `_PROBE_FAIL_STREAK` 次失败才判死；任一次成功即复活计数。
+
+    只在 watchdog 路径用。`restart_singbox` 重启后的自检仍调 `is_singbox_alive`
+    单次 —— 那里刚等过 `startup_grace_sec`，进程要么起来了要么没起，
+    再等三次只会拖长重启窗口。
+    """
+    for _ in range(_PROBE_FAIL_STREAK):
+        if is_singbox_alive():
+            return True
+        time.sleep(_PROBE_RETRY_GAP_SEC)
+    return False
 
 _restart_lock = threading.Lock()
 
@@ -4482,9 +4507,9 @@ def _wal_checkpoint() -> None:
 
 
 def _singbox_watchdog() -> None:
-    """探活 → 必要时重启。`is_singbox_alive` 最长 4s、重启要几十秒，只能在后台跑。"""
+    """探活 → 必要时重启。探测最慢 ~12s、重启要几十秒，只能在后台跑。"""
     global _pool_cooldown_until, _RESTART_COUNT
-    if is_singbox_alive():
+    if _probe_singbox_with_retry():
         with _RESTART_LOCK:
             if _RESTART_COUNT > 0:
                 _RESTART_COUNT = 0

@@ -24,7 +24,8 @@ daemon.py
     → 主动轮换（池）：proactive_mode 二选一 —— requests 满 150 格 dsv4（当前）/ fixed 每 60s
     → 自适应策略：normal=延迟优先 / pressure=均匀分散
     → 节点健康检查：每 300s 并发测试（_health_pool, _DEAD_TTL_STAGES）
-    → sing-box watchdog：重启检测
+    → sing-box watchdog：探活连续 3 次失败才重启（`_probe_singbox_with_retry`，
+      单次抖动不掐断在途 SSE）
     → 死节点导出：cleanup_dead_ttl() 写 _DEAD_NODES 到共享文件
     → 时间戳统一：_now_ts() int 秒
     → 订阅刷新：每 1h 后台执行，清理旧 node_info
