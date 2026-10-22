@@ -478,6 +478,11 @@ _WARP_PROBE_SEEN: dict[tuple[str, str], tuple[str, float]] = {}
 # 只有这两个是地址自身给出的持久结论；探测侧故障不代表地址的长期状态。
 _WARP_PROBE_PERSISTENT = frozenset({"quota", "flagged"})
 
+# 模型探测结论 → 生产侧惩罚类型。quota 是 FreeUsageLimitError（配额耗尽，24h），
+# flagged 是 abusive traffic（信誉标记，6h）—— 与 `_classify_warp_error` 归出的
+# rate429 / abuse403 完全同义，只是观测来源从生产流量换成了主动探测。
+_MODEL_VERDICT_BLOCK_KIND = {"quota": "rate429", "flagged": "abuse403"}
+
 
 def _probe_ttl(verdict: str) -> float:
     w = _warp()
@@ -2095,11 +2100,18 @@ def _note_probe_batch(verdicts: list[str]) -> None:
 
 
 def _ip_disqualified(ip: str | None, now: float, guard: float) -> bool:
-    """该出口是否因历史原因被排除：仍在惩罚期，或窗口内有过成功流量。"""
+    """该出口是否因历史原因被排除：仍在惩罚期，或窗口内有过成功流量。
+
+    惩罚期**两模式都生效**：那是「这个地址确实被拦过」的确定事实，不是启发式。
+    模型模式旁路的只是复用窗口（「窗口内成功过」—— 按段计、几小时恢复，
+    经常与事实不一致），不能连惩罚期一起放行。实测 7 个烧毁段里 648 个 /128
+    被逐个探测、608 个（94%）判 quota，全是本该在探测前就被挡住的。
+    """
+    if _warp_ip_is_blocked(ip, now):
+        return True
     if not _ip_history_is_truth():
         return False
-    return (_warp_ip_is_blocked(ip, now)
-            or _warp_ip_recently_used(ip, now, guard))
+    return _warp_ip_recently_used(ip, now, guard)
 
 
 def _warp_ip_needs_refresh(ip: str | None, now: float,
@@ -2534,6 +2546,14 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
                                              "first_seen": now}
             entry["last_ok_ts"] = max(float(entry.get("last_ok_ts") or 0), now)
             _save_warp_ip_used()
+    elif verdict in _MODEL_VERDICT_BLOCK_KIND:
+        # 模型层判 quota/flagged 与生产侧 429/403 是同一件事（前者是
+        # FreeUsageLimitError，后者是 abusive traffic），都该落进 blocked 台账：
+        # 光记探测缓存的话，「脏 IP 在探测之前就排除」这条设计对模型模式完全失效。
+        # 实测 7 个烧毁段里 648 个 /128 被逐个探测、608 个（94%）判 quota —— 段内
+        # 每个新地址都要白烧一格配额才被认出来，而段级静置本可以提前挡住。
+        _mark_warp_ip_used(ip, time.time(), blocked=True,
+                           kind=_MODEL_VERDICT_BLOCK_KIND[verdict])
     return ok
 
 

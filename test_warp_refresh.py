@@ -606,13 +606,76 @@ def test_probe_runs_at_most_once_per_address_within_ttl(monkeypatch):
     assert len(calls) == 3, f"异段地址同样各探一次，实际 {len(calls)}"
 
 
-def test_model_mode_ignores_ip_history(monkeypatch):
-    """模型模式下 IP 历史不得否决候选：被标记、窗口内用过都放行，由实测决定。"""
+def test_model_mode_ignores_reuse_window_but_keeps_penalty(monkeypatch):
+    """模型模式只旁路「复用窗口」，惩罚期照旧排除。
+
+    惩罚期是「这个地址确实被拦过」的确定事实；复用窗口是启发式，按段计、几小时
+    恢复，经常与事实不一致 —— 旁路的只能后者。实测 7 个烧毁段里 648 个 /128 被
+    逐个探测、608 个（94%）判 quota，全是本该在探测前就挡住的。
+    """
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
-    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: True)
     monkeypatch.setattr(daemon, "_warp_ip_recently_used", lambda ip, now, g=0: True)
+    # 只在复用窗口内、未处于惩罚期 → 模型模式放行
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: False)
     assert daemon._ip_disqualified("ip-a", time.time(), 86400) is False, \
-        "模型模式下历史不得参与判断"
+        "复用窗口不得否决候选"
+    # 处于惩罚期 → 两种模式都必须排除
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: True)
+    assert daemon._ip_disqualified("ip-a", time.time(), 86400) is True, \
+        "惩罚期内不得放回候选"
+
+
+def test_model_quota_verdict_marks_ip_blocked(monkeypatch):
+    """模型层判 quota 必须落进 blocked 台账，否则脏 IP 在探测前无法排除。"""
+    import probe_warp
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(probe_warp, "probe",
+                        lambda port, timeout: ("quota", 0.1, ""))
+    assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-q") is False
+    entry = daemon._WARP_IP_USED.get("ip-q") or {}
+    assert entry.get("blocked") is True, "quota 必须写进 blocked 台账"
+    assert "rate429" in daemon._warp_block_stamps(entry), \
+        "quota 对应生产侧 rate429（同一个 FreeUsageLimitError）"
+    # 结论必须在缓存里活着：清掉它下次调用会重探一遍、白烧一格配额。
+    assert daemon._probe_cache_get("W1", "ip-q") == "quota"
+    assert daemon._ip_disqualified("ip-q", time.time(), 86400) is True
+
+
+def test_model_flagged_verdict_maps_to_abuse403(monkeypatch):
+    """flagged（abusive traffic）对应 abuse403，惩罚期 6h 而非 24h。"""
+    import probe_warp
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(probe_warp, "probe",
+                        lambda port, timeout: ("flagged", 0.1, ""))
+    assert daemon._warp_model_usable({"tag": "W2", "port": 1081}, "ip-f") is False
+    entry = daemon._WARP_IP_USED["ip-f"]
+    assert "abuse403" in daemon._warp_block_stamps(entry)
+
+
+def test_model_ok_verdict_does_not_mark_blocked(monkeypatch):
+    """OK 不得标脏：否则每次测得可用就把地址推进惩罚期，候选池瞬间清空。"""
+    import probe_warp
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(probe_warp, "probe",
+                        lambda port, timeout: ("OK", 0.1, ""))
+    assert daemon._warp_model_usable({"tag": "W3", "port": 1082}, "ip-ok") is True
+    entry = daemon._WARP_IP_USED["ip-ok"]
+    assert entry.get("blocked") is False
+    assert daemon._ip_disqualified("ip-ok", time.time(), 86400) is False
 
 
 def test_blind_channel_falls_back_to_ip_history(monkeypatch):
