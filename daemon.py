@@ -616,7 +616,8 @@ def _warp_ip_refresh_reason(ip: str | None, now: float,
         return "出口未知"
     verdict = _probe_cache_verdict(tag, ip, now)
     if verdict is not None and verdict != "OK":
-        return f"模型层 {verdict}"
+        if not (verdict == "unreachable" and _warp_probe_blind(now)):
+            return f"模型层 {verdict}"
     if _warp_ip_is_blocked(ip, now):
         with _WARP_IP_LOCK:
             entry = _WARP_IP_USED.get(ip) or {}
@@ -2059,8 +2060,38 @@ def _ip_history_is_truth() -> bool:
     历史是启发式（「这个地址被烧过」「窗口内成功过」），而 429 按出口段计、
     恢复期几小时，两者经常与事实不一致 —— 实测重启后从没成功过的新地址，
     首条请求照样 429；反之旧地址过了惩罚期完全可以再用。测得出来就不猜。
+
+    探测通道失明时也退回历史判据（见 `_warp_probe_blind`）。「测得出来就不猜」
+    的前提是探测器还看得见；它整批报 unreachable 时什么都不代表，拿它当真
+    等于用观测者的故障去否定被观测对象。
     """
-    return not _warp().get("refresh_model_check", True)
+    return not _warp().get("refresh_model_check", True) or _warp_probe_blind()
+
+
+# 探测通道失明的判定：一整批探测全部 `unreachable` 才算。单条 `unreachable`
+# 是出口段的真实瞬时故障（退避窗口 2min 已按此设），而整批同时失败只可能是
+# 探测通道本身出了问题 —— 实测 16:50:18 一批 17 条同一秒全灭，重启换 IP 后
+# 16:50:50~52 全部 OK，期间白烧 17 条隧道的重启与配额。
+_WARP_PROBE_BLIND_SEC = 120.0
+_probe_blind_until: float = 0.0
+# 各线最近一次探测结论，供 `_note_probe_batch` 判断「整批」而非单条。
+_PROBE_LAST_VERDICT: dict[str, str] = {}
+
+
+def _warp_probe_blind(now: float | None = None) -> bool:
+    """模型层探测通道此刻是否失明（整批 unreachable 后的降级窗口内）。"""
+    if now is None:
+        now = time.time()
+    return now < _probe_blind_until
+
+
+def _note_probe_batch(verdicts: list[str]) -> None:
+    """记录一批探测结论；整批 unreachable 则宣布探测器失明 `_WARP_PROBE_BLIND_SEC`。"""
+    global _probe_blind_until
+    if verdicts and all(v == "unreachable" for v in verdicts):
+        _probe_blind_until = time.time() + _WARP_PROBE_BLIND_SEC
+        log(f"  ⚠ 本批 {len(verdicts)} 条模型层探测全 unreachable —— 判定探测通道失明，"
+            f"{_WARP_PROBE_BLIND_SEC:.0f}s 内退回历史判据")
 
 
 def _ip_disqualified(ip: str | None, now: float, guard: float) -> bool:
@@ -2086,9 +2117,11 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
         return True
     # 本线实测不通过（quota/err/unreachable）就是「此刻不能服务 opencode」，
     # 与 blocked 同义：只有重启换会话才可能好转。判据复用已有结论，不额外探测。
+    # 通道失明期间例外：那批 unreachable 说的是探测器自己没打通，不是地址被拒
+    # （见 `_warp_probe_blind`）—— 照它重启只会白烧隧道与配额。
     verdict = _probe_cache_verdict(tag, ip, now)
     if verdict is not None and verdict != "OK":
-        return True
+        return not (verdict == "unreachable" and _warp_probe_blind(now))
     if _warp_ip_is_blocked(ip, now):
         return True
     if _ip_history_is_truth():
@@ -2107,8 +2140,11 @@ def _warp_model_test_many(pairs: list[tuple[dict, str]]) -> dict[str, bool]:
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=len(pairs), thread_name_prefix="warp-model") as ex:
         futs = {ex.submit(_warp_model_usable, m, ip): m for m, ip in pairs}
-        return {futs[f]["tag"]: (f.result() if not f.exception() else False)
-                for f in concurrent.futures.as_completed(futs)}
+        out = {futs[f]["tag"]: (f.result() if not f.exception() else False)
+               for f in concurrent.futures.as_completed(futs)}
+    # 整批一起失败才是通道故障；单条 unreachable 是该出口的真实瞬态。
+    _note_probe_batch([_PROBE_LAST_VERDICT.get(m["tag"], "") for m, _ in pairs])
+    return out
 
 
 _last_success_probe: tuple[int, int] | None = None
@@ -2466,6 +2502,12 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         log(f"  · {tag} 出口 {ip} TTL 内已探过: {cached}（跳过）"
             f"{_warp_refresh_count_note(tag)}")
         return ok
+    if _warp_probe_blind():
+        # 通道失明时不探、也不否决：探出来的只会是通道的故障，还要白烧一格配额。
+        # 此刻「能不能用」没有观测来源，退回历史判据（调用方据
+        # `_ip_history_is_truth` 走三档与复用窗口）。
+        log(f"  ⚠ {tag} 出口 {ip} 探测通道失明，跳过实测改用历史判据")
+        return True
     try:
         import probe_warp
         verdict = probe_warp.probe(member["port"],
@@ -2474,6 +2516,7 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         log(f"  ✗ {tag} 模型探测异常: {e}")
         return False
     _probe_cache_put(tag, ip, verdict)
+    _PROBE_LAST_VERDICT[tag] = verdict
     ok = verdict == "OK"
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}"
         f"{_warp_refresh_count_note(tag)}")

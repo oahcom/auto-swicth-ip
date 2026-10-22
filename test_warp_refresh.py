@@ -615,6 +615,53 @@ def test_model_mode_ignores_ip_history(monkeypatch):
         "模型模式下历史不得参与判断"
 
 
+def test_blind_channel_falls_back_to_ip_history(monkeypatch):
+    """整批 unreachable ⇒ 探测通道失明，退回历史判据。
+
+    实测 16:50:18 一批 17 条同一秒全 unreachable，重启换 IP 后 16:50:50~52 全部
+    OK —— 那批结论说的是探测器自己没打通，拿它当真会白烧 17 条隧道的重启与配额。
+    """
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    daemon._note_probe_batch(["unreachable"] * 17)
+    assert daemon._warp_probe_blind() is True
+    assert daemon._ip_history_is_truth() is True, "失明期间必须退回历史判据"
+    # 失明时不得再发探测请求：探出来只会是通道的故障，还白烧一格配额。
+    import probe_warp
+    called = []
+    monkeypatch.setattr(probe_warp, "probe",
+                        lambda port, timeout: (called.append(port), ("OK", 0.1, ""))[1])
+    assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-a") is True
+    assert called == [], "通道失明期间不该再探测"
+
+
+def test_partial_unreachable_is_not_blindness(monkeypatch):
+    """单条 unreachable 是出口的真实瞬态（TTL 2min），不得升级成通道失明。"""
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    daemon._note_probe_batch(["unreachable", "OK", "quota"])
+    assert daemon._warp_probe_blind() is False
+    assert daemon._ip_history_is_truth() is False, "未失明时仍以实测为准"
+
+
+def test_blind_channel_does_not_restart_line_on_stale_unreachable(monkeypatch):
+    """失明期间缓存的 unreachable 不得驱动重启：它不是「地址被拒」。"""
+    monkeypatch.setattr(daemon, "_probe_blind_until", time.time() + 60)
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN",
+                        {("W1", "ip-a"): ("unreachable", time.time())})
+    assert daemon._warp_ip_needs_refresh("ip-a", time.time(), "W1") is False
+    assert daemon._warp_ip_refresh_reason("ip-a", time.time(), "W1") == ""
+
+
+def test_stale_unreachable_still_restarts_when_channel_healthy(monkeypatch):
+    """通道健康时缓存的 unreachable 照旧驱动重启，语义不变。"""
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN",
+                        {("W1", "ip-a"): ("unreachable", time.time())})
+    assert daemon._warp_ip_needs_refresh("ip-a", time.time(), "W1") is True
+    assert daemon._warp_ip_refresh_reason("ip-a", time.time(), "W1") == "模型层 unreachable"
+
+
 def test_old_mode_still_rejects_by_ip_history(monkeypatch):
     """原模式保留：被标记或窗口内用过即排除，不依赖任何探测。"""
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", False)
