@@ -3688,3 +3688,25 @@ def test_probe_refresh_egress_skips_retry_on_success(monkeypatch):
 
     assert daemon._probe_refresh_egress(1080) == "1.1.1.1"
     assert calls == [7], f"首探成功不得重探，实际 {calls}"
+
+
+def test_exclude_active_ip_drops_same_as_current():
+    """新出口与旧出口相同等于没换 —— 必须滤掉，否则白白重启目标线。
+
+    实测 817 次换线里 111 次（13.7%）新出口 == 旧出口，全是 rate429 触发。
+    """
+    pairs = [({"tag": "A"}, "1.1.1.1"), ({"tag": "B"}, "2.2.2.2")]
+    assert daemon._exclude_active_ip(pairs, "1.1.1.1") == [({"tag": "B"}, "2.2.2.2")]
+
+
+def test_exclude_active_ip_dedups_across_tunnels():
+    """两条隧道可能拿到同一 IP（CF 会话重复分配），只留首条（已按优先级排序）。"""
+    pairs = [({"tag": "A"}, "1.1.1.1"), ({"tag": "B"}, "1.1.1.1"),
+             ({"tag": "C"}, "2.2.2.2")]
+    assert [m["tag"] for m, _ in daemon._exclude_active_ip(pairs, None)] == ["A", "C"]
+
+
+def test_exclude_active_ip_falls_back_when_all_filtered():
+    """全被滤空时退回原列表：宁可换到旧地址，也不能因此落轮换池（3h 冷却）。"""
+    pairs = [({"tag": "A"}, "1.1.1.1")]
+    assert daemon._exclude_active_ip(pairs, "1.1.1.1") == pairs

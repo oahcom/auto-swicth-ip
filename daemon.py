@@ -475,6 +475,10 @@ def _refresh_concurrency() -> int:
 # 先解决当前重复探测。
 _WARP_PROBE_SEEN: dict[tuple[str, str], tuple[str, float]] = {}
 
+# 地址最近一次被 403/429 标脏的时刻。只为一件事存在：拒收「起手早于标脏」的
+# 在途探测结论（见 `_probe_cache_put`）。按 IP 不按 (tag, ip) —— 标脏是地址属性。
+_PROBE_BLOCKED_AT: dict[str, float] = {}
+
 # 只有这两个是地址自身给出的持久结论；探测侧故障不代表地址的长期状态。
 _WARP_PROBE_PERSISTENT = frozenset({"quota", "flagged"})
 
@@ -520,15 +524,54 @@ def _probe_cache_verdict(tag: str | None, ip: str | None,
 
 
 def _probe_cache_put(tag: str, ip: str, verdict: str,
-                     now: float | None = None) -> None:
+                     now: float | None = None,
+                     started_at: float | None = None) -> bool:
+    """记下一条实测结论；`started_at` 早于该地址的标脏时刻时拒收并返回 False。
+
+    拒收这一支处理**在途探测**：探测 1.4~8.7s，期间该地址完全可能已被 403/429
+    烧掉并被 `_probe_cache_forget` 清空 —— 只删已有的条目挡不住紧接着返回的
+    那次 `_probe_cache_put`，它会拿着标脏前起手的 OK 把台账重新填满。
+    """
     if now is None:
         now = time.time()
     with _WARP_REFRESH_LOCK:
+        if started_at is not None and started_at <= _PROBE_BLOCKED_AT.get(ip, 0.0):
+            return False
         _WARP_PROBE_SEEN[(tag, ip)] = (verdict, now)
         # 按各自 TTL 清：命中同一 key 时上面已覆盖，这里只清别的地址。
         for k, (v, ts) in list(_WARP_PROBE_SEEN.items()):
             if now - ts > _probe_ttl(v):
                 del _WARP_PROBE_SEEN[k]
+    return True
+
+
+def _probe_cache_forget(ip: str | None) -> None:
+    """该地址一旦被 403/429 标记，作废它所有的探测结论。
+
+    WHY 键控在 (tag, ip) 却按 ip 全清：被烧是**地址**的属性，不是某条隧道的。
+    同一地址可能被两条线先后持有，只清当前 tag 会留下另一条的 OK 结论。
+
+    WHY 必须清：模型模式下历史不否决候选，能不能用只认这张台账；而 OK 结论
+    的 TTL 是 120s，远长于实测段寿命（cache 验收选中的段 p50 只有 6s）。于是
+    「探过 OK → 被 429 烧掉 → 9 秒后又拿着那条旧 OK 切回去」成为闭环：
+    实测 829 次换线里 170 次（20.5%）是同一个 IP 在 120s 内被重新选中，
+    其中 158 次弹回所依据的 OK 早于该 IP 的标脏时刻 —— 证据比事实旧。
+    作废后必须重新实测，实测要么给 quota 走刷新，要么给新的 OK。
+
+    同时记下作废时刻（墓碑）：删表只能清掉已落地的结论，挡不住正在飞的那次
+    探测回来补写，见 `_probe_cache_put` 的 `started_at` 判据。
+    """
+    if not ip:
+        return
+    now = time.time()
+    with _WARP_REFRESH_LOCK:
+        _PROBE_BLOCKED_AT[ip] = now
+        for k in [k for k in _WARP_PROBE_SEEN if k[1] == ip]:
+            del _WARP_PROBE_SEEN[k]
+        # 墓碑只需覆盖「探测在途」那几秒，留最长 TTL 已远超需要；顺带定长。
+        keep = now - _probe_ttl("quota")
+        for k in [k for k, ts in _PROBE_BLOCKED_AT.items() if ts < keep]:
+            del _PROBE_BLOCKED_AT[k]
 
 
 # 每条线「离开主渠道」的时刻与此后累计的隧道重启次数。刷新日志据此回答
@@ -1938,6 +1981,28 @@ def _cached_warp_standby(standby: list[dict], now: float,
     return deduped
 
 
+def _exclude_active_ip(pairs: list[tuple[dict, str]],
+                       active_ip: str | None) -> list[tuple[dict, str]]:
+    """候选出口不能与当前出口或彼此重复 —— 换到同一个地址等于没换。
+
+    WHY 必须硬拦：实测 817 次换线里 111 次（13.7%）「新出口 == 旧出口」，
+    全部是 rate429 触发，切过去后仍然限流，白白重启了目标线（每 IP 同一时刻
+    只属于一条隧道，重复即无效）。20 条隧道并行时同一 IP 也可能被两条线同时
+    拿到（CF 会话重复分配），去重保留首条即最优（调用方已按选线优先级排序）。
+
+    全被滤空时退回原列表：宁可换到旧地址，也不要因为一条理论约束把流量甩到
+    轮换池（池有 3h 冷却，代价远大于一次无效换线）。
+    """
+    seen = set()
+    out = []
+    for m, ip in pairs:
+        if ip == active_ip or ip in seen:
+            continue
+        seen.add(ip)
+        out.append((m, ip))
+    return out or pairs
+
+
 def _warp_line_selected(tag: str, ip: str, ts: float) -> None:
     with _WARP_LINE_LOCK:
         _WARP_LINE_STATE[tag] = {"sel": ts, "ip": ip}
@@ -2423,11 +2488,17 @@ def _warp_ip_survival(ip: str | None) -> float | None:
 
 
 def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
-                       kind: str | None = None) -> None:
+                       kind: str | None = None,
+                       forget_probe: bool = True) -> None:
     """记录出口 IP 的本次使用；blocked=True 表示该 IP 已被 403/429 标记。
 
     `kind` 为 "abuse403" / "rate429"，决定惩罚期是 6h 还是 24h；缺省时
     该条记录按 24h 保守处理。顺手清理已出窗口的条目（表长恒定为窗口内 IP 数）。
+
+    `forget_probe=False` 供模型探测自己记账时用：那是**同一次观测**的产物，
+    清掉它只会让下次调用重探一遍、白烧一格配额（实测同一地址连探两次）。
+    生产侧标记（403/429）才需要作废旧结论 —— 那种情况下台账里的 OK 早于标脏，
+    属于「证据比事实旧」，留着会让脏地址被重新选中。
 
     换线线程与主循环都会写，必须持锁；否则并发 setdefault + 全量落盘会丢更新。
     """
@@ -2435,6 +2506,10 @@ def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
         return
     with _WARP_IP_LOCK:
         _warp_ip_used_locked(ip, now, blocked, kind)
+    # 在锁外清：两张台账没有嵌套需求，拿完就放，避免与 _record_warp_cycle
+    # 的 IP→CYCLES 顺序交叉成环。
+    if blocked and forget_probe:
+        _probe_cache_forget(ip)
     # 历史记在锁外：只追加文件，不碰 _WARP_IP_USED，让磁盘 I/O 不挡换线线程。
     # 只有本函数写历史 —— 每请求成功采样路径也调 _warp_ip_used_locked（为补
     # last_ok_ts），记在那里会让日志按请求量爆炸。
@@ -2520,6 +2595,9 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         # `_ip_history_is_truth` 走三档与复用窗口）。
         log(f"  ⚠ {tag} 出口 {ip} 探测通道失明，跳过实测改用历史判据")
         return True
+    # 探测要 1.4~8.7s，期间该地址可能已被 403/429 标脏并作废台账。带上起手
+    # 时刻，让 `_probe_cache_put` 拒收这种「证据比事实旧」的结论（见其 docstring）。
+    started_at = time.time()
     try:
         import probe_warp
         verdict = probe_warp.probe(member["port"],
@@ -2527,7 +2605,11 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     except Exception as e:
         log(f"  ✗ {tag} 模型探测异常: {e}")
         return False
-    _probe_cache_put(tag, ip, verdict)
+    if not _probe_cache_put(tag, ip, verdict, started_at=started_at):
+        # 也不记 last_ok_ts：那会把已烧地址重新认证成「刚成功过」，下一轮选线
+        # 照样按次级优质把它排回候选池首位。
+        log(f"  ✗ {tag} 出口 {ip} 实测 {verdict} 起手早于该地址标脏，结论作废")
+        return False
     _PROBE_LAST_VERDICT[tag] = verdict
     ok = verdict == "OK"
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}"
@@ -2553,7 +2635,8 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         # 实测 7 个烧毁段里 648 个 /128 被逐个探测、608 个（94%）判 quota —— 段内
         # 每个新地址都要白烧一格配额才被认出来，而段级静置本可以提前挡住。
         _mark_warp_ip_used(ip, time.time(), blocked=True,
-                           kind=_MODEL_VERDICT_BLOCK_KIND[verdict])
+                           kind=_MODEL_VERDICT_BLOCK_KIND[verdict],
+                           forget_probe=False)
     return ok
 
 
@@ -3229,6 +3312,10 @@ def reconnect_warp(reason: str) -> bool:
             log(f"  ✗ {m['tag']} 刷新后仍无可用出口")
         for rest in blocked_lines[1:]:
             _schedule_idle_refresh(rest)
+
+    # 上面两条分支都会往 probes 里加条目（探测/缓存、同步刷新），去重必须放在
+    # 它们之后，否则刷新拿回的新地址照样可能是当前出口本身。
+    probes = _exclude_active_ip(probes, old_ip)
 
     # 选线三级优先：
     #   1) 从未用过的地址 —— 必然没被 opencode 见过，优先级最高；

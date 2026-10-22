@@ -38,8 +38,13 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     # 探测台账是进程级全局：不隔离则前一个用例探过的 IP 在本用例被当成
     # 「TTL 内已探过」而跳过真实探测，台账相关断言全落空。
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    # 标脏墓碑同样是进程级全局：残留条目会拒收后续用例带 started_at 的写入。
+    monkeypatch.setattr(daemon, "_PROBE_BLOCKED_AT", {})
     # 模型探测通过会记 last_ok_ts 并落盘，不隔离就写进生产 .warp_ip_used.json。
     monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(tmp_path / "warp_ip_used.json"))
+    # 历史是只追加文件且永不清理：`_mark_warp_ip_used` 顺手写它，不隔离则桩地址
+    # 永久留在生产 .warp_ip_history.jsonl（已实测写进 10 条假记录）。
+    monkeypatch.setenv("WARP_IP_HISTORY_FILE_PATH", str(tmp_path / "warp_ip_history.jsonl"))
     # 换线三件套是裸全局，`reconnect_warp` 直接赋值、不经 monkeypatch：
     # 不在这里兜住，本文件跑完后它们停在 time.time() 量级，随后导入
     # test_daemon_unit 的换线用例用假时钟 now=1000 就把「生效间隔硬闸」
@@ -234,6 +239,56 @@ def test_probe_cache_reprobe_overwrites_verdict(monkeypatch):
     daemon._probe_cache_put("W1", ip, "OK", now=1000.0)
     daemon._probe_cache_put("W1", ip, "quota", now=1100.0)
     assert daemon._probe_cache_verdict("W1", ip, 1101.0) == "quota"
+
+
+def test_marking_ip_blocked_invalidates_its_probe_verdicts(monkeypatch):
+    """地址被 403/429 标记后，它此前探出的 OK 必须立刻作废。
+
+    实测 829 次换线里 170 次（20.5%）是同一 IP 在 120s 内被重新选中，其中
+    158 次依据的 OK 早于该 IP 的标脏时刻 —— 证据比事实旧，于是「探过 OK →
+    被 429 烧 → 9 秒后又拿旧 OK 切回去」闭环。作废后必须重新实测。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    ip = "2a09:bac5:1ef9:281e::1"
+    daemon._probe_cache_put("W1", ip, "OK", now=1000.0)
+    assert daemon._probe_cache_verdict("W1", ip, 1001.0) == "OK"
+    daemon._mark_warp_ip_used(ip, 1002.0, blocked=True, kind="rate429")
+    assert daemon._probe_cache_verdict("W1", ip, 1003.0) is None, \
+        "标脏后旧 OK 不能继续放行"
+    assert daemon._warp_ip_needs_refresh(ip, 1003.0, "W1") is True
+
+
+def test_forget_by_ip_covers_every_line_holding_it():
+    """作废按 IP 全清，不只清当前线：被烧是地址属性，不是某条隧道的。
+
+    同一地址可能被两条线先后持有（重连竞态），只清当前 tag 会留下另一条的
+    OK —— 下次换线正好从那条线上把它当新鲜地址切回来。
+    """
+    ip = "2a09:bac5:1ef9:281e::1"
+    daemon._probe_cache_put("W1", ip, "OK", now=1000.0)
+    daemon._probe_cache_put("W2", ip, "OK", now=1000.0)
+    daemon._probe_cache_put("W2", "2a09:bac5:1ef9:281e::2", "OK", now=1000.0)
+    daemon._probe_cache_forget(ip)
+    assert daemon._probe_cache_verdict("W1", ip, 1001.0) is None
+    assert daemon._probe_cache_verdict("W2", ip, 1001.0) is None
+    assert daemon._probe_cache_verdict("W2", "2a09:bac5:1ef9:281e::2", 1001.0) == "OK", \
+        "别的地址不受牵连"
+    daemon._probe_cache_forget(None)   # 出口未知时不该炸
+
+
+def test_inflight_probe_started_before_block_is_rejected():
+    """在途探测晚回来时不得把已作废的结论重新写进台账。
+
+    探测 1.4~8.7s，期间地址完全可能被 403/429 烧掉。只删已有条目挡不住紧接着
+    返回的那次 `_probe_cache_put` —— 它拿的是标脏前起手的 OK。codex P2。
+    """
+    ip = "2a09:bac5:1ef9:281e::1"
+    daemon._probe_cache_forget(ip)                      # 标脏时刻 = now
+    assert daemon._probe_cache_put("W1", ip, "OK", started_at=time.time() - 5) is False
+    assert daemon._probe_cache_verdict("W1", ip) is None, "起手早于标脏的 OK 不得落地"
+    # 标脏之后才起手的探测照常收下：那是「烧了之后又实测好」的合法新证据
+    assert daemon._probe_cache_put("W1", ip, "OK", started_at=time.time() + 1) is True
+    assert daemon._probe_cache_verdict("W1", ip) == "OK"
 
 
 class ScriptedBytes:
@@ -632,7 +687,8 @@ def test_model_quota_verdict_marks_ip_blocked(monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
-    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history",
+                        lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
                         lambda port, timeout: ("quota", 0.1, ""))
@@ -686,6 +742,8 @@ def test_blind_channel_falls_back_to_ip_history(monkeypatch):
     """
     monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    # 标脏墓碑同样是进程级全局：残留条目会拒收后续用例带 started_at 的写入。
+    monkeypatch.setattr(daemon, "_PROBE_BLOCKED_AT", {})
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     daemon._note_probe_batch(["unreachable"] * 17)
     assert daemon._warp_probe_blind() is True
