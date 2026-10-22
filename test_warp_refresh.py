@@ -87,7 +87,12 @@ class ScriptedBytes:
         self.seq = list(seq)
 
     def __call__(self, tag):
-        return self.seq.pop(0) if self.seq else None
+        if not self.seq:
+            return None
+        v = self.seq.pop(0)
+        if v is None:
+            return None
+        return (v, 0) if isinstance(v, int) else tuple(v)
 
 
 def test_ip_reuse_window_covers_measured_interval():
@@ -119,45 +124,68 @@ def test_retry_refresh_is_wired_in():
 
 
 def test_line_busy_when_bytes_grow(monkeypatch):
-    monkeypatch.setattr(daemon, "_warp_line_bytes", ScriptedBytes([1000, 2000]))
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([1000, 2000]))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     assert daemon.warp_line_busy("WARP-CF") is True
 
 
 def test_line_idle_when_bytes_unchanged(monkeypatch):
-    monkeypatch.setattr(daemon, "_warp_line_bytes", ScriptedBytes([2000, 2000]))
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([2000, 2000]))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     assert daemon.warp_line_busy("WARP-CF") is False
 
 
 def test_line_idle_when_bytes_drop(monkeypatch):
     """连接被关闭时总量回落，同样说明该线闲下来了。"""
-    monkeypatch.setattr(daemon, "_warp_line_bytes", ScriptedBytes([2000, 1500]))
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([2000, 1500]))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    assert daemon.warp_line_busy("WARP-CF") is False
+
+
+def test_line_busy_when_request_awaits_first_byte(monkeypatch):
+    """字节零增长但仍有请求在等首字节 → 必须判忙，否则重启掐断它。
+
+    实测：重启前该线上仍有此类连接的有 13%，cut 掉后客户端收到的是
+    upstream connection lost（请求已发出，一个 token 都没回来）。
+    """
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([(2000, 0), (2000, 2)]))
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    assert daemon.warp_line_busy("WARP-CF") is True
+
+
+def test_line_idle_despite_long_lived_idle_connections(monkeypatch):
+    """连接数不是判据：长寿空闲连接不得把线钉死在「忙」上。
+
+    活跃线上恒有 7~10 条连接且从不归零（单条实测存活 936s）；按连接数判忙会
+    让这些线永远刷不到新鲜 IP。这里模拟「有连接但都在等首字节之外」的情形：
+    第二次采样仍无等待连接的计数，故判闲。
+    """
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([(2000, 0), (2000, 0)]))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     assert daemon.warp_line_busy("WARP-CF") is False
 
 
 def test_line_busy_unknown_when_query_fails(monkeypatch):
-    monkeypatch.setattr(daemon, "_warp_line_bytes", ScriptedBytes([None, None]))
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([None, None]))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     assert daemon.warp_line_busy("WARP-CF") is None
 
 
 def test_line_busy_unknown_on_partial_failure(monkeypatch):
-    monkeypatch.setattr(daemon, "_warp_line_bytes", ScriptedBytes([1000, None]))
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([1000, None]))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     assert daemon.warp_line_busy("WARP-CF") is None
 
 
 def test_wait_idle_returns_true_when_line_goes_quiet(monkeypatch):
-    monkeypatch.setattr(daemon, "_warp_line_bytes", ScriptedBytes([1, 2, 2, 2]))
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([1, 2, 2, 2]))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     assert daemon._wait_warp_idle({"tag": "WARP-CF"}) is True
 
 
 def test_wait_idle_times_out_when_always_busy(monkeypatch):
     """恒忙（且脚本耗尽后查询失败）必须超时返回 False。"""
-    monkeypatch.setattr(daemon, "_warp_line_bytes", ScriptedBytes([1, 2]))
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([1, 2]))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     clock = {"t": 0.0}
 
@@ -171,7 +199,7 @@ def test_wait_idle_times_out_when_always_busy(monkeypatch):
 
 def test_wait_idle_treats_query_failure_as_busy(monkeypatch):
     """查不到连接表时不得当作空闲，否则会强刷掐断在途连接。"""
-    monkeypatch.setattr(daemon, "_warp_line_bytes", ScriptedBytes([None]))
+    monkeypatch.setattr(daemon, "_warp_line_stats", ScriptedBytes([None]))
     monkeypatch.setattr(time, "sleep", lambda s: None)
     clock = {"t": 0.0}
 

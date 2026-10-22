@@ -1574,8 +1574,22 @@ def _wait_port_ready(port: int, timeout_sec: float) -> bool:
     return False
 
 
-def _warp_line_bytes(tag: str) -> int | None:
-    """该 tag 上所有连接的累计字节；查询失败返回 None。"""
+# 判「等首字节」的连接年龄上限。首 token 延迟实测 p50=1.7s / p90=52.6s /
+# max=532.7s（N=83）；取 120s 覆盖 p90 且留一倍余量。上限是必要的：一条卡死
+# 的连接若永远 download=0，没有它就会把整条线钉死在「忙」上，补刷再也等不到。
+_FIRST_BYTE_WAIT_MAX_SEC = 120.0
+
+
+def _warp_line_stats(tag: str) -> tuple[int, int] | None:
+    """该 tag 上的 (累计字节, 等首字节的请求数)；查询失败返回 None。
+
+    两个值来自同一次 Clash 查询：判闲要连查两次，拆成两个函数就得付两次
+    往返，而这是 5s 一次的守护热路径。
+
+    「等首字节」= download 为 0 且连接年龄在 `_FIRST_BYTE_WAIT_MAX_SEC` 内。
+    这类连接此刻不传任何字节，但与空闲线有本质区别：掐断它，客户端拿到的就是
+    upstream connection lost —— 请求已发出，一个 token 都还没回来。
+    """
     try:
         r = subprocess.run(
             ["curl", "-s", "--max-time", "5", "-H",
@@ -1586,50 +1600,83 @@ def _warp_line_bytes(tag: str) -> int | None:
         data = json.loads(r.stdout)
     except Exception:
         return None
-    return sum((c.get("upload") or 0) + (c.get("download") or 0)
-               for c in (data.get("connections") or [])
-               if tag in (c.get("chains") or []))
+    mine = [c for c in (data.get("connections") or [])
+            if tag in (c.get("chains") or [])]
+    now = time.time()
+    waiting = 0
+    for c in mine:
+        if (c.get("download") or 0) > 0:
+            continue
+        try:
+            started = datetime.fromisoformat(c["start"]).timestamp()
+        except Exception:
+            continue
+        if now - started < _FIRST_BYTE_WAIT_MAX_SEC:
+            waiting += 1
+    return (sum((c.get("upload") or 0) + (c.get("download") or 0)
+                for c in mine), waiting)
 
 
-def warp_line_busy(tag: str, window: float = 2.0) -> bool | None:
-    """该线此刻是否仍在传输数据；查不到返回 None（调用方保守处理）。
+def _warp_line_bytes(tag: str) -> int | None:
+    """该 tag 上所有连接的累计字节；查询失败返回 None。"""
+    s = _warp_line_stats(tag)
+    return s[0] if s else None
 
-    WHY 不用连接数：实测活跃线上恒有 7~10 条连接且从不归零（SSE 长连接
-    + 9router 连接复用，实测单条存活 936s），按"连接数=0"等下去必然超时，
-    被换下的线因此永远刷不到新鲜 IP。
 
-    用两次快照的字节增量判活跃：只要还有一条连接在传数据，总量就会增长。
-    连接被关闭时总量回落，同样说明该线已闲下来。
+# 错误换线路径的判闲观察窗。12s（`busy_window_sec`）是给后台补刷的：那条
+# 路径可以慢慢等。换线路径上每多等一秒，坏出口就多服务一秒失败请求 ——
+# 按候选逐条 12s 时最坏 ~120s 才切走（codex review 指出）。2s 是 HEAD 的
+# 既有默认，这里把它显式化，不再依赖参数默认值。
+_ERROR_PATH_BUSY_WINDOW_SEC = 2.0
 
-    WHY 窗口是 12s 而不是 2s：流式 SSE 的两次 token 之间会静默
-    p50=7s / p90=9.1s / max=10.1s（N=30 连接 100s 实测）。2s 窗口有一半
-    以上采样落在静默期里，把仍在传流的线判成空闲 → 立即重启 → 掐断在途
-    请求 → 9router 注入 upstream connection lost。这正是「每次切渠道都报
-    错」的直接成因：换线后被换下的线 20s 就开始补刷，撞上的多是自己尾部
-    仍在静默排字的 SSE。
+
+def warp_line_busy(tag: str, window: float | None = None) -> bool | None:
+    """该线此刻是否仍在服务请求；查不到返回 None（调用方保守处理）。
+
+    窗口默认取 `busy_window_sec`(12s)，那是给后台补刷 / 脏线守护的。错误
+    换线路径必须显式传短窗（`_ERROR_PATH_BUSY_WINDOW_SEC`），否则每个候选
+    都要先睡满 12s。
+
+    两个判据是**或**关系：
+      1. 字节增量 —— 有连接正在传数据；
+      2. 该线上有请求在等首字节 —— 已发出、一个 token 都还没回来。
+
+    WHY 判据 2 不可省：流式响应在首 token 之前完全不传字节，首 token 延迟实测
+    p50=1.7s / p90=52.6s / max=532.7s（N=83）。只看字节增量时，一条正在等首
+    token 的线看起来和空闲线一模一样，被判空闲后立刻重启；客户端为此收到的是
+    upstream connection lost —— 请求已发出，什么都没等到。实测重启前该线上
+    仍有此类连接的有 13%。
+
+    WHY 判据 2 不能用「连接数 > 0」：活跃线上恒有 7~10 条连接且从不归零（SSE
+    长连接 + 9router 连接复用，单条实测存活 936s），按连接数判忙会让这些线永远
+    刷不到新鲜 IP。只有「download 为 0 且年龄在上限内」才说明请求还在等首字节。
     """
     if window is None:
         window = float(_warp().get("busy_window_sec", 12.0))
-    b0 = _warp_line_bytes(tag)
-    if b0 is None:
+    s0 = _warp_line_stats(tag)
+    if s0 is None:
         return None
     time.sleep(window)
-    b1 = _warp_line_bytes(tag)
-    if b1 is None:
+    s1 = _warp_line_stats(tag)
+    if s1 is None:
         return None
-    return b1 > b0
+    b0 = s0[0]
+    b1, conns = s1
+    return b1 > b0 or conns > 0
 
 
-def _wait_warp_idle(member: dict, timeout_sec: float | None = None) -> bool:
+def _wait_warp_idle(member: dict, timeout_sec: float | None = None,
+                    window: float | None = None) -> bool:
     """等到该线不再传输数据；超时返回 False（调用方自行决定是否强刷）。
 
     默认用 idle_wait_sec(40s) —— 补刷路径可以慢慢等，它不阻塞流量。错误换线
-    路径必须传更短的值：那里每多等一秒，坏出口就多服务一秒失败请求。
+    路径必须同时传更短的超时与更短的观察窗：那里每多等一秒，坏出口就多服务
+    一秒失败请求。
     """
     deadline = time.time() + (timeout_sec if timeout_sec is not None
                               else _warp()["idle_wait_sec"])
     while time.time() < deadline:
-        if warp_line_busy(member["tag"]) is False:
+        if warp_line_busy(member["tag"], window) is False:
             return True
         time.sleep(1)
     return False
