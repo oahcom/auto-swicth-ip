@@ -5,6 +5,7 @@
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -146,6 +147,38 @@ def test_fetch_refuses_checksum_mismatch(tmp_path):
     assert out.returncode != 0, "校验不符时必须非零退出"
     assert "sha256" in out.stderr, f"应报校验失败，实际：{out.stderr[:200]}"
     assert not (repo / "sing-box").exists(), "坏包不得落盘"
+
+
+def test_install_refuses_to_retarget_live_units(tmp_path):
+    """从副本运行且未设 SYSTEMD_DIR 时，不得改写指向别处的现网单元。
+
+    真实事故：`--units-only` 在 /tmp 副本里跑过一次，23 个单元全被改指 /tmp，
+    而副本随时会被清理 —— 服务下次重启即崩。
+    """
+    fake_home = tmp_path / "home"
+    unit_dir = fake_home / ".config/systemd/user"
+    unit_dir.mkdir(parents=True)
+    other_repo = tmp_path / "other-repo"
+    other_repo.mkdir()
+    (other_repo / "daemon.py").write_text("# 生产副本\n")
+    (unit_dir / "auto-switch-ip.service").write_text(
+        f"[Service]\nWorkingDirectory={other_repo}\n")
+
+    # 用真实脚本配一个假 SHELL 环境：脚本按自身位置推出 DIR，所以整份复制到
+    # 新的 clone 目录，才是在"另一处 clone"里运行。
+    here = tmp_path / "this-clone"
+    shutil.copytree(PROJECT / "deploy", here / "deploy")
+    for f in ("config.py", "requirements.txt"):
+        shutil.copy2(PROJECT / f, here / f)
+    shutil.copy2(PROJECT / "sing-box", here / "sing-box")
+
+    out = subprocess.run(["bash", str(here / "deploy/install.sh"), "--units-only"],
+                         capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "HOME": str(fake_home)})
+    assert "拒绝覆盖生产单元" in out.stderr, \
+        f"未触发防护（rc={out.returncode}）：{out.stderr[:300]}"
+    # 关键：现网单元内容原封不动
+    assert str(other_repo) in (unit_dir / "auto-switch-ip.service").read_text()
 
 
 def test_install_detects_arch_mismatch():

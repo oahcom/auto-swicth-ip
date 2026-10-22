@@ -59,6 +59,8 @@ ELF 架构不符时会自动调用它——所以从 arm64 机器 clone（仓库
 
 ```bash
 ./deploy/install.sh          # 生成密钥 + 注册 20 条隧道 + 写 systemd 单元 + 启用
+# 若现网单元已指向另一个目录（如从别处 clone），会拒绝覆盖；加 --adopt 确认迁移
+./deploy/install.sh --adopt
 ```
 
 单元内容全部由 `config.py` 的 `warp.members` 推导，clone 到任何目录、任何用户都能跑，

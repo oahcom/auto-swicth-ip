@@ -11,12 +11,27 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${SYSTEMD_DIR:-$HOME/.config/systemd/user}"
+# 写进 $UNIT_DIR 的单元会把 ExecStart 钉成**本次运行的这个 DIR**。所以拿一份副本
+# 试跑（如 /tmp 下的 clone）时若忘了设 SYSTEMD_DIR，就会把现网单元悄悄改指到副本，
+# 而副本随时可被清理 —— 服务下次重启即崩。真实事故：`--units-only` 在 /tmp 副本
+# 里跑过一次，23 个单元全被改指 /tmp/xxx，直到有人发现。
+cur="$(sed -n 's/^WorkingDirectory=//p' "$UNIT_DIR/auto-switch-ip.service" 2>/dev/null | head -1)"
+if [ -z "${SYSTEMD_DIR:-}" ] && [ -n "$cur" ] && [ "$cur" != "$DIR" ] && [ -f "$cur/daemon.py" ]; then
+    echo "✗ 现网单元当前指向 $cur，而本次运行的是 $DIR —— 拒绝覆盖生产单元" >&2
+    echo "  试跑请设 SYSTEMD_DIR；确认要迁移到本目录请加 --adopt" >&2
+    [ "${ADOPT:-0}" = 1 ] || exit 1
+fi
 # 单元里的解释器写绝对路径，所以必须钉死"给这份代码用的那个 python"，不能是
 # 临时 shell 里碰巧在 PATH 首位的那个（conda 用户会拿到 miniforge，重启后不同）。
 PYBIN="${PYTHON:-/usr/bin/python3}"
 [ -x "$PYBIN" ] || { echo "✗ 解释器不存在：$PYBIN（用 PYTHON=... 指定）" >&2; exit 1; }
-UNITS_ONLY=0
-[ "${1:-}" = "--units-only" ] && UNITS_ONLY=1
+UNITS_ONLY=0; ADOPT=0
+for arg in "$@"; do
+    case "$arg" in
+        --units-only) UNITS_ONLY=1 ;;
+        --adopt)      ADOPT=1 ;;
+    esac
+done
 
 # ---- 二进制：架构不符或缺失就由 fetch 脚本按官方 sha256 补 ----
 # 仓库里提交的 sing-box 是 amd64 构建。arm64 机器 clone 下来能 `-x` 通过，但一跑
