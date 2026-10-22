@@ -656,6 +656,8 @@ _WARP_PROBING: set[str] = set()
 # 探测线程（每次 2 次出口探测 ≈ 2~14s），把活线当靶子反复打；冷却让节奏回到
 # 一条线最多每 refresh_delay_sec 被探一次。
 _WARP_BUSY_UNTIL: dict[str, float] = {}
+# 冷却等待的日志节流：同一轮 defer 只打一行，跨过 5s 门槛后重新打。
+_WARP_DEFER_LOGGED: dict[str, bool] = {}
 _last_proxy_pool_check: float = 0  # 上次探测轮换池可用性的 epoch 秒（双向兜底）
 _proxy_dwell_since: float = 0  # 落到轮换池的时刻；0 = 现不在 proxy 上
 # 上次落池的 epoch 秒，「每 3h 最多切一次」的冷却依据。落盘跨重启保留：
@@ -1644,26 +1646,46 @@ def _wait_port_ready(port: int, timeout_sec: float) -> bool:
 _FIRST_BYTE_WAIT_MAX_SEC = 120.0
 
 
+# 连接表快照的复用窗口。每个判闲调用都要读整张 /connections，20 条线各自
+# 复测时按线各查一次就是把 daemon 变成 curl 风暴（实测每线每秒一次，load
+# 3.4）。1s 内复用同一份快照：判闲本身要睡窗口，快照旧 1s 不影响结论。
+_CONN_SNAPSHOT_TTL_SEC = 1.0
+_conn_snapshot: tuple[float, dict | None] = (0.0, None)
+_conn_snapshot_lock = threading.Lock()
+
+
+def _connections_json() -> dict | None:
+    """Clash 连接表快照；失败也缓存，避免 Clash 挂掉时每个等待者各起一次 curl。"""
+    global _conn_snapshot
+    with _conn_snapshot_lock:
+        ts, data = _conn_snapshot
+        now = time.time()
+        if now - ts < _CONN_SNAPSHOT_TTL_SEC:
+            return data
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "--max-time", "5", "-H",
+                 f"Authorization: Bearer {get_singbox_secret()}",
+                 f'{CFG["singbox"]["clash_api"]}/connections'],
+                capture_output=True, text=True, timeout=8,
+            )
+            data = json.loads(r.stdout)
+        except Exception:
+            data = None
+        _conn_snapshot = (now, data)
+        return data
+
+
 def _warp_line_stats(tag: str) -> tuple[int, int, int] | None:
     """该 tag 上的 (累计字节, 年轻连接数, 总连接数)；查询失败返回 None。
-
-    两个值来自同一次 Clash 查询：判闲要连查两次，拆成两个函数就得付两次
-    往返，而这是 5s 一次的守护热路径。
 
     「可能仍在进行」= 连接年龄在 `_FIRST_BYTE_WAIT_MAX_SEC` 内。**不要求
     download==0**：旧判据加了这条件，把「已收到部分 token、正等下一个」的
     连接全部漏掉 —— 12:22 实测被重启掐断的 4 条连接各已收 ~1MB、年龄
     94~116s，12s 窗口内零增长，恰好同时命中两个漏洞。
     """
-    try:
-        r = subprocess.run(
-            ["curl", "-s", "--max-time", "5", "-H",
-             f"Authorization: Bearer {get_singbox_secret()}",
-             f'{CFG["singbox"]["clash_api"]}/connections'],
-            capture_output=True, text=True, timeout=8,
-        )
-        data = json.loads(r.stdout)
-    except Exception:
+    data = _connections_json()
+    if data is None:
         return None
     mine = [c for c in (data.get("connections") or [])
             if tag in (c.get("chains") or [])]
@@ -1713,21 +1735,27 @@ def warp_line_busy(tag: str, window: float | None = None) -> bool | None:
     换线路径必须显式传短窗（`_ERROR_PATH_BUSY_WINDOW_SEC`），否则每个候选
     都要先睡满 12s。
 
-    两个判据是**或**关系：
-      1. 字节增量 —— 有连接正在传数据；
-      2. 该线上有年龄在 `_FIRST_BYTE_WAIT_MAX_SEC` 内的连接 —— 请求还在生命周期里。
+    三档判定，不等窗口就出结论的两档排在前面：
+      0. 零连接 —— 立即判闲；
+      1. 有年龄在 `_FIRST_BYTE_WAIT_MAX_SEC` 内的连接 —— 立即判忙；
+      2. 只剩老连接 —— 付一个观察窗比字节增量。
 
-    WHY 判据 2 不可省：流式响应会长时间零字节。stall 实测覆盖两种形态：
+    WHY 不先睡窗口：调用方是 1s 一轮的重测循环，睡窗口等于把重测间隔拖到
+    窗口长度（排空路径 30s）。实测 WARP-CF-19 因此每 90s 才测一次，那条线
+    在等待期一直占着旧 IP，备线池随之变窄。年轻连接本来就不看字节（见下），
+    老连接才需要窗口。
+
+    WHY 判据 1 不可省：流式响应会长时间零字节。stall 实测覆盖两种形态：
       a) 首 token 之前完全不传（TTFT p50=1.7s / p90=52.6s / max=532.7s，N=83）；
       b) 收到部分 token 后等下一个（12:22 实测被重启掐断的 4 条连接已各收
          ~1MB、年龄 94~116s，但 12s 窗口内零增长）。
     只看字节增量时两者都与空闲线无异，判闲后重启，客户端收到 upstream
     connection lost。旧判据只抓 (a)（要求 download==0），(b) 全部漏检。
 
-    WHY 判据 2 不能退化成「连接数 > 0」：9router 复用连接，实测活跃线上有年龄
+    WHY 判据 1 不能退化成「连接数 > 0」：9router 复用连接，实测活跃线上有年龄
     中位 476s 的长期连接（WARP-CF 90 个采样里 58 个有连接、最小年龄全是 476s+）。
     按连接数判忙会让这些线永远刷不到新鲜 IP。用年龄上限把它们排除，只留
-    「建立不久、请求可能仍在进行」的那部分。
+    「建立不久、请求可能仍在进行」的那部分；排除掉的老连接才轮到判据 2。
     """
     if window is None:
         window = float(_warp().get("busy_window_sec", 12.0))
@@ -1737,9 +1765,16 @@ def warp_line_busy(tag: str, window: float | None = None) -> bool | None:
     # 零连接＝不可能掐断任何请求，直接判闲。实测 19 条备线常驻只有 2~4 条挂
     # 连接，其余全是空壳 —— 挨个等 12s 把一个 5s 一轮的守护拖成 60s+ 一轮，
     # 而出口 IP 存活中位只有 12.5s，脏线因此滞留远超一个 IP 的寿命。
-    # 这里不能省观察窗：有连接时仍要付满窗口，见下面两条判据。
     if s0[2] == 0:
         return False
+    # 有年轻连接＝请求还在生命周期里，直接判忙，不必等观察窗。这一支本来就不
+    # 看字节：12:22 被掐断的 4 条连接各已收 ~1MB、年龄 94~116s，落在本支里，
+    # 窗口内零增长照样判忙。等窗口唯一的效果是把调用方的重测间隔从 1s 拖到
+    # 30s —— 实测 WARP-CF-19 因此 90s 才重测一次，期间白占着备线名额和旧 IP。
+    if s0[1] > 0:
+        return True
+    # 走到这里只剩「有连接但全部超过 120s」：它们是被 9router 复用的老连接，
+    # 多半空闲。字节增速才是判据，此时才值得付一个观察窗。
     time.sleep(window)
     s1 = _warp_line_stats(tag)
     if s1 is None:
@@ -1792,6 +1827,26 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
     if trace.get("warp") != "on":
         return None
     return trace.get("ip") or None
+
+
+def _probe_refresh_egress(port: int) -> str | None:
+    """刷新路径取出口：先按短预算试一次，慢了就再给一次余量。
+
+    短预算的理由（见 warp_egress_ip）只覆盖「隧道没起来」这一种失败，但**首探冷**
+    是另一种：实测 usque-warp-20 重启后端口 0.12s 就绪，紧接着的 7s 预算首探
+    7.01s 到点 rc=28，而随后同预算的探测 1.68s 就返回 —— MASQUE 首连慢，隧道
+    是好的。这一类探测在旧实现里直接把 attempt 记成失败（全库 748 条
+    「出口探测失败」），随后重启同一条线再试，而隧道还是冷的、又超时，于是循环：
+    实测 14:58 单分钟 60 次 systemd Started；「刷新 #3 失败 → 同线再重启」实测 135 次，
+    间隔 65s 的最多（38 次）—— 正是 3 次重启 + 2/5/10 退避的固定节奏。一次二次探测
+    就能拆掉这个循环。
+
+    仍失败才返回 None（隧道确实不通 / warp=off），由调用方按原逻辑重启重试。
+    """
+    ip = warp_egress_ip(port, timeout_sec=_warp()["refresh_probe_timeout_sec"])
+    if ip:
+        return ip
+    return warp_egress_ip(port, timeout_sec=_warp()["ready_timeout_sec"])
 
 
 def _warp_line_sel(tag: str) -> float:
@@ -2475,8 +2530,7 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
             return None
         if ok:
             # 短超时：这是刚重启的隧道，不是已稳定的线。见 config 同名参数注释。
-            ip = warp_egress_ip(member["port"],
-                                timeout_sec=_warp()["refresh_probe_timeout_sec"])
+            ip = _probe_refresh_egress(member["port"])
             # 模型模式只看实测：IP 历史（脏/复用窗口）不再是否决项，它只在
             # 原模式里当判据。见 _ip_history_is_truth。
             now = time.time()
@@ -2514,7 +2568,8 @@ def _reclaim_dirty_pass() -> None:
             # 换线选中，届时 `_retry_refresh_idle_warp` 会因「已选为当前出口」退出。
             # 离渠冷却期内的线不探也不重启：它刚被换下，在途请求可能仍在走它，
             # 重启即掐断（upstream connection lost）。闸门放在这里而不是 worker
-            # 内部，省掉每轮一次白跑的出口探测。
+            # 内部，省掉每轮一次白跑的出口探测。空壳线不受影响 —— 冷却本身
+            # 只在有连接时才生效（见 `_standby_defer_reason`）。
             if (m["tag"] in _WARP_REFRESHING or m["tag"] in _WARP_REFRESH_PENDING
                     or m["tag"] in _WARP_PROBING
                     or time.time() < _WARP_BUSY_UNTIL.get(m["tag"], 0)
@@ -2575,16 +2630,15 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
             # 正被另一条线程刷：两种情况都该让出 —— 它此刻仍在服务流量，
             # 不该因为它脏就压缩整个备线池，也不该两条线程同时重启它。
             # 重启会掐断这条线上所有在途 SSE（9router 注入 upstream
-            # connection lost）。脏线不在服务流量时才刷得安全；等不到空闲
-            # 就下一轮再试 —— 与补刷路径 _retry_refresh_idle_warp 对齐。
+            # connection lost）。脏线不在服务流量时才刷得安全。
             # 旧实现没有这一步，02:44 换线后 19 秒把 CF/B/C 全部重启，
             # 正好掐在刚被换下、仍在传流的连接上。
             # 判在抢名额之前：探测要 2s，占着名额会让换线路径误报「名额已满」。
             if warp_line_busy(member["tag"]) is not False:
-                # 等不到空闲就退出本轮，不再死循环重试：这条线仍在服务流量，
-                # 重试只是把探测烧在活线上，且 600s 内会重启几十次（实测
-                # 26min 内 10 条隧道共 661 次 systemd Started，WARP-CF-F
-                # 每 19s 一次）。冷却 refresh_delay_sec 后守护会重新调度。
+                # 交给守护下一轮（refresh_delay_sec=20s 后）重测：留在这里
+                # 死等会占住一个线程最长 600s，而每 2s 一次连接查询在 20 条
+                # 线上叠加曾把 load 推到 3.4。等不到空闲说明它仍在服务流量，
+                # 20s 的复测节奏已经足够早 —— 真正要救的是补刷路径的 90s。
                 _WARP_BUSY_UNTIL[member["tag"]] = time.time() + _warp()["refresh_delay_sec"]
                 return
             if not _acquire_refresh_slot(member["tag"]):
@@ -2600,6 +2654,10 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
                     return
             finally:
                 _release_refresh_slot(member["tag"])
+            # 刷新失败时隧道已被重启或冷却闸门挡下，缓存的地址不再代表这条线
+            # 当前的样子 —— 下一轮重新探测，免得拿旧结论反复刷同一条线。
+            ip = None
+            time.sleep(2)
         log(f"  ✗ {member['tag']} {_warp()['ip_refresh_retry_sec']}s 内未换出干净出口")
     finally:
         with _WARP_REFRESH_LOCK:
@@ -2640,14 +2698,19 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
         if known and not _warp_ip_needs_refresh(known, time.time(), member["tag"]):
             _bump_refresh_stat("ok")
             return True
-        # 冷却期内先睡过去，别白等 90s 空闲窗再撞闸门 —— 那样日志还会误报
-        # 「仍在传数据」。分段睡是为了中途若被选为当前出口能尽快发现。
+        # 冷却期内也要常回来测：连接随时可能结束，30s 一觉会让这条线在旧 IP 上
+        # 多占半分钟，备线池随之变窄。1s 与 _wait_warp_idle 的轮询节奏对齐，
+        # 更短只是在 Clash API 上空转（单次查询 5s 超时）。
+        # 日志只在该线首轮被拦时打一行，免得每 1s 刷屏。
         defer = _standby_defer_reason(member["tag"])
         if defer:
             _bump_refresh_stat("retry")
-            log(f"  ⏸ {member['tag']} {defer}，冷却后再刷新")
-            time.sleep(min(_standby_cooldown_left(member["tag"]) or 30.0, 30.0))
+            if not _WARP_DEFER_LOGGED.get(member["tag"]):
+                log(f"  ⏸ {member['tag']} {defer}，冷却中每 1s 复测")
+                _WARP_DEFER_LOGGED[member["tag"]] = True
+            time.sleep(1)
             continue
+        _WARP_DEFER_LOGGED.pop(member["tag"], None)
         idle = _wait_warp_idle(member, window=_DRAIN_BUSY_WINDOW_SEC)
         # 判在重启之前而不是本轮开头：换线线程的快照可能早于本次调度，等空闲的这
         # 40s 内这条线也可能被切成当前出口。此刻重启它就是掐断正在服务的在途连接
@@ -2672,7 +2735,10 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
             finally:
                 _release_refresh_slot(member["tag"])
         _bump_refresh_stat("retry")
-        log(f"  ⚠ {member['tag']} 仍在传数据，{_warp()['idle_wait_sec']}s 后重试刷新")
+        # 不在这里补睡：`_wait_warp_idle` 已经每 1s 测了一次、连续忙满 90s 才
+        # 走到这里，再睡 90s 等于把复测间隔拉成 180s —— 连接结束时该线仍占着
+        # 旧 IP 和资源。直接进下一轮，下一轮开头就重新查连接。
+        log(f"  ⚠ {member['tag']} 连续 {_warp()['idle_wait_sec']}s 仍在传数据，继续复测")
     _bump_refresh_stat("fail")
     log(f"  ✗ {member['tag']} 超过 {_warp()['ip_refresh_retry_sec']}s 仍未刷出新鲜出口")
     return False
@@ -2941,8 +3007,7 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
         ok = (_restart_service(member["service"], member["tag"])
               and _wait_port_ready(member["port"], _warp()["ready_timeout_sec"]))
         if ok:
-            new_ip = warp_egress_ip(member["port"],
-                                    timeout_sec=_warp()["refresh_probe_timeout_sec"])
+            new_ip = _probe_refresh_egress(member["port"])
             now = time.time()
             # 原地重连是落池也失败后的最后兜底。新旧会话相同时重试是死循环，
             # 与本模式无关；地址换了之后的历史判据/实测则按当前模式走。
