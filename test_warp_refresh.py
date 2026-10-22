@@ -32,6 +32,9 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    # 离渠台账是进程级全局：残留条目会让冷却闸门挡住后续用例的重启。
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {})
+    monkeypatch.setattr(daemon, "_WARP_REFRESH_COUNT", {})
     # 探测台账是进程级全局：不隔离则前一个用例探过的 IP 在本用例被当成
     # 「TTL 内已探过」而跳过真实探测，台账相关断言全落空。
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
@@ -63,6 +66,55 @@ def test_offline_refresh_count_starts_when_leaving_and_resets_on_return(monkeypa
     daemon._track_offline_refresh("W1", None)
     assert "W1" in daemon._WARP_OFF_AGE
     assert daemon._WARP_REFRESH_COUNT["W1"] == 0
+
+
+def test_standby_cooldown_blocks_restart_right_after_switch(monkeypatch):
+    """刚被换下的线不得重启：在途 SSE 还在走它，重启即 upstream connection lost。
+
+    实测 646 次换线里 63.3% 的被切下线在 120s 内被重启（中位 73s，最快 0s），
+    而「判闲」只看 12s 窗口内有没有字节增长，证明不了请求生命周期已结束。
+    """
+    assert daemon.CFG["warp"]["standby_cooldown_sec"] == 120, \
+        "冷却窗口是用户指定的 120s，改动需先有实测依据"
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {"W1": time.time() - 30})
+    restarts = []
+    monkeypatch.setattr(daemon, "_restart_service",
+                        lambda s, tag=None: (restarts.append(s), True)[1])
+
+    assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
+                                      "service": "s"}) is None
+    assert restarts == [], "冷却期内不得重启刚被换下的线"
+
+
+def test_standby_cooldown_expires_and_restart_resumes(monkeypatch):
+    """冷却走完后重启照常：闸门是限时窗，不是永久封锁。"""
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {"W1": time.time() - 121})
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
+    monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: "ip-new")
+    monkeypatch.setattr(daemon, "_ip_disqualified", lambda ip, now, guard: False)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda m, ip: True)
+
+    assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
+                                      "service": "s"}) == "ip-new"
+
+
+def test_standby_cooldown_ignores_never_active_line(monkeypatch):
+    """从未当过出口的备线不受冷却约束 —— 它没有「离渠」时刻。
+
+    备线预热本就该立刻生效，把冷却套到它头上等于池子停转 2 分钟。
+    """
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {})
+    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
+    monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: "ip-new")
+    monkeypatch.setattr(daemon, "_ip_disqualified", lambda ip, now, guard: False)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda m, ip: True)
+
+    assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
+                                      "service": "s"}) == "ip-new"
 
 
 def test_quota_verdict_turns_line_into_refresh_candidate(monkeypatch):

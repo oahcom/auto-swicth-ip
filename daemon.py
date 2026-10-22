@@ -570,6 +570,21 @@ def _track_offline_refresh(prev_tag: str | None, new_tag: str | None) -> None:
         _WARP_REFRESH_COUNT.pop(new_tag, None)
 
 
+def _standby_cooldown_left(tag: str) -> float:
+    """该线离渠后还要等多久才允许重启；不在离渠态或已过冷却返回 0。
+
+    WHY 冷却：被换下的线仍在服务在途 SSE（`interrupt_exist_connections=false`），
+    重启它就是掐断这些流，9router 报 upstream connection lost。判「闲」只能看
+    连接是否还在传字节，而流式响应的静默实测 p90=9.1s、首 token 前最长 532.7s
+    —— 单次判闲不足以证明没有在途请求。120s 取自 `_FIRST_BYTE_WAIT_MAX_SEC`：
+    离渠那一刻建立的连接，年龄超过它就不可能还处在「首字节未到」窗口内。
+    """
+    off = _WARP_OFF_AGE.get(tag)
+    if off is None:
+        return 0.0
+    return max(0.0, _warp()["standby_cooldown_sec"] - (time.time() - off))
+
+
 def _warp_ip_refresh_reason(ip: str | None, now: float,
                             tag: str | None = None) -> str:
     """低质原因的可读短语；健康地址返回空串。与 _warp_ip_needs_refresh 同源。"""
@@ -752,7 +767,13 @@ def log_health(msg: str):
 
 # ============= 9router 监控 =============
 
-_EGRESS_ERR_MARKERS = ("abusive traffic", "Rate limit exceeded")
+# opencode 免费层的 429 换过文案：旧版是 "Rate limit exceeded"，现版是
+# "Free usage limit reached. Subscribe to OpenCode Go..."（type 仍是
+# FreeUsageLimitError）。只认旧文案时实测最近 2000 条错误里 1751 条 429 全被
+# 判成「非出口级错误」→ consec_err 恒 0 → 87% 错误率下也永不换线。
+# 两个文案都留：免费层可能按账号/时间灰度高版，不是全局切换。
+_EGRESS_ERR_MARKERS = ("abusive traffic", "Rate limit exceeded",
+                       "Free usage limit reached", "FreeUsageLimitError")
 
 
 def _classify_egress_error(body: str | None) -> str | None:
@@ -768,9 +789,11 @@ def _classify_egress_error(body: str | None) -> str | None:
         return None
     if "abusive traffic" in body:
         return "abuse403"
-    if "Rate limit exceeded" in body:
+    if "Rate limit exceeded" in body or "Free usage limit reached" in body \
+            or "FreeUsageLimitError" in body:
         return "rate429"
     return None
+
 
 
 def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int, list, int, int]:
@@ -1810,7 +1833,16 @@ def _cached_warp_standby(standby: list[dict], now: float,
             continue
         out.append((m, ip))
     out.sort(key=lambda p: _warp_ip_rank(p[1], now, guard))
-    return out
+    # 同一 IP 可能被多条隧道同时持有（重连竞态），只保留最优的一条。
+    # out 已按档位/休息时长排序，首条即最优。
+    seen = set()
+    deduped = []
+    for m, ip in out:
+        if ip in seen:
+            continue
+        seen.add(ip)
+        deduped.append((m, ip))
+    return deduped
 
 
 def _warp_line_selected(tag: str, ip: str, ts: float) -> None:
@@ -2386,6 +2418,16 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
     「都刷一样」看不出为什么刷，事后无法判断某条线是被 429 拖住还是纯配额耗尽。
     """
     t = member["tag"]
+    # 离渠冷却：刚被换下的线仍在服务在途 SSE，重启它就是掐断这些流（客户端
+    # 表现为 API Error: upstream connection lost）。判「闲」证明不了没有在途
+    # 请求 —— 流式响应两次 token 之间静默 p90=9.1s、首 token 前最长 532.7s，
+    # 而 12s 观察窗只看到其中一段。用离渠时刻做硬闸，与等待空闲互为补充：
+    # 空闲判据管「这条线此刻在不在跑流量」，冷却管「这条线刚下线，还有没有
+    # 请求生命周期没走完」。
+    cool = _standby_cooldown_left(t)
+    if cool > 0:
+        log(f"  ⏸ {t} 离渠冷却剩 {cool:.0f}s，暂不重启（在途请求可能仍在走它）")
+        return None
     # 调用方可能已算好原因时传进来（脏线守护在清空旧 IP 之前算的）；否则自己推导。
     reason = (reason_hint
               or _warp_ip_refresh_reason(_warp_line_ip(t), time.time(), t)
@@ -2441,9 +2483,13 @@ def _reclaim_dirty_pass() -> None:
         with _WARP_REFRESH_LOCK:
             # 排队中等空闲的线（PENDING）仍可用，不该挡掉探测：它随时可能被
             # 换线选中，届时 `_retry_refresh_idle_warp` 会因「已选为当前出口」退出。
+            # 离渠冷却期内的线不探也不重启：它刚被换下，在途请求可能仍在走它，
+            # 重启即掐断（upstream connection lost）。闸门放在这里而不是 worker
+            # 内部，省掉每轮一次白跑的出口探测。
             if (m["tag"] in _WARP_REFRESHING or m["tag"] in _WARP_REFRESH_PENDING
                     or m["tag"] in _WARP_PROBING
-                    or time.time() < _WARP_BUSY_UNTIL.get(m["tag"], 0)):
+                    or time.time() < _WARP_BUSY_UNTIL.get(m["tag"], 0)
+                    or _standby_cooldown_left(m["tag"]) > 0):
                 continue
             _WARP_PROBING.add(m["tag"])
         threading.Thread(target=_reclaim_dirty_warp_worker, args=(m,),
@@ -2565,6 +2611,14 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
         if known and not _warp_ip_needs_refresh(known, time.time(), member["tag"]):
             _bump_refresh_stat("ok")
             return True
+        # 冷却期内先睡过去，别白等 90s 空闲窗再撞闸门 —— 那样日志还会误报
+        # 「仍在传数据」。分段睡是为了中途若被选为当前出口能尽快发现。
+        cool = _standby_cooldown_left(member["tag"])
+        if cool > 0:
+            _bump_refresh_stat("retry")
+            log(f"  ⏸ {member['tag']} 离渠冷却剩 {cool:.0f}s，冷却后再刷新")
+            time.sleep(min(cool, 30.0))
+            continue
         idle = _wait_warp_idle(member, window=_DRAIN_BUSY_WINDOW_SEC)
         # 判在重启之前而不是本轮开头：换线线程的快照可能早于本次调度，等空闲的这
         # 40s 内这条线也可能被切成当前出口。此刻重启它就是掐断正在服务的在途连接
@@ -3002,6 +3056,14 @@ def reconnect_warp(reason: str) -> bool:
         log("  ⚠ 脏备线均在后台补刷，本次换线不刷新（等下一次错误重试）")
         return False
     if not probes:
+        # 冷却中的线重启必然返回 None（见 `_refresh_idle_warp` 入口），排到最后：
+        # 先试还能刷的，全在冷却就直接把这条同步路径让给后台补刷。
+        blocked_lines.sort(key=lambda m: _standby_cooldown_left(m["tag"]) > 0)
+        # 全在冷却时直接放弃本次同步刷新：冷却线重启必然返回 None，硬刷一次
+        # 只会把这次换线推进落池（池有 3h 冷却，代价远大于等下一次错误重试）。
+        if blocked_lines and all(_standby_cooldown_left(m["tag"]) > 0 for m in blocked_lines):
+            log("  ⚠ 脏备线均在离渠冷却中，本次换线不刷新（等下一次错误重试）")
+            return False
         for m in blocked_lines[:1]:
             ip = _refresh_idle_warp(m)
             if ip:
@@ -3033,7 +3095,11 @@ def reconnect_warp(reason: str) -> bool:
         # WHY 不用"平均休息时间"排序：实测休息时长与存活无关（<15min 复用的
         # 存活中位 153s，>60min 反而 23s，n=6~26），拿它当判据只会更频繁地
         # 复用同几个地址；这里只用它把最久未用的排前面，且选完仍要刷新。
-        m, ip = max(probes, key=lambda p: now - _warp_ip_last_ts(p[1]))
+        # 冷却中的线排最后：选到它 `_refresh_idle_warp` 会直接返回 None，
+        # 白白把这次换线推到落池。仍留在候选里是兜底 —— 全都冷却时宁可当场
+        # 放弃落池，也不该拿一条刚被换下的线开刀。
+        m, ip = max(probes, key=lambda p: (_standby_cooldown_left(p[0]["tag"]) > 0,
+                                           now - _warp_ip_last_ts(p[1])))
         log(f"  ⚠ 兜底选线: {m['tag']} 上次使用 {(now - _warp_ip_last_ts(ip))/60:.1f}min 前，"
             f"IP={ip} 仍在复用窗口内，将先刷新会话")
         guard = _warp()["ip_reuse_guard_sec"]
@@ -4419,6 +4485,19 @@ def main():
     _m = _warp_member(active_warp_tag())
     if _m:
         _ACTIVE_WARP_IP = warp_egress_ip(_m["port"])
+        # 重启不能把流量打在脏出口上：sing-box 重启后 selector 复位到配置里的
+        # default（主隧道 WARP-CF），而它可能正处 429 惩罚期或已被模型层判 quota。
+        # 不校验就等于「重启后先白烧一段 IP，等第一条 429 才纠正」——实测
+        # 2026-10-22 13:45 重启后 WARP-CF 立即 429 ×3 才被换走。
+        # 主动轮换/错误换线要等主循环第一轮才跑，这里在启动时先纠正一次。
+        if _ACTIVE_WARP_IP and _warp_ip_needs_refresh(
+                _ACTIVE_WARP_IP, time.time(), _m["tag"]):
+            log(f"  ⚠ 启动时当前出口 {_m['tag']} 出口 {_ACTIVE_WARP_IP} "
+                f"判定为低质（{_warp_ip_refresh_reason(_ACTIVE_WARP_IP, time.time()) or '无成功流量'}），启动即换线")
+            _reconnect_warp_now("启动校验 当前出口低质", time.time())
+            _m2 = _warp_member(active_warp_tag())
+            if _m2:
+                _ACTIVE_WARP_IP = warp_egress_ip(_m2["port"])
     else:
         # 启动时就停在 proxy 上：落池时刻从此刻算，否则「落池后仍拦截」
         # 判据会拿 0 当起点，把落池前的旧 403/429 也算进去。
