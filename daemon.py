@@ -439,18 +439,6 @@ _WARP_REFRESHING: set[str] = set()
 _WARP_REFRESH_PENDING: set[str] = set()
 
 
-def _refresh_concurrency() -> int:
-    """同时**真正重启**的备线上限；0 = 不限，等于成员数。
-
-    不限是默认：低质线本就该被刷掉，而不是留在池子里当候选 —— 并发重启它们
-    不损失任何可用备线，留着才损失。同一 tag 的独占仍由 `_acquire_refresh_slot`
-    保证，所以「不限」的实际上限就是成员数（当前出口本身从不被刷）。
-    旧实现用 `or 3`，而文档写的是「0 = 不限」—— 设 0 实际得到 3，开关静默失效。
-    """
-    cap = int(_warp().get("refresh_concurrency", 0) or 0)
-    return cap if cap > 0 else max(len(_warp()["members"]), 1)
-
-
 # ============= 模型层探测台账：按 /128 记，TTL 按结论持久性分两档 =============
 # opencode 免费层一次 probe() 就烧掉一格配额。此前无任何记录：同一 IP 在每轮换线
 # 的并发实测与每次脏线守护里被反复探测 —— 实测 18 分钟内被探 26 次，全是 quota。
@@ -482,6 +470,16 @@ _PROBE_BLOCKED_AT: dict[str, float] = {}
 # 只有这两个是地址自身给出的持久结论；探测侧故障不代表地址的长期状态。
 _WARP_PROBE_PERSISTENT = frozenset({"quota", "flagged"})
 
+# OK 单独一档，比瞬时档长、比持久档短。WHY 不能和 unreachable/err 一起按 2min
+# 过期：OK 说的也是地址状态（这格配额此刻能用），而它的重探间隔中位是 212s ——
+# 120s 的档位命中不到自己，同一地址每轮都重探一遍，实测 1980 次「前一次 OK」里
+# 1831 次（92.5%）结论不变，那 38% 的探测量纯属白烧配额。
+# 上限受「OK 后多久翻脸」约束：29 次 OK→quota 的间隔中位 188s、p90 更短，而 47 例
+# 翻脸里 45 例期间发生过生产侧 429/403 换线 —— 地址是被真实流量烧的，那条路径会
+# `_probe_cache_forget` 立即作废 OK，不依赖本 TTL 兜底。取 600s：命中率已饱和
+# （1200s 只多 0.1 个点），再长只是把「凭旧 OK 选线」的窗口拉宽。
+_WARP_PROBE_OK = frozenset({"OK"})
+
 # 模型探测结论 → 生产侧惩罚类型。quota 是 FreeUsageLimitError（配额耗尽，24h），
 # flagged 是 abusive traffic（信誉标记，6h）—— 与 `_classify_warp_error` 归出的
 # rate429 / abuse403 完全同义，只是观测来源从生产流量换成了主动探测。
@@ -492,6 +490,8 @@ def _probe_ttl(verdict: str) -> float:
     w = _warp()
     if verdict in _WARP_PROBE_PERSISTENT:
         return float(w.get("probe_persistent_ttl_sec", 21600))
+    if verdict in _WARP_PROBE_OK:
+        return float(w.get("probe_ok_ttl_sec", 600))
     return float(w.get("probe_transient_ttl_sec", 120))
 
 
@@ -579,15 +579,31 @@ def _probe_cache_forget(ip: str | None) -> None:
 # 切回主渠道即清零（语义由用户指定）。
 _WARP_OFF_AGE: dict[str, float] = {}
 _WARP_REFRESH_COUNT: dict[str, int] = {}
+# 该线最近一次拿到可用地址的时刻。有了它，日志里的「第 N 次刷」才不会把
+# 「反复刷成功又反复自转变脏」读成「一次连续失败」：实测 WARP-CF-C 23:11:53
+# 刷出 OK，5 分钟后同一 N（无重启）下地址已换成另一个被烧的地址 —— usque
+# 自己会重连换址，那 67 分钟不是一次刷新，是 29 个短周期。
+_WARP_LAST_ACCEPT_TS: dict[str, float] = {}
 
 
 def _warp_refresh_progress(tag: str) -> str:
-    """刷新进度短语；该线不在「离渠刷新」中则返回空串。"""
+    """刷新进度短语；该线不在「离渠刷新」中则返回空串。
+
+    两个计数各说各的事，必须都写清楚：`第 N 次刷` 是离渠以来的累计重启数，
+    `X min` 是离渠以来的总时长 —— 后者包含成功后的静置期，**不是**一次刷新的
+    耗时。实测 WARP-CF-C 在 65.4min / 29 次刷 里，有 45.6min 是 OK 着不动的；
+    只印这两个数，读起来就像「刷了 65 分钟还是坏的」。
+
+    再补 `上次成功 X min 前`：地址是 usque 自己在换的（同一 N 下也会变），
+    「刚 OK 过又判 quota」是那个地址被换掉了，不是 OK 被无视。
+    """
     off = _WARP_OFF_AGE.get(tag)
     if off is None:
         return ""
     n = _WARP_REFRESH_COUNT.get(tag, 0)
-    return f"（离渠后第 {n} 次刷，{(time.time() - off) / 60:.1f}min）"
+    last = _WARP_LAST_ACCEPT_TS.get(tag)
+    ago = f"，上次成功 {(time.time() - last) / 60:.1f}min 前" if last else ""
+    return f"（离渠后第 {n} 次刷，{(time.time() - off) / 60:.1f}min{ago}）"
 
 
 def _warp_refresh_count_note(tag: str) -> str:
@@ -678,17 +694,20 @@ def _warp_ip_refresh_reason(ip: str | None, now: float,
 
 
 def _acquire_refresh_slot(tag: str) -> bool:
-    """重启前占一个并发名额；拿不到返回 False（调用方让出，等下一轮）。
+    """占住这条线的重启独占权；已被别的线程占着返回 False。
 
-    同一 tag 第二次获取必须失败：名额是 tag 的独占权，重入等于让两条线程
-    同时重启同一条隧道（实测 WARP-CF-C 02:31:49~02:32:03 出现 #1#1#2#2#3，
-    同一条线被刷两遍，还白烧了一次「疑似脏 IP」的探测）。旧实现在这里返回
-    True，等于互斥完全失效。
+    WHY 不设全局上限：20 条隧道之间没有任何依赖，各自 systemctl restart 互不影响。
+    排队换不来任何东西 —— 刷不完的脏线留在池里冒充候选，换线选中它还得当场同步
+    刷新，代价更大。唯一需要互斥的是**同一条线**：两条线程同时重启同一条隧道会
+    白烧一次探测（实测 WARP-CF-C 02:31:49~02:32:03 出现 #1#1#2#2#3）。
+
+    WHY 删掉原来的全池上限：它的默认值就是成员数，平时根本不生效；而生效时报出来
+    的「N 条在重启」是**上限常量**不是实际集合大小 —— 日志里 134 次「名额已满」中
+    128 次（95.5%）其实是同一个 tag 自己撞自己。删掉后 False 的含义从此唯一：
+    这条线正在别处被刷。
     """
     with _WARP_REFRESH_LOCK:
         if tag in _WARP_REFRESHING:
-            return False
-        if len(_WARP_REFRESHING) >= _refresh_concurrency():
             return False
         _WARP_REFRESHING.add(tag)
         return True
@@ -2690,6 +2709,9 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
                 log(f"  ✓ {t} 刷新成功{_warp_refresh_progress(t)}"
                     f" 原因={reason} 新出口 {ip}")
                 _set_warp_line_ip(member["tag"], ip)
+                # 记下这次验收：脏线守护据此静置，不再 5s 后又把同一条刚刷好的线
+                # 派出去重探一遍（那会白烧一格配额）。
+                _WARP_LAST_ACCEPT_TS[t] = now
                 return ip
         else:
             log(f"  ✗ {member['tag']} 刷新后端口未就绪")
@@ -2716,6 +2738,15 @@ def _reclaim_dirty_pass() -> None:
             # 重启即掐断（upstream connection lost）。闸门放在这里而不是 worker
             # 内部，省掉每轮一次白跑的出口探测。空壳线不受影响 —— 冷却本身
             # 只在有连接时才生效（见 `_standby_defer_reason`）。
+            # 刚验收过就歇一会儿：worker 之间不共享「这条线刚刷好」这个事实，
+            # 上一个 worker 拿到 OK 后 return，5s 后本轮又派一个新 worker ——
+            # 它探到的还是那个地址，而 usque 随时可能自己重连换址，换成的新地址
+            # 在台账里没有结论就按「从没成功过」判脏，于是每 5s 白烧一格配额。
+            # 实测 WARP-CF-C 67 分钟内 20 次重启里 18 次判 quota、只有 3 次 OK。
+            # 静置窗口取与 `probe_cache_ttl_sec` 同量级：短于它只会重复看同一个地址。
+            if time.time() - _WARP_LAST_ACCEPT_TS.get(m["tag"], 0.0) < _warp().get(
+                    "probe_cache_ttl_sec", 12):
+                continue
             if (m["tag"] in _WARP_REFRESHING or m["tag"] in _WARP_REFRESH_PENDING
                     or m["tag"] in _WARP_PROBING
                     or time.time() < _WARP_BUSY_UNTIL.get(m["tag"], 0)
@@ -2764,6 +2795,7 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
             # 成功流量的线仍是低质，必须换掉。判据与预热、补刷同源。
             if ip and not _warp_ip_needs_refresh(ip, time.time(), member["tag"]):
                 _set_warp_line_ip(member["tag"], ip)
+                _WARP_LAST_ACCEPT_TS[member["tag"]] = time.time()
                 return
             # 探测期间这条线可能已被换线线程切成当前出口：此刻重启会掐断在途
             # 连接（upstream connection lost）。判据必须落在重启之前。
@@ -2772,9 +2804,7 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
                 return
             # 只有确认脏才抢占重生名额：探测阶段不能占，否则干净线被当成
             # 「不可选」，换线会报「备线 0 条」直接落池。
-            # 拿不到名额说明已有 _refresh_concurrency() 条在重启，或这条线
-            # 正被另一条线程刷：两种情况都该让出 —— 它此刻仍在服务流量，
-            # 不该因为它脏就压缩整个备线池，也不该两条线程同时重启它。
+            # 抢不到说明这条线正被另一条线程刷，该让出：不该两条线程同时重启它。
             # 重启会掐断这条线上所有在途 SSE（9router 注入 upstream
             # connection lost）。脏线不在服务流量时才刷得安全。
             # 旧实现没有这一步，02:44 换线后 19 秒把 CF/B/C 全部重启，
@@ -2870,9 +2900,13 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
             # 占着名额会让其余备线永远排不上队（详见 _WARP_REFRESHING 注释）。
             if not _acquire_refresh_slot(member["tag"]):
                 _bump_refresh_stat("retry")
-                log(f"  ⏸ {member['tag']} 已空闲，但重启名额已满"
-                    f"（{_refresh_concurrency()} 条在重启），下轮再刷")
-                time.sleep(_warp()["idle_wait_sec"])
+                # 名额只按 tag 独占，撞上只说明这条线正被另一条线程刷。
+                # 旧文案报的是上限常量并说「N 条在重启」，读日志会误以为被全池挤掉。
+                log(f"  ⏸ {member['tag']} 已被其他线程刷，本轮让出")
+                # 让出不该睡满 idle_wait_sec(90s)：单次刷新只要 8~15s，
+                # 另一条线程刷完这条线通常几十秒内就有结果，睡 90s 只是把
+                # 复测推后。按 refresh_delay_sec(20s) 的节奏回来即可。
+                time.sleep(_warp()["refresh_delay_sec"])
                 continue
             try:
                 if _refresh_idle_warp(member):
@@ -3376,11 +3410,12 @@ def reconnect_warp(reason: str) -> bool:
                 log("  ⚠ 备线均在服务在途连接，强刷会掐断，切轮换池兜底")
                 return _fallback_to_proxy(active, old_ip, now)
             m, ip = idle
-        # 换线路径上的同步刷新也要占名额：它和后台补刷抢的是同一批隧道，
-        # 不占的话会在后台那一批之外再多一条同时重启。
+        # 这条线正被后台线程刷着：重启会拿到同一个会话，再刷一次只是白烧探测。
+        # 落池不是这里的答案 —— 池有 3h 冷却，而那条后台线程几十秒内就有结果。
+        # 本次换线放弃，等下一次 429 重新挑线。
         if not _acquire_refresh_slot(m["tag"]):
-            log(f"  ⚠ 重启名额已满（{_refresh_concurrency()} 条在重启），切轮换池兜底")
-            return _fallback_to_proxy(active, old_ip, now)
+            log(f"  ⚠ 备线 {m['tag']} 正在后台刷新，本次换线不刷新（等下一次错误重试）")
+            return False
         try:
             ip = _refresh_idle_warp(m)
         finally:
@@ -3659,9 +3694,9 @@ def _prewarm_standby_warp(now: float) -> None:
     WARP-CF-B 之间往返。另一类脏线是 403/429 标记过的地址：它可能从没有过成功
     流量，只看「窗口内有无成功」会把它当新鲜线跳过，脏 IP 永远刷不掉。
 
-    一轮把所有低质备线**全部**排进补刷队列：排队段不占名额，真正重启仍由
-    `_refresh_concurrency` 卡住。旧实现每轮只取一条最久没被选中的，实测全库
-    只预热过 11 次且集中在两三条线上，脏线永远轮不完。
+    一轮把所有低质备线**全部**排进补刷队列：池内各线互不依赖，全部并发刷即可，
+    只有同一条线内部互斥。旧实现每轮只取一条最久没被选中的，实测全库只预热过
+    11 次且集中在两三条线上，脏线永远轮不完。
     """
     global _last_warp_prewarm_ts
     if now - _last_warp_prewarm_ts < _warp()["prewarm_sec"]:

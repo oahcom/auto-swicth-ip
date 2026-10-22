@@ -36,6 +36,9 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     # 离渠台账是进程级全局：残留条目会让冷却闸门挡住后续用例的重启。
     monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {})
     monkeypatch.setattr(daemon, "_WARP_REFRESH_COUNT", {})
+    # 验收时刻同样要隔离：`_reclaim_dirty_pass` 在它之后 12s 内跳过该线，
+    # 残留的真 time.time() 会让后续用例的脏线巡检静默少派一条。
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT_TS", {})
     # 探测台账是进程级全局：不隔离则前一个用例探过的 IP 在本用例被当成
     # 「TTL 内已探过」而跳过真实探测，台账相关断言全落空。
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
@@ -215,12 +218,17 @@ def test_probe_cache_never_bleeds_across_ips_in_same_segment(monkeypatch):
 
 
 def test_probe_cache_ttl_by_persistence_not_by_polarity(monkeypatch):
-    """TTL 按**结论持久性**分档，不按好坏：quota/flagged 6h，其余（含 err）2min。
+    """TTL 按**结论持久性**分三档：quota/flagged 6h > OK 10min > err/unreachable 2min。
 
+    OK 不能和 err/unreachable 同档：它说的也是地址状态，而重探间隔中位 212s，
+    2min 档位命中不到自己 —— 实测 1980 次「前一次 OK」里 1831 次（92.5%）结论
+    不变，那 38% 的探测量纯属白烧配额。也不能直接套 6h：47 例 OK→quota 的间隔
+    中位 1267s，长 TTL 只是把「凭旧 OK 选线」的窗口拉宽。
     探测侧故障（err/unreachable）不是地址的长期状态：日志实测同一地址 err 后
     66s 就 OK。给它们长 TTL 等于一次探测抖动锁死健康线 6h（重连已不作废台账）。
     """
     monkeypatch.setitem(daemon.CFG["warp"], "probe_transient_ttl_sec", 120)
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_ok_ttl_sec", 600)
     monkeypatch.setitem(daemon.CFG["warp"], "probe_persistent_ttl_sec", 21600)
     ok_ip = "2a09:bac5:1ef9:281e::1"
     quota_ip = "2a09:bac5:1ef9:281e::2"
@@ -228,9 +236,11 @@ def test_probe_cache_ttl_by_persistence_not_by_polarity(monkeypatch):
     daemon._probe_cache_put("W1", ok_ip, "OK", now=1000.0)
     daemon._probe_cache_put("W1", quota_ip, "quota", now=1000.0)
     daemon._probe_cache_put("W1", err_ip, "err", now=1000.0)
+    # OK 档：比瞬时档长，覆盖 212s 的重探间隔中位
+    assert daemon._probe_cache_verdict("W1", ok_ip, 1600.0) == "OK"      # 边界内
+    assert daemon._probe_cache_verdict("W1", ok_ip, 1601.0) is None      # 过期
     # 瞬时档
-    assert daemon._probe_cache_verdict("W1", ok_ip, 1120.0) == "OK"      # 边界内
-    assert daemon._probe_cache_verdict("W1", ok_ip, 1121.0) is None      # 过期
+    assert daemon._probe_cache_verdict("W1", err_ip, 1120.0) == "err"
     assert daemon._probe_cache_verdict("W1", err_ip, 1121.0) is None, \
         "探测侧故障不得按地址持久结论缓存 6h"
     # 持久档

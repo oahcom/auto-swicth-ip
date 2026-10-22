@@ -54,6 +54,11 @@ def _isolate_production_files(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
     monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {})
     monkeypatch.setattr(daemon, "_WARP_REFRESH_COUNT", {})
+    # 验收时刻是进程级全局，`_reclaim_dirty_pass` 在它之后 12s 内跳过该线。
+    # 不隔离时前一个用例留下的真实 time.time() 会让后续用例的脏线巡检静默
+    # 少派一条（实测 test_dirty_janitor_reclaims_all_non_active_lines 按文档
+    # 顺序与 test_warp_refresh.py 合跑时 launched 只剩 ['W3']）。
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT_TS", {})
     # 模型层探测会真实发请求（每次烧一格出口配额），默认放行；需要验它的
     # 用例自行重新打桩。
     monkeypatch.setattr(daemon, "_warp_model_usable", lambda m, ip: True)
@@ -1821,20 +1826,20 @@ def test_prewarm_batches_all_stale_standby_lines(monkeypatch):
     assert scheduled == ["W2"], f"新鲜线应跳过，实际 {scheduled}"
 
 
-def test_prewarm_skips_batch_when_refresh_slots_full(monkeypatch):
-    """名额已满不得整轮放弃：排队段不占名额，仍应排进队列。
+def test_prewarm_skips_only_the_line_already_being_refreshed(monkeypatch):
+    """正在刷的那条线不重复排队，其余照排 —— 并发不设全池上限。
 
-    旧实现见 len(_WARP_REFRESHING) >= cap 直接 return，在补刷密集时
-    一轮一条都排不上。
+    全池上限 `refresh_concurrency` 已删除（互斥粒度改为单条线），所以「名额满」
+    不再是放弃整轮的理由。仍要守的是：`_WARP_REFRESHING` 里的线不得再排一次，
+    否则同一条隧道会被两条线程同时重启。
     """
     _warp_env(monkeypatch, WARP_TWO + [
         {"tag": "W3", "port": 1082, "service": "usque-warp-c.service"}])
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"],
-                                              "prewarm_sec": 120,
-                                              "refresh_concurrency": 1})
+                                              "prewarm_sec": 120})
     monkeypatch.setattr(daemon, "_last_warp_prewarm_ts", 0.0)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "_WARP_REFRESHING", {"W2"})   # 名额已满
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", {"W2"})   # 这条正在刷
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {
         "W2": {"sel": 500.0, "ip": "ip-w2"},
         "W3": {"sel": 300.0, "ip": "ip-w3"},
@@ -3510,32 +3515,37 @@ def test_ip_history_survives_hot_table_cleanup(monkeypatch, tmp_path):
     assert stats["new-ip"]["uses"] == 1
 
 
-def test_refresh_concurrency_zero_means_unlimited(monkeypatch):
-    """refresh_concurrency=0 必须真的不限，而不是被 `or 3` 退化成 3。
+def test_multiple_lines_can_hold_slots_at_once(monkeypatch):
+    """全池并发放开：五条线一起刷必须全部拿到名额。
 
-    文档一直写「0 = 不限」，旧实现 `int(... or 3)` 把 0 变成 3 —— 想放开并发
-    的人设 0 后看到的仍是三条一轮，开关静默失效。
+    全池上限已随 `refresh_concurrency` 一起删除（互斥粒度改为单条线），
+    本用例守住「多线并发不被挡」这条新语义。
     """
     members = [{"tag": f"W{i}", "port": 1080 + i, "service": "s"} for i in range(5)]
     monkeypatch.setitem(daemon.CFG["warp"], "members", members)
-    monkeypatch.setitem(daemon.CFG["warp"], "refresh_concurrency", 0)
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
 
-    assert daemon._refresh_concurrency() == 5, "0 应等于成员数"
     assert all(daemon._acquire_refresh_slot(m["tag"]) for m in members), \
-        "不限并发时五条线应全部拿到名额"
+        "五条线互不依赖，必须全部放行"
     assert daemon._acquire_refresh_slot("W0") is False, \
-        "即使不限并发，同一 tag 仍不得重入"
+        "放开全池并发不等于同一条线可以重入"
 
 
-def test_refresh_concurrency_positive_still_caps(monkeypatch):
-    """正整数仍照旧限速，供重启风暴时压负载。"""
-    monkeypatch.setitem(daemon.CFG["warp"], "refresh_concurrency", 2)
+def test_refresh_has_no_pool_wide_cap(monkeypatch):
+    """池内各线互不依赖：已在刷 19 条时，第 20 条仍须放行。
+
+    曾有一个全池上限（`refresh_concurrency`，0 时等于成员数）。它平时不生效；
+    生效时日志里报的又是上限常量而非实际集合大小 —— 134 次「名额已满」里
+    128 次其实是同一个 tag 自己撞自己，读日志完全分不清是哪种。互斥粒度只能
+    是单条线。
+    """
+    members = [{"tag": f"W{i}", "port": 1080 + i, "service": "s"} for i in range(20)]
+    monkeypatch.setitem(daemon.CFG["warp"], "members", members)
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
-    assert daemon._refresh_concurrency() == 2
-    assert daemon._acquire_refresh_slot("W1") is True
-    assert daemon._acquire_refresh_slot("W2") is True
-    assert daemon._acquire_refresh_slot("W3") is False, "超过上限必须拒绝"
+    for m in members[:19]:
+        assert daemon._acquire_refresh_slot(m["tag"]) is True
+    assert daemon._acquire_refresh_slot(members[19]["tag"]) is True, \
+        "已有 19 条在重启时第 20 条仍须放行"
 
 
 def test_classify_egress_error_recognizes_current_429_wording():
