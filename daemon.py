@@ -583,7 +583,24 @@ _WARP_REFRESH_COUNT: dict[str, int] = {}
 # 「反复刷成功又反复自转变脏」读成「一次连续失败」：实测 WARP-CF-C 23:11:53
 # 刷出 OK，5 分钟后同一 N（无重启）下地址已换成另一个被烧的地址 —— usque
 # 自己会重连换址，那 67 分钟不是一次刷新，是 29 个短周期。
-_WARP_LAST_ACCEPT_TS: dict[str, float] = {}
+# 该线最近一次验收通过的 (时刻, 地址)。有了它，日志里的「第 N 次刷」才不会
+# 把「反复刷成功又反复自转变脏」读成「一次连续失败」：实测 WARP-CF-C 23:11:53
+# 刷出 OK，5 分钟后同一 N（无重启）下地址已换成另一个被烧的地址 —— usque
+# 自己会重连换址，那 67 分钟不是一次刷新，是 29 个短周期。
+#
+# WHY 必须连地址一起存：usque 自重连会在同一 tag 下换址，只存时刻就答不出
+# 「验的到底还是不是这个地址」。旧实现拿缓存 `_warp_line_ip` 当第二个源，
+# 而那张缓存会被 `_invalidate_warp_line_ip` 在每次重启时清空、也会被换线
+# 路径（不改验收记录地）写进新地址 —— 两个源各说各的，既会把没验过的地址
+# 当成已验收（换线写了缓存、验收记录来自更早的另一个地址），也会在缓存被
+# 清掉后把同一个已验证地址反复重探（每探一次烧一格配额）。
+_WARP_LAST_ACCEPT: dict[str, tuple[float, str]] = {}
+
+
+def _warp_last_accept(tag: str) -> tuple[float, str] | None:
+    """该线上次验收通过的 (时刻, 地址)；没有则 None。"""
+    acc = _WARP_LAST_ACCEPT.get(tag)
+    return acc if isinstance(acc, tuple) and len(acc) == 2 else None
 
 
 def _warp_refresh_progress(tag: str) -> str:
@@ -601,8 +618,8 @@ def _warp_refresh_progress(tag: str) -> str:
     if off is None:
         return ""
     n = _WARP_REFRESH_COUNT.get(tag, 0)
-    last = _WARP_LAST_ACCEPT_TS.get(tag)
-    ago = f"，上次成功 {(time.time() - last) / 60:.1f}min 前" if last else ""
+    acc = _warp_last_accept(tag)
+    ago = f"，上次成功 {(time.time() - acc[0]) / 60:.1f}min 前" if acc else ""
     return f"（离渠后第 {n} 次刷，{(time.time() - off) / 60:.1f}min{ago}）"
 
 
@@ -688,8 +705,10 @@ def _warp_ip_refresh_reason(ip: str | None, now: float,
         return f"{entry.get('blocked_kind') or 'blocked'} 惩罚期"
     if _ip_history_is_truth():
         return "复用窗口内" if _warp_ip_recently_used(ip, now) else ""
+    # 档 3 才是「出现过却一次 OK 都没拿到」。档 2 是探针验过但还没轮到它服务，
+    # 那种地址此刻能服务，只是没撑过真实流量 —— 不当作低质原因报。
     return ("从无成功流量"
-            if _warp_ip_rank(ip, now, _warp()["ip_reuse_guard_sec"])[0] == 2
+            if _warp_ip_rank(ip, now, _warp()["ip_reuse_guard_sec"])[0] == 3
             else "")
 
 
@@ -2211,8 +2230,7 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
 
     模型模式下「低质」只认确定的证据，不用启发式：
       - 仍在 403/429 惩罚期 —— 这条地址确实被拦过；
-      - 出现过却从没有过成功流量（档位 2，实测 350 条里 97 条）—— 切上去
-        就报错那批。
+      - 出现过却连一次 OK 都没拿到（档位 3）—— 切上去就报错那批。
     从没出现过的新地址不算低质，否则刚刷好的线会被当脏线反复重启。
     原模式沿用复用窗口判定，语义不变。
     """
@@ -2229,7 +2247,11 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
         return True
     if _ip_history_is_truth():
         return _warp_ip_recently_used(ip, now)
-    return _warp_ip_rank(ip, now, _warp()["ip_reuse_guard_sec"])[0] == 2
+    # 只有档 3（出现过却连一次 OK 都没拿到）该刷。档 2 是「探针验过、只是还没轮到
+    # 它服务」—— 那正是机制一要保住的资产，刷它等于把好不容易验出的好地址丢掉。
+    # WHY 写 == 3 而不是 == 2：加上探针档后档位从三档变四档，沿用 == 2 会把
+    # 「验过未用」当成脏线反复重启，正好把机制一变成反向优化。
+    return _warp_ip_rank(ip, now, _warp()["ip_reuse_guard_sec"])[0] == 3
 
 
 def _warp_model_test_many(pairs: list[tuple[dict, str]]) -> dict[str, bool]:
@@ -2442,14 +2464,16 @@ def _warp_prefix_rest(ip: str | None, now: float) -> float | None:
 def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, int, float]:
     """选线优先级：越小越优先。返回 (档位, 段是否刚用过, 排序值)。
 
-    三档（对应「按使用来区分」）：
+    四档（对应「按使用来区分」）：
       0. 从未出现过 —— 最优，必然没被 opencode 见过；
-      1. 次级优质 —— 有过成功流量，且已过对应的惩罚期（403 六小时 / 429
-         二十四小时）。过了惩罚期的 IP 可以复用，不是废址；档内按「距上次
-         成功的时长」排序，越久越靠前，这只是次级优质内部的先后，与恢复
+      1. 次级优质 —— **真的撑过生产流量**，且已过对应的惩罚期（403 六小时 /
+         429 二十四小时）。过了惩罚期的 IP 可以复用，不是废址；档内按「距
+         上次成功的时长」排序，越久越靠前，这只是次级优质内部的先后，与恢复
          进度无关。已验证能服务，优先于没成功过的地址；
-      2. 出现过但**没有任何成功流量** —— 切上去就报错、或从没真正服务过。
-         这类不能当新鲜地址直接切（实测 350 条记录里 97 条属于此类），
+      2. 探针验过但从未服务生产 —— 空跑里拿到过 OK，但一次真实流量都没撑过。
+         配额可能在下一格就被烧，也可能永远轮不到它上场；比「从未验过」差
+         （后者至少可能是个新鲜好地址），但比「验过且失败」强；
+      3. 出现过但**没有任何成功记录** —— 切上去就报错、或从没真正服务过。
          排在最后，仅作兜底。
     仍处于惩罚期内的地址由调用方先筛掉，不进本函数比较。
     中间位是 /64 静置判定（见 `_warp_prefix_rest`）：同档内优先选刚烧过的
@@ -2463,10 +2487,15 @@ def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, int, 
     if entry is None:
         return (0, hot, 0.0)
     ok = entry.get("last_ok_ts") if isinstance(entry, dict) else None
-    if not ok:
-        return (2, hot, 0.0)
-    # 取负：调用方用 min()，而「越久没成功越该优先」意味着间隔越大排序值要越小。
-    return (1, hot, -(now - float(ok)))
+    if ok:
+        # 取负：调用方用 min()，而「越久没成功越该优先」意味着间隔越大排序值要越小。
+        return (1, hot, -(now - float(ok)))
+    probe_ok = entry.get("probe_ok_ts") if isinstance(entry, dict) else None
+    if probe_ok:
+        # 同样取负：验得越久（越接近该结果过期）越该先用一次，否则等到 TTL
+        # 过期就白验了。
+        return (2, hot, -(now - float(probe_ok)))
+    return (3, hot, 0.0)
 
 
 def _warp_guard_for_reason(reason: str) -> float:
@@ -2560,7 +2589,8 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
     fresh = {"ts": now, "blocked": blocked,
              "blocked_kind": kind if blocked else None, "first_seen": now,
              "blocked_ts": now if blocked else None,
-             "blocked_ts_by_kind": {}, "served_sec": None, "last_ok_ts": None}
+             "blocked_ts_by_kind": {}, "served_sec": None, "last_ok_ts": None,
+             "probe_ok_ts": None}
     entry = _WARP_IP_USED.setdefault(ip, fresh)
     if not isinstance(entry, dict):
         # 兼容旧格式（float）
@@ -2641,8 +2671,8 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}"
         f"{_warp_refresh_count_note(tag)}")
     if ok:
-        # 实测通过 = 这条地址此刻确实能服务，记进 last_ok_ts。否则同址仍停在
-        # 档位 2（从没成功过），后台会把刚验过的线当低质反复重启，白烧配额。
+        # 实测通过 = 这条地址此刻确实能服务，记进 `probe_ok_ts`。否则同址仍停在
+        # 档位 3（一次 OK 都没拿到），后台会把刚验过的线当低质反复重启，白烧配额。
         now = time.time()
         # 落盘必须在锁内：`_warp_model_test_many` 会并发调本函数，而
         # `_write_json_atomic` 的临时文件名固定，两个线程同时写同一个 .tmp
@@ -2652,7 +2682,12 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
             if not isinstance(entry, dict):
                 entry = _WARP_IP_USED[ip] = {"ts": now, "blocked": False,
                                              "first_seen": now}
-            entry["last_ok_ts"] = max(float(entry.get("last_ok_ts") or 0), now)
+            # WHY 不写 `last_ok_ts`：那个字段的语义是「该地址真的撑过生产流量」，
+            # 由 `_record_active_ip_success` 独占。探针 OK 只说明「此刻配额还没
+            # 耗尽」，下一个请求就可能被烧，也可能永远轮不到它上场。混写会让
+            # `_warp_ip_rank` 把「只在空跑里验过」的地址排进次级优质档，与真正
+            # 撑过流量的地址同权 —— 实测台账 2945 条里 738 条属于这种「验过没用过」。
+            entry["probe_ok_ts"] = max(float(entry.get("probe_ok_ts") or 0), now)
             _save_warp_ip_used()
     elif verdict in _MODEL_VERDICT_BLOCK_KIND:
         # 模型层判 quota/flagged 与生产侧 429/403 是同一件事（前者是
@@ -2718,7 +2753,10 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
                 _set_warp_line_ip(member["tag"], ip)
                 # 记下这次验收：脏线守护据此静置，不再 5s 后又把同一条刚刷好的线
                 # 派出去重探一遍（那会白烧一格配额）。
-                _WARP_LAST_ACCEPT_TS[t] = now
+                # 记下这次验收的**时刻和地址**：脏线守护据此静置，不再 5s 后又
+                # 把同一条刚刷好的线派出去重探一遍（那会白烧一格配额）；等 usque
+                # 自己重连换了址，地址对不上就重新走判定 —— 那正是该复检的时刻。
+                _WARP_LAST_ACCEPT[t] = (now, ip)
                 return ip
         else:
             log(f"  ✗ {member['tag']} 刷新后端口未就绪")
@@ -2751,8 +2789,15 @@ def _reclaim_dirty_pass() -> None:
             # 在台账里没有结论就按「从没成功过」判脏，于是每 5s 白烧一格配额。
             # 实测 WARP-CF-C 67 分钟内 20 次重启里 18 次判 quota、只有 3 次 OK。
             # 静置窗口取与 `probe_cache_ttl_sec` 同量级：短于它只会重复看同一个地址。
-            if time.time() - _WARP_LAST_ACCEPT_TS.get(m["tag"], 0.0) < _warp().get(
-                    "probe_cache_ttl_sec", 12):
+            #
+            # 静置窗口只在「地址仍是验收时那个」时生效 —— 记录里带了地址，就是
+            # 为了区分这两种情况。usque 自重连换址是常态（相邻两次判定间隔 10~30s
+            # 时多数已换址），换掉的地址即便在台账里仍是「已验证好 IP」，池子也已经
+            # 指向一个不存在的出口。所以地址一变就必须重新判定，不能继续静置到窗口
+            # 结束 —— 否则脏线守护会整段窗口内放着一个已换址的线不管。
+            acc = _warp_last_accept(m["tag"])
+            if (acc and acc[1] == _warp_line_ip(m["tag"])
+                    and time.time() - acc[0] < _warp().get("probe_cache_ttl_sec", 12)):
                 continue
             if (m["tag"] in _WARP_REFRESHING or m["tag"] in _WARP_REFRESH_PENDING
                     or m["tag"] in _WARP_PROBING
@@ -2803,20 +2848,24 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
             if ip and not _warp_ip_needs_refresh(ip, time.time(), member["tag"]):
                 # 地址没变、且这条线已验收过它就免测：usque 自重连是换址的**唯一**
                 # 来源，地址一样就意味着还是那个验证过的会话，重探只是白烧一格。
-                if (ip == _warp_line_ip(member["tag"])
-                        and member["tag"] in _WARP_LAST_ACCEPT_TS):
-                    _WARP_LAST_ACCEPT_TS[member["tag"]] = time.time()
+                # 比对源必须是验收记录本身 —— 拿缓存 `_warp_line_ip` 当第二个源
+                # 会两头失真：缓存被 `_invalidate_warp_line_ip` 清空时，同一个已
+                # 验地址会被当作「没验过」反复重探；而换线路径写缓存时不更新验收
+                # 记录，缓存里的新地址会冒用旧地址的验收结论。
+                acc = _warp_last_accept(member["tag"])
+                if acc and acc[1] == ip:
+                    _WARP_LAST_ACCEPT[member["tag"]] = (time.time(), ip)
                     return
                 # 但「不在台账里」只是「没被证伪」，不是「已验证」：模型模式下
                 # 还要当场实测，否则池子里存的全是没验过的地址。实测首探 OK 率
                 # 全新地址 5.47%（56/1024）、T2 0.13%（1/795），而成功过的地址
                 # 95.44% —— 不验收等于把池子交给最差的那一档，换线时才逐条付
                 # 学费（实测 1817 次首探判 quota、只有 1268 次 OK）。
-                # 这也让 `_WARP_LAST_ACCEPT_TS` 名副其实：记录的是「验收通过」。
+                # 这也让 `_WARP_LAST_ACCEPT` 名副其实：记录的是「验收通过」。
                 if (_ip_history_is_truth()
                         or _warp_model_usable(member, ip)):
                     _set_warp_line_ip(member["tag"], ip)
-                    _WARP_LAST_ACCEPT_TS[member["tag"]] = time.time()
+                    _WARP_LAST_ACCEPT[member["tag"]] = (time.time(), ip)
                     return
             # 探测期间这条线可能已被换线线程切成当前出口：此刻重启会掐断在途
             # 连接（upstream connection lost）。判据必须落在重启之前。
@@ -3373,11 +3422,12 @@ def reconnect_warp(reason: str) -> bool:
     # 它们之后，否则刷新拿回的新地址照样可能是当前出口本身。
     probes = _exclude_active_ip(probes, old_ip)
 
-    # 选线三级优先：
+    # 选线四级优先：
     #   1) 从未用过的地址 —— 必然没被 opencode 见过，优先级最高；
-    #   2) 次级优质：已过对应惩罚期的地址（403 6h / 429 24h），可复用，
-    #      不是废址；档内按距上次成功的时长排先后；
-    #   3) 都不满足时兜底复用最久未用的（见下面 elif probes 分支）。
+    #   2) 次级优质：真撑过生产流量、且已过对应惩罚期的地址（403 6h / 429 24h），
+    #      可复用，不是废址；档内按距上次成功的时长排先后；
+    #   3) 探针验过但一次生产流量都没撑过 —— 此刻能服务，只是还没轮到它上场；
+    #   4) 都不满足时兜底复用最久未用的（见下面 elif probes 分支）。
     # 第 1 级单列是因为「从没用过」和「用过但已久」在 _warp_ip_last_ts 上都
     # 可能返回很小的值，混在一起排序会让刚清理掉的旧地址冒充新地址。
     # 模型模式下 probes 里只剩刚实测通过的候选，历史不得再否决它们：惩罚期已在
@@ -3392,7 +3442,9 @@ def reconnect_warp(reason: str) -> bool:
     if _ip_history_is_truth():
         n_new = sum(1 for p in probes if _warp_ip_never_used(p[1]))
         n_ok = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 1)
+        n_probe = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 2)
         log(f"  ↻ 选线: 从没用过 {n_new} 条, 次级优质 {n_ok} 条, "
+            f"验过未用 {n_probe} 条, "
             f"{guard/3600:.0f}h 内无成功流量合计 {len(usable)} 条 / 备线 {len(probes)} 条")
     else:
         log(f"  ↻ 选线: 模型层实测可用 {len(probes)} 条")

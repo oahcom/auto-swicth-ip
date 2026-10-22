@@ -58,7 +58,7 @@ def _isolate_production_files(tmp_path, monkeypatch):
     # 不隔离时前一个用例留下的真实 time.time() 会让后续用例的脏线巡检静默
     # 少派一条（实测 test_dirty_janitor_reclaims_all_non_active_lines 按文档
     # 顺序与 test_warp_refresh.py 合跑时 launched 只剩 ['W3']）。
-    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT_TS", {})
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT", {})
     # 模型层探测会真实发请求（每次烧一格出口配额），默认放行；需要验它的
     # 用例自行重新打桩。
     monkeypatch.setattr(daemon, "_warp_model_usable", lambda m, ip: True)
@@ -3350,31 +3350,42 @@ def test_record_active_ip_success_uses_request_timestamps(monkeypatch):
 
 
 def test_warp_ip_rank_orders_unseen_before_ok_before_no_success(monkeypatch):
-    """选线三档：从没用过 > 有成功记录 > 从没成功过。
+    """选线四档：从没用过 > 撑过生产 > 探针验过 > 一次 OK 都没拿到。
 
-    第 1 档必须排在第 2 档前面：有成功记录的地址已验证能服务，优于「切上去
-    就 403、从没服务成功过」的地址（实测 350 条记录里 97 条）。第 1 档内部
-    按距上次成功的时长倒序，越久越优先。
+    第 1 档必须排在第 2 档前面：有生产成功记录的地址已验证能服务，优于「切上去
+    就 403、从没服务成功过」的地址。第 2 档（探针验过、没撑过生产）排第 3 档之
+    前：它此刻确实能服务，只是还没轮到上场，比「验过且失败」强 —— 而「从未出现
+    过」仍排最前，因为它至少可能是个新鲜好地址。
     """
     now = 100000.0
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {
-        "never-seen": None,                      # 占位，下面会删
-        "burned-no-ok": {"ts": now - 30, "blocked": False, "last_ok_ts": None},
-        "old-ok":      {"ts": now - 5000, "blocked": False, "last_ok_ts": now - 5000},
-        "recent-ok":   {"ts": now - 100, "blocked": False, "last_ok_ts": now - 100},
+        "burned-no-ok": {"ts": now - 30, "blocked": False,
+                         "last_ok_ts": None, "probe_ok_ts": None},
+        "probe-only-old": {"ts": now - 6000, "blocked": False,
+                           "last_ok_ts": None, "probe_ok_ts": now - 6000},
+        "probe-only-new": {"ts": now - 60, "blocked": False,
+                           "last_ok_ts": None, "probe_ok_ts": now - 60},
+        "old-ok":      {"ts": now - 5000, "blocked": False,
+                        "last_ok_ts": now - 5000, "probe_ok_ts": None},
+        "recent-ok":   {"ts": now - 100, "blocked": False,
+                        "last_ok_ts": now - 100, "probe_ok_ts": None},
     })
-    del daemon._WARP_IP_USED["never-seen"]
 
-    ranks = {ip: daemon._warp_ip_rank(ip, now, 86400)
-             for ip in ("brand-new", "burned-no-ok", "old-ok", "recent-ok")}
+    ranks = {ip: daemon._warp_ip_rank(ip, now, 86400) for ip in (
+        "brand-new", "burned-no-ok", "probe-only-old", "probe-only-new",
+        "old-ok", "recent-ok")}
     assert ranks["brand-new"][0] == 0, "没见过的地址应第 0 档"
     assert ranks["old-ok"][0] == 1 and ranks["recent-ok"][0] == 1
-    assert ranks["burned-no-ok"][0] == 2, "没成功过的地址应第 2 档"
+    assert (ranks["probe-only-old"][0] == 2
+            and ranks["probe-only-new"][0] == 2), "探针验过但没服务过应第 2 档"
+    assert ranks["burned-no-ok"][0] == 3, "一次 OK 都没拿到的地址应第 3 档"
     # 第 1 档内部：越久没成功越优先（排序值越小，因为调用方用 min()）
     assert ranks["old-ok"][2] < ranks["recent-ok"][2]
-    # 整体排序：brand-new < old-ok < recent-ok < burned-no-ok
+    # 整体排序：brand-new < old-ok < recent-ok < 验过未用 < burned-no-ok
     ordered = sorted(ranks, key=lambda ip: ranks[ip])
-    assert ordered == ["brand-new", "old-ok", "recent-ok", "burned-no-ok"], ordered
+    assert ordered == ["brand-new", "old-ok", "recent-ok",
+                       "probe-only-old", "probe-only-new",
+                       "burned-no-ok"], ordered
 
 
 def test_warp_ip_rank_prefers_unseen_ip_from_rested_prefix(monkeypatch):

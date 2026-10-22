@@ -38,7 +38,7 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon, "_WARP_REFRESH_COUNT", {})
     # 验收时刻同样要隔离：`_reclaim_dirty_pass` 在它之后 12s 内跳过该线，
     # 残留的真 time.time() 会让后续用例的脏线巡检静默少派一条。
-    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT_TS", {})
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT", {})
     # 探测台账是进程级全局：不隔离则前一个用例探过的 IP 在本用例被当成
     # 「TTL 内已探过」而跳过真实探测，台账相关断言全落空。
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
@@ -889,8 +889,14 @@ def test_dirty_worker_restarts_flagged_line_in_model_mode(monkeypatch):
     assert refreshed == ["W1"], f"被标记的出口必须重连，实际 {refreshed}"
 
 
-def test_model_probe_ok_marks_address_served(monkeypatch):
-    """实测通过要把地址记进 last_ok_ts，否则同址停在档位 2 被反复重启。"""
+def test_model_probe_ok_records_probe_ok_not_served(monkeypatch):
+    """实测通过记 `probe_ok_ts`，不得冒充 `last_ok_ts`。
+
+    `last_ok_ts` 的语义是「该地址真的撑过生产流量」，由 `_record_active_ip_success`
+    独占；探针 OK 只说明此刻配额还没耗尽。混写会让选线把「只在空跑里验过」的地址
+    排进次级优质档，与真的撑过流量的地址同权 —— 实测台账 2945 条里 738 条属于这种
+    「验过没用过」。
+    """
     import probe_warp
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: ("OK", 0.1, ""))
@@ -898,9 +904,13 @@ def test_model_probe_ok_marks_address_served(monkeypatch):
     monkeypatch.setattr(time, "time", lambda: 2000.0)
 
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-a") is True
-    assert daemon._WARP_IP_USED["ip-a"]["last_ok_ts"] == 2000.0
+    assert daemon._WARP_IP_USED["ip-a"]["probe_ok_ts"] == 2000.0
+    assert daemon._WARP_IP_USED["ip-a"].get("last_ok_ts") is None, \
+        "探针 OK 不是生产成功，不得写 last_ok_ts"
     assert daemon._warp_ip_needs_refresh("ip-a", 2000.0) is False, \
         "刚验过的地址不得再被判低质"
+    assert daemon._warp_ip_rank("ip-a", 2000.0, 86400)[0] == 2, \
+        "验过但没服务过的地址应落第 2 档"
 
 
 def test_model_mode_selection_trusts_probe_not_history(monkeypatch):
@@ -1103,6 +1113,75 @@ def test_real_error_after_new_exit_is_still_marked(monkeypatch):
     assert marked == [("ip-new", True)], f"新出口自己的错误必须标脏，实际 {marked}"
 
 
+
+
+def test_dirty_worker_skips_reprobe_when_address_unchanged(monkeypatch):
+    """地址与验收记录一致就免测：usque 自重连是换址的唯一来源。
+
+    缓存 `_warp_line_ip` 被 `_invalidate_warp_line_ip` 在每次重启时清空，拿它
+    当第二个源会把同一个已验证地址当成「没验过」反复重探（每探一次烧一格配额）。
+    比对源必须是验收记录自己带的地址。
+    """
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda *a, **k: "ip-same")
+    monkeypatch.setattr(daemon, "_warp_ip_needs_refresh", lambda *a, **k: False)
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT", {})          # 缓存已清空
+    daemon._WARP_LAST_ACCEPT["W1"] = (999.0, "ip-same")
+    probed = []
+    monkeypatch.setattr(daemon, "_warp_model_usable",
+                        lambda m, ip: (probed.append(ip), True)[1])
+
+    daemon._reclaim_dirty_warp_worker({"tag": "W1", "port": 1080,
+                                       "service": "usque-warp.service"})
+
+    assert probed == [], f"同址不得重探，实际探了 {probed}"
+    assert daemon._WARP_LAST_ACCEPT["W1"][1] == "ip-same", "同址应续期验收记录"
+
+
+def test_dirty_worker_reprobes_after_usque_reconnect(monkeypatch):
+    """usque 自己换址后，验收记录必须作废重判 —— 否则好 IP 的结论被新地址冒用。"""
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda *a, **k: "ip-new")
+    monkeypatch.setattr(daemon, "_warp_ip_needs_refresh", lambda *a, **k: False)
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT", {"W1": (999.0, "ip-old")})
+    probed = []
+
+    def fake_usable(member, ip):
+        probed.append(ip)
+        return True
+
+    monkeypatch.setattr(daemon, "_warp_model_usable", fake_usable)
+
+    daemon._reclaim_dirty_warp_worker({"tag": "W1", "port": 1080,
+                                       "service": "usque-warp.service"})
+
+    assert probed == ["ip-new"], f"换址后必须重探新地址，实际 {probed}"
+    assert daemon._WARP_LAST_ACCEPT["W1"][1] == "ip-new", "通过验收后记录新地址"
+
+
+def test_reclaim_pass_rechecks_line_whose_address_changed(monkeypatch):
+    """静置窗口只在地址未变时生效：换了址的线必须立刻回到巡检范围。
+
+    usque 自重连换址是常态，换掉的地址即便还在静置窗口内，池子也已经指向一个
+    不存在的出口 —— 继续静置等于整段窗口放着脏线不管。
+    """
+    member = {"tag": "W1", "port": 1080, "service": "s1"}
+    monkeypatch.setitem(daemon.CFG["warp"], "members", [member])
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W2")
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    monkeypatch.setattr(daemon, "_WARP_REFRESH_PENDING", set())
+    monkeypatch.setattr(daemon, "_WARP_PROBING", set())
+    monkeypatch.setattr(daemon, "_WARP_BUSY_UNTIL", {})
+    monkeypatch.setattr(daemon, "_standby_defer_reason", lambda tag: None)
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT", {"W1": (time.time(), "ip-old")})
+    monkeypatch.setattr(daemon, "_warp_line_ip", lambda tag: "ip-new")
+    launched = []
+    monkeypatch.setattr(daemon, "_reclaim_dirty_warp_worker",
+                        lambda m: launched.append(m["tag"]))
+
+    daemon._reclaim_dirty_pass()
+
+    assert launched == ["W1"], f"换址后必须重新巡检，实际 {launched}"
 
 
 def test_busy_window_covers_measured_sse_silence():
