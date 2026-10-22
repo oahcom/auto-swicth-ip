@@ -1898,23 +1898,30 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
 
 
 def _probe_refresh_egress(port: int) -> str | None:
-    """刷新路径取出口：先按短预算试一次，慢了就再给一次余量。
+    """刷新路径取出口：轮询到隧道真正通为止，而不是两次预算后就放弃。
 
-    短预算的理由（见 warp_egress_ip）只覆盖「隧道没起来」这一种失败，但**首探冷**
-    是另一种：实测 usque-warp-20 重启后端口 0.12s 就绪，紧接着的 7s 预算首探
-    7.01s 到点 rc=28，而随后同预算的探测 1.68s 就返回 —— MASQUE 首连慢，隧道
-    是好的。这一类探测在旧实现里直接把 attempt 记成失败（全库 748 条
-    「出口探测失败」），随后重启同一条线再试，而隧道还是冷的、又超时，于是循环：
-    实测 14:58 单分钟 60 次 systemd Started；「刷新 #3 失败 → 同线再重启」实测 135 次，
-    间隔 65s 的最多（38 次）—— 正是 3 次重启 + 2/5/10 退避的固定节奏。一次二次探测
-    就能拆掉这个循环。
+    WHY 不再用「短预算两次」：实测同一批生产 device 配置、无守护进程干扰下，
+    从进程启动到出口可用的时间是 5.0/7.6/7.8/7.9/7.9/8.3s（n=6，全部成功），
+    而复刻原「7s 再 12s」两次探测的对照里 6 条有 5 条首探超时、全靠第二探才
+    拿到 —— 首探预算压在可用时间中位数上，等于抛硬币。抛输的那次被判失败，
+    调用方重启隧道、计时归零，隧道于是永远停在冷启动段：实测 1 小时 763 次
+    systemd Started（20 条线各约 94s 一次），每次都在它即将可用时被掐掉。
 
-    仍失败才返回 None（隧道确实不通 / warp=off），由调用方按原逻辑重启重试。
+    WHY 轮询而不是把单次预算调大：隧道可用后首查只要 1.5~2.3s，慢的是「还没
+    可用」这一步。单次大预算会让已坏的隧道白占线程一整个预算；轮询则每次只
+    花 5s，任一跳变好立刻返回。上限沿用 `ready_timeout_sec` 的量级乘以本次
+    最多尝试次数，避免真的无限等。
     """
-    ip = warp_egress_ip(port, timeout_sec=_warp()["refresh_probe_timeout_sec"])
-    if ip:
-        return ip
-    return warp_egress_ip(port, timeout_sec=_warp()["ready_timeout_sec"])
+    w = _warp()
+    per_try = w["refresh_probe_timeout_sec"]
+    deadline = time.time() + w["ready_timeout_sec"] * w["max_attempts"]
+    while True:
+        ip = warp_egress_ip(port, timeout_sec=per_try)
+        if ip:
+            return ip
+        if time.time() >= deadline:
+            return None
+        time.sleep(1)
 
 
 def _warp_line_sel(tag: str) -> float:
@@ -2794,9 +2801,23 @@ def _reclaim_dirty_warp_worker(member: dict) -> None:
             # 探到地址不等于地址优质：被 403/429 标记过、或用过却从没有过
             # 成功流量的线仍是低质，必须换掉。判据与预热、补刷同源。
             if ip and not _warp_ip_needs_refresh(ip, time.time(), member["tag"]):
-                _set_warp_line_ip(member["tag"], ip)
-                _WARP_LAST_ACCEPT_TS[member["tag"]] = time.time()
-                return
+                # 地址没变、且这条线已验收过它就免测：usque 自重连是换址的**唯一**
+                # 来源，地址一样就意味着还是那个验证过的会话，重探只是白烧一格。
+                if (ip == _warp_line_ip(member["tag"])
+                        and member["tag"] in _WARP_LAST_ACCEPT_TS):
+                    _WARP_LAST_ACCEPT_TS[member["tag"]] = time.time()
+                    return
+                # 但「不在台账里」只是「没被证伪」，不是「已验证」：模型模式下
+                # 还要当场实测，否则池子里存的全是没验过的地址。实测首探 OK 率
+                # 全新地址 5.47%（56/1024）、T2 0.13%（1/795），而成功过的地址
+                # 95.44% —— 不验收等于把池子交给最差的那一档，换线时才逐条付
+                # 学费（实测 1817 次首探判 quota、只有 1268 次 OK）。
+                # 这也让 `_WARP_LAST_ACCEPT_TS` 名副其实：记录的是「验收通过」。
+                if (_ip_history_is_truth()
+                        or _warp_model_usable(member, ip)):
+                    _set_warp_line_ip(member["tag"], ip)
+                    _WARP_LAST_ACCEPT_TS[member["tag"]] = time.time()
+                    return
             # 探测期间这条线可能已被换线线程切成当前出口：此刻重启会掐断在途
             # 连接（upstream connection lost）。判据必须落在重启之前。
             if active_warp_tag() == member["tag"]:
