@@ -21,8 +21,7 @@ daemon.py
     ← 或经 Clash API 切 selector（pool 节点轮换 / opencode-out 换线）
     → 403/429 各达阈值 1 后，还要连错 ≥3 条才换（consec_err 门控，采样/标脏之后）
     → 换线冷却 5s；整窗全为出口级错误（full_err）时绕过冷却
-    → 主动轮换（池）：proactive_mode=lifetime 按实测 IP 寿命裁切点；
-      requests 模式回退到每 60 条
+    → 主动轮换（池）：proactive_mode 二选一 —— requests 满 150 格 dsv4（当前）/ fixed 每 60s
     → 自适应策略：normal=延迟优先 / pressure=均匀分散
     → 节点健康检查：每 300s 并发测试（_health_pool, _DEAD_TTL_STAGES）
     → sing-box watchdog：重启检测
@@ -104,14 +103,36 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   在坏出口上（实测 2026-10-19 19:09 三条线同时失效 → 原地重连全败 → 403-abuse
   每分钟 10~116 条持续 7 分钟）。仅当切 proxy 也失败时才退回原地重连，最多
   `max_attempts`（3）次，重试间隔 `retry_backoff_sec`（2/5/10s）。
-- **主动轮换按「典型可用周期」触发**：有样本时 `now - 段起点 ≥ _WARP_MIN_CYCLE_SEC` 即换，
-  无样本才回退到 `已服务 proactive_after_requests(60) 条`。
-  - **周期取中位而非最小值**：最小值由「最倒霉的那条线」决定 —— 24h 窗口里只要有一条
-    成功服务 1 条后就死的段，最小值就塌到 0.1s 级，主动轮换变成每几秒切一次
-    （实测 136 条可用样本 min 0.1s / p25 4.2s / 中位 17.6s / p75 21.5s）。下限 `_WARP_MIN_CYCLE_FLOOR_SEC`=60s。
-  - **必须绕开 `cooldown_ok_sec`(5s)**：换线本身带 1~2s 断流，按 10s 一轮换时约 10% 请求失败；
-    绕过条件 `_last_warp_reconnect_ts <= _last_warp_switch_ok_ts`，即只绕「成功换线后」的
-    冷却；上次换线失败时 `_warp_cooldown_until` 是 `cooldown_fail_sec`(3s)，那是防隧道
+- **主动轮换两种判据，`proactive_mode` 二选一（互斥，只有一个生效）**：`requests`（**当前生效**，
+  当前出口上**成功的 dsv4 调用**累计满 `proactive_after_dsv4_ok`=150 格）与 `fixed`
+  （每 `proactive_fixed_sec`=60s）。非法值按 `fixed` 处理，不让轮换静默停摆。
+  互斥由分支末的 `return` 保证：两个判据叠加时，fixed 到点那次换线会把 requests 的配额
+  计数一起清零，150 格永远跑不到（回归用例 `test_proactive_modes_are_mutually_exclusive`）。
+  - **WHY 不用时间轴**：实测按 60s 切走的 204 个主动段，到点时已用掉 dsv4 中位
+    **113.5** / p90 175 —— 60s 上限本身就在扔还没用完的配额（右删失下界，真实容量
+    至少这么多）。而 429 段存活中位仅 6s。两个分布都不随时钟走，任何固定周期都只能
+    在「切早了浪费地址」与「切晚了吃 429」之间瞎猜。
+  - **WHY 数成功而不是数请求**：配额按成功的 dsv4 调用扣。按请求条数会把被 429 拒掉
+    的请求也算成消耗，风暴里反而切得更勤 —— 那正是最该留在原线路的时候。
+  - **150 的实际效果（直连实测，不是回放估算）**：2026-10-22 12:23~12:33 的 5 段里，
+    3 段跑满（138s/150 格、167s/151 格、116s/151 格，均由本判据主动换线），1 段在
+    86 格时撞 `rate429 ×3` 由错误判据接管，1 段进行中。跑满时每段约 2~2.8 分钟。
+    本模式因此确实按配额触发（非旧注释的「多数时段不触发」），效果是把健康段拉到
+    约 2 分钟；快限流的段仍由 429 兜底。拒绝旧数据：早先「T=150 仅 3% 段可达」的
+    回放取自 fixed 模式，205 段中位段长 61s，150 格来不及跑就被切走 —— 那是右删失，
+    不是地址容量。若 429 占比上升，把 `proactive_after_dsv4_ok` 调小即可。
+  - **日志按当前判据打，不按旧口径**：健康摘要每 10s 一条，`轮换=` 字段显示当前
+    判据与进度（`requests 137/150格` 或 `fixed 57/57s`）；触发换线那一行写
+    `主动轮换 已用配额 N 格 dsv4 ≥ 150`，fixed 则写 `主动轮换 固定 57s ≥ 57s（60s −
+    提前量 3s）`。**比较的是减掉提前量后的门槛**，早期版本写成 `57s ≥ 60s`，字面上
+    57 不小于 60，读日志的人无法判断为何触发。
+  - **配置缺键在导入时炸**：`config.py` 末尾校验 `proactive_mode` 取值与
+    `requests` 模式必须的 `proactive_quota_model`。`count_dsv4_ok_since` 只吞
+    `sqlite3.Error`；早期版本吞 `Exception`，把缺键的 KeyError 一起变成「0 格」——
+    requests 判据静默永不触发，日志里只有一行统计失败，看起来和查库失败无异。
+  - **必须绕开 `cooldown_ok_sec`(5s)**：换线本身带 1~2s 断流；绕过条件
+    `_last_warp_reconnect_ts <= _last_warp_switch_ok_ts`，即只绕「成功换线后」的冷却；
+    上次换线失败时 `_warp_cooldown_until` 是 `cooldown_fail_sec`(3s)，那是防隧道
     雷暴的，不绕。并发始终由 `_WARP_LOCK` 保证。
 
   - **错误触发的换线与主动轮换不得交错**：任一条错误路径换线生效后，主动轮换的计时起点
@@ -119,23 +140,24 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
     `_fallback_to_proxy`（落池）与 `_restart_warp_inplace`（原地重连）都不更新 —— 刚落池
     或刚原地重连，主动轮换仍按上一段的已服务时长算账，立刻再切一次（实测 00:12:00 落池，
     22s 后就报「27s≥27s」）。现在三条生效路径都重置，主动轮换必须重新等满一个周期。
-  - **时间判据曾被误弃用两次**：v1.14 初版样本被冷却期截断（`maybe_reconnect_warp`
-    首句就是冷却判断，403 多在换线后 1 秒内出现，样本最小值恒等于冷却值，实测 18 条全部
-    20.0~21.9s）→ 主动轮换被锁成每 20 秒一次；v1.15 据此回退请求数，但那是把「采样缺失」
-    误归因为「时间判据本身错」。f68ab66 修好采样后判据恢复可用。
+  - **被移除的 `lifetime` 模式**：按「实测 IP 可用寿命」裁切点。它的病不在采样
+    （v1.14 曾被冷却期截断样本，f68ab66 已修），而在被测量本身：段跨度跟的是
+    **请求间隔**（首条成功→末条成功，中位 3.8s），而请求本身 p50 6.5s —— 生效值恒被
+    60s 地板顶住，等于一个测不准的固定 60s。
   - **采样必须先于冷却判断**：`maybe_reconnect_warp` 里「标记当前出口 IP + 记周期样本」
     移到 `now < _warp_cooldown_until` 之前。放后面会让冷却期内被烧的 IP 既不标脏
     （下次换线又当干净地址选回来）、也采不到样本。每段只采一次，判据是本段起点之后
     是否已有 `ended_at >= _last_warp_switch_ok_ts` 的样本，不另设标志位。
   - **样本存 `_WARP_IP_CYCLES` 并落盘**：`.warp_ip_cycles.json`（`WARP_IP_CYCLES_FILE_PATH` 可覆盖，
     测试隔离），样本 `{ip, cycle, span, ended_at, ok, blocked}` —— 一次 cycle =「某 IP 成为出口 → 该 IP
-    首次出现 403/429」，只保留 24h。`_recompute_min_warp_cycle` 每 `min_cycle_recalc_sec`=300s
-    重算一次。
+    首次出现 403/429」，只保留 24h。周期重算已随 `lifetime` 移除；这份台账现在只用于
+    离线诊断与 `sampled` 去重，**不要拿它估单 IP 容量**：它只记错误终止的段，主动轮换
+    不留样本（见下方「单次出口 IP 的可请求数」）。
   - **`ok`/`blocked` 是整段累计**（`count_segment_requests`，无窗口上限），不是滑动窗口里的条数。
     窗口 2 条时 `ok` 恒 0/1，实测 4058 条样本 82% 被记成 `ok=0`，「服务过 40 条」被误判成
-    「一条没服务过」，寿命样本被系统性剔除，**单 IP 承载量统计不出来**。
+    「一条没服务过」，段内承载量被系统性记成 0。
   - **重启后段起点从 IP 记录恢复**：`_last_warp_switch_ok_ts` 重启即归零，若拿 0 当窗口起点，
-    `count_opencode_since` 会把重启前已经服务过的那一段整段算进来（实测重启 70 秒后就报
+    `count_dsv4_ok_since` 会把重启前已经用掉的那一段配额整段算进来（实测重启 70 秒后就报
     「已服务 63 条」并换线）。改用当前出口 IP 在 `.warp_ip_used.json` 里的使用时刻恢复。
   - **兜底**：只有当所有备线都刷新不出 24h 窗口外的新 IP 时，才按「最久没用过」
     （`now - 上次使用时刻`）从长到短选，切前仍先刷新会话。正常路径永远优先「窗口外的
@@ -157,7 +179,7 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   往后推，等于永远不落池。落池时刻落盘 `.warp_proxy_fallback.json` 跨重启保留。
 - 换线动作本身失败（两条线都不通）：`cooldown_fail_sec` 3s 后重试（60s 会让一次失败后整分钟停在坏出口）。
 - 换线后 `refresh_delay_sec`（20s）刷新被换下的闲置线；刷新前最多等 `idle_wait_sec`
-  （40s）让该线闲下来，等不到则**补刷重试**直到 `ip_refresh_retry_sec`（600s）用完。
+  （90s）让该线闲下来，等不到则**补刷重试**直到 `ip_refresh_retry_sec`（600s）用完。
   WHY 必须补刷：单次超时就放弃会让这条线永远停在旧地址上 —— 实测 WARP-CF-C 被
   换下 8 次仅刷 2 次，13 次换线里 7 次切回同一个 10 分钟前的地址。
 - **补刷并发不限**：`refresh_concurrency`（0 = 不限，等于成员数；正整数则限速）。
@@ -165,11 +187,22 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   可用备线。同一 tag 的独占仍由 `_acquire_refresh_slot` 保证，当前出口本身从不被刷。
   注意旧实现写的是 `int(... or 3)`，把 0 静默变成 3，「0 = 不限」从未生效。
   补刷在重启**之前**先查这条线是否已被切成当前出口（换线线程的快照早于本次调度，
-  等空闲的这 40s 内它也可能被切成出口）：是则放弃，留给下次被换下时重新调度 ——
+  等空闲的这 90s 内它也可能被切成出口）：是则放弃，留给下次被换下时重新调度 ——
   重启会掐断它正在服务的在途连接（upstream connection lost）。判据必须落在重启前，
   放在本轮开头挡不住「等待期间才变成出口」那一段。
-  「闲」的判据是**字节增量**（`warp_line_busy`），不是连接数：活跃线上恒有 7~10
-  条连接且从不归零（SSE 长连接 + 连接复用，实测单条存活 936s），按连接数等必然
+  「闲」的判据是**两条或**（`warp_line_busy`），不是连接数：①字节增量（活跃线上
+  恒有 7~10 条连接且从不归零，实测单条存活 936s，按连接数等必然超时）；②线上有
+  年龄在 `_FIRST_BYTE_WAIT_MAX_SEC`(120s) 内的连接 —— 判据 ② 不可省：流式响应会
+  长时间零字节，12:22 实测被重启掐断的 4 条连接各收 ~1MB、年龄 94~116s，只看字节
+  增量判闲后重启，客户端收到 upstream connection lost。上限 120s 同样不可省：
+  9router 复用连接，实测活跃线上有年龄中位 476s 的长期连接，按连接数判忙会让
+  这些线永远刷不到新鲜 IP。
+  观察窗分三档（**必须显式传，不能吃默认值**）：后台补刷/脏线守护用
+  `busy_window_sec`(12s)，覆盖 SSE token 静默 p90=9.1s / max=10.1s；被切下的主
+  渠道排空用 `_DRAIN_BUSY_WINDOW_SEC`(30s)，覆盖静默分布 max=16.1s 并留一倍余量
+  （候选线的重启不需要窗口 —— 它不在服务流量，等端口就绪即可）；错误换线路径用
+  `_ERROR_PATH_BUSY_WINDOW_SEC`(2s) —— 那条路径每多等一秒，坏出口就多服务一秒失败
+  请求，按候选逐条 12s 时最坏 ~120s 才切走。
 - **备线预热按 24h 流量门控**：每 `prewarm_sec`(120s) 把所有低质备线**全部**排进补刷队列，
   仅当最近 **24 小时**内有 opencode 请求时才做（旧窗口 10 分钟，冷启动/低峰期永不预热）。
   窗口与 `ip_reuse_guard_sec` 对齐：预热要解决的问题是「24h 内用过的 IP 全不算新鲜」，
@@ -183,13 +216,9 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   补刷队列；巡检在落到 proxy 池期间同样运行，否则池本身也是脏地址时永远回不来。
   全部备线都在重启时本次换线不刷新（等下次错误重试），不落池 —— 否则预热波次会让
   每次换线都撞上「无候选」而落池。
-- **主动轮换三种判据，`proactive_mode` 切换**：`lifetime`（默认，按实测 IP 可用
-  寿命裁切点）、`requests`（服务满 `proactive_after_requests` 条）、`fixed`
-  （每 `proactive_fixed_sec` 秒）。非法值按 `lifetime` 处理，不让轮换静默停摆。
-- **寿命口径是「首条成功 → 末条成功」，不是「换上去 → 首次报错」**：后者把流量
-  抵达前的空窗算进寿命，又在第一次间歇性 403/429 处截断。实测前者中位 14s
-  （p25 9s / p75 19s），后者只有 2s。按后者定切点会让每个 IP 只用掉不到三成就被
-  扔掉。旧样本没有 span 时回退到 cycle，只为不让样本断档。
+- **`lifetime` 已整模式移除**（连同 `_WARP_MIN_CYCLE_SEC` / `_recompute_min_warp_cycle` /
+  地板 60s / `min_cycle_recalc_sec`）：它测的是请求间隔而非 IP 寿命，生效值恒被地板
+  顶住，等于一个测不准的固定 60s。旧配置写 `lifetime` 会静默回退 `fixed`。
 - **换线耗时靠探测缓存压到 ~0**：脏线守护每 ~5s 已经探过每条非当前出口的线，
   `_cached_warp_standby` 直接采信 12s 内的结果，命中即跳过同步探测。实测换线
   p50 2s→0s、p90 7s→0s（命中率 32/33）。**探测阶段不能占用 `_WARP_REFRESHING`**，
@@ -205,18 +234,24 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   **只有确认脏了才占用 `_WARP_REFRESHING`** —— 后者会被换线路径当作「不可选」，探测中的
   干净线若也算进去，换线会看到「备线 0 条」直接落 proxy 池（实测踩到）。worker 在重启
   前必须复查该线是否已被切成当前出口，否则会掐断在途连接。
-- **模型层探测按 /64 段记账，TTL 内最多一次**：`probe_warp.probe()` 每次烧掉该出口
+- **模型层探测按 /128 记账，TTL 内最多一次**：`probe_warp.probe()` 每次烧掉该出口
   一格 opencode 免费配额，而此前无台账 —— 实测同一 IP 18 分钟内被探 26 次全是 quota，
-  CF-I 20 次、CF-D/E 各 16 次重复探测。台账 `_WARP_PROBE_SEEN[(tag, /64)]`
-  记录结论，命中即复用（日志 `· 已探过: quota（跳过）`）。
-  **两个方向的粒度不对称**：判 quota 时按 `/64` 段记（同段别的 /128 后续 99.5%
-  仍是 quota，n=3141）；判 OK 时只按 `/128` 记（同段别的 /128 后续只有 37.9% 仍 OK、
-  61.1% 已烧，n=1202）—— 把段级 OK 复用出去等于把烧掉的地址当可用切上去。
-  读时段级非 OK 优先于 IP 级 OK。重连 97.5% 落到别的段，段键不会串味。
-  **TTL 而非会话代次**：代次曾让每次重连都作废全部结论，实测 71% 的探测打在已判
-  quota 的段上、其中 99.1% 结果仍是 quota。`probe_verdict_ttl_sec`=900 让结论跨重连
-  存活：冻结快照 N=10113 回放，省 67.1% 探测、漏判 4.10%。取 15min 而非 30min ——
-  30min 只多省 4.5pp 却让漏判涨到 4.75%，而配额不可再生、重连几乎免费。
+  CF-I 20 次、CF-D/E 各 16 次重复探测。台账 `_WARP_PROBE_SEEN[(tag, /128)]`
+  记录结论，命中即复用（日志 `· TTL 内已探过: quota（跳过）`）。
+  **键一律 /128，不按 /64 聚合**：控制变量后（排除日志里没探过但生产流量用过的
+  IP），已烧段里的**全新** /128 OK=0/2469（0.0%），未烧段里的全新 /128
+  OK=3/152（2.0%）—— 段不是充分条件，判死的是地址自己；段级聚合两头都错。
+  **TTL 按结论的「持久性」分档，不是按好坏**：
+    - 持久（`quota` / `flagged`）：`probe_persistent_ttl_sec`=21600。地址自身的配额/信誉
+      结论，重探同 /128 有 99.2% 仍 quota，30h 内仅 1 次恢复（间隔 56min），与生产 403
+      惩罚期同量级。
+    - 瞬时（`OK` / `unreachable` / `err`）：`probe_transient_ttl_sec`=120。OK 复现率
+      <10s 97.9% → ≥1h 43.2%（N=10113）；`err`/`unreachable` 是探测侧故障而非地址状态
+      （日志实测同一地址 err 后 66s 即 OK）。
+  长 TTL 不能套到 `err`/`unreachable`：会话代次已删、重连不再作废台账，一次探测抖动
+  会让健康线在 6h 内被 `_warp_model_usable` 跳过实测恒判 False，刷新守卫还反复重启它。
+  会话代次（epoch）已废：它让每次重连作废全部结论，71% 的探测打在已判 quota 的
+  地址上、99.1% 结果仍是 quota。
   **结论必须回灌为刷新判据**：`_warp_ip_needs_refresh` / `_warp_ip_refresh_reason`
   接受 `tag`，命中台账的非 OK 结论即判低质。否则结论只进不出 —— 线永远进不了
   预热/脏线候选，台账永远命中「已探过（跳过）」，脏线焊死原地。
@@ -384,7 +419,7 @@ node_test_timeout_ms: 15000                    # 节点测试超时
 # intervals
 monitor_sec: 0.05                              # 主循环节奏（让出 CPU，非节流）
 clash_poll_sec: 0.5                            # Clash selector 快照刷新
-proactive_rotate_sec: 60                       # 主动轮换间隔
+proactive_rotate_sec: 60                       # 池节点主动轮换间隔（WARP 出口不用它）
 cooldown_after_switch_sec: 60                  # 切换后冷却（主动/错误触发共用）
 429_cooldown_sec: 60                           # 429 节点让开时长
 proxy_check_sec: 60                            # 落池后回切判据评估间隔
@@ -402,10 +437,14 @@ warp.cooldown_fail_sec: 3                      # 换线失败后冷却
 warp.ip_reuse_guard_sec: 86400                 # 出口 IP 复用窗口（24h）
 warp.refresh_concurrency: 0                    # 同时真正重启的备线上限（0 = 不限）
 warp.rate429_guard_sec: 86400                  # 429 恢复期（24h）
-warp.proactive_mode: "lifetime"                # 主动轮换判据（lifetime/requests/fixed）
+warp.proactive_mode: "requests"                # 主动轮换判据（fixed / requests，当前生效）
+warp.proactive_fixed_sec: 60                   # fixed：每 N 秒
+warp.proactive_after_dsv4_ok: 150              # requests：满 N 格成功的 dsv4 调用
+warp.proactive_quota_model: "deepseek-v4.1-flash-free"
 warp.proxy_fallback_cooldown_sec: 10800        # 落池冷却（3h）
 warp.probe_cache_ttl_sec: 12                   # 探测缓存 TTL（出口 IP 新鲜度）
-warp.probe_verdict_ttl_sec: 900                # 模型层探测结论 TTL（非OK按 /64、OK 按 /128）
+warp.probe_transient_ttl_sec: 120                 # 探测结论 TTL：OK/unreachable/err（瞬时档）
+warp.probe_persistent_ttl_sec: 21600              # 探测结论 TTL：quota/flagged（与 403 惩罚期同量级）
 warp.fallback_idle_wait_sec: 3                 # 错误路径等备线空闲上限
 # 连错门控不是配置项，是代码常量：consec_err < 3 → 不换线（daemon.py maybe_reconnect_warp）
 # _DEAD_TTL_STAGES: _generate_ttl_stages() 算法生成（30s→7d），非手写列表

@@ -1698,7 +1698,7 @@ def _wait_warp_idle(member: dict, timeout_sec: float | None = None,
                     window: float | None = None) -> bool:
     """等到该线不再传输数据；超时返回 False（调用方自行决定是否强刷）。
 
-    默认用 idle_wait_sec(40s) —— 补刷路径可以慢慢等，它不阻塞流量。错误换线
+    默认用 idle_wait_sec(90s) —— 补刷路径可以慢慢等，它不阻塞流量。错误换线
     路径必须同时传更短的超时与更短的观察窗：那里每多等一秒，坏出口就多服务
     一秒失败请求。
     """
@@ -2574,7 +2574,7 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
             log(f"  ↻ {member['tag']} 已被选为当前出口，取消本次刷新")
             return False
         if idle:
-            # 名额只在真正重启前抢：等空闲的那 40s 里这条线还能服务流量，
+            # 名额只在真正重启前抢：等空闲的那 90s 里这条线还能服务流量，
             # 占着名额会让其余备线永远排不上队（详见 _WARP_REFRESHING 注释）。
             if not _acquire_refresh_slot(member["tag"]):
                 _bump_refresh_stat("retry")
@@ -3045,7 +3045,7 @@ def reconnect_warp(reason: str) -> bool:
         # 7 条连接时强刷，换线耗时 48s 且掐断连接。
         # 判据是"还在传数据"而非"有连接"：实测活跃线恒有 7~10 条连接且
         # 从不归零（见 warp_line_busy）。
-        # 这里用的是错误轮换路径上的短等待，不是补刷的 idle_wait_sec(40s)：
+        # 这里用的是错误轮换路径上的短等待，不是补刷的 idle_wait_sec(90s)：
         # 这条路径上每多等一秒，坏出口就多服务一秒失败请求。实测 40s 上限把
         # 「首错→换线生效」拉到 p90=25s / max=206s。
         if warp_line_busy(m["tag"], _ERROR_PATH_BUSY_WINDOW_SEC) and not _wait_warp_idle(

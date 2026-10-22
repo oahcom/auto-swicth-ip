@@ -125,6 +125,22 @@ CFG = {
             {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service"},
             {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service"},
             {"tag": "WARP-CF-J", "port": 1089, "service": "usque-warp-j.service"},
+            # 2026-10-22 扩到 20 条。WHY：扩容前的实测是在排空并发上打满的 ——
+            # 换线间隔 p50 8s（高频时 1.8 次/分钟），被切下的线排空 p50 68s /
+            # p90 335s，任一时刻平均 4.9 条在排空（≥3 条占 84% 的时间），
+            # 而池里只有 10 条、真正服务流量的只有 3 条。近 1 小时 23% 的
+            # 换线时刻只剩 1 条候选。排空等的是真实在途流式响应（28 条连接
+            # 180s 采样零增长占比 0.0%，不是僵尸连接），只能靠加容量吸收。
+            {"tag": "WARP-CF-11", "port": 1090, "service": "usque-warp-11.service"},
+            {"tag": "WARP-CF-12", "port": 1091, "service": "usque-warp-12.service"},
+            {"tag": "WARP-CF-13", "port": 1092, "service": "usque-warp-13.service"},
+            {"tag": "WARP-CF-14", "port": 1093, "service": "usque-warp-14.service"},
+            {"tag": "WARP-CF-15", "port": 1094, "service": "usque-warp-15.service"},
+            {"tag": "WARP-CF-16", "port": 1095, "service": "usque-warp-16.service"},
+            {"tag": "WARP-CF-17", "port": 1096, "service": "usque-warp-17.service"},
+            {"tag": "WARP-CF-18", "port": 1097, "service": "usque-warp-18.service"},
+            {"tag": "WARP-CF-19", "port": 1098, "service": "usque-warp-19.service"},
+            {"tag": "WARP-CF-20", "port": 1099, "service": "usque-warp-20.service"},
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
@@ -285,7 +301,7 @@ CFG = {
         # proactive_fixed_sec 再发起就赶不上节律，必须提前这个时长。
         # requests 模式不用它：配额是离散格数，没有「生效延迟」可提前。
         "switch_lead_sec": 3.0,
-        # 错误换线路径上等目标备线空闲的上限。补刷路径用的是 idle_wait_sec(40s)，
+        # 错误换线路径上等目标备线空闲的上限。补刷路径用的是 idle_wait_sec(90s)，
         # 但错误路径上每多等一秒，坏出口就多服务一秒失败请求 —— 实测 40s 上限
         # 把「首错→换线生效」拉到 p90=25s / max=206s。
         "fallback_idle_wait_sec": 3,
