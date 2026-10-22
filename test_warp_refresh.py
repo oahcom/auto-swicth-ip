@@ -68,27 +68,8 @@ def test_offline_refresh_count_starts_when_leaving_and_resets_on_return(monkeypa
     assert daemon._WARP_REFRESH_COUNT["W1"] == 0
 
 
-def test_standby_cooldown_blocks_restart_right_after_switch(monkeypatch):
-    """刚被换下的线不得重启：在途 SSE 还在走它，重启即 upstream connection lost。
-
-    实测 646 次换线里 63.3% 的被切下线在 120s 内被重启（中位 73s，最快 0s），
-    而「判闲」只看 12s 窗口内有没有字节增长，证明不了请求生命周期已结束。
-    """
-    assert daemon.CFG["warp"]["standby_cooldown_sec"] == 120, \
-        "冷却窗口是用户指定的 120s，改动需先有实测依据"
-    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {"W1": time.time() - 30})
-    restarts = []
-    monkeypatch.setattr(daemon, "_restart_service",
-                        lambda s, tag=None: (restarts.append(s), True)[1])
-
-    assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
-                                      "service": "s"}) is None
-    assert restarts == [], "冷却期内不得重启刚被换下的线"
-
-
-def test_standby_cooldown_expires_and_restart_resumes(monkeypatch):
-    """冷却走完后重启照常：闸门是限时窗，不是永久封锁。"""
-    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {"W1": time.time() - 121})
+def _ok_refresh_stubs(monkeypatch):
+    """让 `_refresh_idle_warp` 走到「重启成功」的最小桩。"""
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     monkeypatch.setattr(daemon, "warp_egress_ip",
@@ -96,8 +77,58 @@ def test_standby_cooldown_expires_and_restart_resumes(monkeypatch):
     monkeypatch.setattr(daemon, "_ip_disqualified", lambda ip, now, guard: False)
     monkeypatch.setattr(daemon, "_warp_model_usable", lambda m, ip: True)
 
+
+def test_standby_cooldown_blocks_restart_while_connections_alive(monkeypatch):
+    """刚被换下且仍有连接 → 不得重启：重启即掐断在途 SSE。
+
+    实测 646 次换线里 63.3% 的被切下线在 120s 内被重启（中位 73s，最快 0s）。
+    """
+    assert daemon.CFG["warp"]["standby_cooldown_sec"] == 120, \
+        "冷却窗口是用户指定的 120s，改动需先有实测依据"
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {"W1": time.time() - 30})
+    monkeypatch.setattr(daemon, "_warp_line_stats", lambda tag: (1024, 1, 3))
+    restarts = []
+    monkeypatch.setattr(daemon, "_restart_service",
+                        lambda s, tag=None: (restarts.append(s), True)[1])
+
+    assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
+                                      "service": "s"}) is None
+    assert restarts == [], "线上还有连接时不得重启"
+
+
+def test_standby_cooldown_skipped_when_line_has_no_connections(monkeypatch):
+    """冷却期内但零连接 → 直接放行。
+
+    一条连接都没有的线不存在会被掐断的请求，等满 120s 纯属空转。实测 17 条
+    备线常驻仅 2 条挂连接，其余全是空壳。
+    """
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {"W1": time.time() - 10})
+    monkeypatch.setattr(daemon, "_warp_line_stats", lambda tag: (0, 0, 0))
+    _ok_refresh_stubs(monkeypatch)
+
     assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
                                       "service": "s"}) == "ip-new"
+
+
+def test_standby_cooldown_expiry_lifts_time_gate_only(monkeypatch):
+    """过了 120s 时间闸门即放行，连接是否还活着由调用方的判闲决定。
+
+    `_refresh_idle_warp` 自己不做空闲判定（它没有观察窗语义，只负责重启）：
+    补刷路径先 `_wait_warp_idle`、脏线守护先 `warp_line_busy`，两处都会在
+    连接还活着时挡下 —— 实测 WARP-CF-J 有 378s 的连接仍在传数据。
+    """
+    monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {"W1": time.time() - 121})
+    monkeypatch.setattr(daemon, "_warp_line_stats", lambda tag: (5_000_000, 2, 4))
+    restarts = []
+    monkeypatch.setattr(daemon, "_restart_service",
+                        lambda s, tag=None: (restarts.append(s), True)[1])
+    _ok_refresh_stubs(monkeypatch)
+    monkeypatch.setattr(daemon, "_restart_service",
+                        lambda s, tag=None: (restarts.append(s), True)[1])
+
+    assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
+                                      "service": "s"}) == "ip-new"
+    assert restarts == ["s"], "冷却已过，时间闸门不得再挡重启"
 
 
 def test_standby_cooldown_ignores_never_active_line(monkeypatch):
@@ -106,15 +137,23 @@ def test_standby_cooldown_ignores_never_active_line(monkeypatch):
     备线预热本就该立刻生效，把冷却套到它头上等于池子停转 2 分钟。
     """
     monkeypatch.setattr(daemon, "_WARP_OFF_AGE", {})
-    monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
-    monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
-    monkeypatch.setattr(daemon, "warp_egress_ip",
-                        lambda port, timeout_sec=20.0: "ip-new")
-    monkeypatch.setattr(daemon, "_ip_disqualified", lambda ip, now, guard: False)
-    monkeypatch.setattr(daemon, "_warp_model_usable", lambda m, ip: True)
+    _ok_refresh_stubs(monkeypatch)
 
     assert daemon._refresh_idle_warp({"tag": "W1", "port": 1080,
                                       "service": "s"}) == "ip-new"
+
+
+def test_zero_connection_line_is_idle_without_waiting(monkeypatch):
+    """零连接的线立即判闲，不付观察窗。
+
+    实测 17 条备线常驻只有 2 条挂连接；每条都等 12s 会把 5s 一轮的守护拖成
+    60s+ 一轮，而出口 IP 存活中位只有 12.5s。
+    """
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(daemon, "_warp_line_stats", lambda tag: (0, 0, 0))
+    assert daemon.warp_line_busy("WARP-CF") is False
+    assert slept == [], "零连接不该睡眠采样"
 
 
 def test_quota_verdict_turns_line_into_refresh_candidate(monkeypatch):
@@ -198,9 +237,11 @@ def test_probe_cache_reprobe_overwrites_verdict(monkeypatch):
 
 
 class ScriptedBytes:
-    """按脚本返回 _warp_line_stats 的 (字节, 等首字节数)；耗尽后返回 None。
+    """按脚本返回 _warp_line_stats 的 (字节, 等首字节数, 总连接数)；耗尽后返回 None。
 
-    只写数字时按「无等待连接」处理，让原先只关心字节的用例保持原义。
+    只写数字时按「一条连接在传字节」处理：零连接不可能有字节增长，写 0
+    会让 `warp_line_busy` 走零连接快速判闲，用例的原义（线在动）就丢了。
+    元组可写 2 或 3 个元素；2 元组的总连接数取 max(等首字节数, 1)。
     末值不重复投递 —— 重复会让「恒忙」被误读成「闲」。
     """
 
@@ -213,7 +254,11 @@ class ScriptedBytes:
         v = self.seq.pop(0)
         if v is None:
             return None
-        return (v, 0) if isinstance(v, int) else tuple(v)
+        if isinstance(v, int):
+            return (v, 0, 1)
+        if len(v) == 3:
+            return tuple(v)
+        return (v[0], v[1], max(v[1], 1))
 
 
 def test_ip_reuse_window_covers_measured_interval():

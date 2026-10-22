@@ -573,16 +573,40 @@ def _track_offline_refresh(prev_tag: str | None, new_tag: str | None) -> None:
 def _standby_cooldown_left(tag: str) -> float:
     """该线离渠后还要等多久才允许重启；不在离渠态或已过冷却返回 0。
 
-    WHY 冷却：被换下的线仍在服务在途 SSE（`interrupt_exist_connections=false`），
-    重启它就是掐断这些流，9router 报 upstream connection lost。判「闲」只能看
-    连接是否还在传字节，而流式响应的静默实测 p90=9.1s、首 token 前最长 532.7s
-    —— 单次判闲不足以证明没有在途请求。120s 取自 `_FIRST_BYTE_WAIT_MAX_SEC`：
-    离渠那一刻建立的连接，年龄超过它就不可能还处在「首字节未到」窗口内。
+    这是**下限**，不是放行条件：冷却期满只代表「离渠那一刻建的请求该走完了」，
+    线上的连接可能活得更久。真正的放行由 `warp_line_busy` 的连接判据决定，
+    见 `_refresh_idle_warp` 与补刷循环两处的组合用法。
+
+    WHY 时间下限仍然要留：流在等首 token 时一个字节都不传，实测 TTFT
+    p90=52.6s / max=532.7s（N=83），但连接年龄判据也只认 120s 以内
+    （`_FIRST_BYTE_WAIT_MAX_SEC`）—— 年龄超过 120s 的连接不再算「可能仍在
+    进行」，`warp_line_busy` 会把它当空闲。离渠后 120s 内不重启，是给
+    「离渠瞬间才建立、还在等首字节」的连接留出被看到的窗口；过了 120s
+    就交给连接判据，不再无脑等。
     """
     off = _WARP_OFF_AGE.get(tag)
     if off is None:
         return 0.0
     return max(0.0, _warp()["standby_cooldown_sec"] - (time.time() - off))
+
+
+def _standby_defer_reason(tag: str) -> str | None:
+    """该线此刻不该重启的原因；可以重启返回 None。
+
+    判据是**有没有连接**，不是时间。一条连接都没有的线不存在会被掐断的请求，
+    冷却对它只是空等 —— 实测 17 条备线常驻仅 2 条挂连接，其余全是空壳，
+    按时间一刀切会让这些线白等 2 分钟才轮到刷新。时间下限只约束「有连接」
+    这一支：那条线可能还在排空，重启就是掐断在途 SSE。
+    """
+    cool = _standby_cooldown_left(tag)
+    if cool <= 0:
+        return None
+    stats = _warp_line_stats(tag)
+    if stats is None:
+        return f"离渠冷却剩 {cool:.0f}s（连接查询失败，保守等待）"
+    if stats[2] == 0:
+        return None
+    return f"离渠冷却剩 {cool:.0f}s，仍有 {stats[2]} 条连接"
 
 
 def _warp_ip_refresh_reason(ip: str | None, now: float,
@@ -793,7 +817,6 @@ def _classify_egress_error(body: str | None) -> str | None:
             or "FreeUsageLimitError" in body:
         return "rate429"
     return None
-
 
 
 def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int, list, int, int]:
@@ -1621,8 +1644,8 @@ def _wait_port_ready(port: int, timeout_sec: float) -> bool:
 _FIRST_BYTE_WAIT_MAX_SEC = 120.0
 
 
-def _warp_line_stats(tag: str) -> tuple[int, int] | None:
-    """该 tag 上的 (累计字节, 年龄在上限内的连接数)；查询失败返回 None。
+def _warp_line_stats(tag: str) -> tuple[int, int, int] | None:
+    """该 tag 上的 (累计字节, 年轻连接数, 总连接数)；查询失败返回 None。
 
     两个值来自同一次 Clash 查询：判闲要连查两次，拆成两个函数就得付两次
     往返，而这是 5s 一次的守护热路径。
@@ -1653,8 +1676,11 @@ def _warp_line_stats(tag: str) -> tuple[int, int] | None:
             continue
         if now - started < _FIRST_BYTE_WAIT_MAX_SEC:
             waiting += 1
+    # 总连接数是「零连接快速判闲」的依据：一条连接都没有的线不可能被重启掐断，
+    # 不必再付一个观察窗。实测 17 条备线常驻只有 2 条挂连接，88% 的探测是在
+    # 空壳线上白等 12s。
     return (sum((c.get("upload") or 0) + (c.get("download") or 0)
-                for c in mine), waiting)
+                for c in mine), waiting, len(mine))
 
 
 def _warp_line_bytes(tag: str) -> int | None:
@@ -1708,12 +1734,18 @@ def warp_line_busy(tag: str, window: float | None = None) -> bool | None:
     s0 = _warp_line_stats(tag)
     if s0 is None:
         return None
+    # 零连接＝不可能掐断任何请求，直接判闲。实测 19 条备线常驻只有 2~4 条挂
+    # 连接，其余全是空壳 —— 挨个等 12s 把一个 5s 一轮的守护拖成 60s+ 一轮，
+    # 而出口 IP 存活中位只有 12.5s，脏线因此滞留远超一个 IP 的寿命。
+    # 这里不能省观察窗：有连接时仍要付满窗口，见下面两条判据。
+    if s0[2] == 0:
+        return False
     time.sleep(window)
     s1 = _warp_line_stats(tag)
     if s1 is None:
         return None
     b0 = s0[0]
-    b1, conns = s1
+    b1, conns = s1[0], s1[1]
     return b1 > b0 or conns > 0
 
 
@@ -2418,15 +2450,12 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
     「都刷一样」看不出为什么刷，事后无法判断某条线是被 429 拖住还是纯配额耗尽。
     """
     t = member["tag"]
-    # 离渠冷却：刚被换下的线仍在服务在途 SSE，重启它就是掐断这些流（客户端
-    # 表现为 API Error: upstream connection lost）。判「闲」证明不了没有在途
-    # 请求 —— 流式响应两次 token 之间静默 p90=9.1s、首 token 前最长 532.7s，
-    # 而 12s 观察窗只看到其中一段。用离渠时刻做硬闸，与等待空闲互为补充：
-    # 空闲判据管「这条线此刻在不在跑流量」，冷却管「这条线刚下线，还有没有
-    # 请求生命周期没走完」。
-    cool = _standby_cooldown_left(t)
-    if cool > 0:
-        log(f"  ⏸ {t} 离渠冷却剩 {cool:.0f}s，暂不重启（在途请求可能仍在走它）")
+    # 还要不要等：看这条线**有没有连接**，不是看离渠多久。
+    # 时间下限只在有连接时才生效（见 `_standby_defer_reason`）：空壳线白等
+    # 两分钟毫无意义，而有连接的线哪怕过了 120s 也可能还在排空。
+    defer = _standby_defer_reason(t)
+    if defer:
+        log(f"  ⏸ {t} {defer}，暂不重启")
         return None
     # 调用方可能已算好原因时传进来（脏线守护在清空旧 IP 之前算的）；否则自己推导。
     reason = (reason_hint
@@ -2489,7 +2518,7 @@ def _reclaim_dirty_pass() -> None:
             if (m["tag"] in _WARP_REFRESHING or m["tag"] in _WARP_REFRESH_PENDING
                     or m["tag"] in _WARP_PROBING
                     or time.time() < _WARP_BUSY_UNTIL.get(m["tag"], 0)
-                    or _standby_cooldown_left(m["tag"]) > 0):
+                    or _standby_defer_reason(m["tag"])):
                 continue
             _WARP_PROBING.add(m["tag"])
         threading.Thread(target=_reclaim_dirty_warp_worker, args=(m,),
@@ -2613,11 +2642,11 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
             return True
         # 冷却期内先睡过去，别白等 90s 空闲窗再撞闸门 —— 那样日志还会误报
         # 「仍在传数据」。分段睡是为了中途若被选为当前出口能尽快发现。
-        cool = _standby_cooldown_left(member["tag"])
-        if cool > 0:
+        defer = _standby_defer_reason(member["tag"])
+        if defer:
             _bump_refresh_stat("retry")
-            log(f"  ⏸ {member['tag']} 离渠冷却剩 {cool:.0f}s，冷却后再刷新")
-            time.sleep(min(cool, 30.0))
+            log(f"  ⏸ {member['tag']} {defer}，冷却后再刷新")
+            time.sleep(min(_standby_cooldown_left(member["tag"]) or 30.0, 30.0))
             continue
         idle = _wait_warp_idle(member, window=_DRAIN_BUSY_WINDOW_SEC)
         # 判在重启之前而不是本轮开头：换线线程的快照可能早于本次调度，等空闲的这
@@ -3098,7 +3127,7 @@ def reconnect_warp(reason: str) -> bool:
         # 冷却中的线排最后：选到它 `_refresh_idle_warp` 会直接返回 None，
         # 白白把这次换线推到落池。仍留在候选里是兜底 —— 全都冷却时宁可当场
         # 放弃落池，也不该拿一条刚被换下的线开刀。
-        m, ip = max(probes, key=lambda p: (_standby_cooldown_left(p[0]["tag"]) > 0,
+        m, ip = max(probes, key=lambda p: (_standby_cooldown_left(p[0]["tag"]) <= 0,
                                            now - _warp_ip_last_ts(p[1])))
         log(f"  ⚠ 兜底选线: {m['tag']} 上次使用 {(now - _warp_ip_last_ts(ip))/60:.1f}min 前，"
             f"IP={ip} 仍在复用窗口内，将先刷新会话")
@@ -3376,6 +3405,26 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
         _reconnect_warp_now(
             f"主动轮换 已用配额 {n} 格 dsv4 ≥ {target}",
             now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
+
+
+def _validate_startup_egress(member: dict) -> None:
+    """启动时当前出口若低质，立刻换线。
+
+    sing-box 重启后 selector 复位到配置里的 default（主隧道 WARP-CF），而它可能
+    正处 429 惩罚期或已被模型层判 quota。主动轮换/错误换线都要等主循环第一轮
+    才跑，不在这里纠正就等于「重启后先白烧一段 IP，等第一条 429 才被换走」
+    ——实测 2026-10-22 13:45 重启后 WARP-CF 立即 429 ×3。
+    """
+    ip = _ACTIVE_WARP_IP
+    if not ip or not _warp_ip_needs_refresh(ip, time.time(), member["tag"]):
+        return
+    log(f"  ⚠ 启动时当前出口 {member['tag']} 出口 {ip} 判定为低质"
+        f"（{_warp_ip_refresh_reason(ip, time.time(), member['tag']) or '无成功流量'}），启动即换线")
+    # 换线是异步线程：这里不能马上复探 active_warp_tag() —— 读到的是旧线，
+    # 白等一次 20s 出口探测，还会把低质 IP 写回 `_ACTIVE_WARP_IP`。
+    # 成功路径自己会更新它（见 reconnect_warp 的 `_ACTIVE_WARP_IP = ip`）。
+    if not _reconnect_warp_now("启动校验 当前出口低质", time.time()):
+        log("  ✗ 启动换线未发起（冷却/锁占用），留给主循环下一轮")
 
 
 def _prewarm_standby_warp(now: float) -> None:
@@ -4485,19 +4534,7 @@ def main():
     _m = _warp_member(active_warp_tag())
     if _m:
         _ACTIVE_WARP_IP = warp_egress_ip(_m["port"])
-        # 重启不能把流量打在脏出口上：sing-box 重启后 selector 复位到配置里的
-        # default（主隧道 WARP-CF），而它可能正处 429 惩罚期或已被模型层判 quota。
-        # 不校验就等于「重启后先白烧一段 IP，等第一条 429 才纠正」——实测
-        # 2026-10-22 13:45 重启后 WARP-CF 立即 429 ×3 才被换走。
-        # 主动轮换/错误换线要等主循环第一轮才跑，这里在启动时先纠正一次。
-        if _ACTIVE_WARP_IP and _warp_ip_needs_refresh(
-                _ACTIVE_WARP_IP, time.time(), _m["tag"]):
-            log(f"  ⚠ 启动时当前出口 {_m['tag']} 出口 {_ACTIVE_WARP_IP} "
-                f"判定为低质（{_warp_ip_refresh_reason(_ACTIVE_WARP_IP, time.time()) or '无成功流量'}），启动即换线")
-            _reconnect_warp_now("启动校验 当前出口低质", time.time())
-            _m2 = _warp_member(active_warp_tag())
-            if _m2:
-                _ACTIVE_WARP_IP = warp_egress_ip(_m2["port"])
+        _validate_startup_egress(_m)
     else:
         # 启动时就停在 proxy 上：落池时刻从此刻算，否则「落池后仍拦截」
         # 判据会拿 0 当起点，把落池前的旧 403/429 也算进去。
