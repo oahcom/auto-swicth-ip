@@ -15,6 +15,7 @@ FreeTierError 拒掉。实测定位到唯一门控项是请求体里 `read`/`she
 9router 的 open-sse/utils/opencodeFingerprint.js，此处冻结为常量。
 """
 import argparse
+import hashlib
 import json
 import os
 import secrets
@@ -25,13 +26,33 @@ import time
 
 from config import CFG
 
-# 9router open-sse/executors/opencode.js — 逐字复刻，改一个字就 403
+# 只复刻 open-sse/executors/opencode.js 的 UA 与指纹工具定义（后者见下方
+# FINGERPRINT_TOOLS，由 --check-fingerprint 自动比对源码）。其余头（x-opencode-project
+# / b3 / traceparent）本文件现在同步 9router 的派生逻辑：project 按身份稳定派生，
+# b3/traceparent 每请求新生成（标准追踪语义）。
 UA = "opencode/latest/2.0.26/cli"
 FREEMODEL = "deepseek-v4.1-flash-free"
 URL = "https://opencode.ai/inference/v1/chat/completions"
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 _B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _MASK48 = (1 << 48) - 1
+
+def _derive_project_id(identity: str) -> str:
+    """Stable project id derived from downstream identity (session/connection)."""
+    material = (identity or "").strip()
+    if not material:
+        return "global"
+    digest = hashlib.sha256(f"opencode-project\0{material}".encode()).hexdigest()[:24]
+    return f"ocp_{digest}"
+
+def _build_trace_headers() -> dict:
+    """Fresh W3C trace headers per request."""
+    import secrets as _secrets
+    def _hex(n): return _secrets.token_hex(n)
+    return {
+        "b3": f"{_hex(16)}-{_hex(8)}-1-{_hex(8)}",
+        "traceparent": f"00-{_hex(16)}-{_hex(8)}-01",
+    }
 
 # open-sse/utils/opencodeFingerprint.js — 上游逐字比对 description 与 parameters，
 # 不得改写或重排。只有 CLI 升级才变，且会先打挂 9router 自身。
@@ -86,6 +107,8 @@ def _session_id() -> str:
 
 
 def _headers(sid: str) -> dict:
+    proj = _derive_project_id(sid)
+    trace = _build_trace_headers()
     return {
         "Content-Type": "application/json",
         "Authorization": "Bearer public",
@@ -95,7 +118,9 @@ def _headers(sid: str) -> dict:
         "x-opencode-session-id": sid,
         "x-session-affinity": sid,
         "x-session-id": sid,
-        "x-opencode-project": "global",
+        "x-opencode-project": proj,
+        "b3": trace["b3"],
+        "traceparent": trace["traceparent"],
         "Accept": "text/event-stream",
     }
 
