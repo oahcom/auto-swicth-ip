@@ -1962,9 +1962,17 @@ def _warp_line_ip(tag: str) -> str | None:
 
 
 def _warp_line_ip_ts(tag: str) -> float:
-    """该线出口 IP 上次被实际验证的时刻；0 = 未验证过。"""
+    """该线出口 IP 上次被实际验证的时刻；0 = 未验证过。
+
+    验证地址一致性：只有当前缓存的 IP 与验收记录的 IP 一致时，才返回 ip_ts。
+    验收记录在 _WARP_LAST_ACCEPT[tag] = (ts, ip)。
+    """
     with _WARP_LINE_LOCK:
-        return float(_WARP_LINE_STATE.get(tag, {}).get("ip_ts") or 0.0)
+        st = _WARP_LINE_STATE.get(tag, {})
+        acc = _WARP_LAST_ACCEPT.get(tag)
+        if acc and st.get("ip") == acc[1]:
+            return float(st.get("ip_ts") or 0.0)
+        return 0.0
 
 
 def _invalidate_warp_line_ip(tag: str) -> None:
@@ -2000,6 +2008,9 @@ def _cached_warp_standby(standby: list[dict], now: float,
 
     TTL 取 12s：守护的探测节奏是 5s + 单次探测耗时（实测 1.2~7s），12s 覆盖
     一个完整周期仍有余量；再长就可能拿到隧道已被其它路径重启前的旧地址。
+    
+    
+    此函数问题很严重，_WARP_LINE_STATE表示的是被切换过的ip信息，却被认为是探过但每用过的ip，应该被禁止或修复
     """
     ttl = _warp().get("probe_cache_ttl_sec", 12)
     out: list[tuple[dict, str]] = []
@@ -3330,6 +3341,8 @@ def reconnect_warp(reason: str) -> bool:
     # 快速路径：脏线守护刚探过的地址直接拿来用，把 2~7s 的同步探测移出关键路径。
     # 没有可用缓存时才退回逐条探测（缓存过期、守护在重启隧道等）。
     fast = _cached_warp_standby(standby, now, guard)
+    # 此函数问题很严重，_WARP_LINE_STATE表示的是被切换过的ip信息，却被认为是探过但每用过的ip，应该被禁止或修复
+    fast = False
     if fast:
         # 全部候选都要收下，不能只取第一条：缓存命中即跳过探测是快的，但一条
         # 候选意味着「这条不合格就只能落池」——10 条隧道下其余 9 条白起了。

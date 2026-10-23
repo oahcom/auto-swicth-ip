@@ -148,7 +148,7 @@ CFG = {
         "proxy_dead_ratio": 0.5,       # 池黑名单节点占比 ≥N
     },
     "thresholds": {
-        "recent_window": 2,    # 只查最近两条的数据，10条太大可能出现多个切换窗口
+        "recent_window": 10,    # 只查最近两条的数据，10条太大可能出现多个切换窗口
         "reject_window": 50,   # 403 客户端拒绝占比的统计窗口（10 条太小，噪声会抖动）
         "opencode_min_success_rate": 0.9,
         "node_test_timeout_ms": 15000,  # 放宽到 15s，避免慢节点误判
