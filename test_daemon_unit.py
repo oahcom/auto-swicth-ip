@@ -807,8 +807,11 @@ def test_warp_failover_not_gated_by_node_switch(monkeypatch):
     """
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "block_threshold": 1})
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "_warp_member", lambda tag: {"tag": tag, "port": 1080, "service": "s"} if tag == "W1" else None)
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 0)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 0.0)  # Must be 0 to bypass stale_only check
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "some-ip")
     monkeypatch.setattr(daemon, "count_warp_blocked_since",
                         lambda ts: {"abuse403": 3, "rate429": 0, "ok": 0, "consec_err": 3})
     called = []
@@ -2659,6 +2662,8 @@ def test_cached_standby_skips_probe_when_fresh(monkeypatch):
     egress.update({"1080": "ip-w1", "1081": "ip-b"})
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE",
                         {"W2": {"ip": "ip-b", "ip_ts": now - 2}})
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT",
+                        {"W2": (now - 2, "ip-b")})  # Must match _WARP_LINE_STATE for consistency check
     monkeypatch.setattr(daemon, "_port_open", lambda p: True)
     probed = []
 
@@ -2694,6 +2699,10 @@ def test_cached_standby_keeps_all_candidates_not_just_first(monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {
         "W2": {"ip": "ip-b", "ip_ts": now - 2},
         "W3": {"ip": "ip-c", "ip_ts": now - 2},
+    })
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT", {
+        "W2": (now - 2, "ip-b"),
+        "W3": (now - 2, "ip-c"),
     })
     monkeypatch.setattr(daemon, "_port_open", lambda p: True)
     monkeypatch.setattr(daemon, "_probe_warp_egress",
