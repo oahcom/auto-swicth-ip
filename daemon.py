@@ -2007,10 +2007,6 @@ def _cached_warp_standby(standby: list[dict], now: float,
     出口的线，结果就在 `_WARP_LINE_STATE` 里，直接拿来用即可。
 
     TTL 取 12s：守护的探测节奏是 5s + 单次探测耗时（实测 1.2~7s），12s 覆盖
-    一个完整周期仍有余量；再长就可能拿到隧道已被其它路径重启前的旧地址。
-    
-    
-    此函数问题很严重，_WARP_LINE_STATE表示的是被切换过的ip信息，却被认为是探过但每用过的ip，应该被禁止或修复
     """
     ttl = _warp().get("probe_cache_ttl_sec", 12)
     out: list[tuple[dict, str]] = []
@@ -3341,8 +3337,6 @@ def reconnect_warp(reason: str) -> bool:
     # 快速路径：脏线守护刚探过的地址直接拿来用，把 2~7s 的同步探测移出关键路径。
     # 没有可用缓存时才退回逐条探测（缓存过期、守护在重启隧道等）。
     fast = _cached_warp_standby(standby, now, guard)
-    # 此函数问题很严重，_WARP_LINE_STATE表示的是被切换过的ip信息，却被认为是探过但每用过的ip，应该被禁止或修复
-    fast = False
     if fast:
         # 全部候选都要收下，不能只取第一条：缓存命中即跳过探测是快的，但一条
         # 候选意味着「这条不合格就只能落池」——10 条隧道下其余 9 条白起了。
@@ -3606,9 +3600,12 @@ def maybe_reconnect_warp(now: float) -> None:
                   and not (fresh.get("abuse403", 0) or fresh.get("rate429", 0)))
     if not sampled and not stale_only:
         if active:
-            # 403 优先：两类同时命中时按恢复期更长的那档之外更严格的信誉标记记。
-            kind = "abuse403" if "abuse403" in triggered else "rate429"
-            _mark_warp_ip_used(active_ip, now, blocked=True, kind=kind)
+            # 两类出口级拦截并行、各自惩罚期，解除时间取最晚（用户规则「按多的来」）。
+            # 只记一种 kind 会被后一次覆盖：403 之后再烧 429，仍按 6h 在 T+6h 解禁，
+            # 提前 18h 放回候选池。因此两类都达阈值时，各自记一次，blocked_ts_by_kind
+            # 留下两个起点，_warp_block_remaining 取 max 后正确锁到 rate429 的 24h。
+            for k in triggered:
+                _mark_warp_ip_used(active_ip, now, blocked=True, kind=k)
         # 只有成功服务过 ≥1 条的段才算「可用周期」；首请求即错的段记 ok=0。
         if active_ip and _last_warp_switch_ok_ts > 0:
             cycle = now - _last_warp_switch_ok_ts
@@ -3634,15 +3631,13 @@ def maybe_reconnect_warp(now: float) -> None:
     # 的 switched_at），不是触发时刻；差别就是 触发→生效 那 p50 4 秒。
     if now - _last_warp_switch_ok_ts < _warp().get("min_switch_gap_sec", 5):
         return
-    if not _WARP_LOCK.acquire(blocking=False):
-        return
-    delay = _warp()["cooldown_ok_sec"]
-    _last_warp_reconnect_ts = _now_ts()
-    _warp_cooldown_until = now + delay  # 先占位，防 tick 重入
-    reason = " + ".join(f"{k} ×{blocked[k]}" for k in triggered)
-    threading.Thread(target=_warp_reconnect_worker,
-                     args=(reason, delay),
-                     daemon=True, name="warp-reconnect").start()
+    # 触发条件已满足，委托给统一入口处理冷却与并发
+    full_err_bypass = blocked.get("full_err", False)
+    _reconnect_warp_now(
+        " + ".join(f"{k} ×{blocked[k]}" for k in triggered),
+        now,
+        ignore_cooldown=full_err_bypass
+    )
 
 
 def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) -> bool:
