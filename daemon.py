@@ -2792,11 +2792,14 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         return True
     tag = member["tag"]
     cached = _probe_cache_get(tag, ip)
-    if cached is not None:
-        ok = cached == "OK"
+    # 只复用「地址已被上游拒绝」的持久结论；OK 绝不能跳过实测。
+    # OK 的 TTL 是 600s，而地址被生产流量烧掉只需几秒 —— 命中旧 OK 等于把
+    # 已知会 429 的地址直接切上去，实测每轮换线后的 429 爆发都落在这种线上。
+    # 负结论相反：它只会驱动刷新，不会放行坏地址，复用纯赚配额。
+    if cached in _WARP_PROBE_PERSISTENT:
         log(f"  · {tag} 出口 {ip} TTL 内已探过: {cached}（跳过）"
             f"{_warp_refresh_count_note(tag)}")
-        return ok
+        return False
     if _warp_probe_blind():
         # 通道失明时不探、也不否决：探出来的只会是通道的故障，还要白烧一格配额。
         # 此刻「能不能用」没有观测来源，退回历史判据（调用方据

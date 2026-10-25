@@ -23,6 +23,10 @@ import pytest
 import config
 import daemon
 
+# 夹具 `_isolate_production_files` 会把 `_warp_model_usable` 打桩成恒真；
+# 验它本身的用例要拿回未打桩的原函数（模块加载期的引用）。
+_REAL_WARP_MODEL_USABLE = daemon._warp_model_usable
+
 
 @pytest.fixture(autouse=True)
 def _isolate_production_files(tmp_path, monkeypatch):
@@ -3972,3 +3976,46 @@ def test_env_bool_parses_observe_override(monkeypatch):
     assert config._env_bool("ASIP_OBSERVE_9ROUTER", False) is True, "1 应开"
     monkeypatch.setenv("ASIP_OBSERVE_9ROUTER", "  ")
     assert config._env_bool("ASIP_OBSERVE_9ROUTER", True) is True, "空串应走默认"
+
+
+def _stub_warp_cfg(monkeypatch):
+    monkeypatch.setattr(daemon, "_warp", lambda: {
+        "refresh_model_check": True,
+        "refresh_model_timeout_sec": 15,
+        "probe_ok_ttl_sec": 600,
+        "probe_persistent_ttl_sec": 21600,
+        "probe_transient_ttl_sec": 120,
+    })
+    monkeypatch.setattr(daemon, "_PROBE_BLOCKED_AT", {})
+
+
+def test_cached_ok_verdict_does_not_skip_probe(monkeypatch):
+    """缓存里的 OK 不得当作「已实测」跳过探测。
+
+    旧 OK 的 TTL 是 600s，地址被生产流量烧掉只需几秒；命中旧 OK 直接切上去
+    就是一轮 429 爆发。只有「地址已被拒」的持久负结论允许跳过。
+    """
+    _stub_warp_cfg(monkeypatch)
+    monkeypatch.setattr(daemon, "_warp_model_usable", _REAL_WARP_MODEL_USABLE)
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN",
+                        {("tag-a", "1.2.3.4"): ("OK", time.time())})
+    called = []
+    import probe_warp
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: (
+        called.append(port) or ("err", 0.1, "boom", None)))
+    ok = daemon._warp_model_usable({"tag": "tag-a", "port": 10001}, "1.2.3.4")
+    assert called == [10001], f"缓存 OK 时仍须实测，实际探测 {len(called)} 次"
+    assert ok is False, "实测 err 应判不可用"
+
+
+def test_cached_quota_verdict_skips_probe(monkeypatch):
+    """持久负结论仍可跳过探测：它只驱动刷新，不会放行坏地址。"""
+    _stub_warp_cfg(monkeypatch)
+    monkeypatch.setattr(daemon, "_warp_model_usable", _REAL_WARP_MODEL_USABLE)
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN",
+                        {("tag-b", "5.6.7.8"): ("quota", time.time())})
+    import probe_warp
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: (
+        (_ for _ in ()).throw(AssertionError("持久负结论命中时不应再探测"))))
+    assert daemon._warp_model_usable(
+        {"tag": "tag-b", "port": 10002}, "5.6.7.8") is False
