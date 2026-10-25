@@ -24,6 +24,14 @@ def _env_path(name: str, default: str) -> str:
     return os.path.expanduser(os.path.expandvars(os.environ.get(name) or default))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """环境变量布尔覆盖。未设/空串 = 用默认值；1/true/yes/on 为真，其余为假。"""
+    v = os.environ.get(name)
+    if v is None or not v.strip():
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 SECRET_FILE = _env_path("SINGBOX_SECRET_FILE_PATH", os.path.join(HOME_DIR, ".singbox_secret"))
 # 局域网代理认证，内容一行 `username:password`（mode 600，gitignored）。
 # 文件不存在 = 不生成 LAN 入站：无认证的 mixed 入站等于开放中继。
@@ -86,9 +94,28 @@ CFG = {
         "db_path": _env_path("NINE_ROUTER_DB_PATH", os.path.join(HOME_DIR, ".9router/db/data.sqlite")),
         "base": "http://127.0.0.1:20127",
     },
+    # 9router 流量观测开关（重启 daemon 生效）。false = blind 模式：
+    #   换线只按时间判据 —— WARP 出口按 proactive_fixed_sec 定时轮换，
+    #   落在代理池上按 proactive_rotate_sec 定时换节点；不读 requestDetails/
+    #   usageHistory，错误触发换线、429 率策略自适应、落池后拦截回切、
+    #   requests 配额判据（同样要查 9router 库）自动停用。
+    #   适合 9router 停用或流量不经过它的场景。
+    # true = 默认行为，9router 错误信号重新驱动换线。
+    # 可用环境变量 ASIP_OBSERVE_9ROUTER 覆盖（true/false），改 .env 重启即可
+    # 切换，不必动这份文件。
+    "traffic": {
+        "observe_9router": _env_bool("ASIP_OBSERVE_9ROUTER", True),
+        # 按时间换线（blind 模式）的唯一反馈是时钟，没有错误信号帮它验 IP，
+        # 所以候选节点必须先过脏 IP 过滤：出口 IP 只要在这个窗口内被**任何**
+        # 节点用过就跳过，避免把刚烧过的地址再切回来。默认 6h（ip-api 的
+        # 21600s）；0 = 不过滤。WARP 隧道不受本项控制 —— 它的复用窗口是
+        # warp.ip_reuse_guard_sec（24h，更强）。
+        "ip_reuse_window_sec": 21600,
+    },
     "singbox": {
         "clash_api": "http://127.0.0.1:9090",
-        "secret": "",  # 运行时通过 get_singbox_secret() 刷新, 此处留空占位
+        # 刻意不在此放 secret：import 时冻结的快照在轮换后不会更新，
+        # 调用方必须走 get_singbox_secret()（见文件末尾注释）。
         "selector": "proxy",
         "binary": _env_path("SINGBOX_BINARY", os.path.join(PROJECT_DIR, "sing-box")),
         "config_file": _env_path("SINGBOX_CONFIG", os.path.join(PROJECT_DIR, "singbox-config.json")),
@@ -148,7 +175,7 @@ CFG = {
         "proxy_dead_ratio": 0.5,       # 池黑名单节点占比 ≥N
     },
     "thresholds": {
-        "recent_window": 10,    # 只查最近两条的数据，10条太大可能出现多个切换窗口
+        "recent_window": 10,    # 策略/错误判据的滑动窗口条数（太小会被单条噪声带偏）
         "reject_window": 50,   # 403 客户端拒绝占比的统计窗口（10 条太小，噪声会抖动）
         "opencode_min_success_rate": 0.9,
         "node_test_timeout_ms": 15000,  # 放宽到 15s，避免慢节点误判

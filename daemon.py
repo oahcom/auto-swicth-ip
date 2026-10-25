@@ -35,6 +35,7 @@ import shutil
 import functools
 import ipaddress
 from logging.handlers import RotatingFileHandler
+from typing import NamedTuple
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
@@ -46,6 +47,52 @@ _db_lock = threading.RLock()  # RLock: init_node_info_db 里 _get_db 需重入
 _BAD_NODES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bad_nodes.json")
 # 出口节点归属日志：每次成功切换追加 (ts,node)，供 per-egress 错误率归因用。
 _EGRESS_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".egress_log.jsonl")
+# 池节点出口 IP 使用台账：ip -> 最后使用时刻（epoch）。按时间换线（blind 模式）
+# 没有错误信号帮它验 IP，换线候选只能靠「这个 IP 刚被用过没」来避让 —— 窗口
+# 见 CFG["traffic"]["ip_reuse_window_sec"]。数据源是换线成功后的
+# fetch_node_ip_region（真实出口探测），不是某次切换时候选节点的预估 IP。
+_NODE_IP_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".node_ip_used.json")
+_NODE_IP_LOCK = threading.Lock()
+_NODE_IP_USED: dict[str, float] = {}
+def _node_ip_used_path() -> str:
+    """IP 台账路径（NODE_IP_USED_FILE_PATH 可覆盖，测试用隔离；同
+    `_egress_log_path()` 模式）。读写必须都走这里。"""
+    return os.environ.get("NODE_IP_USED_FILE_PATH") or _NODE_IP_USED_FILE
+
+
+def _load_node_ip_used() -> None:
+    """启动时加载落盘的 IP 使用台账；坏文件当空台账（只丢过滤精度，不阻断启动）。"""
+    global _NODE_IP_USED
+    try:
+        with open(_node_ip_used_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _NODE_IP_USED = {str(k): float(v) for k, v in data.items() if v}
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"✗ 读 IP 使用台账失败（当空台账）: {e}")
+
+
+def _save_node_ip_used() -> None:
+    """裁剪后落盘：窗口外的条目没有判据价值，留着只会越写越大。上限留
+    24h 余量，让把窗口临时调大的部署能从历史里恢复一部分。"""
+    now = time.time()
+    keep = round(CFG["traffic"]["ip_reuse_window_sec"] or 21600) + 86400
+    with _NODE_IP_LOCK:
+        snapshot = {ip: ts for ip, ts in _NODE_IP_USED.items()
+                    if now - ts < max(keep, 86400)}
+    # 与 .warp_ip_used.json 共用同一套「先写 .tmp 再 replace」的实现。
+    _write_json_atomic(_node_ip_used_path(), snapshot)
+
+
+def _record_node_ip_used(ip: str | None, ts: float | None = None) -> None:
+    """记一次「该出口 IP 刚被用来服务流量」。ts 缺省取当前时间。"""
+    if not ip:
+        return
+    with _NODE_IP_LOCK:
+        _NODE_IP_USED[ip] = float(ts or time.time())
+    _save_node_ip_used()
 
 def _egress_log_path() -> str:
     """egress_log 路径（EGRESS_LOG_FILE_PATH 可覆盖，测试用隔离；与 proxy-global.js
@@ -217,6 +264,9 @@ _last_proactive_warp_check: float = 0  # 主动轮换判据的上次查询时刻
 # 健康摘要里展示的主动轮换进度。由判决函数写入，避免摘要再查一次库，
 # 也保证日志显示的就是判据当时看到的数。
 _proactive_progress: str = "-"
+# 池侧定时轮换进度（blind 模式摘要用）。主循环每次触发/判定时更新，
+# 摘要直接展示判据当时算出的时刻，不重算也不重查。
+_POOL_PROACTIVE_LABEL: str = "-"
 _last_warp_prewarm_ts: float = 0      # 上次预热备线的时刻
 # 出口 IP 可用周期样本：每段 = 换线生效 → 首次被 403/429 判不可用。
 # {"ip", "cycle", "ended_at", "ok"}，只保留 24h。落盘跨重启保留。
@@ -908,9 +958,18 @@ def _classify_egress_error(body: str | None) -> str | None:
     return None
 
 
-def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int, list, int, int]:
-    """从 SQLite 读最近 N 个 OpenCode Free 请求，
-    返回 (total, errors, details_list, consecutive_errors, reject_ratio)
+class ErrorWindow(NamedTuple):
+    """`get_9router_error_rate` 的返回结构（保持 tuple 解包兼容）。"""
+
+    total: int
+    errors: int
+    details: list[dict]
+    consecutive_errors: int
+    reject_ratio: float
+
+
+def get_9router_error_rate(max_backoff_ts: int | None = None) -> ErrorWindow:
+    """从 SQLite 读最近 N 个 OpenCode Free 请求，返回 ErrorWindow。
 
     reject_ratio：最近 REJECT_WINDOW 条中 403 占全部错误的比例。OpenCode 免费层只允许
     其自家客户端使用，403 FreeTierError 是客户端指纹拒绝，与出口 IP 无关——据此避免无效轮换。
@@ -953,7 +1012,7 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int,
         reject_rows = [dict(r) for r in reject_rows]
 
         if not rows:
-            return 0, 0, [], 0, 0
+            return ErrorWindow(0, 0, [], 0, 0.0)
 
         recent = [dict(r) for r in rows]
         total = len(recent)
@@ -999,10 +1058,10 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> tuple[int, int,
             tail = f"（另 {other} 条非出口错误不计）" if other else ""
             log(f"  [OpenCode Free] {errors}/{total} 出口级错误{tail} | 连续失败={consecutive_errors} | 403占比={reject_ratio:.0%} | 失败模型: {', '.join(sorted(err_models))}")
 
-        return total, errors, recent, consecutive_errors, reject_ratio
+        return ErrorWindow(total, errors, recent, consecutive_errors, reject_ratio)
     except Exception as e:
         log(f"✗ 读 SQLite 失败: {e}")
-        return 0, 0, [], 0, 0
+        return ErrorWindow(0, 0, [], 0, 0.0)
 
 def _load_egress_log() -> list[dict]:
     """读 .egress_log.jsonl → 按 ts 升序的切换记录 [(ts, node), ...]。"""
@@ -1230,12 +1289,50 @@ def _expected_proxy_url() -> str:
     return f"http://127.0.0.1:{MIXED_PORT}"
 
 
+def _probe_9router(path: str, timeout: float) -> int | None:
+    """GET 9router 的一个端点，返回 HTTP 状态码；传输层失败返回 None。
+
+    统一走 CFG["9router"]["base"]：9router 只有一个监听口，写死端口会在
+    换部署（或原本就写错）时让健康检查永远失败。
+    """
+    try:
+        r = requests.get(
+            f"{CFG['9router']['base'].rstrip('/')}{path}",
+            headers={"Authorization": "Bearer 9router-local"},
+            timeout=timeout,
+        )
+        return r.status_code
+    except requests.RequestException as e:
+        log(f"⚠ 9router {path} 不可达: {e}")
+        return None
+
+
+def check_9router_health(timeout: float = 5.0) -> bool:
+    """9router 是否可用：dashboard 可达 + v1 API 未返回 5xx。
+
+    `/v1/models` 首次冷启动实测约 10s，固定 5s 超时会把它误判成不可达，
+    因此单独给它更宽的预算。401/429 说明端点活着，不算故障。
+    """
+    status = _probe_9router("/dashboard", timeout)
+    if status is None or status >= 500:
+        if status is not None:
+            log(f"⚠ 9router dashboard 返回 {status}")
+        return False
+
+    status = _probe_9router("/v1/models", max(timeout, 15.0))
+    if status is not None and status >= 500:
+        log(f"⚠ 9router v1 models API 返回 {status}")
+        return False
+    return status is not None
+
+
 def check_9router_outbound_proxy() -> bool:
     """Ensure OpenCode Free proxyPool + outboundProxyEnabled correct. Skip during fallback."""
     with _state_lock:
         if _ALL_DEAD_FALLBACK:
             return True  # 已降级到 okz，不覆盖
-    EXPECTED_URL = _expected_proxy_url()
+    expected_url = _expected_proxy_url()
+    changed = False
     try:
         with _db_lock:
             c = _get_db()
@@ -1250,8 +1347,6 @@ def check_9router_outbound_proxy() -> bool:
                 log(f"⚠ 未找到 {OPENCODE_FREE_PROVIDER} proxyPool 配置")
                 return False
 
-            changed = False
-
             # 1. 检查 proxyPool 当前代理地址
             pool_row = c.execute('SELECT data FROM proxyPools WHERE id=?', (pool_id,)).fetchone()
             if not pool_row:
@@ -1260,9 +1355,9 @@ def check_9router_outbound_proxy() -> bool:
 
             pool = json.loads(pool_row[0])
             url = pool.get("proxyUrl", "")
-            if url != EXPECTED_URL:
-                log(f"⚠ opencode proxyPool 异常 (url={url})，修复为 {EXPECTED_URL}...")
-                pool["proxyUrl"] = EXPECTED_URL
+            if url != expected_url:
+                log(f"⚠ opencode proxyPool 异常 (url={url})，修复为 {expected_url}...")
+                pool["proxyUrl"] = expected_url
                 c.execute('UPDATE proxyPools SET data = ? WHERE id = ?', (json.dumps(pool), pool_id))
                 changed = True
 
@@ -1275,13 +1370,18 @@ def check_9router_outbound_proxy() -> bool:
 
             if changed:
                 c.commit()
-                log(f"✓ 代理配置已修复 -> url={EXPECTED_URL}, outboundProxyEnabled=True")
+                log(f"✓ 代理配置已修复 -> url={expected_url}, outboundProxyEnabled=True")
             else:
                 return True
-        return True
     except Exception as e:
         log(f"✗ 检查代理配置失败: {e}")
         return False
+
+    # 健康检查放在 _db_lock 之外：它是一次网络请求（最长 15s），持锁会挡住
+    # 主循环的错误查询。配置已提交，检查失败只记日志、不回滚。
+    if changed and not check_9router_health():
+        log("⚠ 9router 配置修复后健康检查失败")
+    return True
 
 # ============= Sing-box 操作 =============
 def singbox_api(path: str, method: str = "GET", body: dict | None = None,
@@ -1352,6 +1452,15 @@ def switch_proxy(new_node: str) -> bool:
         return False
 
 # ============= WARP 主备隧道（opencode 专用出口） =============
+def _observe_9router() -> bool:
+    """9router 流量观测开关。false = blind 模式：换线只按时间判据。
+
+    每次现读而不是 import 时固化：单测用 monkeypatch.setitem 开关即可，
+    不依赖 daemon 进程重启。
+    """
+    return bool(CFG.get("traffic", {}).get("observe_9router", True))
+
+
 def _warp() -> dict:
     return CFG["warp"]
 
@@ -3166,10 +3275,14 @@ def _maybe_failback_to_warp(now: float) -> bool:
     # 2. 落池后仍在被出口级拦截。必须传大 limit：判据是「落池以来累计 ≥5 条」，
     # 默认窗口 recent_window=2 只能数到 2 条，永远凑不满 5 → 14:47 落池后
     # 30 分钟里 1590 条 429 也回不去 WARP。
+    # blind 模式无 9router 数据可看（流量不经它），判据 2 整条跳过，回切只看
+    # 池探测与黑名单占比 —— 纯网络判据。
     since = _proxy_dwell_since or 0
-    blocked = (count_warp_blocked_since(since, limit=200) if since
-               else {"abuse403": 0, "rate429": 0, "ok": 0, "other_err": 0,
-                     "consec_err": 0, "full_err": False})
+    if _observe_9router() and since:
+        blocked = count_warp_blocked_since(since, limit=200)
+    else:
+        blocked = {"abuse403": 0, "rate429": 0, "ok": 0, "other_err": 0,
+                   "consec_err": 0, "full_err": False}
     still_limited = (blocked["abuse403"] + blocked["rate429"]
                      >= CFG["intervals"]["proxy_blocked_threshold"])
 
@@ -3665,6 +3778,21 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) 
     return True
 
 
+def _pool_proactive_label(now: float, last_rotate: float, rotate_gap: float) -> str:
+    """池侧定时轮换进度标签：换线间隔 + 已过时长 + 下次换线时刻。
+
+    blind 模式下时钟是唯一反馈，运维要能一眼看出「多久换一次、下次几点换」，
+    所以间隔用配置值 rotate_gap 明写，不藏在进度数字里。
+
+    last_rotate 为 0（刚启动，本轮还没换过）时以 now − rotate_gap 为基准，
+    避免打出「已过 5 位数秒数」这种没意义的数字。
+    """
+    base = last_rotate if last_rotate else now - rotate_gap
+    due_ts = time.strftime("%H:%M:%S", time.localtime(base + rotate_gap))
+    return (f"池定时 间隔{rotate_gap:.0f}s 已过{max(0.0, now - base):.0f}s "
+            f"下次≈{due_ts}")
+
+
 def _proactive_mode() -> str:
     """主动轮换判据：fixed（固定秒数）/ requests（成功的 dsv4 调用数）。
 
@@ -3675,6 +3803,10 @@ def _proactive_mode() -> str:
     等于一个测不准的固定 60s。死因是 429 按成功调用扣配额，与时钟无关。
     """
     mode = str(_warp().get("proactive_mode", "fixed")).lower()
+    if not _observe_9router():
+        # blind 模式强制 fixed：requests 判据查 usageHistory（9router 库），
+        # 流量不经 9router 时计数恒 0，等于永不主动换线。
+        return "fixed"
     if mode not in ("requests", "fixed"):
         return "fixed"
     return mode
@@ -3729,7 +3861,13 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
         target = float(_warp()["proactive_fixed_sec"])
         lead = float(_warp().get("switch_lead_sec", 3.0))
         threshold = max(target - lead, 1.0)
-        _proactive_progress = f"fixed {elapsed:.0f}/{threshold:.0f}s"
+        # 「下次 ≈」不是精确调度：换线在下一个 ≥20s 的 tick 里触发，
+        # 且提前量 lead 也只是目标提前，实际时刻随 tick 抖动 ±20s。
+        next_ts = time.strftime("%H:%M:%S", time.localtime(start + threshold))
+        # 间隔标配置值 target 而非 threshold：运维看的是「多久换一次」，
+        # threshold 含提前量（target − lead），只在下次≈时刻里体现。
+        _proactive_progress = (f"fixed 间隔{target:.0f}s 已{elapsed:.0f}s "
+                               f"下次≈{next_ts}")
         # 固定时长不看样本：运维要求「无论流量快慢每 N 秒换一次」时用。
         if elapsed >= threshold:
             _reconnect_warp_now(
@@ -3784,8 +3922,11 @@ def _prewarm_standby_warp(now: float) -> None:
         return
     _last_warp_prewarm_ts = now
     # 没有 opencode 流量时不刷：预热是为了「下次换线有现成新鲜 IP」，没人
-    # 在用时重启隧道只是白白换掉一个会话。24 小时窗口与 ip_reuse_guard_sec 一致。
-    if count_opencode_since(now - 86400) == 0:
+    # 在用时重启隧道只是白白换掉一个会话。判据读 requestDetails，只在观测
+    # 开启时有效 —— blind 模式下流量不经 9router，计数恒 0，若也照此跳过，
+    # 备线永远不预热，换线候选全是旧会话，所以 blind 直接放弃这条闸门。
+    # 24 小时窗口与 ip_reuse_guard_sec 一致。
+    if _observe_9router() and count_opencode_since(now - 86400) == 0:
         return
     # 名额满不代表要放弃整轮：排队段（PENDING）不占名额，前面刷完自然轮到。
     # 旧实现见到名额满就直接 return，一轮一条都排不上。
@@ -4231,6 +4372,32 @@ def _dedup_by_ip(candidates: list[str], call_map: dict[str, int], ip_map: dict[s
     return dedup_skip
 
 
+def _skip_recent_node_ips(candidates: list[str], ip_map: dict[str, str],
+                          now: float | None = None) -> set[str]:
+    """按时间换线（blind 模式）的脏 IP 过滤：窗口内被任何节点用过的出口 IP
+    对应节点跳过。这是 blind 模式唯一的 IP 反馈 —— 时钟不会告诉它哪个地址
+    刚被烧过，台账会。IP 未知（node_info 还没回填）的候选不受限：没有历史
+    就是干净候选，这条曲线由 fetch_node_ip_region 成功后补齐。
+    traffic-aware 模式返回空集 —— 那里有实时错误信号验 IP，不需要启发式。
+    """
+    if _observe_9router():
+        return set()
+    window = float(CFG["traffic"].get("ip_reuse_window_sec") or 0)
+    if window <= 0 or not _NODE_IP_USED:
+        return set()
+    now = time.time() if now is None else now
+    with _NODE_IP_LOCK:
+        used = dict(_NODE_IP_USED)
+    skip: set[str] = set()
+    for n in candidates:
+        ip = ip_map.get(n) or ""
+        if ip and now - used.get(ip, 0.0) < window:
+            skip.add(n)
+    if skip:
+        log(f"  ⏳ 脏IP避让: {len(skip)} 个候选出口在 {window/3600:.0f}h 内用过，本轮跳过")
+    return skip
+
+
 def _p2c_select(candidates: list[str], dedup_skip: set[str], call_map: dict[str, int]) -> str:
     """Pick from candidates using P2C + adaptive score.
 
@@ -4277,6 +4444,7 @@ def pick_next_node(current: str, all_nodes: list, fail_set: set, count_call: boo
 
     call_map, ip_map = _load_candidate_stats(candidates)
     dedup_skip = _dedup_by_ip(candidates, call_map, ip_map)
+    dedup_skip |= _skip_recent_node_ips(candidates, ip_map)
 
     # 最多尝试 3 个候选，避免死循环
     for attempt in range(3):
@@ -4384,6 +4552,7 @@ def _set_outbound_proxy(url: str = "", enabled: bool = False) -> None:
             c.commit()
     except Exception as e:
         log(f"✗ 设置 outboundProxy 失败: {e}")
+
 
 def restart_singbox() -> bool:
     """重启 sing-box，互斥锁防止并发调用。停服前绕过代理，启动后恢复。"""
@@ -4680,6 +4849,9 @@ def update_node_info_async(node: str):
             if info:
                 ip, country, city, isp = info
                 set_node_info(node, ip, country, city, isp)
+                # 这里是「该出口 IP 真在被服务」的准确时刻 —— 不是切换捏造的
+                # 预估，是 ipify 实测回来的地址。blind 模式的 6h 复用窗口以此为准。
+                _record_node_ip_used(ip)
                 log(f"  📍 {format_node_display(node)}")
             else:
                 log(f"  ⚠ 无法获取 {node} 的 IP/地区信息")
@@ -4866,32 +5038,48 @@ def _acquire_single_instance_lock() -> None:
     _DAEMON_LOCK_FD = fd   # 持有到进程退出；不能 close，否则锁就放了
 
 
+def _log_startup_banner(all_nodes: list[str]) -> None:
+    """启动配置摘要：只读 CFG，不产生副作用，让 main 只保留编排逻辑。"""
+    log(f"  sing-box: {CFG['singbox']['clash_api']}")
+    log(f"  节点数: {len(all_nodes)}")
+    log(f"  轮换: 每 {CFG['intervals']['proactive_rotate_sec']}s P2C")
+    log(f"  健康: 每 {CFG['intervals']['node_health_sec']}s 批量测延迟")
+    log(f"  订阅: 每 {CFG['intervals']['subscription_refresh_sec']}s 刷新")
+    if _observe_9router():
+        log("  流量观测: on — 9router requestDetails 错误信号驱动换线")
+        log(f"  自适应: 429率>{CFG['thresholds']['pressure_error_rate']:.0%}→均匀分散, <{CFG['thresholds']['normal_error_rate']:.0%}→延迟优先")
+        log(f"  错误触发: 出口级拦截(403≥{_warp()['block_threshold']}/429≥{_warp()['rate429_threshold']})"
+            f" 且连续≥3条才切；上游 402/请求超长不计")
+    else:
+        log("  流量观测: off — blind 模式，不读 9router，纯按时间轮换"
+            f" (WARP 每 {CFG['warp']['proactive_fixed_sec']}s)"
+            f" + 池 每 {CFG['intervals']['proactive_rotate_sec']}s")
+        log(f"  换线间隔: WARP {CFG['warp']['proactive_fixed_sec']}s / 池 "
+            f"{CFG['intervals']['proactive_rotate_sec']}s（下次换线时刻见健康摘要 轮换W/轮换P）")
+        log(f"  脏IP避让: 出口IP在 {CFG['traffic']['ip_reuse_window_sec']/3600:.0f}h 内用过则跳过"
+            f"（台账 .node_ip_used.json；0=关闭）")
+    log(f"  Watchdog: 每 {CFG['intervals']['singbox_watchdog_sec']}s")
+    log("  IP去重: 同出口IP保留调用次数最低的节点")
+    log("  调用计数: 仅统计成功调用, 429轮换不计入")
+    log("  interrupt_exist_connections: false (不杀现有连接)")
+    log("=" * 50)
+
+
 def main():
     _acquire_single_instance_lock()
     # Log first, then fetch (avoid hanging before any output)
     log("=" * 50)
     log("auto-switch-ip daemon v2 启动 (加固版)")
-    log(f"  sing-box: {CFG['singbox']['clash_api']}")
 
     all_nodes = get_all_proxy_nodes()
-    log(f"  节点数: {len(all_nodes)}")
-    log(f"  轮换: 每 {CFG['intervals']['proactive_rotate_sec']}s P2C")
-    log(f"  健康: 每 {CFG['intervals']['node_health_sec']}s 批量测延迟")
-    log(f"  订阅: 每 {CFG['intervals']['subscription_refresh_sec']}s 刷新")
-    log(f"  Watchdog: 每 {CFG['intervals']['singbox_watchdog_sec']}s")
-    log(f"  自适应: 429率>{CFG['thresholds']['pressure_error_rate']:.0%}→均匀分散, <{CFG['thresholds']['normal_error_rate']:.0%}→延迟优先")
-    log(f"  IP去重: 同出口IP保留调用次数最低的节点")
-    log(f"  调用计数: 仅统计成功调用, 429轮换不计入")
-    log(f"  interrupt_exist_connections: false (不杀现有连接)")
-    log(f"  错误触发: 出口级拦截(403≥{_warp()['block_threshold']}/429≥{_warp()['rate429_threshold']})"
-        f" 且连续≥3条才切；上游 402/请求超长不计")
-    log("=" * 50)
+    _log_startup_banner(all_nodes)
 
     # 初始化 node_info 表
     init_node_info_db()
     # 恢复跨重启的出口 IP 使用/污染记录与可用周期样本
     _load_warp_ip_used()
     _load_warp_ip_cycles()
+    _load_node_ip_used()
     # 脏线守护：常驻线程，脏 IP 一出现就重连换干净地址，不依赖主循环周期
     _start_dirty_line_janitor()
     # 日志标签用的当前 WARP 出口 IP：启动时探一次，之后由换线路径更新
@@ -4920,7 +5108,7 @@ def main():
 
     global _RESTART_COUNT, _NODE_CALL_RESET_TS, _last_wal_checkpoint, _strategy_mode
     global _health_check_future, _health_check_nodes, _health_check_current
-    global _last_warp_reconnect_ts, _proactive_progress
+    global _last_warp_reconnect_ts, _proactive_progress, _POOL_PROACTIVE_LABEL
     with _RESTART_LOCK:
         _RESTART_COUNT = 0
     _NODE_CALL_RESET_TS = time.time()
@@ -4932,6 +5120,20 @@ def main():
     if not all_nodes:
         log("⚠ sing-box 首次查询超时，等待5s重试...")
         time.sleep(5)
+        # blind 模式不代管 9router 的生死：它可能根本没跑，重启它的
+        # systemd 单元也不是本 daemon 的职责（横幅已声明 blind）。
+        if _observe_9router() and not check_9router_health():
+            log("⚠ 9router 不可达，等待 3s 重试...")
+            time.sleep(3)
+            if not check_9router_health():
+                log("✗ 9router 仍不可达，尝试重启...")
+                # Try to restart 9router via systemd if available
+                try:
+                    subprocess.run(["systemctl", "--user", "restart", "nine-router-src.service"], timeout=30)
+                except Exception:
+                    pass
+                time.sleep(5)
+
         all_nodes = get_all_proxy_nodes()
         if not all_nodes:
             # 配置文件不存在时直接重启必然失败（要白等 30s+60s 且 9router 走直连），
@@ -4993,39 +5195,51 @@ def main():
             # `get_9router_error_rate` 要扫 requestDetails 并解析 data 列，实测
             # 3.3ms；20Hz 轮询等于 6.6% CPU 空转。水位线查询走 provider 索引，
             # 2µs。没有新行就说明「没有任何新错误」，正是最该什么都不做的时候。
-            wm = _rd_watermark()
+            # blind 模式（observe=False）整段跳过：requestDetails 一行都不读，
+            # 换线只认时间判据（下方主动轮换 + 池轮换）。
+            observe = _observe_9router()
+            new_rows = False
+            if observe:
+                wm = _rd_watermark()
+                new_rows = wm != last_watermark
+                if new_rows:
+                    last_watermark = wm
+                    total, errors, details, consecutive_errors, reject_ratio = get_9router_error_rate()
+                    # errors 只数出口级拦截，不能拿 total-errors 当成功数（402/超长
+                    # 会被误算成成功）。成功数直接数 status，才是这个出口真的served 的流量。
+                    ok_count = sum(1 for r in details if r.get("status") == "success")
+                    _record_active_ip_success(total, total - ok_count)
+            # 出口 IP 补探与观测开关无关：WARP 主动轮换的段起点恢复要用
+            # `_ACTIVE_WARP_IP`，函数自带 30s 节流，每 tick 调用一次没有成本。
+            _maybe_init_active_ip(now)
             # 节点列表每 tick 都读：读的是后台快照（一次加锁 + 两次字段访问），
             # 而健康检查/池轮换用的是它。只在有新行时读的话，没有流量的时段里
             # 订阅刷新进来的新节点永远进不了列表。
             cached_all_nodes, cached_current_proxy = _pool_snapshot()
-            new_rows = wm != last_watermark
-            if new_rows:
-                last_watermark = wm
-                total, errors, details, consecutive_errors, reject_ratio = get_9router_error_rate()
-                _maybe_init_active_ip(now)
-                # errors 只数出口级拦截，不能拿 total-errors 当成功数（402/超长
-                # 会被误算成成功）。成功数直接数 status，才是这个出口真的served 的流量。
-                ok_count = sum(1 for r in details if r.get("status") == "success")
-                _record_active_ip_success(total, total - ok_count)
 
             # ---- 0. 9router 代理配置检查 (每 60s) ----
             # SQLite 读写，不在热路径上，但也不该让循环等它 —— 丢后台。
-            if now - last_proxy_check > CFG["intervals"]["proxy_check_sec"]:
+            # blind 模式跳过：9router 停用（或不跑）时这项检查只会每 60s 刷
+            # 一条配置不匹配的 warning，除误导外没有任何产出。
+            if observe and now - last_proxy_check > CFG["intervals"]["proxy_check_sec"]:
                 last_proxy_check = now
                 _submit_once("proxy-config", check_9router_outbound_proxy)
 
             # ---- 1b. 自适应策略切换（带回滞） ----
             # 纯算术，留在主线程：切模式要立刻影响下一次选节点。
-            error_rate = errors / total if total > 0 else 0
-            with _state_lock:
-                old_mode = _strategy_mode
-                _strategy_mode = _update_strategy_mode(
-                    _strategy_mode, error_rate, total,
-                    CFG["thresholds"]["pressure_error_rate"], CFG["thresholds"]["normal_error_rate"],
-                )
-                switched = old_mode != _strategy_mode
-            if switched:
-                log(f"🔄 策略切换: {old_mode} → {_strategy_mode} (429率={error_rate:.0%}, {errors}/{total}, 连续失败={consecutive_errors})")
+            # blind 模式没有 9router 错误率可算，_strategy_mode 保持 normal，
+            # 池内选点维持延迟优先策略。
+            if observe:
+                error_rate = errors / total if total > 0 else 0
+                with _state_lock:
+                    old_mode = _strategy_mode
+                    _strategy_mode = _update_strategy_mode(
+                        _strategy_mode, error_rate, total,
+                        CFG["thresholds"]["pressure_error_rate"], CFG["thresholds"]["normal_error_rate"],
+                    )
+                    switched = old_mode != _strategy_mode
+                if switched:
+                    log(f"🔄 策略切换: {old_mode} → {_strategy_mode} (429率={error_rate:.0%}, {errors}/{total}, 连续失败={consecutive_errors})")
 
             # ---- 1c. 错误触发（走 WARP 换线或池内轮换） ----
             # 两条路径都要扫 requestDetails（1.3ms / 3.3ms），且持 `_db_lock` ——
@@ -5033,7 +5247,8 @@ def main():
             # 有新行（新错误必然带来新行，立刻判），或距上次判定已 1s（冷却期内
             # 被压下的那批错误要补打一次，不能等下一行新数据才换线）。
             # 9router 每 5s 批量落库，所以 1s 的补打已远密于数据产生的速度。
-            if new_rows or now >= next_error_eval:
+            # blind 模式整段跳过：错误触发换线只认 requestDetails 信号。
+            if observe and (new_rows or now >= next_error_eval):
                 next_error_eval = now + 1.0
                 if opencode_out_on_warp():
                     # 只做隧道换线：opencode 走 WARP 时换轮换池节点无效（出口由
@@ -5053,7 +5268,7 @@ def main():
                         _submit_once("pool-rotate-on-error", _rotate_on_error_bg,
                                      errors, total, cached_all_nodes, now)
 
-            # 主动轮换只为「不等报错」—— 403 一出现，在途对话已经断了。
+            # 主动轮换不为「不等报错」—— 403 一出现，在途对话已经断了。
             # 放在水位线判断之外：fixed 模式的判据就是时长，没有新请求时
             # 恰恰更需要靠它来换（否则低峰期一条线会一直干着）。
             #
@@ -5061,6 +5276,9 @@ def main():
             # 无从谈起，照判据换线等于把流量从池里硬拽回 WARP，而错误触发路径
             # 5 秒后又把它踢回池 —— 实测 00:17:24 切回 WARP、00:17:29 又落池，
             # 两套兜底互相打架。回 WARP 只有一条路：`_maybe_failback_to_warp`。
+            #
+            # blind 模式这里就是唯一的 WARP 换线来源（错误触发整路关闭），
+            # `_proactive_mode` 会强制 fixed，纯时钟判据。
             if opencode_out_on_warp():
                 _maybe_proactively_rotate_warp(now)
             else:
@@ -5069,6 +5287,14 @@ def main():
                 _proactive_progress = "不适用(池)"
 
             # ---- 3. 主动轮换轮换池（只在 opencode 落在池上时才有意义） ----
+            # 进度标注每 tick 刷新（纯 local time 格式化，O(1)）：换线间隔、
+            # 已过时长、下次换线时刻三件套，格式见 _pool_proactive_label。
+            if not opencode_out_on_warp():
+                _POOL_PROACTIVE_LABEL = _pool_proactive_label(
+                    now, last_proactive_rotate,
+                    float(CFG["intervals"]["proactive_rotate_sec"]))
+            else:
+                _POOL_PROACTIVE_LABEL = "不适用(WARP)"
             if (not opencode_out_on_warp()
                     and now - last_proactive_rotate > CFG["intervals"]["proactive_rotate_sec"]):
                 last_proactive_rotate = now
@@ -5138,7 +5364,8 @@ def main():
                        f"err>{(err_threshold*100):.0f}%→切"
                        f"冷却至={time.strftime('%H:%M:%S', time.localtime(cool_until)) if cool_until>now else '-'}"
                        f" dead={dead_count} cool={cool_count} 策略={_strategy_mode}"
-                       f" 轮换={_proactive_progress}"
+                       f" 观测={'on' if observe else 'off(blind→时间轮换)'}"
+                       f" 轮换W={_proactive_progress}轮换P={_POOL_PROACTIVE_LABEL}"
                        f" singbox={'🟢' if rc_display==0 else '🔴'}")
 
         except KeyboardInterrupt:

@@ -651,6 +651,9 @@ def test_refresh_model_check_disabled_keeps_old_mode(monkeypatch):
 def test_model_probe_maps_quota_to_unusable(monkeypatch):
     """429/配额类判定不得算可用；OK 才算（换一条线，避开每会话每 IP 只探一次）。"""
     import probe_warp
+    # 本用例测的是模型模式语义；生产默认可能切回 False，由 config 提供，
+    # 用例必须显式声明自己测哪个模式，不被默认值漂移绑架。
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     verdict = {"v": "quota"}
     monkeypatch.setattr(probe_warp, "probe",
                         lambda port, timeout: (verdict["v"], 0.1, ""))
@@ -662,6 +665,7 @@ def test_model_probe_maps_quota_to_unusable(monkeypatch):
 def test_probe_runs_at_most_once_per_address_within_ttl(monkeypatch):
     """同一 /128 在 TTL 内只探一次（避免重复烧配额）；换地址必须重探。"""
     import probe_warp
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setitem(daemon.CFG["warp"], "probe_persistent_ttl_sec", 21600)
     calls = []
     monkeypatch.setattr(probe_warp, "probe",
@@ -776,6 +780,7 @@ def test_blind_channel_falls_back_to_ip_history(monkeypatch):
 
 def test_partial_unreachable_is_not_blindness(monkeypatch):
     """单条 unreachable 是出口的真实瞬态（TTL 2min），不得升级成通道失明。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
     daemon._note_probe_batch(["unreachable", "OK", "quota"])
     assert daemon._warp_probe_blind() is False
@@ -1140,6 +1145,7 @@ def test_dirty_worker_skips_reprobe_when_address_unchanged(monkeypatch):
 
 def test_dirty_worker_reprobes_after_usque_reconnect(monkeypatch):
     """usque 自己换址后，验收记录必须作废重判 —— 否则好 IP 的结论被新地址冒用。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda *a, **k: "ip-new")
     monkeypatch.setattr(daemon, "_warp_ip_needs_refresh", lambda *a, **k: False)

@@ -8,14 +8,14 @@ Meta-goal: The monitoring loop should evolve its own checks.
 - Lightweight, runs inline with existing cron (~100ms overhead)
 """
 
+import copy
 import json
-import os
 import re
 import time
 import subprocess
 import sys
 from pathlib import Path
-from collections import defaultdict, Counter
+from collections import Counter
 
 STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 PROJECT_DIR = STATE_FILE.parent
@@ -28,8 +28,10 @@ try:
     from config import BAD_NODES_TTL as _BAD_NODES_TTL
     from config import CFG as _CFG
     _LOG_FILE = _CFG["log_file"]
+    _MIXED_PROXY = f"http://127.0.0.1:{_CFG['singbox']['mixed_port']}"
 except Exception:
     _BAD_NODES_TTL = 300
+    _MIXED_PROXY = "http://127.0.0.1:7890"
 
 
 def _write_bad_nodes(bad: dict) -> None:
@@ -108,7 +110,9 @@ def load_state():
             pass
     return {
         "round": 0,
-        "checks": DEFAULT_CHECKS.copy(),
+        # deepcopy：checks 里的 dict 会被 main 原地修改 interval，浅拷贝会
+        # 把改动写回 DEFAULT_CHECKS，污染下一次 load_state。
+        "checks": copy.deepcopy(DEFAULT_CHECKS),
         "anomalies": [],
         "history": [],
         "enabled_checks": ["7890_connectivity", "dead_nodes", "bypass_events", "bounded_pool_pressure", "node_switch_distribution", "response_latency_p95", "upstream_failure_rate", "repeat_failure_nodes"],
@@ -129,7 +133,7 @@ def run_check(name, context, state=None):
         if name == "7890_connectivity":
             out = subprocess.run(
                 ["curl", "-m", "5", "-s", "-o", "/dev/null",
-                 "-w", "%{http_code} %{time_total}", "http://127.0.0.1:7890"],
+                 "-w", "%{http_code} %{time_total}", _MIXED_PROXY],
                 capture_output=True, text=True, timeout=10
             )
             code = out.stdout.split()[0] if out.stdout.strip() else ""
@@ -188,7 +192,7 @@ def run_check(name, context, state=None):
         elif name == "response_latency_p95":
             # Quick latency check + trend detection
             out = subprocess.run(
-                ["curl", "-m", "10", "-s", "-x", "http://127.0.0.1:7890",
+                ["curl", "-m", "10", "-s", "-x", _MIXED_PROXY,
                  "https://www.gstatic.com/generate_204", "-o", "/dev/null",
                  "-w", "%{time_total}"],
                 capture_output=True, text=True, timeout=15
@@ -262,7 +266,7 @@ def main():
     existing = {c["name"] for c in state.get("checks", [])}
     for c in DEFAULT_CHECKS:
         if c["name"] not in existing:
-            state.setdefault("checks", []).append(c)
+            state.setdefault("checks", []).append(copy.deepcopy(c))
         if c["name"] not in state["enabled_checks"]:
             state["enabled_checks"].append(c["name"])
 

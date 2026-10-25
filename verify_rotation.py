@@ -15,18 +15,24 @@ import argparse
 import collections
 import concurrent.futures
 import json
-import os
 import re
 import subprocess
 import sys
 import time
+from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 
-from config import get_singbox_secret
+from config import CFG, get_singbox_secret
 
-CLASH_API = "http://127.0.0.1:9090"
-PROXY = "http://127.0.0.1:7890"
+# 端点全部取自 config：改端口/selector 时不必再改本脚本。
+CLASH_API = CFG["singbox"]["clash_api"].rstrip("/")
+SELECTOR = CFG["singbox"]["selector"]
+MIXED_PORT = CFG["singbox"]["mixed_port"]
+CLASH_PORT = urlparse(CLASH_API).port or 9090
+NINE_ROUTER_BASE = CFG["9router"]["base"].rstrip("/")
+PROXY = f"http://127.0.0.1:{MIXED_PORT}"
 IP_URL = "https://api.ipify.org"
 GEO_URL = "https://ipinfo.io/json"
 PROBE_URL = "https://www.gstatic.com/generate_204"
@@ -57,7 +63,7 @@ class ClashUnreachable(RuntimeError):
 
 def _selector() -> dict:
     try:
-        r = requests.get(f"{CLASH_API}/proxies/proxy", headers=hdr(), timeout=10)
+        r = requests.get(f"{CLASH_API}/proxies/{SELECTOR}", headers=hdr(), timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -73,7 +79,7 @@ def current() -> str:
 
 
 def switch(node: str) -> bool:
-    r = requests.put(f"{CLASH_API}/proxies/proxy", json={"name": node},
+    r = requests.put(f"{CLASH_API}/proxies/{SELECTOR}", json={"name": node},
                      headers=hdr(), timeout=10)
     return r.status_code == 204
 
@@ -118,12 +124,12 @@ def journal(since: str, pattern: str) -> list[str]:
         return []
 
 
-# ============= 1. 7890 端口正常性 =============
+# ============= 1. 混合端口正常性 =============
 def verify_port():
-    print("\n[1] 7890 端口正常性")
+    print(f"\n[1] {MIXED_PORT} 端口正常性")
     r = subprocess.run(["ss", "-ltn"], capture_output=True, text=True)
-    check("7890 监听中", ":7890" in r.stdout)
-    check("9090 Clash API 监听中", ":9090" in r.stdout)
+    check(f"{MIXED_PORT} 监听中", f":{MIXED_PORT}" in r.stdout)
+    check(f"{CLASH_PORT} Clash API 监听中", f":{CLASH_PORT}" in r.stdout)
 
     proc = subprocess.run(["pgrep", "-x", "sing-box"], capture_output=True, text=True)
     check("sing-box 进程存活", bool(proc.stdout.strip()))
@@ -136,18 +142,18 @@ def verify_port():
                           "https://api.github.com"]),
     ]:
         code = curl(args, timeout=15)
-        check(f"{label} 经 7890 可用", code in ("200", "204"), f"HTTP {code}")
+        check(f"{label} 经 {MIXED_PORT} 可用", code in ("200", "204"), f"HTTP {code}")
 
     dn = curl(["-x", PROXY, "https://1.1.1.1/dns-query?name=example.com&type=A",
                "-H", "accept: application/dns-json"], timeout=12)
-    check("DNS over 7890 解析正常", dn.startswith("{") and '"Status":0' in dn, dn[:60])
+    check(f"DNS over {MIXED_PORT} 解析正常", dn.startswith("{") and '"Status":0' in dn, dn[:60])
 
     size = curl(["-x", PROXY, "-o", "/dev/null", "-w", "%{http_code} %{size_download}",
                  "https://speed.cloudflare.com/__down?bytes=100000"], timeout=25)
-    check("大文件传输经 7890 正常", size.startswith("200"), size)
+    check(f"大文件传输经 {MIXED_PORT} 正常", size.startswith("200"), size)
 
     code = curl(["-o", "/dev/null", "-w", "%{http_code}",
-                 "http://127.0.0.1:20127/v1/models"], timeout=8)
+                 f"{NINE_ROUTER_BASE}/v1/models"], timeout=8)
     check("9router 网关可达", code == "200", f"HTTP {code}")
 
 
@@ -210,12 +216,10 @@ def verify_reasonableness(all_nodes: list[str], quick: bool):
     print("\n[3] 切换合理性")
 
     # 3.1 轮换节律符合配置
-    import config
-    want = config.CFG["intervals"]["proactive_rotate_sec"]
+    want = CFG["intervals"]["proactive_rotate_sec"]
     lines = journal("30 minutes ago", "主动轮换")
     ts = [re.search(r"\[([\d-]+ [\d:]+)\]", l) for l in lines]
     stamps = []
-    from datetime import datetime
     for m in ts:
         if m:
             try:

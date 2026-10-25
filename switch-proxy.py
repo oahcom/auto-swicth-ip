@@ -10,57 +10,77 @@ switch-proxy — 快速切换 sing-box 代理节点
   switch-proxy goto <name>  # 切到指定节点（支持模糊匹配）
   switch-proxy status       # 详细状态（含 9router 代理指向）
 """
-import os
+import logging
 import random
 import sys
 import time
-import logging
 
 import requests
 
-logger = logging.getLogger(__name__)
-
-# ============= 配置 =============
 from config import CFG, get_singbox_secret
 
-CLASH_API = CFG["singbox"]["clash_api"]
+logger = logging.getLogger(__name__)
+
+CLASH_API = CFG["singbox"]["clash_api"].rstrip("/")
 SELECTOR = CFG["singbox"]["selector"]
 TIMEOUT = 3
 
 
-def _headers():
-    return {"Authorization": "Bearer " + get_singbox_secret(), "Content-Type": "application/json"}
+def _headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {get_singbox_secret()}",
+        "Content-Type": "application/json",
+    }
 
 
-def get_nodes():
+def _selector_url() -> str:
+    return f"{CLASH_API}/proxies/{SELECTOR}"
+
+
+def get_nodes() -> tuple[str | None, list[str]]:
+    """返回 (当前节点, 全部节点)；sing-box 不可达时返回 (None, [])。"""
     try:
-        r = requests.get(
-            CLASH_API + "/proxies/" + SELECTOR,
-            headers={"Authorization": "Bearer " + get_singbox_secret()},
-            timeout=TIMEOUT,
-        )
+        r = requests.get(_selector_url(), headers=_headers(), timeout=TIMEOUT)
         if r.status_code == 200:
-            d = r.json()
-            return d.get("now", "?"), d.get("all", [])
+            data = r.json()
+            return data.get("now", "?"), data.get("all", [])
     except Exception as e:
         logger.warning("get_nodes 失败 (sing-box 可能不可达/密钥失效/非JSON响应): %s", e)
     return None, []
 
 
-def get_9router_proxy():
+def get_9router_proxy() -> tuple[bool | None, str]:
+    """返回 (outboundProxyEnabled, outboundProxyUrl)；9router 不可达时 (None, "N/A")。"""
     try:
-        r = requests.get(CFG["9router"]["base"] + "/api/settings", timeout=3)
+        r = requests.get(
+            f"{CFG['9router']['base'].rstrip('/')}/api/settings", timeout=TIMEOUT
+        )
         if r.status_code == 200:
-            d = r.json()
-            return d.get("outboundProxyEnabled", False), d.get("outboundProxyUrl", "N/A")
+            data = r.json()
+            return data.get("outboundProxyEnabled", False), data.get("outboundProxyUrl", "N/A")
     except Exception as e:
         logger.warning("get_9router_proxy 失败 (9router 不可达?): %s", e)
     return None, "N/A"
 
 
+def _switch_to(node: str) -> bool:
+    """PUT selector；成功返回 True，网络/HTTP 失败返回 False。"""
+    try:
+        r = requests.put(
+            _selector_url(),
+            headers=_headers(),
+            json={"name": node},
+            timeout=TIMEOUT,
+        )
+        return r.status_code in (200, 204)
+    except Exception as e:
+        logger.warning("切换到 %s 失败: %s", node, e)
+        return False
+
+
 # ============= 子命令 =============
-def cmd_report(window_min: int = 60):
-    """展示过去 window_min 内各出口节点的请求成功率（轮换效果）"""
+def cmd_report(window_min: int = 60) -> int:
+    """展示过去 window_min 内各出口节点的请求成功率（轮换效果）。"""
     try:
         import daemon as _daemon  # noqa: E402 (late import breaks CLI↔daemon cycle)
         rates = _daemon.get_per_egress_error_rate(window_min=window_min)
@@ -73,21 +93,20 @@ def cmd_report(window_min: int = 60):
         # 读它记录的失败原因，把二者分开报告 —— 避免把查询故障误读成"daemon 没切换"。
         err = _daemon.get_last_egress_error()
         if err:
-            print("  (归因查询失败: %s)" % err)
+            print(f"  (归因查询失败: {err})")
             return 2          # 数据不可信，与"确实无数据"区分
         print("  (暂无出口归因记录 — daemon 可能未在日志周期内切换)")
         return 0
-    print("=== 轮换效果 (最近 %d 分钟 per-egress 成功率) ===" % window_min)
+    print(f"=== 轮换效果 (最近 {window_min} 分钟 per-egress 成功率) ===")
     # rate 是错误率；表头/柱子讲的是成功率，所以按 rate 升序（成功率降序）
-    rows = sorted(rates.items(), key=lambda kv: kv[1][2])
-    for node, (total, errs, rate) in rows:
+    for node, (total, errs, rate) in sorted(rates.items(), key=lambda kv: kv[1][2]):
         ok_pct = (1 - rate) * 100
         bar = "#" * round((1 - rate) * 20)
-        print("  %-38s %4d/%-4d ok  %5.1f%%  |%s" % (node, total - errs, total, ok_pct, bar))
+        print(f"  {node:<38} {total - errs:>4}/{total:<4} ok  {ok_pct:>5.1f}%  |{bar}")
     return 0
 
 
-def cmd_status():
+def cmd_status() -> int:
     current, nodes = get_nodes()
     if current is None:
         print("sing-box 连接失败")
@@ -95,64 +114,52 @@ def cmd_status():
     enabled, url = get_9router_proxy()
     label = "开启" if enabled else "关闭"
     print("=== 代理状态 ===")
-    print("  节点:        " + current)
-    print("  可用节点:    " + str(len(nodes)))
-    print("  9router代理: " + label + " -> " + url)
+    print(f"  节点:        {current}")
+    print(f"  可用节点:    {len(nodes)}")
+    print(f"  9router代理: {label} -> {url}")
     return 0
 
 
-def cmd_list():
+def cmd_list() -> int:
     current, nodes = get_nodes()
     if current is None:
         print("sing-box 连接失败")
         return 1
-    print("=== 可用节点 (" + str(len(nodes)) + "个) ===")
+    print(f"=== 可用节点 ({len(nodes)}个) ===")
     for i, node in enumerate(nodes):
         mark = " <-- 当前" if node == current else ""
         tag = " [anytls]" if node.endswith("-any") else ""
-        print("  %2d. %s%s%s" % (i + 1, node, tag, mark))
+        print(f"  {i + 1:>2}. {node}{tag}{mark}")
     return 0
 
 
-def cmd_next(count=1):
+def cmd_next(count: int = 1) -> int:
     if count < 1:
         print("count 必须是正整数")
         return 1
     for i in range(count):
         current, nodes = get_nodes()
         if current is None:
-            print("第" + str(i + 1) + "次切换失败")
+            print(f"第{i + 1}次切换失败")
             return 1
         candidates = [n for n in nodes if n != current and n != "direct"]
         if not candidates:
             print("没有其他可用节点")
             return 1
         new_node = random.choice(candidates)
-        try:
-            r = requests.put(
-                CLASH_API + "/proxies/" + SELECTOR,
-                headers=_headers(),
-                json={"name": new_node},
-                timeout=TIMEOUT,
-            )
-            ok = r.status_code in (200, 204)
-        except Exception as e:
-            logger.warning("cmd_next PUT 失败: %s", e)
-            ok = False
-        if ok:
-            if count == 1:
-                print(current + " -> " + new_node)
-            else:
-                print("  [%d/%d] %s -> %s" % (i + 1, count, current, new_node))
-            if i < count - 1:
-                time.sleep(0.5)
-        else:
-            print("第" + str(i + 1) + "次切换失败")
+        if not _switch_to(new_node):
+            print(f"第{i + 1}次切换失败")
             return 1
+        if count == 1:
+            print(f"{current} -> {new_node}")
+        else:
+            print(f"  [{i + 1}/{count}] {current} -> {new_node}")
+        if i < count - 1:
+            time.sleep(0.5)
     return 0
 
 
-def cmd_goto(name):
+def cmd_goto(name: str) -> int:
     current, nodes = get_nodes()
     if current is None:
         print("sing-box 连接失败")
@@ -165,71 +172,58 @@ def cmd_goto(name):
         if len(matches) == 1:
             name = matches[0]
         elif len(matches) > 1:
-            print("'%s' 匹配到多个:" % name)
+            print(f"'{name}' 匹配到多个:")
             for m in matches:
-                print("  " + m)
+                print(f"  {m}")
             return 1
         else:
-            print("节点 '%s' 不存在, 用 list 查看" % name)
+            print(f"节点 '{name}' 不存在, 用 list 查看")
             return 1
-    try:
-        r = requests.put(
-            CLASH_API + "/proxies/" + SELECTOR,
-            headers=_headers(),
-            json={"name": name},
-            timeout=TIMEOUT,
-        )
-        ok = r.status_code in (200, 204)
-    except Exception as e:
-        logger.warning("cmd_goto PUT 失败: %s", e)
-        ok = False
-    if ok:
-        print(current + " -> " + name)
-        return 0
-    else:
+    if not _switch_to(name):
         print("切换失败")
         return 1
+    print(f"{current} -> {name}")
+    return 0
 
 
 # ============= 入口 =============
-def main():
+def main() -> int:
     args = sys.argv[1:]
     if not args:
         return cmd_status()
     cmd = args[0].lower()
     if cmd in ("status", "s"):
         return cmd_status()
-    elif cmd in ("list", "ls", "l"):
+    if cmd in ("list", "ls", "l"):
         return cmd_list()
-    elif cmd in ("next", "n", "switch", "sw"):
+    if cmd in ("next", "n", "switch", "sw"):
         try:
             count = int(args[1]) if len(args) > 1 else 1
         except ValueError:
             print("count 必须是整数")
             return 1
         return cmd_next(count)
-    elif cmd in ("report", "rpt", "r"):
+    if cmd in ("report", "rpt", "r"):
         try:
-            w = int(args[1]) if len(args) > 1 else 60
+            window = int(args[1]) if len(args) > 1 else 60
         except ValueError:
             print("窗口分钟数必须是整数 (默认 60)")
             return 1
-        if w < 1:
+        if window < 1:
             # 负数会让 cutoff 落到未来 → 空结果，被误读成"daemon 没切换"
-            print("窗口分钟数必须 ≥ 1 (收到 %d)" % w)
+            print(f"窗口分钟数必须 ≥ 1 (收到 {window})")
             return 1
-        return cmd_report(w)
-    elif cmd in ("goto", "go", "g"):
+        return cmd_report(window)
+    if cmd in ("goto", "go", "g"):
         if len(args) < 2:
             print("用法: switch-proxy goto <节点名>")
             return 1
         return cmd_goto(args[1])
-    elif cmd in ("help", "h"):
+    if cmd in ("help", "h"):
         print(__doc__)
         return 0
-    else:
-        print("未知指令 '%s' — 用法: switch-proxy goto <节点名>  或输入 help 查看帮助" % cmd)
-        return 1
+    print(f"未知指令 '{cmd}' — 用法: switch-proxy goto <节点名>  或输入 help 查看帮助")
+    return 1
 
 
 if __name__ == "__main__":

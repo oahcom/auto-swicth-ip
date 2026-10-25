@@ -11,12 +11,16 @@
 import json
 import os
 import sqlite3
+import tempfile
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
+import config
 import daemon
 
 
@@ -40,6 +44,10 @@ def _isolate_production_files(tmp_path, monkeypatch):
     # warp_ip_history：_mark_warp_ip_used 会追加历史，不隔离则桩地址写进生产
     # .warp_ip_history.jsonl —— 该文件永不清理，污染是永久的。
     monkeypatch.setenv("WARP_IP_HISTORY_FILE_PATH", str(tmp_path / "warp_ip_history.jsonl"))
+    # node_ip_used：_record_node_ip_used 会落盘，不隔离则桩地址写进生产
+    # .node_ip_used.json，下次真实 restart 时把生产节点误判为「6h 内用过」。
+    monkeypatch.setenv("NODE_IP_USED_FILE_PATH", str(tmp_path / "node_ip_used.json"))
+    monkeypatch.setattr(daemon, "_NODE_IP_USED", {})
     # proxy_fallback：落池成功会落盘，不隔离则测试会写生产文件、且下一次
     # 测试会读到真实落池时刻而误入冷却。
     monkeypatch.setenv("WARP_PROXY_FALLBACK_FILE_PATH", str(tmp_path / "proxy_fallback.json"))
@@ -3766,3 +3774,167 @@ def test_exclude_active_ip_falls_back_when_all_filtered():
     """全被滤空时退回原列表：宁可换到旧地址，也不能因此落轮换池（3h 冷却）。"""
     pairs = [({"tag": "A"}, "1.1.1.1")]
     assert daemon._exclude_active_ip(pairs, "1.1.1.1") == pairs
+
+
+# ============= blind 模式（observe_9router=false，纯时间轮换） =============
+
+def test_observe_9router_toggle(monkeypatch):
+    """开关三态：缺 key 默认开、显式 true/false 生效。"""
+    assert daemon._observe_9router() is True
+    monkeypatch.setitem(daemon.CFG, "traffic", {"observe_9router": False})
+    assert daemon._observe_9router() is False
+    monkeypatch.setitem(daemon.CFG, "traffic", {})
+    assert daemon._observe_9router() is True, "缺 observe_9router 键应视为开启"
+
+
+def test_proactive_mode_forced_fixed_when_observe_off(monkeypatch):
+    """blind 模式强制 fixed：requests 判据要查 usageHistory，无数据=永不换线。
+
+    config 里 proactive_mode=requests 时，blind 模式必须无视它 —— 要么退化为
+    永不主动换线（计数恒 0），要么每 tick 查一次空库，两者都不对。
+    """
+    fired = _proactive_mode_env(monkeypatch, "requests")
+    monkeypatch.setitem(daemon.CFG, "traffic", {"observe_9router": False})
+    monkeypatch.setattr(daemon, "count_dsv4_ok_since",
+                        lambda ts: (_ for _ in ()).throw(
+                            AssertionError("blind 模式不得查 usageHistory")))
+    daemon._maybe_proactively_rotate_warp(1100.0)   # 100s ≥ 57s
+    assert len(fired) == 1 and "固定" in fired[0], \
+        f"blind 强制 fixed 时间轮换，实际 {fired}"
+
+
+def test_prewarm_skips_opencode_count_when_observe_off(monkeypatch):
+    """blind 模式下预热不等流量闸门：流量不经 9router，计数恒 0。
+
+    若照搬「count_opencode_since==0 就跳过」，9router 之外的流量会被当成
+    「没人用」，备线永远不预热，换线候选全是旧会话。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG, "traffic", {"observe_9router": False})
+    monkeypatch.setattr(daemon, "_last_warp_prewarm_ts", 0.0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {"W2": {"sel": 1.0, "ip": "ip-w2"}})
+    monkeypatch.setattr(daemon, "_warp_ip_recently_used", lambda ip, now: True)
+    monkeypatch.setattr(daemon, "count_opencode_since",
+                        lambda ts: (_ for _ in ()).throw(
+                            AssertionError("blind 模式不得查 requestDetails")))
+    scheduled = []
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh",
+                        lambda m: scheduled.append(m["tag"]))
+
+    daemon._prewarm_standby_warp(1000.0)
+    assert scheduled == ["W2"], f"blind 下预热照常执行，实际 {scheduled}"
+
+
+def test_failback_skips_blocked_counts_when_observe_off(monkeypatch):
+    """blind 模式回切只看池探测/黑名单占比，不数落池后的 403/429（无数据）。"""
+    thr = daemon.CFG["intervals"]["proxy_blocked_threshold"]
+    called = _failback_env(monkeypatch, healthy=True, blocked=(thr, 0))
+    monkeypatch.setitem(daemon.CFG, "traffic", {"observe_9router": False})
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts, limit=None: (_ for _ in ()).throw(
+                            AssertionError("blind 模式不得查 requestDetails")))
+    assert daemon._maybe_failback_to_warp(1e6) is False, \
+        "blind 下判据 2 无数据，池健康+黑名单低时不得回切"
+
+
+def test_record_node_ip_used_persists_and_reload(monkeypatch):
+    """台账写 → 落盘 → 清内存 → 重载，一条链路。"""
+    with tempfile.TemporaryDirectory() as d:
+        monkeypatch.setenv("NODE_IP_USED_FILE_PATH", str(Path(d) / "n.json"))
+        ts = time.time() - 100.0    # 台账落盘会裁掉窗口外条目，用近期时刻
+        daemon._record_node_ip_used("1.2.3.4", ts=ts)
+        monkeypatch.setattr(daemon, "_NODE_IP_USED", {})          # 模拟重启清内存
+        daemon._load_node_ip_used()
+        assert daemon._NODE_IP_USED.get("1.2.3.4") == ts
+        # 空 ip / None 不打点不应炸
+        daemon._record_node_ip_used(None)
+
+
+def test_skip_recent_node_ips_blind_uses_6h_window(monkeypatch):
+    """blind 模式脏 IP 避让：窗口内用过的跳过、过期的放行、无历史 IP 的放行。"""
+    now = 10000.0
+    monkeypatch.setitem(daemon.CFG, "traffic",
+                        {"observe_9router": False, "ip_reuse_window_sec": 21600})
+    monkeypatch.setattr(daemon, "_NODE_IP_USED",
+                        {"fresh-ip": now - 100.0, "old-ip": now - 65000.0})
+    skip = daemon._skip_recent_node_ips(
+        ["n-hot", "n-cold", "n-new"], {"n-hot": "fresh-ip", "n-cold": "old-ip"}, now=now)
+    assert skip == {"n-hot"}, f"6h 内用过的 n-hot 应跳过，过期的 n-cold 放行，实际 {skip}"
+
+
+def test_skip_recent_node_ips_noop_when_observe_on(monkeypatch):
+    """traffic-aware 模式不做时间维度避让：那里有实时错误信号验 IP。"""
+    now = 10000.0
+    monkeypatch.setattr(daemon, "_NODE_IP_USED", {"fresh-ip": now - 1.0})
+    assert daemon._skip_recent_node_ips(["n1"], {"n1": "fresh-ip"}, now=now) == set()
+
+
+def test_skip_recent_node_ips_window_zero_disables(monkeypatch):
+    """ip_reuse_window_sec=0 显式关闭（默认仍开）。"""
+    now = 10000.0
+    monkeypatch.setitem(daemon.CFG, "traffic",
+                        {"observe_9router": False, "ip_reuse_window_sec": 0})
+    monkeypatch.setattr(daemon, "_NODE_IP_USED", {"fresh-ip": now - 1.0})
+    assert daemon._skip_recent_node_ips(["n1"], {"n1": "fresh-ip"}, now=now) == set()
+
+
+def test_pick_next_node_respects_dirty_ip_skip(monkeypatch):
+    """集成：两个候选里脏 IP 节点被避让，切到干净的。"""
+    now = time.time()
+    _warp_env(monkeypatch, WARP_TWO)   # 复用现有 env 桩（节点/池/DB 假装可用）
+    monkeypatch.setitem(daemon.CFG, "traffic",
+                        {"observe_9router": False, "ip_reuse_window_sec": 21600})
+    monkeypatch.setattr(daemon, "_NODE_IP_USED", {"dirty-ip": now - 60.0})
+    monkeypatch.setattr(daemon, "_filter_candidates",
+                        lambda cur, all_nodes, fail: ["n1", "n2"])
+    monkeypatch.setattr(daemon, "_load_candidate_stats",
+                        lambda cands: ({}, {"n1": "dirty-ip", "n2": "clean-ip"}))
+    monkeypatch.setattr(daemon, "test_node_quick", lambda n, timeout_ms: True)
+    monkeypatch.setattr(daemon, "_recent_nodes", deque())
+    chosen = daemon.pick_next_node("", [], set(), count_call=False)
+    assert chosen == "n2", f"脏 IP 节点 n1 应被避让选 n2，实际 {chosen}"
+
+
+# ============= 按时间换线的进度标注（间隔 + 下次换线时刻） =============
+
+def test_warp_fixed_progress_marks_interval_and_next_due(monkeypatch):
+    """WARP fixed 判据的进度标签必须自带换线间隔与下次换线时刻。
+
+    blind 模式下健康摘要是运维唯一的时间线来源，标签缺间隔或下次时刻就
+    要回去翻 config 才知道多久换一次。
+    """
+    fired = _proactive_mode_env(monkeypatch, "fixed")
+    daemon._maybe_proactively_rotate_warp(1055.0)      # 55s < 57s：只刷标签
+    assert fired == [], "未到间隔不该换线，先把标签看清"
+    label = daemon._proactive_progress
+    assert "间隔60s" in label, f"标签需标换线间隔（配置值），实际 {label!r}"
+    assert "已55s" in label, f"标签需标已过时长，实际 {label!r}"
+    assert "下次≈" in label, f"标签需标下次换线时刻，实际 {label!r}"
+
+
+def test_pool_proactive_label_marks_interval_and_next_due():
+    """池侧定时轮换标签：间隔、已过时长、下次换线时刻三件套齐全。"""
+    label = daemon._pool_proactive_label(1000.0, last_rotate=970.0, rotate_gap=60.0)
+    assert "间隔60s" in label, f"标签需标换线间隔，实际 {label!r}"
+    assert "已过30s" in label, f"标签需标已过时长，实际 {label!r}"
+    assert "下次≈" in label, f"标签需标下次换线时刻，实际 {label!r}"
+
+
+def test_pool_proactive_label_cold_start_counts_from_next_due():
+    """刚启动（还没换过线，last_rotate=0）不得打出 5 位数的已过秒数。"""
+    label = daemon._pool_proactive_label(1000.0, last_rotate=0.0, rotate_gap=60.0)
+    assert "已过60s" in label, f"基准应退到 now − 间隔，实际 {label!r}"
+
+
+def test_env_bool_parses_observe_override(monkeypatch):
+    """ASIP_OBSERVE_9ROUTER：未设走默认，true/1/ON 为真，false 为假。"""
+    monkeypatch.delenv("ASIP_OBSERVE_9ROUTER", raising=False)
+    assert config._env_bool("ASIP_OBSERVE_9ROUTER", True) is True, "未设应走默认"
+    monkeypatch.setenv("ASIP_OBSERVE_9ROUTER", "false")
+    assert config._env_bool("ASIP_OBSERVE_9ROUTER", True) is False, "false 应关"
+    monkeypatch.setenv("ASIP_OBSERVE_9ROUTER", "1")
+    assert config._env_bool("ASIP_OBSERVE_9ROUTER", False) is True, "1 应开"
+    monkeypatch.setenv("ASIP_OBSERVE_9ROUTER", "  ")
+    assert config._env_bool("ASIP_OBSERVE_9ROUTER", True) is True, "空串应走默认"

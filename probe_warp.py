@@ -11,17 +11,30 @@
 
 背景：主动轮换此前是盲切（config.warp 注释），因为直连上游会被 403
 FreeTierError 拒掉。实测定位到唯一门控项是请求体里 `read`/`shell` 两个工具
-的逐字定义（消融：含工具 200 / 去工具 403，system 提示无关）。定义抄自
-9router 的 open-sse/utils/opencodeFingerprint.js，此处冻结为常量。
+的逐字定义（消融：含工具 200 / 去工具 403），以及系统提示里的 `<env>` 块和
+**TLS 栈**：同一出口、同一分钟、同一份 body，Bun 200 / curl 429（9router
+commit bfd5ad66 实测）。因此请求必须走 Bun 的 HTTP 栈，不能用 curl。
+
+per-tunnel 是 SOCKS5（1080-1099），Bun fetch 只认 HTTP 代理，故每次探测先在
+本地起一个 CONNECT→SOCKS5 的桥（probe_fetch.mjs 负责 Bun 侧）。会话按「端口」
+稳定复用（9router 的 stable session 语义，TTL 2h），遇到 quota 才换一代重试一次
+（对应 opencode.js 的 rotateSession + 一次重试）。会话表落 `.probe_sessions.json`。
 """
 import argparse
+import glob
 import hashlib
 import json
 import os
+import pwd
 import secrets
+import shutil
+import socket
+import socketserver
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from config import CFG
@@ -34,6 +47,15 @@ UA = "opencode/latest/2.0.26/cli"
 FREEMODEL = "deepseek-v4.1-flash-free"
 URL = "https://opencode.ai/inference/v1/chat/completions"
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+ENV_MARKER = ("<env>\n"
+              "  Working directory: /workspace\n"
+              "  Workspace root folder: /workspace\n"
+              "</env>")
+BUN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_fetch.mjs")
+SESSION_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  ".probe_sessions.json")
+SESSION_TTL_SEC = 2 * 60 * 60
+ROTATE_DELAY_SEC = 1.5
 _B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _MASK48 = (1 << 48) - 1
 
@@ -106,6 +128,89 @@ def _session_id() -> str:
     return "ses_" + format(prefix, "012x") + "".join(secrets.choice(_B62) for _ in range(14))
 
 
+_SESS_LOCK = threading.Lock()
+
+
+def _load_sessions() -> dict:
+    try:
+        with open(SESSION_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_sessions(data: dict) -> None:
+    directory = os.path.dirname(SESSION_STATE_FILE) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".probe_sessions_", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, SESSION_STATE_FILE)
+    except OSError as e:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        print(f"⚠ 会话表写入失败: {e}", file=sys.stderr)
+
+
+def _session_for(port: int, rotate: bool = False) -> str:
+    """一条隧道一个稳定会话，TTL 2h（对齐 9router stableSessionId）。
+
+    新会话只在首次、过期或 quota 轮换时生成。每请求换会话会白烧配额，
+    且上游会按会话前缀的时钟拒收旧 id —— 所以不能长期复用，必须带 TTL。
+    """
+    now = time.time()
+    key = str(port)
+    with _SESS_LOCK:
+        data = _load_sessions()
+        entry = data.get(key)
+        if not isinstance(entry, dict):
+            entry = None
+        expired = entry is None or now - float(entry.get("ts") or 0) > SESSION_TTL_SEC
+        if rotate or expired:
+            if rotate and entry is not None and not expired:
+                rotations = int(entry.get("rotations") or 0) + 1
+            else:
+                rotations = 0
+            entry = {"session": _session_id(), "ts": now, "rotations": rotations}
+            data[key] = entry
+            _save_sessions(data)
+        return entry["session"]
+
+
+def _apply_env_marker(body: dict) -> dict:
+    """Mirror opencodeFingerprint.js applyFingerprintSystemPrompt for messages bodies.
+
+    The upstream free lane rejects a request whose system prompt lacks the full
+    workspace block (workdir AND root). 9router appends/upgrades it in place; the
+    probe has to send the exact same shape or it measures the wrong thing.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    first = messages[0] if messages else None
+    if isinstance(first, dict) and first.get("role") == "system":
+        content = first.get("content")
+        if isinstance(content, str):
+            if ENV_MARKER not in content:
+                merged = f"{content}\n\n{ENV_MARKER}" if content.strip() else ENV_MARKER
+                messages[0] = {**first, "content": merged}
+            return body
+        if isinstance(content, list):
+            marked = any(isinstance(part, dict) and ENV_MARKER in (part.get("text") or "")
+                         for part in content)
+            if not marked:
+                messages[0] = {**first, "content": [*content,
+                                                    {"type": "text", "text": ENV_MARKER}]}
+            return body
+    body["messages"] = [{"role": "system", "content": ENV_MARKER}, *messages]
+    return body
+
+
 def _headers(sid: str) -> dict:
     proj = _derive_project_id(sid)
     trace = _build_trace_headers()
@@ -126,18 +231,19 @@ def _headers(sid: str) -> dict:
 
 
 def _body() -> dict:
-    return {
+    body = {
         "model": FREEMODEL,
         "messages": [{"role": "user", "content": "say ok"}],
         "stream": True,
         "tools": FINGERPRINT_TOOLS,
     }
+    return _apply_env_marker(body)
 
 
-# 走 SOCKS 必须用 curl，不能用 requests：daemon 跑在 systemd 的 env python3
-# （/usr/bin/python3.12），该解释器没有 PySocks，requests 遇 socks5h:// 会立刻
-# 抛 InvalidSchema（实测耗时 0.0s，根本没发包），100% 被判 unreachable。
-# curl --socks5-hostname 是 daemon.warp_egress_ip 同款通道。
+# egress_ip 仍用 curl：Cloudflare trace 不校 TLS 指纹。模型层请求不能走 curl：
+# 同一出口、同一分钟、同一份 body，Bun 200 / curl 429（9router bfd5ad66）。
+# daemon 跑在 systemd 的 /usr/bin/python3，没有 PySocks，requests 遇 socks5h://
+# 会立刻 InvalidSchema；curl --socks5-hostname 只留给出口 IP 探测。
 
 def _socks(port: int) -> list[str]:
     return ["--socks5-hostname", f"127.0.0.1:{port}"]
@@ -156,6 +262,187 @@ def egress_ip(port: int, timeout: float = 10.0) -> str:
     return "?"
 
 
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("socks connection closed")
+        buf += chunk
+    return buf
+
+
+def _socks5_connect(socks_port: int, host: str, port: int, timeout: float = 15.0) -> socket.socket:
+    s = socket.create_connection(("127.0.0.1", socks_port), timeout=timeout)
+    try:
+        s.settimeout(30)
+        s.sendall(b"\x05\x01\x00")
+        if _recv_exact(s, 2) != b"\x05\x00":
+            raise OSError("socks auth rejected")
+        name = host.encode("idna")
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + struct.pack("!H", port))
+        reply = _recv_exact(s, 4)
+        if reply[1] != 0:
+            raise OSError(f"socks connect failed ({reply[1]})")
+        atyp = reply[3]
+        if atyp == 1:
+            _recv_exact(s, 4)
+        elif atyp == 4:
+            _recv_exact(s, 16)
+        elif atyp == 3:
+            _recv_exact(s, _recv_exact(s, 1)[0])
+        else:
+            raise OSError(f"socks bad address type {atyp}")
+        _recv_exact(s, 2)
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
+def _pump(src: socket.socket, dst: socket.socket) -> None:
+    try:
+        while True:
+            chunk = src.recv(65536)
+            if not chunk:
+                break
+            dst.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+class _BridgeHandler(socketserver.BaseRequestHandler):
+    """Minimal HTTP CONNECT proxy that dials through the tunnel's SOCKS5 port."""
+
+    def handle(self) -> None:
+        self.request.settimeout(30)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.request.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            if len(buf) > 16384:
+                return
+        parts = buf.split(b"\r\n", 1)[0].decode("latin1").split()
+        if len(parts) < 2 or parts[0] != "CONNECT" or ":" not in parts[1]:
+            self.request.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+            return
+        host, _, port_text = parts[1].rpartition(":")
+        upstream = None
+        established = False
+        try:
+            upstream = _socks5_connect(self.server.socks_port, host, int(port_text))
+            self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            established = True
+            back = threading.Thread(target=_pump, args=(self.request, upstream), daemon=True)
+            back.start()
+            _pump(upstream, self.request)
+            back.join(timeout=5)
+        except Exception:
+            if not established:
+                try:
+                    self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                except OSError:
+                    pass
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+
+class _SocksBridge(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, socks_port: int):
+        self.socks_port = socks_port
+        super().__init__(("127.0.0.1", 0), _BridgeHandler)
+
+
+class _LocalBridge:
+    """Run the CONNECT bridge for the duration of one probe."""
+
+    def __init__(self, socks_port: int):
+        self._socks_port = socks_port
+        self._server: _SocksBridge | None = None
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> str:
+        self._server = _SocksBridge(self._socks_port)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def __exit__(self, *exc_info) -> bool:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        return False
+
+
+def _bun_bin() -> str | None:
+    """Bun binary: env override → PATH → ~/.bun → nvm (systemd PATH has no nvm)."""
+    for name in ("PROBE_BUN_BIN", "OPENCODE_BUN_BIN"):
+        value = os.environ.get(name)
+        if value and os.path.exists(value):
+            return value
+    found = shutil.which("bun")
+    if found:
+        return found
+    homes = {os.path.expanduser("~"), pwd.getpwuid(os.getuid()).pw_dir}
+    for home in homes:
+        for pattern in (".bun/bin/bun", ".nvm/versions/node/*/bin/bun"):
+            hits = sorted(glob.glob(os.path.join(home, pattern)))
+            if hits:
+                return hits[-1]
+    return None
+
+
+def _bun_probe(bun: str, proxy_url: str, sid: str,
+               timeout: float) -> tuple[int | None, str, str | None]:
+    payload = {
+        "url": URL,
+        "method": "POST",
+        "headers": _headers(sid),
+        "body": json.dumps(_body()),
+        "proxy": proxy_url,
+        "timeoutMs": int(timeout * 1000),
+    }
+    fd, path = tempfile.mkstemp(prefix="probe_job_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        r = subprocess.run([bun, BUN_SCRIPT, path], capture_output=True, text=True,
+                           timeout=timeout + 5)
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or "").strip().splitlines()
+            return None, "", (detail[-1] if detail else f"bun rc={r.returncode}")[:120]
+        lines = [line for line in r.stdout.splitlines() if line.strip()]
+        if not lines:
+            return None, "", "bun produced no output"
+        data = json.loads(lines[-1])
+        if data.get("error"):
+            return None, "", str(data["error"])[:120]
+        return int(data["status"]), str(data.get("head") or ""), None
+    except Exception as e:
+        return None, "", f"{type(e).__name__}: {e}"[:120]
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def classify(status: int | None, head: str) -> str:
     if "abusive traffic" in head or "FreeTierError" in head:
         return "flagged"     # 出口 IP 信誉被拉黑 → 换线有效
@@ -169,32 +456,28 @@ def classify(status: int | None, head: str) -> str:
 
 def probe(port: int, timeout: float) -> tuple[str, float, str]:
     t0 = time.time()
-    fd, path = tempfile.mkstemp(prefix="probe_warp_")
-    os.close(fd)
+    bun = _bun_bin()
+    if not bun:
+        return "unreachable", 0.0, "bun not found (set PROBE_BUN_BIN)"
     try:
-        hdr: list[str] = []
-        for k, v in _headers(_session_id()).items():
-            hdr += ["-H", f"{k}: {v}"]
-        r = subprocess.run(
-            ["curl", "-s", "--max-time", str(timeout), *_socks(port),
-             "-X", "POST", URL, *hdr,
-             "--data-binary", json.dumps(_body()),
-             "-o", path, "-w", "%{http_code}"],
-            capture_output=True, timeout=timeout + 5)
-        status = int(r.stdout.decode("ascii", "replace") or 0) or None
-        if r.returncode != 0 or status is None:
-            # curl 代理握手/连不上（rc=97 等）→ 隧道真不可用，非 429
-            return "unreachable", round(time.time() - t0, 1), f"curl rc={r.returncode}"
-        with open(path, "rb") as f:
-            head = f.read(256).decode("utf-8", "replace")
-        return classify(status, head), round(time.time() - t0, 1), head.strip()[:100]
+        with _LocalBridge(port) as proxy_url:
+            session = _session_for(port)
+            status, head, err = _bun_probe(bun, proxy_url, session, timeout)
+            if err is not None:
+                return "unreachable", round(time.time() - t0, 1), f"bun: {err}"[:100]
+            verdict = classify(status, head)
+            if verdict != "quota":
+                return verdict, round(time.time() - t0, 1), head.strip()[:100]
+            # quota 可能是会话级（9router 实测轮换 epoch 能恢复），换一代再试一次；
+            # 仍是 quota 才算出口级。对齐 opencode.js 的 rotateSession + 一次重试。
+            session = _session_for(port, rotate=True)
+            time.sleep(ROTATE_DELAY_SEC)
+            status, head, err = _bun_probe(bun, proxy_url, session, timeout)
+            if err is not None:
+                return "unreachable", round(time.time() - t0, 1), f"bun(retry): {err}"[:100]
+            return classify(status, head), round(time.time() - t0, 1), head.strip()[:100]
     except Exception as e:
         return "unreachable", round(time.time() - t0, 1), f"{type(e).__name__}: {e}"[:100]
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
 
 
 def check_fingerprint() -> int:
@@ -208,6 +491,16 @@ def check_fingerprint() -> int:
         print(f"✗ 未找到 9router 源码: {src}")
         return 1
     text = open(src, encoding="utf-8").read()
+    # <env> 块和工具定义一样是上游门控项：只带 Working directory 的旧块实测
+    # 直接被 429 拒。源码升级后这里要能和工具定义一起先红。
+    env_lines = ["Working directory: /workspace", "Workspace root folder: /workspace"]
+    if "OPENCODE_ENV_MARKER" not in text:
+        print("✗ 9router 源码没有 OPENCODE_ENV_MARKER，指纹规则已变")
+        return 1
+    missing_env = [line for line in env_lines if line not in text or line not in ENV_MARKER]
+    if missing_env:
+        print(f"✗ <env> 标记与 9router 源码不一致，缺: {missing_env}")
+        return 1
     # 上游比对的是 description 与 parameters 两者（opencodeFingerprint.js 的
     # isFingerprintDefinition）；只比 description 会漏掉 schema 变更 —— 那种
     # 情况下线上探测全 403，而这里仍报「一致」。JS 对象字面量与 json.dumps
@@ -225,7 +518,7 @@ def check_fingerprint() -> int:
     if missing:
         print(f"✗ 以下工具定义与 9router 源码不一致，需重新抄录: {missing}")
         return 1
-    print(f"✓ {len(FINGERPRINT_TOOLS)} 个工具定义与 9router 源码逐字一致")
+    print(f"✓ {len(FINGERPRINT_TOOLS)} 个工具定义 + <env> 标记与 9router 源码逐字一致")
     return 0
 
 

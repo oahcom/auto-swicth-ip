@@ -567,6 +567,10 @@ def make_config(nodes: list[dict], listen_port: int = 0,
     outbounds = nodes[:] + warps
     outbounds.append({"type": "direct", "tag": "direct"})
     inbounds = _build_inbounds(listen_port)
+    # selector tag 与 daemon / CLI 共用 config 里的名字：改一处即可整体改名，
+    # 不必再同步 grep 本文件里的字符串字面量。
+    pool_selector = CFG["singbox"]["selector"]
+    warp_selector = CFG["warp"]["selector"]
 
     return {
         "log": {"level": "info", "timestamp": True},
@@ -574,7 +578,7 @@ def make_config(nodes: list[dict], listen_port: int = 0,
         "outbounds": outbounds + [
             {
                 "type": "selector",
-                "tag": "proxy",
+                "tag": pool_selector,
                 "outbounds": [n["tag"] for n in nodes] + ["direct"],
                 "default": nodes[0]["tag"] if nodes else "direct",
                 "interrupt_exist_connections": False,
@@ -583,8 +587,8 @@ def make_config(nodes: list[dict], listen_port: int = 0,
             # 多个 WARP 出口时是主备 selector：daemon 切到备线即可让主隧道重连换 IP。
             *([{
                 "type": "selector",
-                "tag": "opencode-out",
-                "outbounds": [w["tag"] for w in warps] + ["proxy"],
+                "tag": warp_selector,
+                "outbounds": [w["tag"] for w in warps] + [pool_selector],
                 "default": warps[0]["tag"],
                 "interrupt_exist_connections": False,
             }] if warps else []),
@@ -617,10 +621,10 @@ def make_config(nodes: list[dict], listen_port: int = 0,
                 *_build_lan_guard(inbounds),
                 {"action": "sniff"},
                 # 必须先于 resolve：resolve 后 destination 变为 IP，domain 规则不再命中
-                *([{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"}] if warps else []),
+                *([{"domain_suffix": ["opencode.ai"], "outbound": warp_selector}] if warps else []),
                 {"action": "resolve", "domain_suffix": ["opencode.ai", ".opencode.ai"]},
             ],
-            "final": "proxy",
+            "final": pool_selector,
             # 配了多个 dns server 时缺此字段 → sing-box 1.12+ 拒绝启动
             "default_domain_resolver": {"server": "dns-default"},
             "auto_detect_interface": True,
@@ -643,7 +647,8 @@ if __name__ == "__main__":
     ap.add_argument("--url", help="single subscription URL (legacy)")
     ap.add_argument("--out", default=CFG["singbox"]["config_file"])
     ap.add_argument("--port", type=int, default=CFG["singbox"]["mixed_port"])
-    ap.add_argument("--clash-port", type=int, default=9090)
+    ap.add_argument("--clash-port", type=int,
+                    default=int(CFG["singbox"]["clash_api"].rsplit(":", 1)[-1]))
     ap.add_argument("--secret", default=None)
     ap.add_argument("--include-h2", action="store_true", help="include hysteria2 (default: skip, WSL2 utls incompatible)")
     ap.add_argument("--filter", default="", help="substring filter node name (case-insensitive)")

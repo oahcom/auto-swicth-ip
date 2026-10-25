@@ -23,3 +23,8 @@ singbox-config.json.tmp
 # 部署密钥（订阅 token、路径覆盖）；模板见 .env.example
 .env
 
+# 探测会话表（按隧道端口复用，2h TTL）
+.probe_sessions.json
+
+# 池节点 IP 使用台账（运行时状态）
+.node_ip_used.json
