@@ -12,9 +12,10 @@ config.
 from __future__ import annotations
 
 import ipaddress
-import subprocess
 from dataclasses import dataclass
 from typing import Iterable
+
+from .proc import run as proc_run
 
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 IPIFY_URL = "https://api.ipify.org"
@@ -35,11 +36,6 @@ class EgressResult:
     warp: bool | None = None
     url: str | None = None
     error: str | None = None
-
-
-def run(*args, **kwargs):
-    """Indirection so tests can patch ``subprocess.run`` or this name."""
-    return subprocess.run(*args, **kwargs)
 
 
 def _valid_ip(value: str) -> str | None:
@@ -95,17 +91,16 @@ def probe_egress(*, socks_port: int | None = None,
 
     for url in urls:
         argv = ["curl", "-sS", "--max-time", str(timeout), *proxy_args, url]
-        try:
-            proc = run(argv, capture_output=True, text=True,
-                       timeout=timeout + 5)
-        except subprocess.TimeoutExpired:
+        # 经 asip.proc：超时会回收整个进程组（curl 可能拉起子进程），
+        # 且错误分类统一（启动失败 vs 非零退出 vs 超时）。
+        proc = proc_run(argv, timeout=timeout + 5)
+        if proc.timed_out:
             note("timeout")
             continue
-        except OSError:
+        if proc.error:
             note("curl_missing")
             continue
-
-        if proc.returncode != 0:
+        if proc.code != 0:
             note("rc")
             continue
 

@@ -152,3 +152,22 @@ def test_refresh_line_serialized_releases_slot_on_failure(monkeypatch):
     with pytest.raises(RuntimeError):
         daemon._refresh_line_serialized({"tag": tag})
     assert tag not in daemon._WARP_REFRESHING
+
+
+def test_connections_json_caches_failures_by_completion_time(monkeypatch):
+    """请求自身耗时超过 TTL 时，失败也必须缓存，否则等待者会串行重发。"""
+    import time as _time
+
+    calls = []
+
+    def slow_boom(*a, **k):
+        calls.append(1)
+        _time.sleep(1.1)
+        raise RuntimeError("clash slow failure")
+
+    monkeypatch.setattr(daemon._CLASH, "connections", slow_boom)
+    monkeypatch.setattr(daemon, "_conn_snapshot", (0.0, None))
+    monkeypatch.setattr(daemon, "_LAST_HEALTH_LOG", 0.0)
+    assert daemon._connections_json() is None
+    assert daemon._connections_json() is None
+    assert len(calls) == 1

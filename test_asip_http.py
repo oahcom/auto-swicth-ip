@@ -200,3 +200,11 @@ def test_text_limit_can_be_disabled_for_large_bodies(monkeypatch):
 
     assert len(default.text) == 2000
     assert full.text == body
+
+
+def test_any_2xx_is_ok_like_raise_for_status():
+    """旧白名单只认 200/204；201/206 会被误判为失败（订阅源分片返回 206）。"""
+    assert HttpResult(status=206).ok is True
+    assert HttpResult(status=299).ok is True
+    assert HttpResult(status=300).ok is False
+    assert HttpResult(status=None).ok is False

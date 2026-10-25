@@ -1885,8 +1885,7 @@ def _connections_json() -> dict | None:
     global _conn_snapshot
     with _conn_snapshot_lock:
         ts, data = _conn_snapshot
-        now = time.time()
-        if now - ts < _CONN_SNAPSHOT_TTL_SEC:
+        if time.time() - ts < _CONN_SNAPSHOT_TTL_SEC:
             return data
         # 走 HTTP 客户端而不是 curl：token 放 argv 会被 `ps` 看到（同一泄漏面
         # 在订阅刷新处已用 0600 临时文件规避）。读取失败仍缓存 None，否则
@@ -1896,7 +1895,9 @@ def _connections_json() -> dict | None:
         except Exception as e:
             data = None
             log_health(f"⚠ 读取 Clash 连接表失败: {e}")
-        _conn_snapshot = (now, data)
+        # 时间戳取请求**完成**时刻：请求本身最长 5s，若用开始时刻入库，
+        # 返回时已超过 1s TTL，每个等待者都会立刻重发（串行风暴）。
+        _conn_snapshot = (time.time(), data)
         return data
 
 

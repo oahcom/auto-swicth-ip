@@ -1,7 +1,6 @@
-"""asip.egress 的确定性单测（不联网，monkeypatch subprocess.run）。"""
+"""asip.egress 的确定性单测（不联网，monkeypatch egress.proc_run）。"""
 
-import subprocess
-from types import SimpleNamespace
+from asip.proc import ProcResult
 
 import pytest
 
@@ -23,9 +22,9 @@ def _install(monkeypatch, stdout="", returncode=0):
 
     def fake(argv, **kwargs):
         calls.append((argv, kwargs))
-        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+        return ProcResult(code=returncode, stdout=stdout)
 
-    monkeypatch.setattr(egress.subprocess, "run", fake)
+    monkeypatch.setattr(egress, "proc_run", fake)
     return calls
 
 
@@ -77,20 +76,17 @@ def test_empty_body_is_bad_body(monkeypatch):
 
 
 def test_curl_missing(monkeypatch):
-    def boom(argv, **kwargs):
-        raise FileNotFoundError("curl")
-
-    monkeypatch.setattr(egress.subprocess, "run", boom)
+    monkeypatch.setattr(
+        egress, "proc_run",
+        lambda argv, **kw: ProcResult(code=None, error="binary not found: curl"))
     result = probe_egress()
     assert result.ip is None
     assert result.error == "curl_missing"
 
 
 def test_timeout(monkeypatch):
-    def slow(argv, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
-
-    monkeypatch.setattr(egress.subprocess, "run", slow)
+    monkeypatch.setattr(egress, "proc_run",
+                        lambda argv, **kw: ProcResult(code=None, timed_out=True))
     result = probe_egress()
     assert result.ip is None
     assert result.error == "timeout"
@@ -109,9 +105,9 @@ def test_multiple_urls_skip_warp_off_then_succeed(monkeypatch):
 
     def fake(argv, **kwargs):
         seen.append(argv[-1])
-        return SimpleNamespace(returncode=0, stdout=next(bodies), stderr="")
+        return ProcResult(code=0, stdout=next(bodies))
 
-    monkeypatch.setattr(egress.subprocess, "run", fake)
+    monkeypatch.setattr(egress, "proc_run", fake)
     urls = (TRACE_URL, IPIFY_URL)
     result = probe_egress(urls=urls, require_warp=True)
     assert result.ip == "203.0.113.7"
@@ -153,29 +149,22 @@ def test_http_proxy_is_passed_through(monkeypatch):
 
 def test_most_informative_error_wins(monkeypatch):
     outcomes = iter([
-        subprocess.TimeoutExpired(cmd="curl", timeout=1),
-        SimpleNamespace(returncode=7, stdout="", stderr=""),
+        ProcResult(code=None, timed_out=True),
+        ProcResult(code=7, stdout=""),
     ])
-
-    def fake(argv, **kwargs):
-        item = next(outcomes)
-        if isinstance(item, Exception):
-            raise item
-        return item
-
-    monkeypatch.setattr(egress.subprocess, "run", fake)
+    monkeypatch.setattr(egress, "proc_run", lambda *a, **k: next(outcomes))
     result = probe_egress(urls=(TRACE_URL, IPIFY_URL))
     assert result.ip is None
     assert result.error == "timeout"
 
 
-def test_module_level_run_alias_is_patchable(monkeypatch):
+def test_proc_run_is_the_single_execution_seam(monkeypatch):
     seen = []
 
     def fake(argv, **kwargs):
         seen.append(argv)
-        return SimpleNamespace(returncode=0, stdout=TRACE_ON, stderr="")
+        return ProcResult(code=0, stdout=TRACE_ON)
 
-    monkeypatch.setattr(egress, "run", fake)
+    monkeypatch.setattr(egress, "proc_run", fake)
     assert probe_egress().ip == "203.0.113.7"
     assert len(seen) == 1

@@ -12,8 +12,9 @@ class Fake:
     """最小 daemon 依赖面，记录所有会产生副作用的调用。"""
 
     def __init__(self, ip, acc, active=None, needs=False, busy=False,
-                 usable=True, reason="测试原因", members=None):
+                 usable=True, reason="测试原因", members=None, line_ip=None):
         self.ip = ip
+        self.line_ip = line_ip
         self.acc = acc
         self.active = active
         self.needs = needs
@@ -32,6 +33,9 @@ class Fake:
 
     def _warp_last_accept(self, tag):
         return self.acc
+
+    def _warp_line_ip(self, tag):
+        return self.line_ip
 
     def _warp_model_usable(self, member, ip):
         self.calls.append(("verify", ip))
@@ -235,6 +239,63 @@ def test_stale_observation_does_not_switch_away_new_active_line():
     c = run(FlipActive())
     assert not acted(c, "switch")
     assert "取消换线" in logs(c)
+
+
+def test_restart_bootstrap_uses_persisted_line_ip_as_verified():
+    """daemon 重启后内存验收为空：持久化线路 IP 相同就不该换走当前出口。"""
+    c = run(Fake("ip1", None, active="T", line_ip="ip1"))
+    assert not acted(c, "verify")
+    assert not acted(c, "switch")
+    assert not acted(c, "restart")
+
+
+def test_standby_bootstrap_does_not_burn_model_quota():
+    c = run(Fake("ip1", None, active="OTHER", line_ip="ip1"))
+    assert not acted(c, "verify")
+    assert not acted(c, "restart")
+    assert not acted(c, "set_ip")
+
+
+def test_active_rechecked_after_slot_acquisition():
+    """判闲/拿槽期间变成当前出口，重启前必须再次发现并放弃。"""
+    class ThirdCheckActive(Fake):
+        def __init__(self):
+            super().__init__("ip9", None, active=None, usable=False)
+            self.checks = 0
+
+        def active_warp_tag(self):
+            self.checks += 1
+            return "T" if self.checks >= 3 else None
+
+    c = run(ThirdCheckActive())
+    assert not acted(c, "restart")
+    assert "已成为当前出口，取消重启" in logs(c)
+
+
+def test_accept_skipped_when_ip_changed_during_model_probe():
+    class Shifted(Fake):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.probes = 0
+
+        def _probe_refresh_egress(self, port):
+            self.probes += 1
+            return self.ip if self.probes == 1 else "ip-other"
+
+    fake = Shifted("ip9", None, active="OTHER")
+    w._host = fake
+    w._LAST_LOG.clear()
+    fake.calls.clear()
+    w.tick(M)
+    assert not any(x[0] == "set_ip" for x in fake.calls)
+    assert fake._WARP_LAST_ACCEPT == {}
+    assert "模型验收期间出口变更" in logs(fake.calls)
+
+
+@pytest.mark.parametrize("bad", [0, -0.1])
+def test_start_rejects_non_positive_interval(bad):
+    with pytest.raises(ValueError, match="interval_sec"):
+        w.start(Fake("ip1", ("ip1",)), members=[M], interval_sec=bad)
 
 
 def test_start_empty_members_no_threads():

@@ -88,7 +88,14 @@ def start(host: DaemonHost, members: list[dict] | None = None, *,
     global _host, _DRY_RUN, _INTERVAL
     _host = host
     _DRY_RUN = bool(dry_run)
-    _INTERVAL = INTERVAL_SEC if interval_sec is None else float(interval_sec)
+    if interval_sec is None:
+        _INTERVAL = INTERVAL_SEC
+    else:
+        _INTERVAL = float(interval_sec)
+        if _INTERVAL <= 0:
+            # 0 会把 tick 变成死循环空转，负数会让 sleep 抛错、线程直接退出
+            # 且不再有人重启它 —— 两种都静默失效，必须在启动时拒绝。
+            raise ValueError(f"interval_sec must be > 0, got {interval_sec}")
 
     if members is None:
         members = host._warp()["members"]
@@ -120,6 +127,9 @@ def _loop(member: dict, dry_run: bool = False,
 def tick(member: dict, *, dry_run: bool = False) -> None:
     """一轮判断 + 一轮动作。所有线都走这里，不只是低质线。
 
+    验收基线 = 内存 `_WARP_LAST_ACCEPT` 或持久化的线路 IP（两者都没有时才
+    真去烧一格模型配额），所以 daemon 重启后的首轮不会把同址的当前出口换走。
+
     判据分两种，不能混：「探不到出口」是观测缺失，「探到了但判低质」才是结论。
     只有后者构成重启理由 —— 探不到就重启，等于拿重启去解一个探测问题，
     新会话照样可能在冷启动窗口里（见 daemon._probe_refresh_egress）。
@@ -136,6 +146,11 @@ def tick(member: dict, *, dry_run: bool = False) -> None:
     now = time.time()
     acc = h._warp_last_accept(tag)
     verified = bool(ip and acc and acc[1] == ip)
+    if ip and not verified and h._warp_line_ip(tag) == ip:
+        # `_WARP_LAST_ACCEPT` 是内存态，daemon 重启后为空。持久化的线路 IP
+        # 只在刷新/验收成功时写入，地址相同即上一轮已验收 —— 否则每条线都
+        # 会被当成「新址待验」各烧一格配额，当前出口还会被误判换址而换走。
+        verified = True
     active = tag == h.active_warp_tag()
 
     if not ip:
@@ -263,12 +278,32 @@ def _ctx(tag: str, acc: tuple | None, active: bool, verified: bool,
     return "，" + "，".join(bits) + f"{h._warp_refresh_progress(tag)}"
 
 
-def _accept(member: dict, ip: str) -> None:
+def _accept_unsafe(member: dict, ip: str) -> None:
     h = _host
     tag = member["tag"]
     h._set_warp_line_ip(tag, ip)
     h._WARP_LAST_ACCEPT[tag] = (time.time(), ip)
     h._mark_warp_ip_used(ip, time.time())
+
+
+def _accept(member: dict, ip: str) -> None:
+    """验收一条未在刷新中的线：持按线锁，并复核模型探测期间地址未变。
+
+    tick 的观测早于 1~9s 的模型探测；期间后台补刷/换线路径可能重启这条线，
+    把旧 ip 写进 `_WARP_LAST_ACCEPT` 会让后续判据一直拿过期地址比对。
+    """
+    h = _host
+    tag = member["tag"]
+    if not h._acquire_refresh_slot(tag):
+        h.log(f"  ⏸ {tag} 验收期间该线被其他线程接管，本轮不写台账")
+        return
+    try:
+        if h._probe_refresh_egress(member["port"]) != ip:
+            h.log(f"  ⏸ {tag} 模型验收期间出口变更，本轮不写台账，下一轮重判")
+            return
+        _accept_unsafe(member, ip)
+    finally:
+        h._release_refresh_slot(tag)
 
 
 def _switch_away(member: dict, reason: str) -> None:
@@ -314,6 +349,12 @@ def _restart_and_verify(member: dict, reason: str) -> None:
     if not h._acquire_refresh_slot(tag):
         h.log(f"  ⏸ {tag} 待重启但刷新槽已被占用，本轮跳过 原因={reason}")
         return
+    # 判闲/拿槽可能耗时数秒，期间这条线可能已被换线路径选为当前出口。
+    # 此时重启会掐断在途请求，且新会话还要重新冷启动。
+    if h.active_warp_tag() == tag:
+        h._release_refresh_slot(tag)
+        h.log(f"  ⏸ {tag} 等待期间已成为当前出口，取消重启 原因={reason}")
+        return
     h.log(f"  ↻ {tag} 重启中 原因={reason}{h._warp_refresh_progress(tag)}")
     try:
         h._invalidate_warp_line_ip(tag)
@@ -334,7 +375,11 @@ def _restart_and_verify(member: dict, reason: str) -> None:
 
         h._mark_warp_ip_used(new_ip, time.time())   # 换出来的地址入库
         if h._warp_model_usable(member, new_ip):
-            _accept(member, new_ip)
+            if h._probe_refresh_egress(port) != new_ip:
+                h.log(f"  ⏸ {tag} 验收期间出口再次变更，本轮不写台账，下一轮重判"
+                      f"{h._warp_refresh_progress(tag)}")
+                return
+            _accept_unsafe(member, new_ip)
             h.log(f"  ✓ {tag} 刷新成功 原因={reason} 新出口 {new_ip}"
                   f"{h._warp_refresh_progress(tag)}")
         else:
@@ -365,6 +410,9 @@ if __name__ == "__main__":
 
         def _warp_last_accept(self, tag):
             return self.acc
+
+        def _warp_line_ip(self, tag):
+            return None
 
         def _warp_model_usable(self, member, ip):
             calls.append(("verify", ip))

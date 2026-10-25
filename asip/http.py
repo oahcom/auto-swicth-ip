@@ -46,7 +46,9 @@ class HttpResult:
 
     @property
     def ok(self) -> bool:
-        return self.status in (200, 204)
+        # 与 requests.raise_for_status 一致：全部 2xx 都算成功。旧调用点用
+        # 200/204 白名单时，201/206 会被误判成失败（订阅源返回 206 分片即中招）。
+        return self.status is not None and 200 <= self.status < 300
 
 
 def request_json(

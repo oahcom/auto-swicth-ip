@@ -1978,6 +1978,9 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | T-245 | P2 | Clash 连接表读取异常不得冒泡 | `pytest test_asip_integration.py -k connections_json` | 客户端抛任意异常时 `_connections_json()` 返回 `None` 并缓存，调用方不崩 |
 | T-246 | P2 | 日志注入覆盖 Unicode 行分隔符 | `pytest test_asip_integration.py -k log_message` | `\n`/`\r\n`/`\u2028`/`\u2029`/`\x85`/`\v`/`\f` 都压成字面 `\n` |
 | T-247 | P1 | 同步刷新与后台补刷/按线 worker 共用按线锁 | `pytest test_asip_integration.py -k refresh_line_serialized` | 锁被占时返回 `(None, False)` 且不调 `_refresh_idle_warp`；`_refresh_idle_warp` 抛异常时仍释放锁 |
+| T-248 | P2 | 任意 2xx 视为成功（与 raise_for_status 一致） | `pytest test_asip_http.py -k 2xx` | 200/206/299 `ok=True`；300/`None` `ok=False` |
+| T-249 | P2 | 非法轮询间隔启动即拒绝 | `pytest test_warp_line_worker.py -k interval` | `interval_sec` 为 0 或负数时 `start` 抛 `ValueError` |
+| T-250 | P2 | 出口探测统一走 `asip.proc` | `pytest test_asip_egress.py`；`grep -n "subprocess" asip/egress.py` | 无直接 `subprocess.run`；超时/启动失败/非零退出按 `ProcResult` 分类 |
 
 **实战验证（改动合入前人工执行一次）**：
 
@@ -2033,4 +2036,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.34 | 2026-10-22 | 自对抗审查补 5 项 (T-216~T-219)：**3 项是上一轮我自己引入的 P0** —— ①`_env_path` 不展开，而 systemd `EnvironmentFile` 实测不展开 `$HOME`（`journalctl` 里原样是 `$HOME/.some/path`），start 脚本 source 却展开，同一份 `.env` 两条路径两种结果 → 展开移进 `_env_path`；②README 的 `for d in .warp/usque*/` 匹配到主目录自身，沙箱实测把唯一二进制换成自指链接（`Too many levels of symbolic links`），20 条隧道全灭 → `install.sh` 建链接时排除 `usque/` 并加「主二进制不得是链接」前置检查；③`PYBIN` 用 `command -v python3`，conda shell 下生成 `miniforge3/bin/python3`，与现网 `/usr/bin/env python3` 不符且换 shell 就变 → 钉死 `/usr/bin/python3`（`PYTHON=` 可覆盖）。另两项：README 自述「仓库不含二进制」但 `sing-box` 实际被 git 跟踪（57MB）→ 更正为「usque 需自备、sing-box 随仓库」；`parse_subscription.py` 无参回退此前只认 `OKZ_SUB_URL`，与 Q1 记的「四条订阅源」不符 → 复核为已覆盖并写进用例。变异验证：撤掉展开 → T-216 红；去掉 `[ "$dir" = "usque" ]` 排除 → T-217 红；恢复后 `test_portability.py` 7 passed，四文件混跑 **284 passed** | 自对抗 |
 | v1.35 | 2026-10-22 | 补 T-219 落地：首版隧道注册失败只打 `⚠` 仍继续 `enable`，注册失败的单元启动即退出并无脑重启，而部署退出码为 0（假成功）。改为计数并在末尾非零退出；同时在 `--units-only` 的检查里加「主二进制存在且不是链接」 | 自对抗 |
 | v1.36 | 2026-10-26 | ASIP 分层重构（R165）§13 与审查回归：T-240 订阅全文（修 HTTP 层 2000 字符截断导致节点丢失）、T-241 陈旧观测竞态、T-242 grep 失败语义、T-243 Clash 非 2xx 不返回错误页；T-239 补齐「dry-run 跳过模型验收」 | codex 20 维 review |
-| v1.38 | 2026-10-26 | 第二轮审查修复：T-244 `asip.proc` 超时改杀进程组（孙进程不再泄漏）、T-245 Clash 连接表异常不外抛、T-246 日志注入覆盖 Unicode 行分隔符、T-241 扩展到「决策后已非当前出口则取消换线」、T-247 同步刷新改走按线锁 | codex 20 维 review |
+| v1.38 | 2026-10-26 | 第二轮审查修复：T-244 `asip.proc` 超时改杀进程组（孙进程不再泄漏）、T-245 Clash 连接表异常不外抛、T-246 日志注入覆盖 Unicode 行分隔符、T-241 扩展到「决策后已非当前出口则取消换线」、T-247 同步刷新改走按线锁、T-248~T-250 补齐 2xx/间隔/进程组 | codex 20 维 review |
