@@ -18,6 +18,7 @@ PROJECT = Path(config.PROJECT_DIR)
 RUNTIME_FILES = [
     "config.py", "daemon.py", "parse_subscription.py", "probe_warp.py",
     "self_evolve_checkpoint.py", "start-auto-switch-ip.sh", "deploy/install.sh",
+    "deploy/preflight.sh", "deploy/wsl-boot.conf.example",
 ]
 
 
@@ -226,3 +227,64 @@ def test_deploy_renders_every_member(tmp_path):
     for row, m in zip(rows, members):
         assert row[0] == m["tag"] and int(row[1]) == m["port"] and row[2] == m["service"]
         assert row[4] == ("-6" if m.get("ipv6") else "-")
+
+
+def test_start_script_pins_interpreter():
+    """手动启动也要钉死解释器：conda shell 的 python3 与 systemd 单元可能不同。"""
+    text = (PROJECT / "start-auto-switch-ip.sh").read_text(encoding="utf-8")
+    assert 'PYBIN="${PYTHON:-/usr/bin/python3}"' in text
+    assert 'nohup "$PYBIN" "$DAEMON"' in text
+    assert "nohup python3" not in text
+
+
+def test_preflight_covers_new_host_checks():
+    """新主机预检必须覆盖 systemd/linger/Python/Bun/订阅/9router，缺一不可。"""
+    text = (PROJECT / "deploy/preflight.sh").read_text(encoding="utf-8")
+    for token in ("systemctl --user", "loginctl", "python", "bun", "_SUB_URL",
+                  "9router", "mirrored", "fetch-binaries"):
+        assert token in text, f"preflight 缺少检查项: {token}"
+    # install.sh 必须调用它，且允许沙箱跳过
+    install = (PROJECT / "deploy/install.sh").read_text(encoding="utf-8")
+    assert "deploy/preflight.sh" in install
+    assert "SKIP_PREFLIGHT" in install
+
+
+def test_wsl_template_has_no_machine_paths():
+    """WSL 引导模板不能带真实用户/项目绝对路径：换机即失效。"""
+    text = (PROJECT / "deploy/wsl-boot.conf.example").read_text(encoding="utf-8")
+    assert "systemd=true" in text
+    assert "/home/" not in text and "/mnt/c/Users/" not in text
+
+
+def test_readme_has_no_hardcoded_home():
+    """移植文档不能把某台机器的家目录写成步骤。"""
+    text = (PROJECT / "README.md").read_text(encoding="utf-8")
+    assert "/home/administrator" not in text
+    assert "preflight.sh" in text
+
+
+def test_bun_search_includes_local_bin():
+    """systemd PATH 没有 ~/.local/bin；bun 兜底搜索必须覆盖它。"""
+    text = (PROJECT / "probe_warp.py").read_text(encoding="utf-8")
+    assert ".local/bin/bun" in text
+
+
+def test_install_renders_units_on_fresh_host(tmp_path):
+    """全新主机上 UNIT_DIR 为空时不得因 pipefail 中止（sed 读不存在的单元返回 2）。
+
+    真实回归：`SYSTEMD_DIR=/tmp/x install.sh --units-only` 首次运行时，
+    `sed ... | head -1` 在 set -euo pipefail 下直接退出 2，一个单元都没生成。
+    """
+    here = tmp_path / "clone"
+    shutil.copytree(PROJECT / "deploy", here / "deploy")
+    for f in ("config.py", "requirements.txt", "sing-box"):
+        shutil.copy2(PROJECT / f, here / f)
+    unit_dir = tmp_path / "units"
+    env = {**os.environ, "SYSTEMD_DIR": str(unit_dir),
+           "HOME": str(tmp_path / "home"), "PYTHON": sys.executable,
+           "SKIP_PREFLIGHT": "1"}
+    out = subprocess.run(["bash", str(here / "deploy/install.sh"), "--units-only"],
+                         capture_output=True, text=True, timeout=60, env=env)
+    assert out.returncode == 0, f"rc={out.returncode}: {out.stderr[-400:]}"
+    assert (unit_dir / "auto-switch-ip.service").exists()
+    assert len(list(unit_dir.iterdir())) == len(config.CFG["warp"]["members"]) + 3

@@ -25,14 +25,16 @@
 - `asip/` — 无副作用的可复用工具（原子 JSON 写、密钥脱敏、Clash API 客户端、出口探测）；daemon 通过同名门面委托，便于单测与复用
 - `.env` — 订阅 token 与路径覆盖（**不入库**，chmod 600）
 - `singbox-config.json` — 生成的 sing-box 配置（**不入库**，含 Clash API secret 与节点凭据；启动时按需生成）
-- `sing-box` — Linux x64 二进制（1.13.0）
+- `sing-box` — 仓库内是 Linux amd64 二进制（1.13.0）；arm64 由 `deploy/fetch-binaries.sh` 自动获取
+- `deploy/` — `install.sh`（单元生成/启用）、`preflight.sh`（新主机预检）、`fetch-binaries.sh`（校验下载）、`wsl-boot.conf.example`（WSL 引导模板）
 - `daemon.log` — daemon 运行日志
 
 ## 安装
 
 ### 0. 前置条件
 
-- Linux x86_64（WSL2 可用），systemd 用户实例（`systemctl --user`），Python ≥ 3.10
+- Linux amd64 / arm64（WSL2 可用），systemd 用户实例（`systemctl --user`），Python ≥ 3.10
+- `curl`、`tar`；模型层探测需要 **Bun**（`curl -fsSL https://bun.sh/install | bash`，非标准路径用 `PROBE_BUN_BIN=`）
 - 二进制由 `./deploy/fetch-binaries.sh` 自动获取并校验（详见 §0.1），无需手工下载
 - Python 依赖：`python3 -m pip install -r requirements.txt`
 - 9router 已在本机运行（`~/.9router/db/data.sqlite` 存在），或用 `NINE_ROUTER_DB_PATH` 指过去
@@ -107,6 +109,32 @@ curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
      http://127.0.0.1:9090/proxies/opencode-out | head -c 200
 ```
 
+## 移植到新机器（WSL2 / 通用 Linux）
+
+同一份代码不绑目录、不绑用户：`config.py` 以仓库目录 + 当前用户家目录为基准，
+外部路径都可用 `.env` 覆盖。完整步骤：
+
+1. 克隆仓库（保留可执行位即可）：`git clone <repo> ~/dkk-projects/auto-switch-ip`
+2. 装依赖：`sudo apt install -y python3 python3-pip curl tar`，然后
+   `python3 -m pip install -r requirements.txt`；Bun 见 §0 前置条件。
+3. 预检：`./deploy/preflight.sh`。硬项（Python/依赖/systemd/curl）失败即退出；
+   软项（linger、订阅、9router DB、Bun、WSL mirrored、端口）只警告。
+4. 配置：`cp .env.example .env && chmod 600 .env`，至少填一个 `*_SUB_URL`。
+5. 部署：`./deploy/install.sh`（自动取二进制、注册 WARP、写 23 个用户单元并启用）。
+   已有单元指向旧目录时会拒绝覆盖；确认迁移用 `./deploy/install.sh --adopt`。
+6. 开机自启（无桌面登录）：`sudo loginctl enable-linger $USER`。
+7. WSL 额外：
+   - Windows `%USERPROFILE%\.wslconfig` 设 `[wsl2] networkingMode=mirrored`，`wsl --shutdown` 重进；
+   - `/etc/wsl.conf` 设 `[boot] systemd=true`（模板 `deploy/wsl-boot.conf.example`）。
+8. 9router 必须在本机（daemon 读它的 SQLite + Clash API）。若 9router 不在本机，
+   只能盲轮换：`.env` 设 `ASIP_OBSERVE_9ROUTER=false`；或将 9router DB 只读挂载后
+   用 `NINE_ROUTER_DB_PATH` 指过去（Clash API 仍需本机 sing-box）。
+9. 验证：`systemctl --user status auto-switch-ip.service`；
+   `python3 -m pytest test_portability.py -q`。
+
+无 systemd 的沙箱/CI 可用 `SKIP_PREFLIGHT=1 SYSTEMD_DIR=/tmp/x ./deploy/install.sh --units-only`
+只渲染单元，不碰真实服务。
+
 ## 配置
 
 `config.py` 的 CFG dict（与 daemon.py 共用），常用项：
@@ -137,7 +165,8 @@ curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
 
 ## 网络要求
 
-- WSL2 mirrored 模式（`/mnt/c/Users/Administrator/.wslconfig` 里 `networkingMode=mirrored`）— Windows 127.0.0.1 能直通 WSL2 内的服务
+- WSL2 mirrored 模式（Windows `%USERPROFILE%\.wslconfig` 里 `[wsl2] networkingMode=mirrored`）— Windows 127.0.0.1 能直通 WSL2 内的服务
+- 通用 Linux 无此要求；用户服务要开机自启需 `sudo loginctl enable-linger $USER`
 - hysteria2 在 WSL2 下有 utls 不兼容问题（sing-box 报错 "unsupported usage for uTLS"），本项目默认排除 h2 节点（用 `--include-h2` 开启）
 
 ## 恢复
@@ -146,8 +175,9 @@ curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
 ```bash
 # 9router 改回 6696 (okz)
 python3 -c "
-import sqlite3, json
-con = sqlite3.connect('/home/administrator/.9router/db/data.sqlite')
+import sqlite3, json, os
+db = os.environ.get('NINE_ROUTER_DB_PATH') or os.path.expanduser('~/.9router/db/data.sqlite')
+con = sqlite3.connect(db)
 cur = con.cursor()
 cur.execute('SELECT data FROM settings WHERE id=1')
 s = json.loads(cur.fetchone()[0])

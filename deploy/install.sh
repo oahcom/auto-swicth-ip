@@ -19,7 +19,8 @@ UNIT_DIR="${SYSTEMD_DIR:-$HOME_DIR/.config/systemd/user}"
 # 试跑（如 /tmp 下的 clone）时若忘了设 SYSTEMD_DIR，就会把现网单元悄悄改指到副本，
 # 而副本随时可被清理 —— 服务下次重启即崩。真实事故：`--units-only` 在 /tmp 副本
 # 里跑过一次，23 个单元全被改指 /tmp/xxx，直到有人发现。
-cur="$(sed -n 's/^WorkingDirectory=//p' "$UNIT_DIR/auto-switch-ip.service" 2>/dev/null | head -1)"
+# 首次部署时单元文件尚不存在：pipefail 下 sed 的非零退出会让 set -e 直接中止。
+cur="$(sed -n 's/^WorkingDirectory=//p' "$UNIT_DIR/auto-switch-ip.service" 2>/dev/null | head -1 || true)"
 if [ -z "${SYSTEMD_DIR:-}" ] && [ -n "$cur" ] && [ "$cur" != "$DIR" ] && [ -f "$cur/daemon.py" ]; then
     echo "✗ 现网单元当前指向 $cur，而本次运行的是 $DIR —— 拒绝覆盖生产单元" >&2
     echo "  试跑请设 SYSTEMD_DIR；确认要迁移到本目录请加 --adopt" >&2
@@ -36,6 +37,16 @@ for arg in "$@"; do
         --adopt)      ADOPT=1 ;;
     esac
 done
+
+# ---- 新主机前置检查：硬项失败即退出，软项只警告 ----
+# 试跑/无 systemd 的沙箱可 SKIP_PREFLIGHT=1 跳过。
+if [ "${SKIP_PREFLIGHT:-0}" != 1 ]; then
+    if [ "$UNITS_ONLY" = 1 ]; then
+        PYTHON="$PYBIN" bash "$DIR/deploy/preflight.sh" --units-only || exit 1
+    else
+        PYTHON="$PYBIN" bash "$DIR/deploy/preflight.sh" || exit 1
+    fi
+fi
 
 # ---- 二进制：架构不符或缺失就由 fetch 脚本按官方 sha256 补 ----
 # 仓库里提交的 sing-box 是 amd64 构建。arm64 机器 clone 下来能 `-x` 通过，但一跑
@@ -142,6 +153,7 @@ After=default.target
 Type=oneshot
 ExecStart=$PYBIN $DIR/self_evolve_checkpoint.py
 WorkingDirectory=$DIR
+EnvironmentFile=-$DIR/.env
 StandardOutput=journal
 StandardError=journal
 
