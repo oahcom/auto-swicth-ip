@@ -17,6 +17,7 @@ import time
 
 import requests
 
+from asip.clash_client import ClashClient
 from config import CFG, get_singbox_secret
 
 logger = logging.getLogger(__name__)
@@ -24,28 +25,22 @@ logger = logging.getLogger(__name__)
 CLASH_API = CFG["singbox"]["clash_api"].rstrip("/")
 SELECTOR = CFG["singbox"]["selector"]
 TIMEOUT = 3
-
-
-def _headers() -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {get_singbox_secret()}",
-        "Content-Type": "application/json",
-    }
-
-
-def _selector_url() -> str:
-    return f"{CLASH_API}/proxies/{SELECTOR}"
+_clash = ClashClient(CLASH_API, get_singbox_secret, timeout=TIMEOUT)
 
 
 def get_nodes() -> tuple[str | None, list[str]]:
     """返回 (当前节点, 全部节点)；sing-box 不可达时返回 (None, [])。"""
-    try:
-        r = requests.get(_selector_url(), headers=_headers(), timeout=TIMEOUT)
-        if r.status_code == 200:
+    r = _clash.request("GET", f"proxies/{SELECTOR}")
+    if r is not None and r.status_code == 200:
+        try:
             data = r.json()
             return data.get("now", "?"), data.get("all", [])
-    except Exception as e:
-        logger.warning("get_nodes 失败 (sing-box 可能不可达/密钥失效/非JSON响应): %s", e)
+        except ValueError as e:
+            logger.warning("get_nodes 失败 (非 JSON 响应): %s", e)
+    elif r is not None:
+        logger.warning("get_nodes 失败: HTTP %s (密钥失效?)", r.status_code)
+    else:
+        logger.warning("get_nodes 失败: sing-box 不可达")
     return None, []
 
 
@@ -65,17 +60,10 @@ def get_9router_proxy() -> tuple[bool | None, str]:
 
 def _switch_to(node: str) -> bool:
     """PUT selector；成功返回 True，网络/HTTP 失败返回 False。"""
-    try:
-        r = requests.put(
-            _selector_url(),
-            headers=_headers(),
-            json={"name": node},
-            timeout=TIMEOUT,
-        )
-        return r.status_code in (200, 204)
-    except Exception as e:
-        logger.warning("切换到 %s 失败: %s", node, e)
-        return False
+    if _clash.select(SELECTOR, node):
+        return True
+    logger.warning("切换到 %s 失败", node)
+    return False
 
 
 # ============= 子命令 =============

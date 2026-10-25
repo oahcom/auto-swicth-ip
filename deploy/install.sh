@@ -12,7 +12,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 与 config.py 一致：从 passwd 取本用户家目录，不信 $HOME。`sudo -u` 下
 # HOME 可能仍是 /root，会把单元/密钥写到错误用户的家目录。
-HOME_DIR="$(getent passwd "$(id -u)" | cut -d: -f6)"
+HOME_DIR="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
 [ -n "$HOME_DIR" ] || HOME_DIR="$HOME"
 UNIT_DIR="${SYSTEMD_DIR:-$HOME_DIR/.config/systemd/user}"
 # 写进 $UNIT_DIR 的单元会把 ExecStart 钉成**本次运行的这个 DIR**。所以拿一份副本

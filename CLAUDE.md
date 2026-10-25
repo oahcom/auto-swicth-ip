@@ -701,13 +701,14 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `self_evolve_checkpoint.py` | 326 | 自进化巡检引擎（每 10min 由 asi-selfcheck.timer 触发，写 .monitor_state.json）|
 | `.egress_log.jsonl` | 动态 | 出口节点归属日志（每次成功切换 append (ts,node)，供 per-egress 错误率归因）|
 | `asi-selfcheck.timer` | — | systemd 用户定时器：每 10min 触发 asi-selfcheck.service 跑巡检引擎 |
-| `test_daemon_unit.py` | 4144 | 确定性单测（无网络，196 个用例：错误率/策略/评分/坏节点/看门狗/WARP 换线门控）|
+| `test_daemon_unit.py` | 4177 | 确定性单测（无网络，198 个用例：错误率/策略/评分/坏节点/看门狗/WARP 换线门控）|
 | `test_subscription_parse.py` | 561 | 订阅解析回归单测（无网络，40 个用例：vless/trojan transport/单源失败/rc 检查/URL 文件传参/局域网入站与来源守卫）|
 | `test_warp_refresh.py` | 1243 | WARP 刷新/换线门控单测（22 个用例）|
 | `verify_rotation.py` | 360 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），结束时恢复原选择，`--quick` 约 20s |
 | `deploy/install.sh` | — | 部署脚本：生成密钥 + 注册 20 条隧道 + 由 config.py 推导并写入 23 个 systemd 单元 + enable |
 | `deploy/members.py` | — | 把 `CFG["warp"]["members"]` 渲染成 `tag port service dir family`，供 install.sh 用 |
 | `test_portability.py` | — | 可移植性回归（4 例）：路径不越出仓库、运行期文件无硬编码家目录、成员可部署、单元渲染全覆盖 |
+| `test_asip_tools.py` | 73 | asip 工具单测（5 例）：Clash 选择码/密钥轮换、脱敏、原子写权限 |
 | `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写）、`redact`（token 脱敏）、`clash_client`、`egress`；daemon 同名门面委托 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
 

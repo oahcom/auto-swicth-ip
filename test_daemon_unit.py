@@ -3855,6 +3855,14 @@ def test_exclude_active_ip_falls_back_when_all_filtered():
     assert daemon._exclude_active_ip(pairs, "1.1.1.1") == pairs
 
 
+def test_dedupe_probe_pairs_skips_active_and_duplicates():
+    """实测前先按 IP 收敛：同址多线只探一次，当前出口不探（马上会被排除）。"""
+    pairs = [({"tag": "A"}, "1.1.1.1"), ({"tag": "B"}, "1.1.1.1"),
+             ({"tag": "C"}, "2.2.2.2"), ({"tag": "D"}, "3.3.3.3")]
+    out = daemon._dedupe_probe_pairs(pairs, "3.3.3.3")
+    assert [m["tag"] for m, _ in out] == ["A", "C"]
+
+
 # ============= blind 模式（observe_9router=false，纯时间轮换） =============
 
 def test_observe_9router_toggle(monkeypatch):
@@ -4107,6 +4115,22 @@ def test_flagged_retry_after_does_not_shorten_403(monkeypatch):
     assert daemon._warp_ip_is_blocked("ip-403", now + 5 * h) is True, \
         "6h 窗口内仍须挡住，不能被 Retry-After 缩短"
     assert daemon._warp_ip_is_blocked("ip-403", now + 6 * h + 1) is False
+
+
+def test_legacy_403_ban_until_does_not_shorten_default(monkeypatch):
+    """旧版把 Retry-After 写到 403 上留下的 ban_until 必须被忽略。
+
+    否则同 kind 仍在 stamps 里时，`_warp_block_window` 会拿那个更短的
+    ban_until 当窗口，把 403 的 6h 默认封禁缩短成响应头给的几十秒。
+    """
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "ip-legacy403": {"ts": now, "blocked": True,
+                         "blocked_ts_by_kind": {"abuse403": now},
+                         "ban_until": now + h, "ban_kind": "abuse403"}})
+    assert daemon._warp_ip_is_blocked("ip-legacy403", now + 5 * h) is True
+    assert daemon._warp_ip_is_blocked("ip-legacy403", now + 6 * h + 1) is False
 
 
 def test_expired_exact_ban_does_not_swallow_new_429(monkeypatch):

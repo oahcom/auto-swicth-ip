@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from asip.clash_client import ClashClient
 from config import CFG, get_singbox_secret
 
 # 端点全部取自 config：改端口/selector 时不必再改本脚本。
@@ -61,13 +62,16 @@ class ClashUnreachable(RuntimeError):
     """Clash API 不可达 —— 比裸 traceback 更能说明问题。"""
 
 
+_clash = ClashClient(CLASH_API, get_singbox_secret, timeout=10)
+
+
 def _selector() -> dict:
-    try:
-        r = requests.get(f"{CLASH_API}/proxies/{SELECTOR}", headers=hdr(), timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        raise ClashUnreachable(f"Clash API {CLASH_API} 不可达: {type(e).__name__}: {e}") from e
+    status, data = _clash.get_json(f"proxies/{SELECTOR}", timeout=10)
+    if status is None:
+        raise ClashUnreachable(f"Clash API {CLASH_API} 不可达")
+    if status != 200 or not isinstance(data, dict):
+        raise ClashUnreachable(f"Clash API {CLASH_API} 返回 HTTP {status}")
+    return data
 
 
 def nodes() -> list[str]:
@@ -79,9 +83,7 @@ def current() -> str:
 
 
 def switch(node: str) -> bool:
-    r = requests.put(f"{CLASH_API}/proxies/{SELECTOR}", json={"name": node},
-                     headers=hdr(), timeout=10)
-    return r.status_code == 204
+    return _clash.select(SELECTOR, node, timeout=10)
 
 
 def curl(args: list[str], timeout: int = 15) -> str:
@@ -172,9 +174,13 @@ def verify_switch(samples: int, quick: bool) -> list[str]:
     try:
         return _verify_switch_body(samples, quick)
     finally:
-        if original and current() != original:
-            print(f"  恢复原选择: {original}")
-            switch(original)
+        if original:
+            try:
+                if current() != original:
+                    print(f"  恢复原选择: {original}")
+                    switch(original)
+            except ClashUnreachable:
+                print("  ⚠ Clash API 不可达，未能恢复原选择")
 
 
 def _verify_switch_body(samples: int, quick: bool) -> list[str]:

@@ -42,6 +42,9 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     # 探测台账是进程级全局：不隔离则前一个用例探过的 IP 在本用例被当成
     # 「TTL 内已探过」而跳过真实探测，台账相关断言全落空。
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    # 整批探测结论也是进程级全局：不隔离会让上一个用例的 tag→verdict 参与
+    # 本用例的失明判定（尤其「缓存跳过也要记结论」分支）。
+    monkeypatch.setattr(daemon, "_PROBE_LAST_VERDICT", {})
     # 标脏墓碑同样是进程级全局：残留条目会拒收后续用例带 started_at 的写入。
     monkeypatch.setattr(daemon, "_PROBE_BLOCKED_AT", {})
     # 模型探测通过会记 last_ok_ts 并落盘，不隔离就写进生产 .warp_ip_used.json。
@@ -180,15 +183,22 @@ def test_quota_verdict_turns_line_into_refresh_candidate(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     ip = "2a09:bac5:1ef9:281e::1"
     assert daemon._warp_ip_needs_refresh(ip, 1000.0) is False  # 无结论：全新地址不算低质
+    daemon._mark_warp_ip_used(ip, 1000.0, blocked=True, kind="rate429",
+                              ban_after=3600)
     daemon._probe_cache_put("W1", ip, "quota", now=1000.0)
     assert daemon._probe_cache_verdict("W1", ip, 1001.0) == "quota"
     assert daemon._warp_ip_needs_refresh(ip, 1001.0, "W1") is True, \
         "本线实测 quota 必须判为低质"
     assert "quota" in daemon._warp_ip_refresh_reason(ip, 1001.0, "W1")
 
-    # 长 TTL 过后结论作废：同一地址重新可探，也不再凭旧结论判低质
+    # 精确解禁（Retry-After 1h）到期、缓存 TTL（6h）未到：旧 quota 不得再
+    # 驱动重启，否则「精确解禁」只在探测路径生效、预热路径仍白烧隧道。
+    assert daemon._probe_cache_verdict("W1", ip, 4602.0) == "quota"
+    assert daemon._warp_ip_needs_refresh(ip, 4602.0, "W1") is False
+    assert "quota" not in daemon._warp_ip_refresh_reason(ip, 4602.0, "W1")
+
+    # 长 TTL 过后结论作废：同一地址重新可探，不再凭缓存作答
     assert daemon._probe_cache_verdict("W1", ip, 1000.0 + 21601) is None
-    assert daemon._warp_ip_needs_refresh(ip, 1000.0 + 21601, "W1") is False
 
 
 def test_probe_cache_never_bleeds_across_ips_in_same_segment(monkeypatch):

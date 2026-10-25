@@ -749,6 +749,9 @@ def _warp_ip_refresh_reason(ip: str | None, now: float,
     if not ip:
         return "出口未知"
     verdict = _probe_cache_verdict(tag, ip, now)
+    if verdict in _WARP_PROBE_PERSISTENT and not _warp_ip_is_blocked(ip, now):
+        # 精确解禁已到期：旧结论不再作为低质理由（与 needs_refresh 同源）。
+        verdict = None
     if verdict is not None and verdict != "OK":
         if not (verdict == "unreachable" and _warp_probe_blind(now)):
             return f"模型层 {verdict}"
@@ -2139,6 +2142,22 @@ def _cached_warp_standby(standby: list[dict], now: float,
     return deduped
 
 
+def _dedupe_probe_pairs(pairs: list[tuple[dict, str]],
+                        skip_ip: str | None = None) -> list[tuple[dict, str]]:
+    """按 IP 去重并跳过指定地址，供模型实测前收敛探测次数。
+
+    每条候选实测消耗该出口一格配额；同址多线重复探测只会得到同一个结论。
+    """
+    seen = set()
+    out = []
+    for m, ip in pairs:
+        if not ip or ip == skip_ip or ip in seen:
+            continue
+        seen.add(ip)
+        out.append((m, ip))
+    return out
+
+
 def _exclude_active_ip(pairs: list[tuple[dict, str]],
                        active_ip: str | None) -> list[tuple[dict, str]]:
     """候选出口不能与当前出口或彼此重复 —— 换到同一个地址等于没换。
@@ -2210,9 +2229,11 @@ def _warp_ban_until(entry: dict) -> tuple[float | None, str]:
     until = _as_ts(entry.get("ban_until"))
     if until is None or until <= 0:
         return None, ""
+    # 只有 429 的 Retry-After 是可信的精确封禁。旧版曾把响应头套到 403 上，
+    # 那种 ban_until 只会把 6h 默认窗口缩短；缺失/未知 kind 也按默认窗口。
     kind = entry.get("ban_kind")
-    if kind not in ("abuse403", "rate429"):
-        kind = "rate429"
+    if kind != "rate429":
+        return None, ""
     return until, kind
 
 
@@ -2416,6 +2437,10 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
     # 通道失明期间例外：那批 unreachable 说的是探测器自己没打通，不是地址被拒
     # （见 `_warp_probe_blind`）—— 照它重启只会白烧隧道与配额。
     verdict = _probe_cache_verdict(tag, ip, now)
+    if verdict in _WARP_PROBE_PERSISTENT:
+        # 精确解禁（Retry-After）可能早于 6h 缓存 TTL 到期：惩罚期已过就不该
+        # 再凭旧结论重启，交给下一次模型实测重新判定。
+        return _warp_ip_is_blocked(ip, now)
     if verdict is not None and verdict != "OK":
         return not (verdict == "unreachable" and _warp_probe_blind(now))
     if _warp_ip_is_blocked(ip, now):
@@ -2832,6 +2857,9 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     # 负结论也要看 ban_until：上游给过 Retry-After 时，它可能比缓存 TTL 先到期；
     # 此时必须重探，否则「精确解禁」在模型模式下会被缓存多锁住最多 1.4h。
     if cached in _WARP_PROBE_PERSISTENT and _warp_ip_is_blocked(ip):
+        # 记录本条目的结论，供 `_note_probe_batch` 判定整批失明；否则被缓存
+        # 跳过的 tag 会沿用上一次（可能是别的地址）的旧值，掩盖全批异常。
+        _PROBE_LAST_VERDICT[tag] = cached
         log(f"  · {tag} 出口 {ip} TTL 内已探过: {cached}（跳过）"
             f"{_warp_refresh_count_note(tag)}")
         return False
@@ -3580,12 +3608,16 @@ def reconnect_warp(reason: str) -> bool:
     # 里「出口已被标记」的线同义 —— 都只有重连换会话 IP 才有意义，故并入
     # blocked_lines 走同一条刷新路径：同步刷一条拿本次候选，其余后台并发补刷。
     if not _ip_history_is_truth() and probes:
-        tested = _warp_model_test_many(probes)
-        failed = [m for m, _ in probes if not tested.get(m["tag"])]
+        # 同一 IP 可能被多条线持有，先按 IP 去重；当前出口马上要被排除，也不再
+        # 为它烧一格配额。结论按 IP 生效：同址的其它线即使没被测到也要一起丢弃。
+        to_test = _dedupe_probe_pairs(probes, old_ip)
+        tested = _warp_model_test_many(to_test)
+        failed = [m for m, _ in to_test if not tested.get(m["tag"])]
+        failed_ips = {ip for m, ip in to_test if not tested.get(m["tag"])}
         if failed:
             log(f"  ↻ {len(failed)} 条备线模型层实测不通过，重连换会话 IP")
             blocked_lines.extend(failed)
-        probes = [(m, ip) for m, ip in probes if tested.get(m["tag"])]
+        probes = [(m, ip) for m, ip in probes if ip not in failed_ips]
 
 
     # 备线出口全被标记时刷新一条拿新会话 IP，刷新不出才落 proxy 池 —— 池只是
@@ -3650,6 +3682,9 @@ def reconnect_warp(reason: str) -> bool:
     # 瞬间再查一次惩罚期，代价是每条候选一次台账读取 —— 量级小，但收益同样小。
     usable = (probes if not _ip_history_is_truth()
               else [p for p in probes if not _ip_disqualified(p[1], now, guard)])
+    # 与当前出口同址的候选等于没换。全部如此时走下面的兜底分支重启换 IP，
+    # 而不是切到相同地址、被下一次 429 原样打回来。
+    usable = [p for p in usable if p[1] != old_ip]
     if _ip_history_is_truth():
         n_new = sum(1 for p in probes if _warp_ip_never_used(p[1]))
         n_ok = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 1)
