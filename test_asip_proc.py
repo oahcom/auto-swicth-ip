@@ -1,0 +1,131 @@
+"""Deterministic tests for asip.proc (no network, no long-running commands)."""
+
+import sys
+
+import pytest
+
+from asip import proc
+from asip.proc import ProcResult, run, run_curl, run_systemctl
+
+
+def _py(code: str) -> list[str]:
+    return [sys.executable, "-c", code]
+
+
+def _record_run(monkeypatch):
+    captured = {}
+
+    def fake(argv, *, timeout, cwd=None, env=None, redact=True):
+        captured["argv"] = argv
+        captured["timeout"] = timeout
+        captured["redact"] = redact
+        return ProcResult(0, stdout="ok")
+
+    monkeypatch.setattr(proc, "run", fake)
+    return captured
+
+
+def test_run_success_returns_code_and_stdout():
+    result = run(_py("print('hi')"), timeout=10)
+    assert result.code == 0
+    assert result.stdout == "hi\n"
+    assert result.ok is True
+    assert result.timed_out is False
+    assert result.error is None
+
+
+def test_run_nonzero_exit_is_reported_not_raised():
+    result = run(_py("import sys; sys.stderr.write('boom'); sys.exit(3)"),
+                 timeout=10)
+    assert result.code == 3
+    assert result.ok is False
+    assert "boom" in result.stderr
+
+
+def test_run_timeout_marks_timed_out_and_clears_code():
+    result = run(_py("import time; time.sleep(5)"), timeout=0.3)
+    assert result.timed_out is True
+    assert result.code is None
+    assert result.ok is False
+    assert result.error is None
+
+
+def test_run_missing_binary_returns_error_instead_of_raising():
+    result = run(["asip-no-such-binary-xyz"], timeout=5)
+    assert result.code is None
+    assert result.ok is False
+    assert result.error is not None
+    assert "binary not found" in result.error
+
+
+def test_run_redacts_stderr_by_default():
+    code = ("import sys; sys.stderr.write("
+            "'Authorization: Bearer abc.def token=deadbeef')")
+    result = run(_py(code), timeout=10)
+    assert "abc.def" not in result.stderr
+    assert "deadbeef" not in result.stderr
+    assert "***" in result.stderr
+
+
+def test_run_redact_false_keeps_stderr_verbatim():
+    code = "import sys; sys.stderr.write('Authorization: Bearer abc.def')"
+    result = run(_py(code), timeout=10, redact=False)
+    assert "abc.def" in result.stderr
+
+
+def test_run_never_redacts_stdout():
+    result = run(_py("print('token=deadbeef')"), timeout=10)
+    assert result.stdout == "token=deadbeef\n"
+
+
+def test_run_curl_builds_socks_argv_and_hard_timeout(monkeypatch):
+    captured = _record_run(monkeypatch)
+    result = run_curl(["https://example.test/trace"], timeout=7,
+                      socks_port=1080, extra=("-H", "X-Test: 1"))
+    assert result.ok is True
+    assert captured["argv"] == [
+        "curl", "-sS", "--max-time", "7",
+        "--proxy", "socks5h://127.0.0.1:1080",
+        "https://example.test/trace", "-H", "X-Test: 1",
+    ]
+    assert captured["timeout"] == 12
+
+
+def test_run_curl_builds_http_proxy_argv(monkeypatch):
+    captured = _record_run(monkeypatch)
+    run_curl(["https://example.test"], timeout=3,
+             http_proxy="http://127.0.0.1:7890")
+    assert captured["argv"] == [
+        "curl", "-sS", "--max-time", "3",
+        "--proxy", "http://127.0.0.1:7890",
+        "https://example.test",
+    ]
+
+
+def test_run_curl_rejects_socks_and_http_together(monkeypatch):
+    _record_run(monkeypatch)
+    with pytest.raises(ValueError):
+        run_curl(["https://example.test"], timeout=3, socks_port=1080,
+                 http_proxy="http://127.0.0.1:7890")
+
+
+def test_run_systemctl_uses_user_scope_and_default_timeout(monkeypatch):
+    captured = _record_run(monkeypatch)
+    result = run_systemctl("restart", "auto-switch-ip.service")
+    assert result.ok is True
+    assert captured["argv"] == [
+        "systemctl", "--user", "restart", "auto-switch-ip.service",
+    ]
+    assert captured["timeout"] == 20
+
+
+def test_run_systemctl_honours_custom_timeout(monkeypatch):
+    captured = _record_run(monkeypatch)
+    run_systemctl("is-active", "x.service", timeout=5)
+    assert captured["timeout"] == 5
+
+
+@pytest.mark.parametrize("bad", [0, -1, None])
+def test_run_rejects_non_positive_timeout(bad):
+    with pytest.raises(ValueError):
+        run(_py("print('x')"), timeout=bad)
