@@ -73,3 +73,33 @@ def test_session_expires(monkeypatch, tmp_path):
     fresh = probe_warp._session_for(1081)
     assert fresh != "ses_old"
     assert json.loads(state.read_text())["1081"]["rotations"] == 0
+
+
+def test_parse_retry_after_header_numeric():
+    assert probe_warp.parse_retry_after({"retry-after": "16671"}) == 16671
+    assert probe_warp.parse_retry_after({"Retry-After": "90"}) == 90
+    assert probe_warp.parse_retry_after({"x-ratelimit-reset-after": "30"}) == 30
+
+
+def test_parse_retry_after_header_wins_over_body():
+    head = '{"retry_after": 10}'
+    assert probe_warp.parse_retry_after({"retry-after": "120"}, head) == 120
+
+
+def test_parse_retry_after_body_fields_and_text():
+    assert probe_warp.parse_retry_after({}, '{"retry_after": 30}') == 30
+    assert probe_warp.parse_retry_after({}, '{"retry_after_ms": 1500}') == 1
+    assert probe_warp.parse_retry_after({}, "please retry in 2h") == 7200
+
+
+def test_parse_retry_after_http_date():
+    from email.utils import formatdate
+    now = 1_700_000_000.0
+    date = formatdate(now + 600, usegmt=True)
+    assert probe_warp.parse_retry_after({"retry-after": date}, "", now=now) == 600
+
+
+def test_parse_retry_after_missing_and_clamped():
+    assert probe_warp.parse_retry_after({}, "") is None
+    assert probe_warp.parse_retry_after({"retry-after": "0"}) is None
+    assert probe_warp.parse_retry_after({"retry-after": "999999"}) == 86400

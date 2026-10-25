@@ -3207,6 +3207,40 @@ def test_reburned_after_recovery_starts_new_penalty(monkeypatch):
     assert daemon._warp_ip_is_blocked("ip-x", now + 8 * h) is True, "应在新的 24h 惩罚期内"
 
 
+def test_retry_after_sets_exact_ban_until(monkeypatch):
+    """上游 429 的 Retry-After 是确切封禁期，替换 rate429 的默认 24h 猜测。
+
+    探针在 429 响应头里拿到 retry-after 后写入 ban_until；到期即放行，
+    既不会因默认 24h 多封 20 小时，也不会提前放回。
+    """
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    daemon._mark_warp_ip_used("ip-ban", now, blocked=True, kind="rate429",
+                              ban_after=2 * h)
+    assert daemon._WARP_IP_USED["ip-ban"]["ban_until"] == now + 2 * h
+    assert daemon._WARP_IP_USED["ip-ban"]["ban_kind"] == "rate429"
+    assert daemon._warp_ip_is_blocked("ip-ban", now + h) is True
+    assert daemon._warp_ip_is_blocked("ip-ban", now + 2 * h - 1) is True
+    assert daemon._warp_ip_is_blocked("ip-ban", now + 2 * h + 1) is False
+
+
+def test_ban_until_does_not_shorten_parallel_403(monkeypatch):
+    """Retry-After 只替换同类型窗口；并行 403 的 6h 仍按「按多的来」。"""
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    daemon._mark_warp_ip_used("ip-mix", now, blocked=True, kind="abuse403")
+    daemon._mark_warp_ip_used("ip-mix", now + h, blocked=True, kind="rate429",
+                              ban_after=2 * h)
+    assert daemon._warp_ip_is_blocked("ip-mix", now + 6 * h - 60) is True
+    assert daemon._warp_ip_is_blocked("ip-mix", now + 6 * h + 60) is False
+
+
 def test_expired_block_becomes_secondary_tier(monkeypatch):
     """过了惩罚期的 IP 降级为「次级优质」，重新进入候选；未过期的仍被排除。
 

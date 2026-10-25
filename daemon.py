@@ -2222,11 +2222,24 @@ def _warp_block_stamps(entry: dict) -> dict[str, float]:
 
 
 def _warp_block_remaining(entry: dict, now: float) -> float:
-    """剩余惩罚期（秒），<=0 表示已恢复。多类标记取最晚解除的那一类。"""
+    """剩余惩罚期（秒），<=0 表示已恢复。多类标记取最晚解除的那一类。
+
+    上游 429 带 `Retry-After` 时，探针把确切恢复时刻写进 `ban_until`；它替换
+    同类型的默认惩罚期（rate429 的 24h），不是与之取最大值 —— 24h 本就是没有
+    观测时的保守猜测。403 等其它类型仍按各自窗口并行，仍遵守「按多的来」。
+    """
     stamps = _warp_block_stamps(entry)
     if not stamps:
         return _warp_block_ttl(None)
-    return max(t + _warp_block_ttl(k) - now for k, t in stamps.items())
+    ban_until = entry.get("ban_until")
+    ban_kind = entry.get("ban_kind") or "rate429"
+    remain = 0.0
+    for k, t in stamps.items():
+        if ban_until is not None and k == ban_kind:
+            remain = max(remain, float(ban_until) - now)
+        else:
+            remain = max(remain, t + _warp_block_ttl(k) - now)
+    return remain
 
 
 def _warp_ip_recently_used(ip: str | None, now: float,
@@ -2660,11 +2673,14 @@ def _warp_ip_survival(ip: str | None) -> float | None:
 
 def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
                        kind: str | None = None,
-                       forget_probe: bool = True) -> None:
+                       forget_probe: bool = True,
+                       ban_after: float | None = None) -> None:
     """记录出口 IP 的本次使用；blocked=True 表示该 IP 已被 403/429 标记。
 
     `kind` 为 "abuse403" / "rate429"，决定惩罚期是 6h 还是 24h；缺省时
-    该条记录按 24h 保守处理。顺手清理已出窗口的条目（表长恒定为窗口内 IP 数）。
+    该条记录按 24h 保守处理。`ban_after` 是上游 429 响应给出的确切剩余秒数
+    （Retry-After），有它时替换该类型的默认惩罚期，见 `_warp_block_remaining`。
+顺手清理已出窗口的条目（表长恒定为窗口内 IP 数）。
 
     `forget_probe=False` 供模型探测自己记账时用：那是**同一次观测**的产物，
     清掉它只会让下次调用重探一遍、白烧一格配额（实测同一地址连探两次）。
@@ -2676,7 +2692,7 @@ def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
     if not ip:
         return
     with _WARP_IP_LOCK:
-        _warp_ip_used_locked(ip, now, blocked, kind)
+        _warp_ip_used_locked(ip, now, blocked, kind, ban_after)
     # 在锁外清：两张台账没有嵌套需求，拿完就放，避免与 _record_warp_cycle
     # 的 IP→CYCLES 顺序交叉成环。
     if blocked and forget_probe:
@@ -2688,7 +2704,8 @@ def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
 
 
 def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
-                         kind: str | None = None) -> None:
+                         kind: str | None = None,
+                         ban_after: float | None = None) -> None:
     """持锁版本的写入主体（调用方必须已持有 _WARP_IP_LOCK）。
 
     记录 `first_seen` / `blocked_ts` / `served_sec`：只存"最后一次使用时刻"
@@ -2701,12 +2718,15 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
     保留最早的起点；该类型已满期再被烧则是新一轮，起点重新计 —— 否则恢复
     过一次的地址会永远被判为「已恢复」。`blocked_ts` / `blocked_kind` 保留
     作展示与旧记录兼容，取当前最早的一类。
+
+    `ban_until` 来自上游 429 的 Retry-After（探针实测）：它是**确切**恢复
+    时刻，优先于该类型的默认窗口；没有观测时仍用 6h/24h 保守值。
     """
     fresh = {"ts": now, "blocked": blocked,
              "blocked_kind": kind if blocked else None, "first_seen": now,
              "blocked_ts": now if blocked else None,
              "blocked_ts_by_kind": {}, "served_sec": None, "last_ok_ts": None,
-             "probe_ok_ts": None}
+             "probe_ok_ts": None, "ban_until": None, "ban_kind": None}
     entry = _WARP_IP_USED.setdefault(ip, fresh)
     if not isinstance(entry, dict):
         # 兼容旧格式（float）
@@ -2726,6 +2746,19 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
         entry["blocked_kind"] = min(stamps, key=stamps.get)
         if new_round:
             entry["served_sec"] = now - float(entry.get("first_seen") or now)
+            entry["ban_until"] = None
+            entry["ban_kind"] = None
+        if ban_after is not None:
+            try:
+                secs = float(ban_after)
+            except (TypeError, ValueError):
+                secs = 0.0
+            if secs > 0:
+                secs = min(max(secs, 1.0), 86400.0)
+                until = now + secs
+                prev_until = float(entry.get("ban_until") or 0)
+                entry["ban_until"] = max(until, prev_until) if prev_until > now else until
+                entry["ban_kind"] = kind if kind in ("abuse403", "rate429") else "rate429"
     entry["blocked"] = entry.get("blocked", False) or blocked
     w = _warp()
     cutoff = now - w["ip_reuse_guard_sec"]
@@ -2736,6 +2769,9 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
                                w.get("blocked_ttl_sec", 86400))
     for k in list(_WARP_IP_USED):
         v = _WARP_IP_USED[k]
+        # 上游给出长于默认窗口的确切封禁时，条目必须留到 ban_until。
+        if isinstance(v, dict) and float(v.get("ban_until") or 0) > now:
+            continue
         ts = v.get("ts") if isinstance(v, dict) else v
         keep = blocked_cutoff if (isinstance(v, dict) and v.get("blocked")) else cutoff
         if ts < keep:
@@ -2772,8 +2808,8 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     started_at = time.time()
     try:
         import probe_warp
-        verdict = probe_warp.probe(member["port"],
-                                   w.get("refresh_model_timeout_sec", 15))[0]
+        verdict, _sec, _detail, retry_after = probe_warp.probe(
+            member["port"], w.get("refresh_model_timeout_sec", 15))
     except Exception as e:
         log(f"  ✗ {tag} 模型探测异常: {e}")
         return False
@@ -2784,7 +2820,9 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         return False
     _PROBE_LAST_VERDICT[tag] = verdict
     ok = verdict == "OK"
-    log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}"
+    hint = (f"（Retry-After {retry_after / 3600:.1f}h）"
+            if retry_after and retry_after > 0 else "")
+    log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}{hint}"
         f"{_warp_refresh_count_note(tag)}")
     if ok:
         # 实测通过 = 这条地址此刻确实能服务，记进 `probe_ok_ts`。否则同址仍停在
@@ -2813,7 +2851,7 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         # 每个新地址都要白烧一格配额才被认出来，而段级静置本可以提前挡住。
         _mark_warp_ip_used(ip, time.time(), blocked=True,
                            kind=_MODEL_VERDICT_BLOCK_KIND[verdict],
-                           forget_probe=False)
+                           forget_probe=False, ban_after=retry_after)
     return ok
 
 

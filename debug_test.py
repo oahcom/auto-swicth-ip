@@ -18,7 +18,7 @@ daemon.CFG['warp']['refresh_model_check'] = True
 daemon.CFG['warp']['probe_persistent_ttl_sec'] = 21600
 
 def mock_probe(port, timeout):
-    return ('quota', 0.1, '')
+    return ('quota', 0.1, '', None)
 
 probe_warp.probe = mock_probe
 
