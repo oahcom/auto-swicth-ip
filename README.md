@@ -22,7 +22,8 @@
 
 - `parse_subscription.py` — 拉 okz 订阅 + 解析 vless/vmess/hysteria2/anytls/trojan/shadowsocks + 生成 sing-box config
 - `daemon.py` — 监控 9router + 主动轮换 sing-box 节点
-- `asip/` — 无副作用的可复用工具（原子 JSON 写、密钥脱敏、Clash API 客户端、出口探测）；daemon 通过同名门面委托，便于单测与复用
+- `asip/` — 无副作用的可复用工具（原子 JSON 写、密钥脱敏、Clash API 客户端、出口探测、带超时的子进程/HTTP 封装）；daemon 通过同名门面委托，便于单测与复用
+- `warp_line_worker.py` — 每条 WARP 隧道一个常驻 worker（判断与执行同循环）；由 `warp.line_worker.enabled` 开启，默认关闭，开启前可先用 `dry_run` 观察
 - `.env` — 订阅 token 与路径覆盖（**不入库**，chmod 600）
 - `singbox-config.json` — 生成的 sing-box 配置（**不入库**，含 Clash API secret 与节点凭据；启动时按需生成）
 - `sing-box` — Linux x64 二进制（1.13.0）

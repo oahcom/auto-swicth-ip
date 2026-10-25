@@ -1946,6 +1946,40 @@ New-NetFirewallRule -DisplayName 'auto-switch-ip LAN proxy (TCP 7891)' -Directio
   而不是让单元静默起不来。
 - 密钥文件已存在时不得覆盖（覆盖会让正在跑的 sing-box 掉线）。
 
+## 13. 共享层与按线 worker（T-230~T-239）
+
+**范围**：`asip/{proc,http,egress,atomic_io,clash_client}.py`、`warp_line_worker.py`、
+daemon 的 asip 边界。全部用例离线（monkeypatch 子进程/HTTP，不访问 Clash 与订阅源），
+单文件运行 <1s。
+
+```bash
+python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
+    test_asip_atomic.py test_asip_clash.py test_asip_integration.py \
+    test_warp_line_worker.py -q
+```
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-230 | P0 | 子进程不得无超时 | `pytest test_asip_proc.py` | `timeout<=0` 抛 `ValueError`；超时返回 `timed_out=True` 且 `code=None`；二进制缺失返回 `error="binary not found: ..."` 而不抛 |
+| T-231 | P0 | 曲奇/代理参数不经 shell | `grep -n "shell=True" asip/ proc 调用点` | 全仓 0 命中；`run_curl` 的 socks/http 代理互斥，HTTP 变量为 `--proxy socks5h://<host>:<port>` |
+| T-232 | P0 | 传输失败与 HTTP 错误必须可区分 | `pytest test_asip_http.py test_asip_integration.py` | 传输失败 `status=None`；`singbox_api` 包装后为 `(0, None)`；4xx/5xx 原样返回状态码；重试仅在显式 `retries>0` 时发生 |
+| T-233 | P0 | 出口探测保留失败原因且要求 warp=on | `pytest test_asip_egress.py` | `probe_egress` 返回 `curl_missing/timeout/rc/bad_body/invalid_ip/warp_off` 优先级最高者；`warp_egress_ip` 传入 `require_warp=True` 与配置里的 `socks_host` |
+| T-234 | P0 | JSONL 追加不得交错 | `pytest test_asip_atomic.py -k concurrent` | 8 线程 × 50 行后 400 行全部可 `json.loads`；文件权限 0600（已存在的 0644 会被收紧） |
+| T-235 | P0 | read-modify-write 必须持锁且失败不落盘 | `pytest test_asip_atomic.py -k update_json` | 有 `lock_path` 时全程持 `flock`；`merge` 抛异常后原文件字节不变 |
+| T-236 | P1 | Clash 节点名必须 URL 编码 | `pytest test_asip_clash.py` | 含 `/` 或空格的节点名在 `select/delay/selector_state` 中 `quote(name, safe="")`；`delays` 对重复节点只请求一次且保序归因 |
+| T-237 | P0 | 日志不得被消息内换行伪造 | `pytest test_asip_integration.py -k log_message` | `\n`/`\r\n` 压成字面 `\n`；超长消息截断并带 `…(truncated)` |
+| T-238 | P0 | worker 默认不接管，启用后旧路径让路 | `pytest test_asip_integration.py -k "line_worker or schedule_idle"` | 默认 `enabled=False`；启用时 `_prewarm_standby_warp` 不调、`_schedule_idle_refresh` 不登记待刷、`_start_dirty_line_janitor` 不起 |
+| T-239 | P0 | dry_run 不得产生副作用 | `pytest test_warp_line_worker.py`；`python3 warp_line_worker.py` | dry-run 下不调 `_mark_warp_ip_used`/`_set_warp_line_ip`/`_restart_service`/`_reconnect_warp_now`，只记 `[dry-run] 应换线/应重启/应验收`；自检 `selftest OK (9 cases)` |
+
+**实战验证（改动合入前人工执行一次）**：
+
+1. `python3 verify_rotation.py --quick` —— 端口/IP 切换正常，结束时恢复原选择。
+2. `python3 switch-proxy.py status` / `list` —— 节点列表与当前选择可读，无 401。
+3. `python3 probe_warp.py`（只读探测）—— 返回各线出口地址，不重启隧道。
+4. `warp_line_worker` 灰度：把 `warp.line_worker` 设为 `{"enabled": true, "dry_run": true}` 并重启
+   daemon，观察 `daemon.log` 只有 `[dry-run] 应…`，20 条线的 `systemctl` 重启次数不增；
+   确认无异常后再关 `dry_run`。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
