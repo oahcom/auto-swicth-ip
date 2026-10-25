@@ -14,6 +14,9 @@
 
 通过 `start(host)` 注入 daemon 模块对象，模块自己不 import daemon ——
 daemon 既可能被 import（测试）也可能作为 __main__ 运行，直接 import 会二次加载。
+
+`start(..., dry_run=True)` 时只探出口并记录本应执行的动作，不重启、不换线、
+不写台账，用于接入 daemon 前观察行为。
 """
 import threading
 import time
@@ -65,32 +68,55 @@ HEARTBEAT_SEC = 60.0
 INTERVAL_SEC = 5.0
 # 出口探测不复用单次预算：tick 走 daemon 的 _probe_refresh_egress（轮询到通为止）。
 
+# start() 保存的当前配置。线程创建时把值一并传进 _loop，已存活线程不受
+# 后续 start() 调用的影响。
+_DRY_RUN = False
+_INTERVAL = INTERVAL_SEC
 
-def start(host: DaemonHost, members: list[dict] | None = None) -> None:
+_DRY_RUN_LABEL = {
+    "switch": "应换线",
+    "restart": "应重启",
+    "accept": "应验收",
+    "none": "无动作",
+}
+
+
+def start(host: DaemonHost, members: list[dict] | None = None, *,
+          dry_run: bool = False, interval_sec: float | None = None) -> None:
     """为每条隧道起一个常驻 worker。重复调用无副作用。"""
-    global _host
+    global _host, _DRY_RUN, _INTERVAL
     _host = host
-    for m in (members if members is not None else host._warp()["members"]):
+    _DRY_RUN = bool(dry_run)
+    _INTERVAL = INTERVAL_SEC if interval_sec is None else float(interval_sec)
+
+    if members is None:
+        members = host._warp()["members"]
+    if not members:
+        return
+
+    for m in members:
         tag = m["tag"]
         t = _threads.get(tag)
         if t is not None and t.is_alive():
             continue
-        t = threading.Thread(target=_loop, args=(m,), daemon=True,
-                             name=f"warp-line-{tag}")
+        t = threading.Thread(target=_loop, args=(m, _DRY_RUN, _INTERVAL),
+                             daemon=True, name=f"warp-line-{tag}")
         _threads[tag] = t
         t.start()
 
 
-def _loop(member: dict) -> None:
+def _loop(member: dict, dry_run: bool = False,
+          interval_sec: float | None = None) -> None:
+    interval = INTERVAL_SEC if interval_sec is None else interval_sec
     while True:
         try:
-            tick(member)
+            tick(member, dry_run=dry_run)
         except Exception as e:
             _host.log(f"  ✗ {member['tag']} 线程异常: {e}")
-        time.sleep(INTERVAL_SEC)
+        time.sleep(interval)
 
 
-def tick(member: dict) -> None:
+def tick(member: dict, *, dry_run: bool = False) -> None:
     """一轮判断 + 一轮动作。所有线都走这里，不只是低质线。
 
     判据分两种，不能混：「探不到出口」是观测缺失，「探到了但判低质」才是结论。
@@ -123,50 +149,65 @@ def tick(member: dict) -> None:
           f"  · {tag} 观测 出口={ip} 验收={'同址已验过' if verified else '新址待验'}"
           f"{_ctx(tag, acc, active, verified, ip)}")
 
+    plan = _plan(member, ip, acc, active, verified, now)
+    if plan is None or plan[0] == "none":
+        return
+    action, reason = plan
+
+    # dry-run 只读：出口探测能看出「本该做什么」，但绝不写台账、不重启、不换线。
+    if dry_run:
+        _note(tag, f"dry:{action}:{ip}",
+              f"  [dry-run] {tag} {_DRY_RUN_LABEL.get(action, action)}"
+              f"（本应执行 {action}）原因={reason}"
+              f"{h._warp_refresh_progress(tag)}")
+        return
+
     # 地址变了：变化前那个地址确实服务过，入台账（换出来的 IP 该入库就入库）。
     if acc and not verified:
         h._mark_warp_ip_used(acc[1], now)
         h.log(f"  ⇄ {tag} 出口变更 {acc[1]} → {ip}，旧址入地址台账")
 
-    # 当前出口：重启它等于掐断在途请求，永不原地重启。但地址变了必须重验 -
-    # 不合格就走换线路径（换到另一条线），那条路径会顺带把这条脏线排队刷新。
-    #
-    # WHY 换址本身就要换线：usque 自发换址时旧地址仍在服务在途请求，新地址的
-    # 配额/信誉是**全新且未知**的。不换线等于拿一条未验收的地址继续服务生产
-    # 流量，下一秒的 403/429 会替我们验收 —— 那时已经白失败了一批请求。
-    # 实测同 tag 相邻判定间隔 10~30s 时 99.4% 换了地址，这个窗口很短。
-    if active:
-        if not verified:
-            # 当前出口换址 → 马上换线，不等验收。
-            #
-            # 先验收再换是错的：新地址的额度与信誉都是未知的，把它继续挂在
-            # 生产流量上做验收，等于拿真实失败请求当探针（首条错误延迟 p50
-            # 只有 1.6s）。换下去之后这条线转成备线，由下面「未验收新址」
-            # 的分支正常处理 —— 验收合格留在池子里，不合格就重启。
-            #
-            # 旧址入台账：它确实服务过生产流量，这个事实不能丢。
-            if acc:
-                h._mark_warp_ip_used(acc[1], now)
-            _note(tag, f"swap:{ip}",
-                  f"  ⇄ {tag} 当前出口换址 {acc[1] if acc else '未知'} → {ip}，立即换线"
-                  f"{h._warp_refresh_progress(tag)}")
-            _switch_away(member, f"当前出口换址 {ip}")
-        return
+    if action == "switch":
+        _note(tag, f"swap:{ip}",
+              f"  ⇄ {tag} 当前出口换址 {acc[1] if acc else '未知'} → {ip}，立即换线"
+              f"{h._warp_refresh_progress(tag)}")
+        _switch_away(member, reason)
+    elif action == "accept":
+        _accept(member, ip)
+    elif action == "restart":
+        _restart_and_verify(member, reason)
 
-    # 未验收过的新地址：先验，验过就不再走重启。
+
+def _plan(member: dict, ip: str | None, acc: tuple | None, active: bool,
+          verified: bool, now: float) -> tuple[str, str] | None:
+    """把观测映射成一个待执行动作，本身不做任何写操作。
+
+    action 取 restart/switch/accept/none，无需动作时返回 None。执行交给 tick，
+    这样 dry_run 只需跳过执行即可保证零副作用。
+    """
+    h = _host
+    tag = member["tag"]
+    if not ip:
+        return None
+
+    # 当前出口：重启它等于掐断在途请求，所以地址没变就什么都不做。地址变了
+    # 必须换线：新地址的配额/信誉全新且未知，继续服务生产流量等于拿真实请求
+    # 当探针（首条错误延迟 p50 只有 1.6s）。
+    if active:
+        if verified:
+            return None
+        return ("switch", f"当前出口换址 {ip}")
+
+    # 未验收过的新地址：先验，验过就入池，不过就重启。
     if not verified:
         if h._warp_model_usable(member, ip):
-            _accept(member, ip)
-            return
-        _restart_and_verify(member, f"新址 {ip} 验收未过")
+            return ("accept", f"新址 {ip} 验收通过")
+        return ("restart", f"新址 {ip} 验收未过")
 
-    # 已验收且台账说健康：什么都不做。只读台账，不烧配额。
-    elif not h._warp_ip_needs_refresh(ip, now, tag):
-        return
-
-    else:
-        reason = h._warp_ip_refresh_reason(ip, now, tag) or "台账判低质"
-        _restart_and_verify(member, reason)
+    # 已验收且台账健康：什么都不做。只读台账，不烧配额。
+    if not h._warp_ip_needs_refresh(ip, now, tag):
+        return None
+    return ("restart", h._warp_ip_refresh_reason(ip, now, tag) or "台账判低质")
 
 
 def _note(tag: str, key: str, line: str) -> None:

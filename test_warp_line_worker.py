@@ -1,0 +1,254 @@
+"""warp_line_worker 单测：状态机分支 + dry-run 只读 + start/interval 行为。"""
+import threading
+
+import pytest
+
+import warp_line_worker as w
+
+M = {"tag": "T", "port": 1080, "service": "s"}
+
+
+class Fake:
+    """最小 daemon 依赖面，记录所有会产生副作用的调用。"""
+
+    def __init__(self, ip, acc, active=None, needs=False, busy=False,
+                 usable=True, reason="测试原因", members=None):
+        self.ip = ip
+        self.acc = acc
+        self.active = active
+        self.needs = needs
+        self.busy = busy
+        self.usable = usable
+        self.reason = reason
+        self.members = [] if members is None else members
+        self.calls = []
+        self._WARP_LAST_ACCEPT = {}
+
+    def _warp(self):
+        return {"members": self.members, "ready_timeout_sec": 12}
+
+    def log(self, msg):
+        self.calls.append(("log", msg))
+
+    def _warp_last_accept(self, tag):
+        return self.acc
+
+    def _warp_model_usable(self, member, ip):
+        self.calls.append(("verify", ip))
+        return self.usable
+
+    def _warp_ip_needs_refresh(self, ip, now, tag):
+        return self.needs
+
+    def _warp_ip_refresh_reason(self, ip, now, tag):
+        return self.reason
+
+    def active_warp_tag(self):
+        return self.active
+
+    def warp_line_busy(self, tag):
+        return self.busy
+
+    def _acquire_refresh_slot(self, tag):
+        self.calls.append(("acquire", tag))
+        return True
+
+    def _release_refresh_slot(self, tag):
+        self.calls.append(("release", tag))
+
+    def _invalidate_warp_line_ip(self, tag):
+        self.calls.append(("invalidate", tag))
+
+    def _restart_service(self, service, tag=None):
+        self.calls.append(("restart", tag))
+        return True
+
+    def _wait_port_ready(self, port, timeout_sec):
+        return True
+
+    def _probe_refresh_egress(self, port):
+        return self.ip
+
+    def _mark_warp_ip_used(self, ip, now, blocked=False, **kw):
+        self.calls.append(("used", ip, blocked))
+
+    def _reconnect_warp_now(self, reason, now, ignore_cooldown=False):
+        self.calls.append(("switch", reason))
+        return True
+
+    def _set_warp_line_ip(self, tag, ip):
+        self.calls.append(("set_ip", tag, ip))
+
+    def _warp_refresh_progress(self, tag):
+        return ""
+
+
+@pytest.fixture(autouse=True)
+def _reset_globals():
+    w._threads.clear()
+    w._LAST_LOG.clear()
+    w._host = None
+    w._DRY_RUN = False
+    w._INTERVAL = w.INTERVAL_SEC
+    yield
+    w._threads.clear()
+    w._LAST_LOG.clear()
+    w._host = None
+    w._DRY_RUN = False
+    w._INTERVAL = w.INTERVAL_SEC
+
+
+def run(fake, dry_run=False):
+    w._host = fake
+    w._LAST_LOG.clear()
+    fake.calls.clear()
+    w.tick(M, dry_run=dry_run)
+    return fake.calls
+
+
+def acted(calls, kind):
+    return any(c[0] == kind for c in calls)
+
+
+def logs(calls):
+    return " ".join(c[1] for c in calls if c[0] == "log")
+
+
+def test_healthy_line_no_action_and_observation_log():
+    c = run(Fake("ip1", (1.0, "ip1")))
+    assert not acted(c, "restart") and not acted(c, "switch")
+    assert not any(x[0] == "set_ip" for x in c)
+    assert "观测 出口=ip1" in logs(c)
+
+
+def test_address_change_marks_old_and_accepts_new():
+    c = run(Fake("ip2", (1.0, "ip1")))
+    assert ("used", "ip1", False) in c
+    assert ("verify", "ip2") in c
+    assert ("set_ip", "T", "ip2") in c
+    assert not acted(c, "restart")
+
+
+def test_probe_missing_is_not_restart():
+    c = run(Fake(None, None))
+    assert not acted(c, "restart") and not acted(c, "switch")
+    assert "出口探测未果" in logs(c)
+
+
+def test_same_address_low_quality_restarts():
+    c = run(Fake("ip1", (1.0, "ip1"), needs=True))
+    assert ("restart", "T") in c
+
+
+def test_active_same_address_never_restarts():
+    c = run(Fake("ip1", (1.0, "ip1"), active="T", needs=True))
+    assert not acted(c, "restart") and not acted(c, "switch")
+
+
+def test_busy_line_waits_without_restart():
+    c = run(Fake("ip1", (1.0, "ip1"), needs=True, busy=True))
+    assert not acted(c, "restart")
+    assert not acted(c, "acquire")
+    assert "线上有连接" in logs(c)
+
+
+def test_unverified_new_address_verification_failure_restarts():
+    c = run(Fake("ip9", None, usable=False))
+    assert ("verify", "ip9") in c
+    assert ("restart", "T") in c
+
+
+def test_active_address_change_switches_without_restart_or_verify():
+    c = run(Fake("ip9", (1.0, "ip1"), active="T", usable=False))
+    assert not acted(c, "restart")
+    assert acted(c, "switch")
+    assert not any(x[0] == "verify" for x in c)
+    assert ("used", "ip1", False) in c
+    assert not any(x[0] == "set_ip" for x in c)
+
+
+def test_low_quality_restart_reason_carries_ip():
+    c = run(Fake("ip7", (1.0, "ip7"), needs=True))
+    joined = logs(c)
+    assert "ip7" in joined
+    assert "出口未知" not in joined
+
+
+def test_dry_run_active_switch_logs_only():
+    c = run(Fake("ip2", (1.0, "ip1"), active="T"), dry_run=True)
+    assert not acted(c, "switch")
+    assert not any(x[0] == "used" for x in c)
+    assert not any(x[0] == "set_ip" for x in c)
+    assert "[dry-run]" in logs(c) and "应换线" in logs(c)
+
+
+def test_dry_run_unverified_failure_logs_only():
+    c = run(Fake("ip9", None, usable=False), dry_run=True)
+    assert not acted(c, "restart")
+    assert not acted(c, "acquire")
+    assert not acted(c, "invalidate")
+    assert "[dry-run]" in logs(c) and "应重启" in logs(c)
+
+
+def test_dry_run_accept_logs_without_ledger():
+    fake = Fake("ip9", None, usable=True)
+    c = run(fake, dry_run=True)
+    assert not any(x[0] == "set_ip" for x in c)
+    assert not any(x[0] == "used" for x in c)
+    assert fake._WARP_LAST_ACCEPT == {}
+    assert "[dry-run]" in logs(c) and "应验收" in logs(c)
+
+
+def test_start_empty_members_no_threads():
+    fake = Fake(None, None)
+    w.start(fake, members=[])
+    assert w._threads == {}
+    w.start(fake)
+    assert w._threads == {}
+    assert w._DRY_RUN is False
+    assert w._INTERVAL == w.INTERVAL_SEC
+
+
+def test_start_twice_keeps_single_thread(monkeypatch):
+    started = threading.Event()
+    stop = threading.Event()
+
+    def fake_loop(member, dry_run, interval_sec):
+        started.set()
+        stop.wait(5)
+
+    monkeypatch.setattr(w, "_loop", fake_loop)
+    fake = Fake(None, None, members=[M])
+    w.start(fake, members=[M], dry_run=True, interval_sec=1.5)
+    assert started.wait(2)
+    first = w._threads["T"]
+    assert first.is_alive()
+
+    w.start(fake, members=[M], dry_run=False, interval_sec=2.5)
+    assert w._threads["T"] is first
+    assert len(w._threads) == 1
+    assert w._DRY_RUN is False
+    assert w._INTERVAL == 2.5
+
+    stop.set()
+    first.join(2)
+    assert not first.is_alive()
+
+
+class StopLoop(Exception):
+    pass
+
+
+def test_loop_uses_interval_sec(monkeypatch):
+    fake = Fake(None, None)
+    w._host = fake
+    seen = []
+
+    def fake_sleep(sec):
+        seen.append(sec)
+        raise StopLoop
+
+    monkeypatch.setattr(w.time, "sleep", fake_sleep)
+    with pytest.raises(StopLoop):
+        w._loop(M, False, 12.5)
+    assert seen == [12.5]
