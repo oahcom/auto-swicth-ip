@@ -6,8 +6,11 @@ import base64
 import json
 import urllib.parse
 import sys
-import os
 from pathlib import Path
+
+from asip.atomic_io import write_json
+from asip.http import request_json
+from asip.redact import redact_secrets
 
 import config
 from config import CFG, get_lan_auth, get_singbox_secret
@@ -20,13 +23,24 @@ def fetch_and_decode_sub(url: str) -> list[str]:
     """拉订阅，base64 解码，返回原始 URL 列表
     支持：标准 base64 订阅、明文 URL 列表、Clash YAML 配置（提取 proxy 节点）
     """
-    import requests
     import yaml
     # 仅对 dasho 等需要 UA 的源添加 headers
     headers = {"User-Agent": "clash-verge/1.0"} if "dasho" in url else {}
-    r = requests.get(url, timeout=30, headers=headers)
-    r.raise_for_status()
-    raw = r.text
+    result = request_json("GET", url, timeout=30, headers=headers)
+    if not result.ok:
+        # 与 raise_for_status 等价：传输失败单独说明，非 2xx 带上状态码。
+        if result.status is None:
+            detail = redact_secrets(result.error or "transport error")
+        else:
+            detail = f"HTTP {result.status}"
+        raise RuntimeError(f"订阅拉取失败: {detail}")
+    # JSON 响应走 data；非 JSON（base64/Clash YAML/明文列表）走截断后的 text。
+    # 结构化 data 重新序列化，后面的 base64/YAML/splitlines 解析都针对字符串。
+    if result.data is not None:
+        raw = (result.data if isinstance(result.data, str)
+               else json.dumps(result.data, ensure_ascii=False))
+    else:
+        raw = result.text or ""
 
     all_lines = []
 
@@ -681,8 +695,7 @@ if __name__ == "__main__":
         try:
             urls = fetch_and_decode_sub(url)
         except Exception as e:
-            # requests 异常串带完整 URL（含 token），stderr 会进 daemon.log。
-            from asip.redact import redact_secrets
+            # 异常串可能带完整 URL（含 token），stderr 会进 daemon.log。
             print(f"  ✗ 源失败，跳过: {type(e).__name__}: "
                   f"{redact_secrets(str(e))[:120]}", file=sys.stderr)
             continue
@@ -708,11 +721,11 @@ if __name__ == "__main__":
         sys.exit(1)
 
     cfg = make_config(nodes, args.port, args.clash_port, args.secret or get_singbox_secret(), include_h2=args.include_h2)
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    out_path = Path(args.out)
-    fd = os.open(str(out_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    # 调用方（daemon）传进来的 args.out 本身已是 <config>.tmp：它要在 promote
+    # 前做节点数/sing-box check 校验。write_json 先写同目录唯一临时文件再
+    # os.replace 到 args.out，既不截断写（崩溃不会留下半份 JSON），也不改变
+    # 调用方看到的路径契约。
+    write_json(args.out, cfg, mode=0o600, indent=2)
     print(f"wrote config to {args.out}")
     print(f"first 3 nodes:")
     for n in nodes[:3]:

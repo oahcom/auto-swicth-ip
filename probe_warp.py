@@ -33,7 +33,6 @@ import shutil
 import socket
 import socketserver
 import struct
-import subprocess
 import sys
 import tempfile
 import threading
@@ -41,6 +40,9 @@ import time
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 
+from asip.atomic_io import write_json
+from asip.egress import probe_egress
+from asip.proc import run as run_proc
 from config import CFG
 
 # 只复刻 open-sse/executors/opencode.js 的 UA 与指纹工具定义（后者见下方
@@ -50,7 +52,6 @@ from config import CFG
 UA = "opencode/latest/2.0.26/cli"
 FREEMODEL = "deepseek-v4.1-flash-free"
 URL = "https://opencode.ai/inference/v1/chat/completions"
-TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 ENV_MARKER = ("<env>\n"
               "  Working directory: /workspace\n"
               "  Workspace root folder: /workspace\n"
@@ -151,19 +152,9 @@ def _load_sessions() -> dict:
 
 
 def _save_sessions(data: dict) -> None:
-    directory = os.path.dirname(SESSION_STATE_FILE) or "."
-    tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(prefix=".probe_sessions_", dir=directory)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, SESSION_STATE_FILE)
+        write_json(SESSION_STATE_FILE, data)
     except OSError as e:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
         print(f"⚠ 会话表写入失败: {e}", file=sys.stderr)
 
 
@@ -250,26 +241,17 @@ def _body() -> dict:
     return _apply_env_marker(body)
 
 
-# egress_ip 仍用 curl：Cloudflare trace 不校 TLS 指纹。模型层请求不能走 curl：
-# 同一出口、同一分钟、同一份 body，Bun 200 / curl 429（9router bfd5ad66）。
-# daemon 跑在 systemd 的 /usr/bin/python3，没有 PySocks，requests 遇 socks5h://
-# 会立刻 InvalidSchema；curl --socks5-hostname 只留给出口 IP 探测。
-
-def _socks(port: int) -> list[str]:
-    return ["--socks5-hostname", f"127.0.0.1:{port}"]
-
+# egress_ip 仍走 curl（经 asip.egress）：Cloudflare trace 不校 TLS 指纹。模型层
+# 请求不能走 curl：同一出口、同一分钟、同一份 body，Bun 200 / curl 429
+# （9router bfd5ad66）。daemon 跑在 systemd 的 /usr/bin/python3，没有 PySocks，
+# requests 遇 socks5h:// 会立刻 InvalidSchema；curl --proxy 只留给出口 IP 探测。
 
 def egress_ip(port: int, timeout: float = 10.0) -> str:
     try:
-        r = subprocess.run(
-            ["curl", "-s", "--max-time", str(timeout), *_socks(port), TRACE_URL],
-            capture_output=True, text=True, timeout=timeout + 5)
+        result = probe_egress(socks_port=port, timeout=timeout)
     except Exception:
         return "?"
-    for line in r.stdout.splitlines():
-        if line.startswith("ip="):
-            return line[3:].strip()
-    return "?"
+    return result.ip or "?"
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -516,11 +498,14 @@ def _bun_probe(bun: str, proxy_url: str, sid: str,
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
-        r = subprocess.run([bun, BUN_SCRIPT, path], capture_output=True, text=True,
-                           timeout=timeout + 5)
-        if r.returncode != 0:
+        r = run_proc([bun, BUN_SCRIPT, path], timeout=timeout + 5)
+        if r.error:
+            return None, "", {}, r.error[:120]
+        if r.timed_out:
+            return None, "", {}, "bun timed out"
+        if r.code != 0:
             detail = (r.stderr or r.stdout or "").strip().splitlines()
-            return None, "", {}, (detail[-1] if detail else f"bun rc={r.returncode}")[:120]
+            return None, "", {}, (detail[-1] if detail else f"bun rc={r.code}")[:120]
         lines = [line for line in r.stdout.splitlines() if line.strip()]
         if not lines:
             return None, "", {}, "bun produced no output"

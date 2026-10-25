@@ -14,10 +14,10 @@ import logging
 import random
 import sys
 import time
-
-import requests
+from urllib.parse import quote
 
 from asip.clash_client import ClashClient
+from asip.http import request_json
 from config import CFG, get_singbox_secret
 
 logger = logging.getLogger(__name__)
@@ -30,31 +30,35 @@ _clash = ClashClient(CLASH_API, get_singbox_secret, timeout=TIMEOUT)
 
 def get_nodes() -> tuple[str | None, list[str]]:
     """返回 (当前节点, 全部节点)；sing-box 不可达时返回 (None, [])。"""
-    r = _clash.request("GET", f"proxies/{SELECTOR}")
-    if r is not None and r.status_code == 200:
-        try:
-            data = r.json()
-            return data.get("now", "?"), data.get("all", [])
-        except ValueError as e:
-            logger.warning("get_nodes 失败 (非 JSON 响应): %s", e)
-    elif r is not None:
-        logger.warning("get_nodes 失败: HTTP %s (密钥失效?)", r.status_code)
-    else:
+    status, data = _clash.get_json(f"proxies/{quote(SELECTOR, safe='')}")
+    if status is None:
         logger.warning("get_nodes 失败: sing-box 不可达")
+    elif status != 200:
+        logger.warning("get_nodes 失败: HTTP %s (密钥失效?)", status)
+    elif not isinstance(data, dict):
+        logger.warning("get_nodes 失败 (非 JSON 响应)")
+    else:
+        return data.get("now", "?"), data.get("all", [])
     return None, []
 
 
 def get_9router_proxy() -> tuple[bool | None, str]:
     """返回 (outboundProxyEnabled, outboundProxyUrl)；9router 不可达时 (None, "N/A")。"""
-    try:
-        r = requests.get(
-            f"{CFG['9router']['base'].rstrip('/')}/api/settings", timeout=TIMEOUT
-        )
-        if r.status_code == 200:
-            data = r.json()
-            return data.get("outboundProxyEnabled", False), data.get("outboundProxyUrl", "N/A")
-    except Exception as e:
-        logger.warning("get_9router_proxy 失败 (9router 不可达?): %s", e)
+    result = request_json(
+        "GET",
+        f"{CFG['9router']['base'].rstrip('/')}/api/settings",
+        timeout=TIMEOUT,
+    )
+    if result.ok and isinstance(result.data, dict):
+        data = result.data
+        return data.get("outboundProxyEnabled", False), data.get("outboundProxyUrl", "N/A")
+    if result.error:
+        reason = result.error
+    elif result.status is not None:
+        reason = f"HTTP {result.status}"
+    else:
+        reason = "空响应"
+    logger.warning("get_9router_proxy 失败 (9router 不可达?): %s", reason)
     return None, "N/A"
 
 
