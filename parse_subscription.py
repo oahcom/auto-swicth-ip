@@ -37,7 +37,8 @@ def fetch_and_decode_sub(url: str) -> list[str]:
         else:
             detail = f"HTTP {result.status}"
         raise RuntimeError(f"订阅拉取失败: {detail}")
-    # JSON 响应走 data；非 JSON（base64/Clash YAML/明文列表）走截断后的 text。
+    # JSON 响应走 data；非 JSON（base64/Clash YAML/明文列表）走全文 text
+    # （request_json 显式传 text_limit=None，不能截断）。
     # 结构化 data 重新序列化，后面的 base64/YAML/splitlines 解析都针对字符串。
     if result.data is not None:
         raw = (result.data if isinstance(result.data, str)

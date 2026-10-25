@@ -78,7 +78,6 @@ _DRY_RUN_LABEL = {
     "restart": "应重启",
     "accept": "应验收",
     "probe": "应模型验收（dry-run 未实测）",
-    "none": "无动作",
 }
 
 
@@ -167,7 +166,7 @@ def tick(member: dict, *, dry_run: bool = False) -> None:
 
     plan = _plan(member, ip, acc, active, verified, now,
                  probe=not dry_run)
-    if plan is None or plan[0] == "none":
+    if plan is None:
         return
     action, reason = plan
 

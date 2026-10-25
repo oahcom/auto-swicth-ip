@@ -714,7 +714,7 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `test_portability.py` | — | 可移植性回归（4 例）：路径不越出仓库、运行期文件无硬编码家目录、成员可部署、单元渲染全覆盖 |
 | `test_asip_tools.py` | 73 | asip 工具单测（5 例）：Clash 选择码/密钥轮换、脱敏、原子写权限 |
 | `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写、`append_line`、`update_json`）、`redact`、`clash_client`（`request_json`/`selector_state`/`delay`/`delays`/`connections`）、`egress`（`probe_egress` 保留失败原因）、`proc`（强制超时、无 shell）、`http`（`status=None` 区分传输失败）；daemon 同名门面委托 |
-| `test_asip_unit.py` 系列 | — | 共享层离线单测：`test_asip_{proc,http,egress,atomic,clash}.py` + `test_asip_integration.py`（daemon 边界）|
+| `test_asip_*.py` | — | 共享层离线单测：`test_asip_{proc,http,egress,atomic,clash}.py` + `test_asip_integration.py`（daemon 边界）；无 `test_asip_unit.py` 文件 |
 | `warp_line_worker.py` | — | 每条 WARP 隧道常驻 worker：`_plan` 决策与执行分离，`dry_run` 只读；由 `warp.line_worker` 开关接管三个旧守护 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
 

@@ -74,6 +74,31 @@ def test_run_timeout_reaps_grandchildren(tmp_path):
     pytest.fail(f"孙进程 {pid} 在超时后仍存活，killpg 未生效")
 
 
+def test_run_timeout_survives_process_exiting_before_kill(monkeypatch):
+    """孙进程在超时判定瞬间退出：getpgid/kill 抛 ProcessLookupError 不得外抛。"""
+    import subprocess
+
+    class RacyChild:
+        pid = 424242
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+            return "", ""
+
+        def kill(self):
+            raise ProcessLookupError
+
+    monkeypatch.setattr(proc.subprocess, "Popen",
+                        lambda *a, **k: RacyChild())
+    monkeypatch.setattr(proc.os, "getpgid",
+                        lambda pid: (_ for _ in ()).throw(ProcessLookupError))
+    result = run(["x"], timeout=1)
+    assert result.timed_out is True
+    assert result.code is None
+
+
 def test_run_missing_binary_returns_error_instead_of_raising():
     result = run(["asip-no-such-binary-xyz"], timeout=5)
     assert result.code is None
@@ -153,3 +178,11 @@ def test_run_systemctl_honours_custom_timeout(monkeypatch):
 def test_run_rejects_non_positive_timeout(bad):
     with pytest.raises(ValueError):
         run(_py("print('x')"), timeout=bad)
+
+
+def test_run_replaces_invalid_utf8_instead_of_raising():
+    """curl/bun 的错误输出可能不是 UTF-8；解码失败不能把超时结果变成异常。"""
+    result = run(_py("import sys; sys.stdout.buffer.write(b'\\xff\\xfe')"),
+                 timeout=10)
+    assert result.code == 0
+    assert result.stdout

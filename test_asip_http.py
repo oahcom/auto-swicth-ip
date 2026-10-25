@@ -208,3 +208,9 @@ def test_any_2xx_is_ok_like_raise_for_status():
     assert HttpResult(status=299).ok is True
     assert HttpResult(status=300).ok is False
     assert HttpResult(status=None).ok is False
+
+
+def test_negative_text_limit_is_rejected():
+    """负数切片会静默截错，不能当合法 limit。"""
+    with pytest.raises(ValueError, match="text_limit"):
+        request_json("GET", "http://x", timeout=1.0, text_limit=-1)

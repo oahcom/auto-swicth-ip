@@ -1429,9 +1429,10 @@ def singbox_api(path: str, method: str = "GET", body: dict | None = None,
             method, path, body=body, timeout=timeout,
         )
     except Exception as e:
-        status, data = None, None
         if not silent:
             log(f"✗ Clash API 异常: {e}")
+        # 已在上面记过具体原因，别让同一次失败再落一条「连接失败」。
+        return 0, None
     if status is None:
         if not silent:
             log(f"✗ Clash API 连接失败: {CFG['singbox']['clash_api']}{path}")
@@ -3078,6 +3079,16 @@ def _line_worker_enabled() -> bool:
     return bool((_warp().get("line_worker") or {}).get("enabled"))
 
 
+def _line_worker_owns_scheduling() -> bool:
+    """worker 是否接管旧守护。dry_run 只观测，旧守护必须继续干活。
+
+    灰度期若只凭 `enabled` 就让三条旧路径让路，worker 又只打「应…」不执行，
+    窗口内就没有任何预热/补刷/脏线重连 —— 观测到了问题却没人处理。
+    """
+    cfg = _warp().get("line_worker") or {}
+    return bool(cfg.get("enabled")) and not bool(cfg.get("dry_run", True))
+
+
 def _start_line_workers() -> None:
     """每条隧道起一个常驻 worker，接管「判质量 → 重启 → 验收 → 换线」。
 
@@ -3276,8 +3287,9 @@ def _schedule_idle_refresh(member: dict) -> None:
     探测+重启要 7~9s，期间流量仍停在已被标记的旧出口上 —— 实测 17:36:55 那次
     换线因此多花了 9s。预先刷好，守卫就不必在换线路径上等。
     """
-    if _line_worker_enabled():
+    if _line_worker_owns_scheduling():
         # 常驻 worker 每轮都会判这条线；这里再排一次会与 worker 抢同一条隧道。
+        # dry_run 不接管：worker 只观测，旧路径继续按原语义预热/补刷。
         return
     with _WARP_REFRESH_LOCK:
         # 只登记排队，不占名额：这条线在等到空闲之前一直能服务流量。
@@ -5292,7 +5304,7 @@ def main():
     # line_worker 启用时由它接管同一条职责（判断与执行在同一循环）。
     if _line_worker_enabled():
         _start_line_workers()
-    else:
+    if not _line_worker_owns_scheduling():
         _start_dirty_line_janitor()
     # 日志标签用的当前 WARP 出口 IP：启动时探一次，之后由换线路径更新
     global _ACTIVE_WARP_IP
@@ -5526,7 +5538,7 @@ def main():
             # 任一隧道出口疑似脏就重连；掉在 proxy 池上时也要继续，
             # 否则池本身就是脏地址时永远回不来。line_worker 自己每轮判所有线，
             # 两套同时跑会把同一条线重启两次。
-            if not _line_worker_enabled():
+            if not _line_worker_owns_scheduling():
                 _prewarm_standby_warp(now)
 
             # ---- 5. 节点健康检查 (每 300s) ----

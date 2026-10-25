@@ -91,14 +91,28 @@ def _healthy_nodes(candidates: list[str]) -> list[str]:
     return [n for n in candidates if delays.get(n) is not None]
 
 
-def journal(since: str, pattern: str) -> list[str]:
+class JournalLines(list):
+    """journalctl 结果。error 非空表示**没有读到日志**，不等于「没有匹配」。
+
+    旧实现把失败折叠成空列表，`daemon 主循环无异常` 于是恒过 —— 观测缺失
+    被当成健康证据。
+    """
+
+    error: str | None = None
+
+
+def journal(since: str, pattern: str) -> JournalLines:
     r = proc_run(
         ["journalctl", "--user", "-u", "auto-switch-ip.service",
          "--since", since, "--no-pager"],
         timeout=10)
+    out = JournalLines()
     if not r.ok:
-        return []
-    return [l for l in r.stdout.splitlines() if re.search(pattern, l)]
+        out.error = ("journalctl 超时" if r.timed_out
+                     else (r.error or f"journalctl rc={r.code}"))
+        return out
+    out.extend(l for l in r.stdout.splitlines() if re.search(pattern, l))
+    return out
 
 
 # ============= 1. 混合端口正常性 =============
@@ -292,7 +306,10 @@ def verify_reasonableness(all_nodes: list[str], quick: bool):
     # 3.5 daemon 无异常
     if not quick:
         bad = journal("5 minutes ago", "Traceback|UnboundLocalError|主循环异常")
-        check("daemon 主循环无异常", not bad, f"{len(bad)} 条")
+        if bad.error:
+            check("daemon 主循环无异常", False, f"无法读取日志：{bad.error}")
+        else:
+            check("daemon 主循环无异常", not bad, f"{len(bad)} 条")
         check("daemon 服务 active", proc_run(
             ["systemctl", "--user", "is-active", "auto-switch-ip.service"],
             timeout=20).stdout.strip() == "active")

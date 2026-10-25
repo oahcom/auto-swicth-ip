@@ -69,6 +69,8 @@ def test_warp_egress_ip_returns_none_when_probe_fails(monkeypatch):
     ("line1\u2028line2", "line1\\nline2"),
     ("line1\u2029line2", "line1\\nline2"),
     ("line1\x85line2", "line1\\nline2"),
+    ("line1\vline2", "line1\\nline2"),
+    ("line1\fline2", "line1\\nline2"),
     ("plain", "plain"),
 ])
 def test_log_message_is_single_line(raw, expected):
@@ -110,14 +112,24 @@ def test_start_line_workers_forwards_config(monkeypatch):
     assert seen["interval"] == 7
 
 
-def test_schedule_idle_refresh_is_noop_when_worker_enabled(monkeypatch):
+def test_schedule_idle_refresh_is_noop_when_worker_owns_scheduling(monkeypatch):
     monkeypatch.setitem(daemon.CFG, "warp", {
         **daemon.CFG["warp"],
-        "line_worker": {"enabled": True},
+        "line_worker": {"enabled": True, "dry_run": False},
     })
     before = set(daemon._WARP_REFRESH_PENDING)
     daemon._schedule_idle_refresh({"tag": "W1", "port": 1080})
     assert daemon._WARP_REFRESH_PENDING == before
+
+
+def test_line_worker_dry_run_keeps_legacy_schedulers(monkeypatch):
+    """dry_run 只观测；若让它接管，灰度窗口内没有任何预热/补刷/脏线重连。"""
+    monkeypatch.setitem(daemon.CFG, "warp", {
+        **daemon.CFG["warp"],
+        "line_worker": {"enabled": True, "dry_run": True},
+    })
+    assert daemon._line_worker_enabled() is True
+    assert daemon._line_worker_owns_scheduling() is False
 
 
 def test_connections_json_swallows_client_exceptions(monkeypatch):

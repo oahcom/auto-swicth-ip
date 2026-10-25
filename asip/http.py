@@ -85,6 +85,9 @@ def request_json(
     """
     if timeout is None or not timeout > 0:
         raise ValueError("timeout must be a positive number")
+    if text_limit is not None and text_limit < 0:
+        # 负数切片会把正文截成「去尾留头」的怪结果，静默丢数据。
+        raise ValueError("text_limit must be None or >= 0")
 
     request = session.request if session is not None else requests.request
     kwargs: dict[str, Any] = {"timeout": timeout}

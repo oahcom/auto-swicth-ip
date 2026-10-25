@@ -74,6 +74,7 @@ def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",
             cwd=cwd,
             env=env,
             start_new_session=True,
@@ -101,7 +102,13 @@ def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
         try:
             os.killpg(os.getpgid(child.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
-            child.kill()
+            # The child may have exited between communicate() timing out and
+            # killpg(). kill() then raises ProcessLookupError too; the timeout
+            # result must still be returned instead of escaping.
+            try:
+                child.kill()
+            except ProcessLookupError:
+                pass
         stdout, stderr = child.communicate()
         stderr = _as_text(stderr)
         return ProcResult(
