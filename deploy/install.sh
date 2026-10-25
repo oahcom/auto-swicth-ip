@@ -10,7 +10,11 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UNIT_DIR="${SYSTEMD_DIR:-$HOME/.config/systemd/user}"
+# 与 config.py 一致：从 passwd 取本用户家目录，不信 $HOME。`sudo -u` 下
+# HOME 可能仍是 /root，会把单元/密钥写到错误用户的家目录。
+HOME_DIR="$(getent passwd "$(id -u)" | cut -d: -f6)"
+[ -n "$HOME_DIR" ] || HOME_DIR="$HOME"
+UNIT_DIR="${SYSTEMD_DIR:-$HOME_DIR/.config/systemd/user}"
 # 写进 $UNIT_DIR 的单元会把 ExecStart 钉成**本次运行的这个 DIR**。所以拿一份副本
 # 试跑（如 /tmp 下的 clone）时若忘了设 SYSTEMD_DIR，就会把现网单元悄悄改指到副本，
 # 而副本随时可被清理 —— 服务下次重启即崩。真实事故：`--units-only` 在 /tmp 副本
@@ -79,7 +83,7 @@ MEMBERS="$("$PYBIN" "$DIR/deploy/members.py")"
          && echo "已生成 .warp/warp-outbound.json"; }
 
 # ---- 密钥：缺失时生成，绝不覆盖已有的（改它会让正在跑的 sing-box 掉线）----
-SECRET_FILE="${SINGBOX_SECRET_FILE_PATH:-$HOME/.singbox_secret}"
+SECRET_FILE="${SINGBOX_SECRET_FILE_PATH:-$HOME_DIR/.singbox_secret}"
 if [ ! -f "$SECRET_FILE" ]; then
     (umask 077; "$PYBIN" -c "import base64,os;print(base64.b64encode(os.urandom(32)).decode())" > "$SECRET_FILE")
     echo "已生成 $SECRET_FILE"

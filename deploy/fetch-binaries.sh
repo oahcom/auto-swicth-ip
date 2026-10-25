@@ -83,7 +83,9 @@ PYZ
   esac
   # zip 不保留 unix 权限位（实测解出来是 644），所以不能按 -perm -u+x 找；
   # 找到后自己补执行位。tar 解出的通常已是 755，补一次也无害。
-  local src; src="$(find "$TMP" -type f -name "$inner" | head -1)"
+  # -print -quit：找到第一个就停，避免在几百个文件里扫完整棵树再被 head 截断；
+  # 也避免 `find | head` 在 pipefail 下因 SIGPIPE 被判失败。
+  local src; src="$(find "$TMP" -type f -name "$inner" -print -quit)"
   [ -n "$src" ] || { echo "✗ 解包后找不到 $inner（包内布局变了？）" >&2; return 1; }
   chmod 755 "$src"
 

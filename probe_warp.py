@@ -428,9 +428,12 @@ def _retry_seconds(raw, now: float | None = None) -> float | None:
         if value <= 0:
             return None
         if value > 1e12:
-            return max(0.0, value / 1000.0 - now)
+            # epoch 毫秒：已过去的值表示「现在就能重试」，不是 1 秒封禁。
+            diff = value / 1000.0 - now
+            return diff if diff > 0 else None
         if value > 1e9:
-            return max(0.0, value - now)
+            diff = value - now
+            return diff if diff > 0 else None
         return value
     text = str(raw).strip()
     if not text:

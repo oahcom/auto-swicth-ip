@@ -2734,6 +2734,47 @@ def test_cached_standby_keeps_all_candidates_not_just_first(monkeypatch):
     assert sel and "备线 2 条" in sel[0], f"候选池应有 2 条，实际日志: {sel}"
 
 
+def test_single_cached_candidate_probes_remainder(monkeypatch):
+    """缓存只命中 1 条时必须补探其余备线，不能把候选池压成 1 条。
+
+    `if len(fast) > 1: pass` 那版是空操作；真正需要的是反向分支 —— 命中
+    不足 2 条时唯一候选一旦模型层不过就直接落池，其余健康线全被丢掉。
+    """
+    egress = _reuse_env(monkeypatch, {"1080": "ip-w1", "1081": "ip-b",
+                                     "1082": "ip-c"})
+    members = [
+        {"tag": "W1", "port": 1080, "service": "s1"},
+        {"tag": "W2", "port": 1081, "service": "s2"},
+        {"tag": "W3", "port": 1082, "service": "s3"},
+    ]
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "members": members})
+    now = 1000.0
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE",
+                        {"W2": {"ip": "ip-b", "ip_ts": now - 2}})
+    monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT",
+                        {"W2": (now - 2, "ip-b")})
+    monkeypatch.setattr(daemon, "_port_open", lambda p: True)
+    probed = []
+
+    def _probe(ms):
+        probed.append([m["tag"] for m in ms])
+        return {m["tag"]: egress[str(m["port"])] for m in ms}
+
+    monkeypatch.setattr(daemon, "_probe_warp_egress", _probe)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp",
+                        lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
+    lines = []
+    monkeypatch.setattr(daemon, "log", lambda msg: lines.append(msg))
+
+    assert daemon.reconnect_warp("test") is True
+    assert probed == [["W3"]], f"只补探未命中的 W3，实际 {probed}"
+    sel = [l for l in lines if "选线:" in l]
+    assert sel and "备线 2 条" in sel[0], f"候选池应有 2 条，实际: {sel}"
+
+
 def test_cached_standby_rejects_stale_blocked_and_closed_port(monkeypatch):
     """缓存过期、出口已被标记、端口不在监听时都不得采信。"""
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "probe_cache_ttl_sec": 12})
@@ -3985,6 +4026,9 @@ def _stub_warp_cfg(monkeypatch):
         "probe_ok_ttl_sec": 600,
         "probe_persistent_ttl_sec": 21600,
         "probe_transient_ttl_sec": 120,
+        "blocked_guard_sec": 6 * 3600,
+        "rate429_guard_sec": 24 * 3600,
+        "blocked_ttl_sec": 24 * 3600,
     })
     monkeypatch.setattr(daemon, "_PROBE_BLOCKED_AT", {})
 
@@ -4009,13 +4053,101 @@ def test_cached_ok_verdict_does_not_skip_probe(monkeypatch):
 
 
 def test_cached_quota_verdict_skips_probe(monkeypatch):
-    """持久负结论仍可跳过探测：它只驱动刷新，不会放行坏地址。"""
+    """持久负结论且封禁仍生效时跳过探测：它只驱动刷新，不会放行坏地址。"""
     _stub_warp_cfg(monkeypatch)
     monkeypatch.setattr(daemon, "_warp_model_usable", _REAL_WARP_MODEL_USABLE)
+    now = time.time()
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN",
-                        {("tag-b", "5.6.7.8"): ("quota", time.time())})
+                        {("tag-b", "5.6.7.8"): ("quota", now)})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "5.6.7.8": {"ts": now, "blocked": True,
+                    "blocked_ts_by_kind": {"rate429": now}}})
     import probe_warp
     monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: (
         (_ for _ in ()).throw(AssertionError("持久负结论命中时不应再探测"))))
     assert daemon._warp_model_usable(
         {"tag": "tag-b", "port": 10002}, "5.6.7.8") is False
+
+
+def test_cached_persistent_verdict_reprobes_after_exact_ban(monkeypatch):
+    """缓存 TTL 6h 长于上游给的精确 ban：到期后必须重探，不能多锁 1.4h。
+
+    旧实现见 `cached in _WARP_PROBE_PERSISTENT` 就返回 False；上游给 4.6h
+    Retry-After 时，缓存仍会挡住到第 6 小时 —— 精确解禁在模型模式下失效。
+    """
+    _stub_warp_cfg(monkeypatch)
+    monkeypatch.setattr(daemon, "_warp_model_usable", _REAL_WARP_MODEL_USABLE)
+    now = time.time()
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN",
+                        {("tag-c", "9.9.9.9"): ("quota", now - 5 * 3600)})
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "9.9.9.9": {"ts": now - 5 * 3600, "blocked": True,
+                    "blocked_ts_by_kind": {"rate429": now - 5 * 3600},
+                    "ban_until": now - 1800, "ban_kind": "rate429"}})
+    called = []
+    import probe_warp
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: (
+        called.append(port) or ("OK", 0.2, "ok", None)))
+    assert daemon._warp_model_usable(
+        {"tag": "tag-c", "port": 10003}, "9.9.9.9") is True
+    assert called == [10003], "精确封禁已到期，缓存负结论不得继续挡住实测"
+
+
+def test_flagged_retry_after_does_not_shorten_403(monkeypatch):
+    """403（flagged）不应用 Retry-After：6h 窗口不能被响应头缩成几十秒。"""
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    daemon._mark_warp_ip_used("ip-403", now, blocked=True, kind="abuse403",
+                              ban_after=30)
+    entry = daemon._WARP_IP_USED["ip-403"]
+    assert entry["ban_until"] is None, "403 不应写入精确封禁"
+    assert daemon._warp_ip_is_blocked("ip-403", now + 5 * h) is True, \
+        "6h 窗口内仍须挡住，不能被 Retry-After 缩短"
+    assert daemon._warp_ip_is_blocked("ip-403", now + 6 * h + 1) is False
+
+
+def test_expired_exact_ban_does_not_swallow_new_429(monkeypatch):
+    """精确封禁到期后再被 429：必须重开一轮 24h，不能被旧 ban_until 放行。
+
+    回归 d41cd74：旧实现保留同一类型的 stamp（24h 内）并把过期 ban_until
+    当成「已恢复」，于是新 429 写进去后 `_warp_ip_is_blocked` 立刻返回 False。
+    """
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    daemon._mark_warp_ip_used("ip-re", now, blocked=True, kind="rate429",
+                              ban_after=2 * h)
+    assert daemon._warp_ip_is_blocked("ip-re", now + 2 * h + 1) is False
+    daemon._mark_warp_ip_used("ip-re", now + 3 * h, blocked=True, kind="rate429")
+    entry = daemon._WARP_IP_USED["ip-re"]
+    assert entry["ban_until"] is None, "上一轮的精确封禁必须清掉"
+    assert entry["blocked_ts_by_kind"] == {"rate429": now + 3 * h}
+    assert daemon._warp_ip_is_blocked("ip-re", now + 3 * h + 1) is True
+    assert daemon._warp_ip_is_blocked("ip-re", now + 3 * h + 23 * h) is True
+    assert daemon._warp_ip_is_blocked("ip-re", now + 3 * h + 25 * h) is False
+
+
+def test_bad_ban_until_does_not_break_hot_path(monkeypatch):
+    """损坏的 ban_until 只丢精确封禁，仍按默认窗口挡住，且不抛异常。"""
+    now = 1_000_000.0
+    h = 3600
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "ip-bad": {"ts": now, "blocked": True,
+                   "blocked_ts_by_kind": {"rate429": now},
+                   "ban_until": "not-a-number", "ban_kind": "rate429"}})
+    assert daemon._warp_ip_is_blocked("ip-bad", now + h) is True
+    assert daemon._warp_ip_is_blocked("ip-bad", now + 24 * h + 1) is False
+
+    # 非有限值同样是损坏台账：不能当「永久封禁」把 IP 锁死。
+    for bad in (float("inf"), float("nan")):
+        monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+            "ip-bad": {"ts": now, "blocked": True,
+                       "blocked_ts_by_kind": {"rate429": now},
+                       "ban_until": bad, "ban_kind": "rate429"}})
+        assert daemon._warp_ip_is_blocked("ip-bad", now + h) is True
+        assert daemon._warp_ip_is_blocked("ip-bad", now + 24 * h + 1) is False

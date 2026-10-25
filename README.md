@@ -22,6 +22,8 @@
 
 - `parse_subscription.py` — 拉 okz 订阅 + 解析 vless/vmess/hysteria2/anytls/trojan/shadowsocks + 生成 sing-box config
 - `daemon.py` — 监控 9router + 主动轮换 sing-box 节点
+- `asip/` — 无副作用的可复用工具（原子 JSON 写、密钥脱敏、Clash API 客户端、出口探测）；daemon 通过同名门面委托，便于单测与复用
+- `.env` — 订阅 token 与路径覆盖（**不入库**，chmod 600）
 - `singbox-config.json` — 生成的 sing-box 配置（**不入库**，含 Clash API secret 与节点凭据；启动时按需生成）
 - `sing-box` — Linux x64 二进制（1.13.0）
 - `daemon.log` — daemon 运行日志
@@ -38,6 +40,9 @@
   否则 Windows 的 127.0.0.1 到不了 WSL 内的 7890
 
 订阅地址、路径都可覆盖：`cp .env.example .env` 后改，脚本与 systemd 单元都会读。
+订阅源**没有内置默认值**：`.env` 至少要有一个 `*_SUB_URL`，否则订阅刷新会明确
+失败，而不是静默使用仓库里的 token。历史提交中出现过真实 token，即使已在工作树
+移除，也应在服务商侧轮换一次。
 
 ### 0.1 二进制获取
 

@@ -755,6 +755,28 @@ def test_model_ok_verdict_does_not_mark_blocked(monkeypatch):
     assert daemon._ip_disqualified("ip-ok", time.time(), 86400) is False
 
 
+def test_all_probe_exceptions_mark_channel_blind(monkeypatch):
+    """整批探测抛异常与整批 unreachable 同义：都是探测器自己没跑通。
+
+    旧实现异常分支不写 `_PROBE_LAST_VERDICT`，批判据看到的是空串/旧 OK，
+    失明机制不触发 —— 每条线都被判「地址坏了」白重启、白烧配额。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    monkeypatch.setattr(daemon, "_PROBE_LAST_VERDICT", {})
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    import probe_warp
+
+    def _boom(port, timeout):
+        raise RuntimeError("bun gone")
+
+    monkeypatch.setattr(probe_warp, "probe", _boom)
+    pairs = [({"tag": f"W{i}", "port": 1080 + i}, f"ip-{i}") for i in range(3)]
+    out = daemon._warp_model_test_many(pairs)
+    assert out == {"W0": False, "W1": False, "W2": False}
+    assert daemon._warp_probe_blind() is True, "整批异常须判定通道失明"
+
+
 def test_blind_channel_falls_back_to_ip_history(monkeypatch):
     """整批 unreachable ⇒ 探测通道失明，退回历史判据。
 

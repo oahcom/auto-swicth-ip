@@ -697,17 +697,18 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `daemon.py` | 4224 | 节点管理 + 错误检测 + 轮换 + WARP 主备换线 |
 | `config.py` | 262 | 共享配置常量（CFG dict） |
 | `singbox-config.json` | 1732 | sing-box 代理节点配置（83 池节点 + 10 WARP + opencode-out） |
-| `.bad_nodes.json` | 动态 | 坏节点文件（daemon 独占读写） |
+| `.bad_nodes.json` | 动态 | 坏节点文件（daemon 只读；self_evolve 用 flock + 原子写更新） |
 | `self_evolve_checkpoint.py` | 326 | 自进化巡检引擎（每 10min 由 asi-selfcheck.timer 触发，写 .monitor_state.json）|
 | `.egress_log.jsonl` | 动态 | 出口节点归属日志（每次成功切换 append (ts,node)，供 per-egress 错误率归因）|
 | `asi-selfcheck.timer` | — | systemd 用户定时器：每 10min 触发 asi-selfcheck.service 跑巡检引擎 |
-| `test_daemon_unit.py` | 3177 | 确定性单测（无网络，150 个用例：错误率/策略/评分/坏节点/看门狗/WARP 换线门控）|
-| `test_subscription_parse.py` | 522 | 订阅解析回归单测（无网络，覆盖 vless/trojan transport/单源失败/rc 检查/局域网入站与来源守卫）|
-| `test_warp_refresh.py` | 296 | WARP 刷新/换线门控单测（22 个用例）|
-| `verify_rotation.py` | 345 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），`--quick` 约 20s |
+| `test_daemon_unit.py` | 4144 | 确定性单测（无网络，196 个用例：错误率/策略/评分/坏节点/看门狗/WARP 换线门控）|
+| `test_subscription_parse.py` | 561 | 订阅解析回归单测（无网络，40 个用例：vless/trojan transport/单源失败/rc 检查/URL 文件传参/局域网入站与来源守卫）|
+| `test_warp_refresh.py` | 1243 | WARP 刷新/换线门控单测（22 个用例）|
+| `verify_rotation.py` | 360 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），结束时恢复原选择，`--quick` 约 20s |
 | `deploy/install.sh` | — | 部署脚本：生成密钥 + 注册 20 条隧道 + 由 config.py 推导并写入 23 个 systemd 单元 + enable |
 | `deploy/members.py` | — | 把 `CFG["warp"]["members"]` 渲染成 `tag port service dir family`，供 install.sh 用 |
 | `test_portability.py` | — | 可移植性回归（4 例）：路径不越出仓库、运行期文件无硬编码家目录、成员可部署、单元渲染全覆盖 |
+| `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写）、`redact`（token 脱敏）、`clash_client`、`egress`；daemon 同名门面委托 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
 
 ## 部署与可移植性（2026-10-22）
@@ -761,8 +762,8 @@ WHY 必须在单元层判：地址族是 usque 的进程启动参数，运行中
 `.warp/usqueN/usque` 是指向 `../usque/usque` 的符号链接，clone 后需重建
 （`deploy/install.sh` 的注册步骤会创建目录，注册时需先建好符号链接）。
 
-**`parse_subscription.py` 无参数时回退到 `config.py` 的全部订阅源**（原来只认
-`OKZ_SUB_URL` 环境变量），与 daemon 每小时刷新同一份清单。
+**`parse_subscription.py` 无参数时使用 `config.subscription_urls()`**：环境变量优先，
+且没有内置 token 默认值；`.env` 缺失订阅源时刷新会明确失败，与 daemon 每小时刷新同一份清单。
 
 ## provider 多样性约束（2026-07-08 确认）
 

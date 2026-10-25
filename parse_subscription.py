@@ -644,6 +644,8 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--urls", nargs="+", help="subscription URLs (can specify multiple)")
+    ap.add_argument("--urls-file",
+                    help="file containing one subscription URL per line (avoids argv leak)")
     ap.add_argument("--url", help="single subscription URL (legacy)")
     ap.add_argument("--out", default=CFG["singbox"]["config_file"])
     ap.add_argument("--port", type=int, default=CFG["singbox"]["mixed_port"])
@@ -656,10 +658,18 @@ if __name__ == "__main__":
 
     # 无参数时回退到 CFG 里的全部订阅源（与 daemon 的每小时刷新同一份清单，
     # 每项都可用环境变量覆盖）。README 的首装命令依赖此路径。
-    sub_urls = args.urls or ([args.url] if args.url else []) or [
-        u for u in (CFG.get(k, {}).get("sub_url", "")
-                    for k in ("okz", "hd23n", "dasho", "dasho_alt")) if u
-    ]
+    file_urls = []
+    if args.urls_file:
+        try:
+            with open(args.urls_file, encoding="utf-8") as f:
+                file_urls = [ln.strip() for ln in f
+                             if ln.strip() and not ln.lstrip().startswith("#")]
+        except OSError as e:
+            print(f"ERROR: 读取 --urls-file 失败: {e}", file=sys.stderr)
+            sys.exit(1)
+    sub_urls = (args.urls or file_urls
+                or ([args.url] if args.url else [])
+                or config.subscription_urls())
     if not sub_urls:
         print("ERROR: no subscription URLs provided (use --urls or --url)", file=sys.stderr)
         sys.exit(1)
@@ -671,7 +681,10 @@ if __name__ == "__main__":
         try:
             urls = fetch_and_decode_sub(url)
         except Exception as e:
-            print(f"  ✗ 源失败，跳过: {type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
+            # requests 异常串带完整 URL（含 token），stderr 会进 daemon.log。
+            from asip.redact import redact_secrets
+            print(f"  ✗ 源失败，跳过: {type(e).__name__}: "
+                  f"{redact_secrets(str(e))[:120]}", file=sys.stderr)
             continue
         print(f"  got {len(urls)} raw URLs")
         all_urls.extend(urls)

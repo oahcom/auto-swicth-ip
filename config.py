@@ -130,25 +130,21 @@ CFG = {
         # 免得这个入站被当成可从任何地方拨入的开放代理。
         "lan_cidrs": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
     },
-    # 订阅地址含账户 token，全部可用环境变量覆盖（换用户/换订阅源不必改代码）。
-    # 默认值保留是为了本机开箱即用；部署到别人的机器时设在 environ 或 systemd
-    # EnvironmentFile 里，别提交自己的 token。
+    # 订阅地址含账户 token，**不在源码里保留默认值**：token 会被 git 历史、
+    # 日志和 argv 三处带走，轮换一次就要翻整棵树。必须由 .env / EnvironmentFile
+    # 注入（见 .env.example）；缺失时订阅刷新会明确报错，而不是静默用别人的 token。
     "okz": {
         "proxy_url": "http://127.0.0.1:6696",
-        "name": "okz",
-        "sub_url": _env_path("OKZ_SUB_URL", "https://s-dywrwizazu.cn-shanghai.fcapp.run/okz/sub?token=aa0f63eb1e9a65d23fcae0dcc8a867ab"),
+        "sub_url": _env_path("OKZ_SUB_URL", ""),
     },
     "hd23n": {
-        "name": "hd.23n.club",
-        "sub_url": _env_path("HD23N_SUB_URL", "http://hd.23n.club/api/v1/client/subscribe?token=5b4815ade93497224153e0bb0ae60cc6"),
+        "sub_url": _env_path("HD23N_SUB_URL", ""),
     },
     "dasho": {
-        "name": "dasho.pqjc.site",
-        "sub_url": _env_path("DASHO_SUB_URL", "https://dasho.pqjc.site/api/v1/pq/d6b05bf5edc2d676335d0726371868bf"),
+        "sub_url": _env_path("DASHO_SUB_URL", ""),
     },
     "dasho_alt": {
-        "name": "dasho.xn--cp3a08l.com",
-        "sub_url": _env_path("DASHO_ALT_SUB_URL", "https://dasho.xn--cp3a08l.com/api/v1/pq/d6b05bf5edc2d676335d0726371868bf"),
+        "sub_url": _env_path("DASHO_ALT_SUB_URL", ""),
     },
     "intervals": {
         # 主循环轮询节奏。不是节流 —— 循环体里已经没有阻塞 I/O，错误统计又按
@@ -411,14 +407,20 @@ CFG = {
 # ponytail: SINGBOX_SECRET 不在此导出为模块级常量——CFG["singbox"]["secret"] 是 import 时冻结的
 # 旧快照，轮换后不会刷新。调用方必须走 get_singbox_secret()（mtime 自动刷新）。
 NODE_INFO_DB = CFG["9router"]["db_path"]
-SINGBOX_API = CFG["singbox"]["clash_api"]
-SELECTOR = CFG["singbox"]["selector"]
 MIXED_PORT = CFG["singbox"]["mixed_port"]
 BAD_NODES_TTL = CFG["bad_nodes"]["ttl_sec"]
 BAD_NODES_MAX_TTL = CFG["bad_nodes"]["max_ttl_sec"]
 LOG_FORMAT = CFG["log_format"]
 RECENT_WINDOW = CFG["thresholds"]["recent_window"]
 REJECT_WINDOW = CFG["thresholds"]["reject_window"]
+
+# 订阅源顺序即合并优先级（okz 主力，其余补充）。值为空表示未配置。
+SUBSCRIPTION_KEYS = ("okz", "hd23n", "dasho", "dasho_alt")
+
+
+def subscription_urls() -> list[str]:
+    """Configured subscription URLs, in merge order, empty entries dropped."""
+    return [url for url in (CFG.get(k, {}).get("sub_url", "") for k in SUBSCRIPTION_KEYS) if url]
 
 # ============= 启动校验 =============
 # requests 模式整个判据就是「数哪个模型的成功调用」。键写错时 daemon 不该
@@ -429,9 +431,7 @@ if _w.get("proactive_mode") not in ("fixed", "requests"):
 if _w["proactive_mode"] == "requests" and not _w.get("proactive_quota_model"):
     raise SystemExit("✗ warp.proactive_quota_model 未配置，requests 模式无法计数")
 
-# ============= FREE_PROVIDERS 常量 =============
+# ============= provider 常量 =============
 # OPENCODE_FREE_PROVIDER: 9router providerStrategies 中的 key = "opencode"
 # provider 值在 requestDetails 表中也是 "opencode"
 OPENCODE_FREE_PROVIDER = "opencode"
-# 辅助检查用的 provider 集合（仅用于 query 请求历史）
-FREE_PROVIDERS = {OPENCODE_FREE_PROVIDER, "kiro", "nvidia", "ollama", "xiaomi-tokenplan"}

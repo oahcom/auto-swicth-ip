@@ -9,13 +9,17 @@ Meta-goal: The monitoring loop should evolve its own checks.
 """
 
 import copy
+import fcntl
 import json
 import re
+import shlex
 import time
 import subprocess
 import sys
 from pathlib import Path
 from collections import Counter
+
+from asip.atomic_io import read_json, write_json
 
 STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 PROJECT_DIR = STATE_FILE.parent
@@ -41,17 +45,18 @@ def _write_bad_nodes(bad: dict) -> None:
     daemon 的 cleanup_dead_ttl 已读取此文件并受 _POOL_MIN_RATIO 阀门保护，故写入即接入拉黑闭环。
     """
     now = int(time.time())
-    try:
-        data = json.loads(_BAD_NODES_FILE.read_text()) if _BAD_NODES_FILE.exists() else {}
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    for node in bad:
-        data[node] = {"expire": now + _BAD_NODES_TTL, "reason": "egress_error_rate"}
-    tmp = _BAD_NODES_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False))
-    tmp.replace(_BAD_NODES_FILE)
+    # read-modify-write 必须串行：两个 cron 轮次同时归因时，后写者会拿旧
+    # 快照覆盖前者刚写入的节点，等于漏拉黑。daemon 只读此文件，所以仅需
+    # 在写入方加锁。
+    lock_path = _BAD_NODES_FILE.with_suffix(".json.lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = read_json(str(_BAD_NODES_FILE), {})
+        if not isinstance(data, dict):
+            data = {}
+        for node in bad:
+            data[node] = {"expire": now + _BAD_NODES_TTL, "reason": "egress_error_rate"}
+        write_json(str(_BAD_NODES_FILE), data)
 
 # 与 daemon.py 阀门一致：允许 70% 节点拉黑（_POOL_MIN_RATIO=0.3）。
 # 天花板从 Clash API 实时节点数 derivation，防止订阅变更后 65 这类魔表失效。
@@ -123,7 +128,7 @@ def save_state(state):
     # Only keep last 100 rounds
     if len(state.get("history", [])) > 100:
         state["history"] = state["history"][-100:]
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    write_json(str(STATE_FILE), state, indent=2)
 
 
 def run_check(name, context, state=None):
@@ -178,7 +183,7 @@ def run_check(name, context, state=None):
 
         elif name == "node_switch_distribution":
             out = subprocess.run(
-                ["bash", "-c", f"grep -a '切' {_LOG_FILE} 2>/dev/null | grep -v '冷却\\|fallback\\|okz\\|标记死节点' | tail -50 | grep -oP '(?<=-> ).*?(?= |$)' | sort | uniq -c | sort -rn | head -10"],
+                ["bash", "-c", f"grep -a '切' {shlex.quote(str(_LOG_FILE))} 2>/dev/null | grep -v '冷却\\|fallback\\|okz\\|标记死节点' | tail -50 | grep -oP '(?<=-> ).*?(?= |$)' | sort | uniq -c | sort -rn | head -10"],
                 capture_output=True, text=True, timeout=10
             )
             dist = out.stdout.strip()

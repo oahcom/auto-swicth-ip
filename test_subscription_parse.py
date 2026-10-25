@@ -8,6 +8,7 @@
 - parse_trojan 写 transport.type="tcp" → sing-box check FATAL，起不来
 - 生成的配置含非法 transport → sing-box 无法启动
 """
+import os
 import subprocess
 
 import pytest
@@ -244,6 +245,8 @@ def test_shrunken_refresh_rejected(monkeypatch, tmp_path):
         {"type": "trojan", "tag": f"n{i}", "server": f"1.2.3.{i}", "server_port": 443}
         for i in range(1, 20)] + [{"type": "direct", "tag": "direct"}]}))
     monkeypatch.setitem(daemon.CFG["singbox"], "config_file", str(cfg))
+    # 订阅源已改为必须环境注入（config.py 不再内置 token 默认值）。
+    monkeypatch.setattr(daemon, "_SUB_URLS", ["https://example.invalid/sub"])
 
     def fake_run(cmd, **k):
         out = cmd[cmd.index("--out") + 1]
@@ -281,6 +284,7 @@ def test_parse_failure_makes_refresh_return_false(monkeypatch, tmp_path):
     # config_file 必须一并重定向：refresh 失败路径会 _discard(config_file + ".tmp")，
     # 不重定向就会删掉生产 singbox-config.json.tmp（含刚拉取的节点凭据）
     monkeypatch.setitem(daemon.CFG["singbox"], "config_file", str(tmp_path / "cfg.json"))
+    monkeypatch.setattr(daemon, "_SUB_URLS", ["https://example.invalid/sub"])
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
     monkeypatch.setattr(daemon, "restart_singbox",
@@ -289,6 +293,41 @@ def test_parse_failure_makes_refresh_return_false(monkeypatch, tmp_path):
 
     text = (tmp_path / "daemon.log").read_text()
     assert "订阅解析失败" in text, f"日志未落在 tmp: {text!r}"
+
+
+def test_refresh_passes_urls_via_file_not_argv(monkeypatch, tmp_path):
+    """订阅 token 不得出现在子进程 argv（ps 对同机用户可见）。
+
+    改为 0600 临时文件传参，解析结束立即删除；argv 里只留文件路径。
+    """
+    seen = {}
+
+    class R:
+        returncode = 1
+        stderr = "Error: boom"
+        stdout = ""
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = list(cmd)
+        path = cmd[cmd.index("--urls-file") + 1]
+        seen["path"] = path
+        seen["mode"] = os.stat(path).st_mode & 0o777
+        seen["content"] = open(path, encoding="utf-8").read()
+        return R()
+
+    token_url = "https://sub.example/pq/0123456789abcdef?token=supersecret"
+    monkeypatch.setattr(daemon, "_SUB_URLS", [token_url])
+    monkeypatch.setitem(daemon.CFG["singbox"], "config_file", str(tmp_path / "cfg.json"))
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert daemon.refresh_subscription() is False
+    assert "--urls" not in seen["cmd"], "不得再用 --urls 传 token"
+    assert all("supersecret" not in part for part in seen["cmd"]), \
+        f"argv 泄漏 token: {seen['cmd']}"
+    assert seen["mode"] == 0o600, "URL 文件必须 0600"
+    assert "supersecret" in seen["content"], "URL 文件内容应完整"
+    assert not os.path.exists(seen["path"]), "临时 URL 文件未清理"
+
 
 
 # ============= 5. 生成配置对 sing-box 合法 =============

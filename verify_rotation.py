@@ -159,6 +159,25 @@ def verify_port():
 
 # ============= 2. IP 切换正常性 =============
 def verify_switch(samples: int, quick: bool) -> list[str]:
+    """切到若干节点验证出口，返回节点池；结束时恢复原选择。
+
+    WHY 必须 finally：本脚本是运维手动跑的诊断工具，中途异常/超时会把线上
+    opencode 留在被测试的节点上，后续请求继续打到那个出口 —— 测完不还原
+    等于让诊断改变被测系统。
+    """
+    try:
+        original = current()
+    except ClashUnreachable:
+        original = ""
+    try:
+        return _verify_switch_body(samples, quick)
+    finally:
+        if original and current() != original:
+            print(f"  恢复原选择: {original}")
+            switch(original)
+
+
+def _verify_switch_body(samples: int, quick: bool) -> list[str]:
     print("\n[2] IP 切换正常性")
     all_nodes = nodes()
     check("节点池非空", len(all_nodes) > 10, f"实际={len(all_nodes)}")
