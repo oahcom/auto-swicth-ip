@@ -132,7 +132,8 @@ curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
 **安全特性**：
 - 出口 IP 记录落盘 `.warp_ip_used.json`，24h 内用过的地址不复用
 - 403/429 标脏的 IP 按 6h/24h 恢复期挡在候选池外
-- 所有 WARP 不可用时兜底落 proxy 池（3h 冷却防来回弹）
+- 所有 WARP 不可用时原地重连当前 WARP 线；**落 proxy 池已禁用**（2026-10-26，
+  `warp.proxy_fallback_enabled=false`，池内节点全挂）
 
 ## 网络要求
 
