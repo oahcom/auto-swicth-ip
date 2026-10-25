@@ -1,6 +1,8 @@
 """Deterministic tests for asip.proc (no network, no long-running commands)."""
 
+import os
 import sys
+import time
 
 import pytest
 
@@ -48,6 +50,28 @@ def test_run_timeout_marks_timed_out_and_clears_code():
     assert result.code is None
     assert result.ok is False
     assert result.error is None
+
+
+def test_run_timeout_reaps_grandchildren(tmp_path):
+    """超时必须杀掉整个进程组，而不是只杀直接子进程。"""
+    pidfile = tmp_path / "grandchild.pid"
+    code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(30)\n"
+    )
+    result = run(_py(code), timeout=1.0)
+    assert result.timed_out is True
+    pid = int(pidfile.read_text())
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"孙进程 {pid} 在超时后仍存活，killpg 未生效")
 
 
 def test_run_missing_binary_returns_error_instead_of_raising():

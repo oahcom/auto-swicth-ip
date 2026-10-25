@@ -287,6 +287,11 @@ def _switch_away(member: dict, reason: str) -> None:
     h = _host
     tag = member["tag"]
     now = time.time()
+    # 决策到执行之间这条线可能已经不是当前出口；此时再走换线路径会把
+    # 新的健康出口切走。放弃本轮，下一 tick 重新观测。
+    if h.active_warp_tag() != tag:
+        h.log(f"  ⏸ {tag} 决策后已不是当前出口，取消换线（{reason}）")
+        return
     if h._reconnect_warp_now(reason, now, ignore_cooldown=True):
         h.log(f"  ⇄ {tag} 触发换线（{reason}）")
     else:

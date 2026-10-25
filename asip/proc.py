@@ -18,6 +18,8 @@ echo a failing command line. ``stdout`` is left raw: callers parse it as data
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 from dataclasses import dataclass
 from typing import Iterable, Sequence
@@ -67,23 +69,14 @@ def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
     """
     _require_positive_timeout(timeout)
     try:
-        completed = subprocess.run(
+        child = subprocess.Popen(
             list(argv),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=timeout,
             cwd=cwd,
             env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = _as_text(exc.stdout)
-        stderr = _as_text(exc.stderr)
-        return ProcResult(
-            code=None,
-            stdout=stdout,
-            stderr=redact_secrets(stderr) if redact else stderr,
-            timed_out=True,
+            start_new_session=True,
         )
     except FileNotFoundError:
         error = f"binary not found: {argv[0]}"
@@ -98,10 +91,30 @@ def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
             error=redact_secrets(error) if redact else error,
         )
 
-    stderr = completed.stderr or ""
+    try:
+        stdout, stderr = child.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # `subprocess.run(timeout=...)` only kills the direct child.  curl and
+        # bun can spawn helpers; leaving them alive keeps the port/handshake
+        # wedged and leaks processes across retries.  The child is a session
+        # leader (start_new_session), so killpg reaps the whole tree.
+        try:
+            os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            child.kill()
+        stdout, stderr = child.communicate()
+        stderr = _as_text(stderr)
+        return ProcResult(
+            code=None,
+            stdout=_as_text(stdout),
+            stderr=redact_secrets(stderr) if redact else stderr,
+            timed_out=True,
+        )
+
+    stderr = stderr or ""
     return ProcResult(
-        code=completed.returncode,
-        stdout=completed.stdout or "",
+        code=child.returncode,
+        stdout=stdout or "",
         stderr=redact_secrets(stderr) if redact else stderr,
     )
 

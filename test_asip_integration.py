@@ -66,6 +66,9 @@ def test_warp_egress_ip_returns_none_when_probe_fails(monkeypatch):
 @pytest.mark.parametrize("raw,expected", [
     ("line1\nline2", "line1\\nline2"),
     ("line1\r\nline2", "line1\\nline2"),
+    ("line1\u2028line2", "line1\\nline2"),
+    ("line1\u2029line2", "line1\\nline2"),
+    ("line1\x85line2", "line1\\nline2"),
     ("plain", "plain"),
 ])
 def test_log_message_is_single_line(raw, expected):
@@ -115,3 +118,37 @@ def test_schedule_idle_refresh_is_noop_when_worker_enabled(monkeypatch):
     before = set(daemon._WARP_REFRESH_PENDING)
     daemon._schedule_idle_refresh({"tag": "W1", "port": 1080})
     assert daemon._WARP_REFRESH_PENDING == before
+
+
+def test_connections_json_swallows_client_exceptions(monkeypatch):
+    """读取失败必须缓存 None；旧实现吞掉所有异常，新通道不能把异常抛给调用方。"""
+    def boom(*a, **k):
+        raise RuntimeError("clash exploded")
+
+    monkeypatch.setattr(daemon._CLASH, "connections", boom)
+    monkeypatch.setattr(daemon, "_conn_snapshot", (0.0, None))
+    monkeypatch.setattr(daemon, "_LAST_HEALTH_LOG", 0.0)
+    assert daemon._connections_json() is None
+
+
+def test_refresh_line_serialized_respects_background_slot(monkeypatch):
+    """后台补刷/按线 worker 持锁时，同步路径不得再重启同一条线。"""
+    called = []
+    monkeypatch.setattr(daemon, "_acquire_refresh_slot", lambda tag: False)
+    monkeypatch.setattr(daemon, "_refresh_idle_warp",
+                        lambda m: called.append(m["tag"]) or "1.2.3.4")
+    assert daemon._refresh_line_serialized({"tag": "W1"}) == (None, False)
+    assert called == []
+
+
+def test_refresh_line_serialized_releases_slot_on_failure(monkeypatch):
+    tag = "W9"
+    daemon._WARP_REFRESHING.discard(tag)
+
+    def boom(m):
+        raise RuntimeError("restart blew up")
+
+    monkeypatch.setattr(daemon, "_refresh_idle_warp", boom)
+    with pytest.raises(RuntimeError):
+        daemon._refresh_line_serialized({"tag": tag})
+    assert tag not in daemon._WARP_REFRESHING

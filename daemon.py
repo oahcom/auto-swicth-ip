@@ -931,7 +931,7 @@ def _init_logger():
     sh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt=LOG_FORMAT))
     _logger.addHandler(sh)
 
-_LOG_LINE_BREAKS = _re.compile(r"[\r\n]+")
+_LOG_LINE_BREAKS = _re.compile(r"[\r\n\u2028\u2029\x85\v\f]+")
 _LOG_MESSAGE_MAX = 4000
 
 
@@ -1889,8 +1889,13 @@ def _connections_json() -> dict | None:
         if now - ts < _CONN_SNAPSHOT_TTL_SEC:
             return data
         # 走 HTTP 客户端而不是 curl：token 放 argv 会被 `ps` 看到（同一泄漏面
-        # 在订阅刷新处已用 0600 临时文件规避）。
-        data = _CLASH.connections(timeout=5)
+        # 在订阅刷新处已用 0600 临时文件规避）。读取失败仍缓存 None，否则
+        # Clash 挂掉时每个等待者都会各发一次请求。
+        try:
+            data = _CLASH.connections(timeout=5)
+        except Exception as e:
+            data = None
+            log_health(f"⚠ 读取 Clash 连接表失败: {e}")
         _conn_snapshot = (now, data)
         return data
 
@@ -2992,6 +2997,21 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
     return None
 
 
+def _refresh_line_serialized(member: dict) -> tuple[str | None, bool]:
+    """同步刷新一条线，与后台补刷/按线 worker 共用按线锁。
+
+    返回 ``(ip, acquired)``；``acquired=False`` 表示这条线正在别处刷新，
+    本轮不该重启它（重启只会拿到同一会话，白烧一次探测与一次在途中断）。
+    """
+    tag = member["tag"]
+    if not _acquire_refresh_slot(tag):
+        return None, False
+    try:
+        return _refresh_idle_warp(member), True
+    finally:
+        _release_refresh_slot(tag)
+
+
 _dirty_janitor_started = False
 
 
@@ -3689,7 +3709,13 @@ def reconnect_warp(reason: str) -> bool:
             log("  ⚠ 脏备线均在离渠冷却中，本次换线不刷新（等下一次错误重试）")
             return False
         for m in blocked_lines[:1]:
-            ip = _refresh_idle_warp(m)
+            # 与后台补刷/按线 worker 共用同一把按线锁：同步路径不占锁时，
+            # 两条线程会同时 restart 同一条隧道（实测 #1#1#2#2#3），白烧一次
+            # 会话与探测。拿不到锁说明这条线正在别处刷新，等下一次错误重试。
+            ip, acquired = _refresh_line_serialized(m)
+            if not acquired:
+                log(f"  ⚠ 脏备线 {m['tag']} 正在后台刷新，本次换线不刷新（等下一次错误重试）")
+                return False
             if ip:
                 probes.append((m, ip))
                 break

@@ -221,6 +221,22 @@ def test_stale_observation_does_not_restart_new_active_line():
     assert "取消 restart" in logs(c)
 
 
+def test_stale_observation_does_not_switch_away_new_active_line():
+    """决策后这条线已不是当前出口：不能再触发换线，把新出口切走。"""
+    class FlipActive(Fake):
+        def __init__(self):
+            super().__init__("ip9", (1.0, "ip1"), active="T")
+            self.checks = 0
+
+        def active_warp_tag(self):
+            self.checks += 1
+            return "T" if self.checks == 1 else "OTHER"
+
+    c = run(FlipActive())
+    assert not acted(c, "switch")
+    assert "取消换线" in logs(c)
+
+
 def test_start_empty_members_no_threads():
     fake = Fake(None, None)
     w.start(fake, members=[])
