@@ -470,3 +470,35 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
 - `timeout` 缺失时 `awk`/`journalctl` 可静默返回空，看似"无事件"实为查询本身
   失败。关键窗口的"日志空白"要先确认日志系统本身是否健康（本次 user journal
   最早条目仅到 19:29:55，之前的已丢失）。
+
+## INC-007 — 落池兜底把流量交给全挂的付费池（2026-10-26）
+
+**日期**: 2026-10-26
+**等级**: P1（WARP 全不可用时落池，池内节点全部 connection reset → 断流）
+**现象**: 02:57:13 daemon 日志 `出口=PROXY:pq.aws67.yydjc.top:443-vl`，
+`.egress_log.jsonl` 最后一条 ts=1792954624 停在该节点；05:32 部署重启后 selector
+回到 WARP，但 `proxy` 仍在 `opencode-out` 成员里，随时可能再落池。
+
+### 根因
+
+1. 付费 anytls 节点（`*.juhazf.cn` / `pq.aws67.yydjc.top`）全部 connection reset，
+   落池后没有可用出口。
+2. `_fallback_to_proxy` 的设计前提是「池比原地重连可靠」（2026-10-19 INC-006 的
+   反向教训），池整体失效后该前提不成立。
+3. 代码没有关闭开关，`deploy/install.sh` 每次部署 `enable --now`，看起来像
+   「自动切换被切断」，实际一直在跑。
+
+### 修复
+
+- `config.py` 新增 `warp.proxy_fallback_enabled: False`。
+- `_fallback_to_proxy` 入口守卫：禁用时只 `_restart_warp_inplace` 当前线；
+  `restart_singbox` 恢复路径也不再切回 proxy。
+- 保留 WARP 轮换（当前 9router 200 靠它换到未烧出口）。
+- 验证：`pytest -q` 351 passed；daemon 06:02:39 重启（PID 844647），
+  selector WARP-CF-C，`/v1/chat/completions` 200。
+
+### 教训
+
+- 兜底路径也要有「兜底资源是否还活着」的开关；共享池全挂时，原地重连优于落池。
+- 「服务被停用」要看 journal 的 `Stopped/Started` 和 `is-enabled`，不要从日志
+  空窗推断。

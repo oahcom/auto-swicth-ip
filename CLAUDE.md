@@ -135,12 +135,12 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   （18:58:05 用过的 `2a09:bac5:1efb:281e::3ff:42` 在 10.6 分钟后被原样切回，53 秒后爆发）。
   记录落盘 `.warp_ip_used.json`，跨重启保留。
 - 动作：探测备线连通性 → `PUT /proxies/opencode-out` 切过去（`interrupt_exist_connections: false`，在途请求不断）→ 后台重连刚被换下的那条，刷新其会话 IP，下次可原样切回。
-- 备线不通时先拉起；所有备线都不可用（或目标 IP 刷新不出新鲜值、备线均忙于在途
-  连接）时**切轮换池 `proxy`**，而不是原地重连 —— 切 proxy 只是一次 PUT，秒级且
-  不断流；原地重连要 `systemctl restart usque-*`，D-Bus 不可用时必败且流量会干等
-  在坏出口上（实测 2026-10-19 19:09 三条线同时失效 → 原地重连全败 → 403-abuse
-  每分钟 10~116 条持续 7 分钟）。仅当切 proxy 也失败时才退回原地重连，最多
-  `max_attempts`（3）次，重试间隔 `retry_backoff_sec`（2/5/10s）。
+- 备线不通时先拉起；所有备线都不可用时**原地重连当前 WARP 线**（`max_attempts`=3，
+  间隔 `retry_backoff_sec` 2/5/10s）。2026-10-26 起**不再落轮换池 `proxy`**
+  （`warp.proxy_fallback_enabled=false`）：池内 anytls 节点全部 connection reset，
+  落池等于断流（02:57 实测落池后 egress_log 停在 `pq.aws67.yydjc.top:443-vl`）。
+  历史上切 proxy 是为了避免 D-Bus 不可用时原地重连必败（2026-10-19 19:09），
+  但池已整体失效，这个兜底不再成立；要恢复把开关改回 `true`。
 - **主动轮换两种判据，`proactive_mode` 二选一（互斥，只有一个生效）**：`requests`（**当前生效**，
   当前出口上**成功的 dsv4 调用**累计满 `proactive_after_dsv4_ok`=150 格）与 `fixed`
   （每 `proactive_fixed_sec`=60s）。配置只能是 `fixed`/`requests`；导入时会校验，
@@ -294,6 +294,9 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   就值得做，拉长冷却只会让错误持续积累。5s 的依据：新出口首条错误延迟 p25=0.7s /
   p50=1.6s / p75=4.5s，1s 冷却会让 40% 的「刚换就错」冷却后立刻再触发（日志里的
   锯齿来源），5s 覆盖 79%。**例外**：整窗全为出口级错误（`full_err`）时绕过冷却立刻换。
+- **落池已禁用（2026-10-26，`warp.proxy_fallback_enabled=false`）**：以下冷却/回切
+  逻辑仅在开关为 `true` 时生效。禁用原因：池内节点全挂，落池=断流；WARP 全不可用时
+  改原地重连。恢复方式：`warp.proxy_fallback_enabled: true`。
 - **落池冷却 `proxy_fallback_cooldown_sec`（默认 3h）**：切到轮换池 `proxy` 后，
   3 小时内即使隧道全挂也不再落池。WHY：proxy 是 83 节点共享池，落池意味着把流量
   交给成功率 3~5% 的兜底资源（INC-002 的失败模式），而 WARP 换一条线只要一次 PUT。
@@ -453,7 +456,7 @@ daemon 随即置 bypass 直连，opencode 看到本地 IP 直接返回 abuse 403
 
 | 方向 | 触发 | 实现 |
 |---|---|---|
-| WARP → proxy | 全部隧道不可用或出口 IP 已被标记（换线时探测） | `_fallback_to_proxy()`，一次 PUT，不掐断在途连接 |
+| WARP → proxy（**已禁用**） | 仅在 `warp.proxy_fallback_enabled=true` 时生效；默认关闭，全不可用时原地重连 | `_fallback_to_proxy()` |
 | proxy → WARP | 三条判据任一成立（每 `proxy_check_sec`(60s) 评估）：①池健康探测**连续** `proxy_fail_streak`(3) 次全失败；②落池后 opencode 仍被 403/429 拦截 ≥ `proxy_blocked_threshold`(5) 条；③黑名单节点占比 ≥ `proxy_dead_ratio`(0.5)。另需 WARP 至少一条能出未标记 IP | `_maybe_failback_to_warp()` |
 
 WHY 反向必须主动探：停在 proxy 上时 `opencode_out_on_warp()` 为 False，错误分支走
@@ -620,6 +623,7 @@ warp.proactive_fixed_sec: 60                   # fixed：每 N 秒
 warp.proactive_after_dsv4_ok: 150              # requests：满 N 格成功的 dsv4 调用
 warp.proactive_quota_model: "deepseek-v4.1-flash-free"
 warp.proxy_fallback_cooldown_sec: 10800        # 落池冷却（3h）
+warp.proxy_fallback_enabled: false             # 落池开关（2026-10-26 关闭，池节点全挂）
 warp.probe_cache_ttl_sec: 12                   # 探测缓存 TTL（出口 IP 新鲜度）
 warp.probe_transient_ttl_sec: 120                 # 探测结论 TTL：OK/unreachable/err（瞬时档）
 warp.probe_persistent_ttl_sec: 21600              # 探测结论 TTL：quota/flagged（与 403 惩罚期同量级）

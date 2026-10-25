@@ -3458,6 +3458,13 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
     停在 proxy 上）时会把全部成员作为候选。
     """
     global _proxy_dwell_since, _last_warp_switch_ok_ts, _last_proxy_fallback_ts
+    if not _warp().get("proxy_fallback_enabled", False):
+        # 落池已禁用（2026-10-26）：池内节点全不可用，落池即断流。
+        # 没有当前线可重连时直接放弃，交给下一轮错误重试。
+        log("⚠ 落池已禁用，改为原地重连 WARP 线")
+        if active is None:
+            return False
+        return _restart_warp_inplace(active, old_ip)
     cooldown = _warp()["proxy_fallback_cooldown_sec"]
     last_ts = _load_proxy_fallback_ts()
     since_last = now - last_ts
@@ -4770,11 +4777,15 @@ def restart_singbox() -> bool:
             if prev_warp and prev_warp != _warp()["members"][0]["tag"]:
                 _switch_warp(prev_warp)
                 log(f"  ↺ WARP 线路恢复为 {prev_warp}")
-            elif prev_mode == "proxy":
+            elif prev_mode == "proxy" and _warp().get("proxy_fallback_enabled", False):
                 # 重启前停在轮换池，重启后 selector 回到 default(WARP-CF)：
                 # 不切回去等于静默改变出口模式，落池冷却也就白等了。
                 _switch_warp("proxy")
                 _ACTIVE_WARP_IP = None   # 会话已重开，旧 IP 不再属于任何线路
+            elif prev_mode == "proxy":
+                # 落池已禁用：保持 default(WARP-CF)，不把流量送回死池。
+                _ACTIVE_WARP_IP = None
+                log("  ⚠ 落池已禁用，重启后保持默认 WARP 出口")
             elif prev_mode == "unknown":
                 log("  ⚠ 重启前查不到出口模式，selector 停在 default，交由下次换线校正")
             if prev_warp:

@@ -579,7 +579,9 @@ def test_restart_singbox_resets_count_on_success():
     calls = []
     daemon._switch_warp = lambda tag: calls.append(tag) or True
     # 重启前停在轮换池：selector 会回到 default(WARP-CF)，必须切回 proxy，
-    # 否则一次重启就把出口静默从池换成 WARP。
+    # 否则一次重启就把出口静默从池换成 WARP。本用例显式打开落池开关。
+    orig_fallback_enabled = daemon.CFG["warp"]["proxy_fallback_enabled"]
+    daemon.CFG["warp"]["proxy_fallback_enabled"] = True
     daemon._current_mode = lambda: ("proxy", None)
     try:
         ok = daemon.restart_singbox()
@@ -587,6 +589,7 @@ def test_restart_singbox_resets_count_on_success():
         assert daemon._RESTART_COUNT == 0, f"成功应清零计数，实际 {daemon._RESTART_COUNT}"
         assert calls == ["proxy"], f"重启前在池应切回 proxy，实际 {calls}"
     finally:
+        daemon.CFG["warp"]["proxy_fallback_enabled"] = orig_fallback_enabled
         daemon.subprocess.run = orig_sub
         daemon.subprocess.Popen = orig_popen
         daemon._set_outbound_proxy = orig_set
@@ -1282,6 +1285,7 @@ def test_failover_skips_dead_standby(monkeypatch):
     D-Bus 不可用时必败，流量会停在坏出口上（实测 2026-10-19 19:09）。
     """
     _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1" if port == 1080 else None)
     switched = []
@@ -1295,6 +1299,7 @@ def test_failover_skips_dead_standby(monkeypatch):
 def test_failover_without_standby_falls_back_to_proxy(monkeypatch):
     """单隧道部署（无备线）切到轮换池 proxy，而非原地重连当前隧道。"""
     _warp_env(monkeypatch, WARP_TWO[:1])
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1")
     switched = []
@@ -1324,6 +1329,7 @@ def test_proxy_fallback_respects_cooldown(monkeypatch):
 def test_proxy_fallback_cooldown_switches_other_warp_line(monkeypatch):
     """冷却期内改切其它 WARP 成员，且不更新落池计时。"""
     _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", True)
     monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 1000.0)
     monkeypatch.setattr(daemon, "_port_open", lambda p: True)
@@ -1339,6 +1345,7 @@ def test_proxy_fallback_cooldown_switches_other_warp_line(monkeypatch):
 def test_proxy_fallback_updates_cooldown_after_success(monkeypatch):
     """冷却通过时切 proxy，落池时刻取切换生效时刻并落盘。"""
     _warp_env(monkeypatch, WARP_TWO[:1])
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", True)
     monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 0.0)
     monkeypatch.setattr(daemon.time, "time", lambda: 5000.0)
@@ -1347,6 +1354,32 @@ def test_proxy_fallback_updates_cooldown_after_success(monkeypatch):
     assert daemon._fallback_to_proxy(None, None, 20000.0) is True
     assert switched == ["proxy"], f"冷却通过应落池, 实际 {switched}"
     assert daemon._last_proxy_fallback_ts == 5000.0
+
+
+def test_proxy_fallback_disabled_restarts_inplace(monkeypatch):
+    """落池禁用时不得切 proxy，只原地重连当前 WARP 线。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", False)
+    monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", True)
+    monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 0.0)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    restarted = []
+    monkeypatch.setattr(daemon, "_restart_warp_inplace",
+                        lambda m, ip: restarted.append(m["tag"]) or True)
+    assert daemon._fallback_to_proxy(WARP_TWO[0], "1.1.1.1", 20000.0) is True
+    assert switched == [], f"落池禁用时不得切 proxy, 实际 {switched}"
+    assert restarted == ["W1"], f"应原地重连当前线, 实际 {restarted}"
+
+
+def test_proxy_fallback_disabled_without_active_gives_up(monkeypatch):
+    """落池禁用且当前没有 WARP 线时直接放弃，不切任何出口。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", False)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    assert daemon._fallback_to_proxy(None, None, 20000.0) is False
+    assert switched == [], f"落池禁用时不得切任何出口, 实际 {switched}"
 
 
 def test_inplace_restart_gives_up_after_max_attempts(monkeypatch):
@@ -1598,6 +1631,7 @@ def test_sync_path_refreshes_at_most_one_blocked_line(monkeypatch):
                                       "1082": "burn-2", "1083": "burn-3"}, guard=3600)
     monkeypatch.setitem(daemon.CFG, "warp",
                         {**daemon.CFG["warp"], "members": members})
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     for ip in ("burn-0", "burn-1", "burn-2", "burn-3"):
         daemon._WARP_IP_USED[ip] = {"ts": 990.0, "blocked": True,
                                     "blocked_kind": "rate429", "blocked_ts": 990.0,
@@ -1620,6 +1654,7 @@ def test_sync_path_refreshes_at_most_one_blocked_line(monkeypatch):
 def test_warp_failover_skips_target_when_refresh_keeps_stale_ip(monkeypatch):
     """刷新后仍是窗口内用过的地址 → 跳过该备线，改切轮换池 proxy。"""
     egress = _reuse_env(monkeypatch, {"1080": "ip-w1", "1081": "stale-ip"})
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     daemon._WARP_IP_USED["stale-ip"] = {"ts": 900.0, "blocked": False, "last_ok_ts": 900.0}
     monkeypatch.setattr(daemon, "_restart_service", lambda service, tag=None: True)
     switched = []
@@ -2174,6 +2209,7 @@ def test_warp_failover_refreshes_blocked_line_instead_of_proxy(monkeypatch):
 def test_warp_failover_falls_back_when_blocked_refresh_fails(monkeypatch):
     """刷新后仍是同一批被标记地址 → 此时才落 proxy 池。"""
     _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon.time, "time", lambda: 1000.0)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
@@ -2428,6 +2464,7 @@ def test_fallback_stamps_actual_landing_time_not_stale_caller_now(monkeypatch):
     「落池后仍拦截」判据把落池前的旧 403/429 也算进去。
     """
     monkeypatch.setattr(daemon, "opencode_out_on_warp", lambda: True)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon, "_proxy_dwell_since", 0.0)
@@ -2706,7 +2743,8 @@ def test_cached_standby_keeps_all_candidates_not_just_first(monkeypatch):
         {"tag": "W2", "port": 1081, "service": "s2"},
         {"tag": "W3", "port": 1082, "service": "s3"},
     ]
-    monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "members": members})
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "members": members})
     now = 1000.0
     monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {
         "W2": {"ip": "ip-b", "ip_ts": now - 2},
@@ -2818,6 +2856,7 @@ def test_error_switch_resets_proactive_timer(monkeypatch):
     已服务时长算账，立刻再切一次（实测 00:12:00 落池，22s 后就报 27s≥27s）。
     """
     _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     switched = []
