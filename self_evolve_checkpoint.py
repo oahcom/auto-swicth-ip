@@ -201,6 +201,22 @@ def save_state(state):
     write_json(str(STATE_FILE), state, indent=2)
 
 
+def _grep_log(pattern, timeout=5):
+    """grep 日志，返回 (lines, error)。
+
+    grep 的退出码语义：0=有匹配、1=无匹配（正常）、>1=出错。把 1 当失败会
+    误报，把 >1/超时当「0 条匹配」则会让检查恒真 —— 这正是 D9 的形态。
+    """
+    out = proc.run(["grep", "-a", pattern, _LOG_FILE], timeout=timeout)
+    if out.timed_out:
+        return [], "grep timeout"
+    if out.error:
+        return [], out.error
+    if out.code not in (0, 1):
+        return [], f"grep rc={out.code}"
+    return out.stdout.splitlines(), None
+
+
 def run_check(name, context, state=None):
     """Run a specific check and return (status, metric_value, details)."""
     try:
@@ -235,20 +251,18 @@ def run_check(name, context, state=None):
             return dead <= ceiling, dead, f"dead={dead}/{ceiling}"
 
         elif name == "bypass_events":
-            out = proc.run(
-                ["grep", "-a", "BYPASS\\|bypass", _LOG_FILE],
-                timeout=5,
-            )
-            count = len([l for l in out.stdout.splitlines() if today in l and ("enabled" in l.lower() or "BYPASS" in l.upper())][-10:])
+            lines, err = _grep_log("BYPASS\\|bypass")
+            if err:
+                return False, None, f"unavailable: {err}"
+            count = len([l for l in lines if today in l and ("enabled" in l.lower() or "BYPASS" in l.upper())][-10:])
             return count == 0, count, f"bypass_count={count}"
 
         elif name == "bounded_pool_pressure":
             # Check if _BoundedPool ever logged queue full warning
-            out = proc.run(
-                ["grep", "-a", "pool.*满\\|queue.*full", _LOG_FILE],
-                timeout=5,
-            )
-            count = len([l for l in out.stdout.splitlines() if today in l])
+            lines, err = _grep_log("pool.*满\\|queue.*full")
+            if err:
+                return False, None, f"unavailable: {err}"
+            count = len([l for l in lines if today in l])
             return count == 0, count, f"pool_warnings={count}"
 
         elif name == "node_switch_distribution":
@@ -287,21 +301,19 @@ def run_check(name, context, state=None):
 
         elif name == "upstream_failure_rate":
             # Check recent upstream connect failures in upstream
-            out = proc.run(
-                ["grep", "-a", "upstream connect fail", _LOG_FILE],
-                timeout=5,
-            )
-            lines = [l for l in out.stdout.splitlines() if today in l][-20:]  # last 20 today
-            return len(lines) < 10, len(lines), f"recent_upstream_fails={len(lines)}"
+            lines, err = _grep_log("upstream connect fail")
+            if err:
+                return False, None, f"unavailable: {err}"
+            today_lines = [l for l in lines if today in l][-20:]
+            return len(today_lines) < 10, len(today_lines), f"recent_upstream_fails={len(today_lines)}"
 
         elif name == "repeat_failure_nodes":
             """Detect nodes that repeatedly die (>3× in last 10 cycles)."""
-            out = proc.run(
-                ["grep", "-a", "死", _LOG_FILE],
-                timeout=5,
-            )
+            grep_lines, err = _grep_log("死")
+            if err:
+                return False, None, f"unavailable: {err}"
             nodes = Counter()
-            for line in out.stdout.splitlines():
+            for line in grep_lines:
                 if today not in line:
                     continue
                 m = re.search(r"✗\s+(.+?)\s+死", line)

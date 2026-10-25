@@ -61,6 +61,7 @@ def request_json(
     backoff: float = 0.2,
     redact: bool = True,
     session: requests.Session | None = None,
+    text_limit: int | None = _TEXT_LIMIT,
 ) -> HttpResult:
     """Send a request and decode its body when the body is JSON.
 
@@ -76,7 +77,9 @@ def request_json(
 
     A JSON body becomes ``data``. Anything else, including an HTML error page,
     lands in ``text`` truncated to 2000 characters so a stray gateway page
-    cannot flood a log. 204 and empty bodies are not parsed at all.
+    cannot flood a log. Callers that need the full payload (a subscription is a
+    base64 blob many kilobytes long) pass ``text_limit=None``; truncating it
+    would silently drop nodes. 204 and empty bodies are not parsed at all.
     """
     if timeout is None or not timeout > 0:
         raise ValueError("timeout must be a positive number")
@@ -121,4 +124,6 @@ def request_json(
     try:
         return HttpResult(status=status, data=response.json())
     except ValueError:
-        return HttpResult(status=status, text=raw[:_TEXT_LIMIT])
+        if text_limit is None:
+            return HttpResult(status=status, text=raw)
+        return HttpResult(status=status, text=raw[:text_limit])

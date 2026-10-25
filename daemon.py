@@ -1436,7 +1436,11 @@ def singbox_api(path: str, method: str = "GET", body: dict | None = None,
         if not silent:
             log(f"✗ Clash API 连接失败: {CFG['singbox']['clash_api']}{path}")
         return 0, None
-    return status, data
+    # 历史契约：只有 2xx（200/204）才返回响应体。4xx/5xx 的 JSON 错误页
+    # 不能被当成业务数据（调用方会读 data["now"] 之类）。
+    if status in (200, 204):
+        return status, data
+    return status, None
 
 def get_current_proxy() -> str | None:
     r, data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}')

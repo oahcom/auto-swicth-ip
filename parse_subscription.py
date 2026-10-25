@@ -26,7 +26,10 @@ def fetch_and_decode_sub(url: str) -> list[str]:
     import yaml
     # 仅对 dasho 等需要 UA 的源添加 headers
     headers = {"User-Agent": "clash-verge/1.0"} if "dasho" in url else {}
-    result = request_json("GET", url, timeout=30, headers=headers)
+    # text_limit=None：非 JSON 订阅是整段 base64/明文，截断到 2000 字符
+    # 会静默丢掉后面的节点（多源合并后按截断内容生成配置）。
+    result = request_json("GET", url, timeout=30, headers=headers,
+                          text_limit=None)
     if not result.ok:
         # 与 raise_for_status 等价：传输失败单独说明，非 2xx 带上状态码。
         if result.status is None:

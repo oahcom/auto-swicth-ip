@@ -77,6 +77,7 @@ _DRY_RUN_LABEL = {
     "switch": "应换线",
     "restart": "应重启",
     "accept": "应验收",
+    "probe": "应模型验收（dry-run 未实测）",
     "none": "无动作",
 }
 
@@ -149,7 +150,8 @@ def tick(member: dict, *, dry_run: bool = False) -> None:
           f"  · {tag} 观测 出口={ip} 验收={'同址已验过' if verified else '新址待验'}"
           f"{_ctx(tag, acc, active, verified, ip)}")
 
-    plan = _plan(member, ip, acc, active, verified, now)
+    plan = _plan(member, ip, acc, active, verified, now,
+                 probe=not dry_run)
     if plan is None or plan[0] == "none":
         return
     action, reason = plan
@@ -160,6 +162,14 @@ def tick(member: dict, *, dry_run: bool = False) -> None:
               f"  [dry-run] {tag} {_DRY_RUN_LABEL.get(action, action)}"
               f"（本应执行 {action}）原因={reason}"
               f"{h._warp_refresh_progress(tag)}")
+        return
+
+    # 模型探测要 1~9s，这段时间换线路径可能已把这条线选为当前出口。
+    # 此时再 restart/accept 会掐断在途请求，或把过期 IP 写进台账。
+    if action in ("restart", "accept") and h.active_warp_tag() == tag:
+        _note(tag, f"stale:{action}:{ip}",
+              f"  ⏸ {tag} 决策后已被选为当前出口，取消 {action}"
+              f"（观测 IP={ip}），下一轮重判")
         return
 
     # 地址变了：变化前那个地址确实服务过，入台账（换出来的 IP 该入库就入库）。
@@ -179,11 +189,16 @@ def tick(member: dict, *, dry_run: bool = False) -> None:
 
 
 def _plan(member: dict, ip: str | None, acc: tuple | None, active: bool,
-          verified: bool, now: float) -> tuple[str, str] | None:
+          verified: bool, now: float, *,
+          probe: bool = True) -> tuple[str, str] | None:
     """把观测映射成一个待执行动作，本身不做任何写操作。
 
-    action 取 restart/switch/accept/none，无需动作时返回 None。执行交给 tick，
-    这样 dry_run 只需跳过执行即可保证零副作用。
+    action 取 restart/switch/accept/probe/none，无需动作时返回 None。执行交给
+    tick，这样 dry_run 只需跳过执行即可保证零副作用。
+
+    ``probe=False``（dry-run）时不对未验收地址做模型探测：`_warp_model_usable`
+    会真实消耗一格出口配额，并把会话状态写进 `.probe_sessions.json` —— 那不是
+    只读。此时返回 ``probe``，只提示「这里需要实测」。
     """
     h = _host
     tag = member["tag"]
@@ -200,6 +215,8 @@ def _plan(member: dict, ip: str | None, acc: tuple | None, active: bool,
 
     # 未验收过的新地址：先验，验过就入池，不过就重启。
     if not verified:
+        if not probe:
+            return ("probe", f"新址 {ip} 需模型验收")
         if h._warp_model_usable(member, ip):
             return ("accept", f"新址 {ip} 验收通过")
         return ("restart", f"新址 {ip} 验收未过")

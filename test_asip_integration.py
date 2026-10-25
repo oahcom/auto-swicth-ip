@@ -23,6 +23,13 @@ def test_singbox_api_passes_through_http_status(monkeypatch):
     assert daemon.singbox_api("/proxies/x", silent=True) == (401, None)
 
 
+def test_singbox_api_drops_error_body_on_non_2xx(monkeypatch):
+    """4xx/5xx 的 JSON 错误页不能当业务数据返回（历史契约）。"""
+    monkeypatch.setattr(daemon._CLASH, "request_json",
+                        lambda *a, **k: (500, {"message": "boom"}))
+    assert daemon.singbox_api("/p", silent=True) == (500, None)
+
+
 def test_singbox_api_returns_parsed_body(monkeypatch):
     monkeypatch.setattr(daemon._CLASH, "request_json",
                         lambda *a, **k: (200, {"now": "W1"}))

@@ -182,21 +182,43 @@ def test_dry_run_active_switch_logs_only():
     assert "[dry-run]" in logs(c) and "应换线" in logs(c)
 
 
-def test_dry_run_unverified_failure_logs_only():
+def test_dry_run_unverified_does_not_burn_model_quota():
+    """dry-run 不得调 _warp_model_usable：它会真实扣配额并写探测会话。"""
     c = run(Fake("ip9", None, usable=False), dry_run=True)
+    assert not acted(c, "verify")
     assert not acted(c, "restart")
     assert not acted(c, "acquire")
     assert not acted(c, "invalidate")
-    assert "[dry-run]" in logs(c) and "应重启" in logs(c)
+    assert "[dry-run]" in logs(c) and "应模型验收" in logs(c)
 
 
 def test_dry_run_accept_logs_without_ledger():
     fake = Fake("ip9", None, usable=True)
     c = run(fake, dry_run=True)
+    assert not acted(c, "verify")
     assert not any(x[0] == "set_ip" for x in c)
     assert not any(x[0] == "used" for x in c)
     assert fake._WARP_LAST_ACCEPT == {}
-    assert "[dry-run]" in logs(c) and "应验收" in logs(c)
+    assert "[dry-run]" in logs(c) and "应模型验收" in logs(c)
+
+
+def test_stale_observation_does_not_restart_new_active_line():
+    """决策后这条线被选为当前出口：必须放弃 restart，不能在途请求被掐断。"""
+    class FlipActive(Fake):
+        def __init__(self):
+            super().__init__("ip9", None, active=None, usable=False)
+            self.checks = 0
+
+        def active_warp_tag(self):
+            self.checks += 1
+            return None if self.checks == 1 else "T"
+
+    fake = FlipActive()
+    c = run(fake)
+    assert acted(c, "verify")           # 决策阶段确实验过
+    assert not acted(c, "restart")      # 但执行前发现已变当前出口
+    assert not acted(c, "acquire")
+    assert "取消 restart" in logs(c)
 
 
 def test_start_empty_members_no_threads():

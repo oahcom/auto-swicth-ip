@@ -187,3 +187,16 @@ def test_204_and_empty_body_are_not_parsed(monkeypatch):
         result = request_json("GET", "http://x", timeout=1.0)
         assert result.data is None
         assert result.text is None
+
+
+def test_text_limit_can_be_disabled_for_large_bodies(monkeypatch):
+    """订阅是几十 KB 的 base64：截断会静默丢节点，必须能取全文。"""
+    body = "x" * 9000
+    monkeypatch.setattr(http.requests, "request",
+                        lambda *a, **k: _Resp(200, text=body))
+
+    default = request_json("GET", "http://x", timeout=1.0)
+    full = request_json("GET", "http://x", timeout=1.0, text_limit=None)
+
+    assert len(default.text) == 2000
+    assert full.text == body
