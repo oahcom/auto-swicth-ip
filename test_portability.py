@@ -277,6 +277,7 @@ def test_install_renders_units_on_fresh_host(tmp_path):
     """
     here = tmp_path / "clone"
     shutil.copytree(PROJECT / "deploy", here / "deploy")
+    shutil.copytree(PROJECT / "asip", here / "asip")
     for f in ("config.py", "requirements.txt", "sing-box"):
         shutil.copy2(PROJECT / f, here / f)
     unit_dir = tmp_path / "units"
