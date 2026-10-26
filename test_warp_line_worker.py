@@ -356,10 +356,15 @@ class StopLoop(Exception):
     pass
 
 
-def test_loop_stops_when_member_removed_from_config(monkeypatch):
-    """配置移除后线程必须退出：否则会继续重启一个已删除的 unit。"""
-    other = {"tag": "NEW", "port": 1099, "service": "n.service"}
-    fake = Fake(None, None, members=[other])
+@pytest.mark.parametrize("remaining", [[], [{"tag": "NEW", "port": 1099,
+                                               "service": "n.service"}]],
+                         ids=["last-member-removed", "others-remain"])
+def test_loop_stops_when_member_removed_from_config(monkeypatch, remaining):
+    """配置移除后线程必须退出：否则会继续重启一个已删除的 unit。
+
+    空表是「全部移除」，同样要退；只有读取失败(None)才保持运行。
+    """
+    fake = Fake(None, None, members=remaining)
     w._host = fake
     w._threads["T"] = object()
     w._LAST_ERR["T"] = (1.0, "old")
@@ -396,7 +401,7 @@ def test_loop_throttles_repeated_error_logs(monkeypatch):
 
 
 def test_loop_uses_interval_sec(monkeypatch):
-    fake = Fake(None, None)
+    fake = Fake(None, None, members=[M])
     w._host = fake
     seen = []
 

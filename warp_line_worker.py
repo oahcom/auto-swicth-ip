@@ -122,11 +122,12 @@ def _loop(member: dict, dry_run: bool = False,
     while True:
         # 配置里已经移除的线不再守护：否则线程会拿着旧 member 继续重启一个
         # 已删除的 unit，日志也会一直指向不存在的隧道（只有重启 daemon 才清）。
+        # 读取失败(None)时保持运行：瞬断不该杀线程；空表则是「全部移除」，要退出。
         try:
             members = _host._warp()["members"]
         except Exception:
             members = None
-        if members and all(m.get("tag") != tag for m in members):
+        if members is not None and all(m.get("tag") != tag for m in members):
             _host.log(f"  ⏹ {tag} 已从配置移除，停止守护")
             _threads.pop(tag, None)
             _LAST_ERR.pop(tag, None)
