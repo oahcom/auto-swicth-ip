@@ -3224,25 +3224,25 @@ def test_proactive_rotate_recovers_segment_start_after_restart(monkeypatch):
 
 
 def test_guard_window_depends_on_trigger_reason():
-    """403 用 6h 窗口、429 用 24h 窗口，其它触发用默认窗口。"""
+    """403 用 6h 窗口、429 用 60s 默认窗口，其它触发用默认窗口。"""
     w = daemon._warp()
     assert daemon._warp_guard_for_reason("abuse403 ×1") == w["blocked_guard_sec"]
     assert daemon._warp_guard_for_reason("rate429 ×3") == w["rate429_guard_sec"]
     assert daemon._warp_guard_for_reason(
         "主动轮换 已用配额 150 格 dsv4 ≥ 150") == w["ip_reuse_guard_sec"]
-    # 两者同时命中时按 403 处理（403 恢复期短，但信誉标记更严格、优先）
+    # 两者同时命中时按 403 处理（403 恢复期长于 429 默认，信誉标记更严格、优先）
     assert daemon._warp_guard_for_reason("abuse403 ×1 + rate429 ×2") == w["blocked_guard_sec"]
-    # 403 六小时刷新、429 二十四小时刷新：403 窗口必须严格短于 429
-    assert w["blocked_guard_sec"] < w["rate429_guard_sec"], "403 窗口应严格短于 429"
+    # 429 的默认冷却短于 403 恢复期：长封禁靠解析写入的 ban_until 承载
+    assert w["blocked_guard_sec"] > w["rate429_guard_sec"], "403 恢复期应长于 429 默认冷却"
     assert w["blocked_guard_sec"] == 6 * 3600, "403 恢复期应为 6h"
-    assert w["rate429_guard_sec"] == 24 * 3600, "429 恢复期应为 24h"
+    assert w["rate429_guard_sec"] == 60, "429 默认冷却应为 60s"
 
 
-def test_blocked_ip_recovers_after_6h_for_403_and_24h_for_429(monkeypatch):
-    """惩罚期按 blocked_kind 分别计时：403 六小时、429 二十四小时。
+def test_blocked_ip_recovers_after_6h_for_403_and_60s_for_429(monkeypatch):
+    """惩罚期按 blocked_kind 分别计时：403 六小时、429 默认六十秒。
 
-    403 是出口 IP 信誉标记，休息满 6h 即可再试；429 是出口 IP 级限流，必须
-    等 24h。kind 缺失的旧记录按 24h 保守处理。
+    403 是出口 IP 信誉标记，休息满 6h 即可再试；429 无解析值时按 60s 默认
+    回池（长恢复由 ban_until 精确值承载）。kind 缺失的旧记录按 24h 保守处理。
     """
     now = 1_000_000.0
     monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
@@ -3259,10 +3259,9 @@ def test_blocked_ip_recovers_after_6h_for_403_and_24h_for_429(monkeypatch):
     # 403：6h 内仍挡，6h 后放行
     assert daemon._warp_ip_is_blocked("ip-403", now + 5 * h + 59 * 60) is True
     assert daemon._warp_ip_is_blocked("ip-403", now + 6 * h + 60) is False
-    # 429：6h 后仍挡、23h59m 后仍挡、24h 后放行
-    assert daemon._warp_ip_is_blocked("ip-429", now + 6 * h + 60) is True
-    assert daemon._warp_ip_is_blocked("ip-429", now + 24 * h - 60) is True
-    assert daemon._warp_ip_is_blocked("ip-429", now + 24 * h + 60) is False
+    # 429：默认 60s 内仍挡、61s 后放行
+    assert daemon._warp_ip_is_blocked("ip-429", now + 30) is True
+    assert daemon._warp_ip_is_blocked("ip-429", now + 61) is False
     # 旧记录没有 kind → 按 24h 保守处理
     assert daemon._warp_ip_is_blocked("ip-legacy", now + 6 * h + 60) is True
     assert daemon._warp_ip_is_blocked("ip-legacy", now + 24 * h + 60) is False
@@ -3273,10 +3272,11 @@ def test_blocked_ip_recovers_after_6h_for_403_and_24h_for_429(monkeypatch):
 
 
 def test_403_then_429_blocks_until_later_expiry(monkeypatch):
-    """先 403 后 429 的 IP 按晚的那条解禁，不被 429 的标记改回 6h 窗口。
+    """先 403 后 429 的 IP 按晚的那条解禁，两条时钟互不覆盖。
 
-    只留单个 (kind, start) 时，后一次 429 会覆盖前一次 403 的起点，于是这条
-    地址按 6h 解禁，比规则要求的 24h 早 18 小时回到候选池。用户规则「按多的来」。
+    单 (kind, start) 会让后一次 429 把 403 的起点一并清掉；按 kind 分账后
+    解禁时刻取 max。新默认下 429 的 60s 远短于 403 的 6h —— 较晚的一条恰是
+    403；解析出长 Recover-After 时由 ban_until 拉长 429 那条（见精确封禁用例）。
     """
     now = 1_000_000.0
     h = 3600
@@ -3287,23 +3287,23 @@ def test_403_then_429_blocks_until_later_expiry(monkeypatch):
     daemon._mark_warp_ip_used("ip-y", now + 2 * h, blocked=True, kind="rate429")
     entry = daemon._WARP_IP_USED["ip-y"]
     assert entry["blocked_ts_by_kind"] == {"abuse403": now, "rate429": now + 2 * h}
-    # 403 那条在 T+6h 到期，但 429 那条要到 T+2h+24h
-    assert daemon._warp_ip_is_blocked("ip-y", now + 8 * h) is True, \
-        "403 虽已满 6h，429 的 24h 仍未到期，须继续挡住"
-    assert daemon._warp_ip_is_blocked("ip-y", now + 2 * h + 24 * h + 60) is False
+    # 429 默认早已在 T+2h+60s 到期，但 403 要到 T+6h
+    assert daemon._warp_ip_is_blocked("ip-y", now + 4 * h) is True, \
+        "429 虽已满 60s，403 的 6h 仍未到期，须继续挡住"
+    assert daemon._warp_ip_is_blocked("ip-y", now + 6 * h + 60) is False
     # 从没成功过的地址 recently_used 恒 False（它只看成功流量），由 is_blocked 兜住
-    assert daemon._warp_ip_recently_used("ip-y", now + 8 * h) is False
-    # 成功服务过再被两类烧掉：窗口取最长的 24h，8h 后仍算「刚用过」
+    assert daemon._warp_ip_recently_used("ip-y", now + 4 * h) is False
+    # 成功服务过再被两类烧掉：窗口取最晚的 403 6h，5h 后仍算「刚用过」
     entry["last_ok_ts"] = now
-    assert daemon._warp_ip_recently_used("ip-y", now + 8 * h) is True, \
-        "有 429 标记时窗口须取 24h，不能按 403 的 6h 提前放行"
-    assert daemon._warp_ip_recently_used("ip-y", now + 25 * h) is False
+    assert daemon._warp_ip_recently_used("ip-y", now + 5 * h) is True, \
+        "有 403 标记时窗口须取 6h，不能按 429 的 60s 提前放行"
+    assert daemon._warp_ip_recently_used("ip-y", now + 6 * h + 60) is False
 
 
 def test_reburned_after_recovery_starts_new_penalty(monkeypatch):
     """惩罚期过后再被烧 → 新一轮计时，不得沿用旧 blocked_ts 判成「已恢复」。
 
-    否则一个恢复过一次的地址以后再被 429 烧掉会立刻被放行，24h 限流形同虚设。
+    否则一个恢复过一次的地址以后再被 429 烧掉会立刻被放行，默认冷却形同虚设。
     同一轮内的重复标记仍保留最早的 kind 与 blocked_ts（见上一个用例）。
     """
     now = 1_000_000.0
@@ -3318,14 +3318,15 @@ def test_reburned_after_recovery_starts_new_penalty(monkeypatch):
     entry = daemon._WARP_IP_USED["ip-x"]
     assert entry["blocked_kind"] == "rate429", "新一轮按本次错误类型计时"
     assert entry["blocked_ts"] == now + 7 * h, "新一轮起点为本次标记时刻"
-    assert daemon._warp_ip_is_blocked("ip-x", now + 8 * h) is True, "应在新的 24h 惩罚期内"
+    assert daemon._warp_ip_is_blocked("ip-x", now + 7 * h + 30) is True, "应在新的 60s 冷却内"
+    assert daemon._warp_ip_is_blocked("ip-x", now + 8 * h) is False, "默认 60s 到期即回池"
 
 
 def test_retry_after_sets_exact_ban_until(monkeypatch):
-    """上游 429 的 Retry-After 是确切封禁期，替换 rate429 的默认 24h 猜测。
+    """上游 429 的 Retry-After 是确切封禁期，替换 rate429 的默认 60s 猜测。
 
     探针在 429 响应头里拿到 retry-after 后写入 ban_until；到期即放行，
-    既不会因默认 24h 多封 20 小时，也不会提前放回。
+    既不会因默认多封数小时，也不会提前放回。
     """
     now = 1_000_000.0
     h = 3600
@@ -4203,9 +4204,9 @@ def test_legacy_403_ban_until_does_not_shorten_default(monkeypatch):
 
 
 def test_expired_exact_ban_does_not_swallow_new_429(monkeypatch):
-    """精确封禁到期后再被 429：必须重开一轮 24h，不能被旧 ban_until 放行。
+    """精确封禁到期后再被 429：必须重开一轮冷却，不能被旧 ban_until 放行。
 
-    回归 d41cd74：旧实现保留同一类型的 stamp（24h 内）并把过期 ban_until
+    回归 d41cd74：旧实现保留同一类型的 stamp（窗口内）并把过期 ban_until
     当成「已恢复」，于是新 429 写进去后 `_warp_ip_is_blocked` 立刻返回 False。
     """
     now = 1_000_000.0
@@ -4221,8 +4222,7 @@ def test_expired_exact_ban_does_not_swallow_new_429(monkeypatch):
     assert entry["ban_until"] is None, "上一轮的精确封禁必须清掉"
     assert entry["blocked_ts_by_kind"] == {"rate429": now + 3 * h}
     assert daemon._warp_ip_is_blocked("ip-re", now + 3 * h + 1) is True
-    assert daemon._warp_ip_is_blocked("ip-re", now + 3 * h + 23 * h) is True
-    assert daemon._warp_ip_is_blocked("ip-re", now + 3 * h + 25 * h) is False
+    assert daemon._warp_ip_is_blocked("ip-re", now + 3 * h + 61) is False
 
 
 def test_bad_ban_until_does_not_break_hot_path(monkeypatch):
@@ -4233,8 +4233,8 @@ def test_bad_ban_until_does_not_break_hot_path(monkeypatch):
         "ip-bad": {"ts": now, "blocked": True,
                    "blocked_ts_by_kind": {"rate429": now},
                    "ban_until": "not-a-number", "ban_kind": "rate429"}})
-    assert daemon._warp_ip_is_blocked("ip-bad", now + h) is True
-    assert daemon._warp_ip_is_blocked("ip-bad", now + 24 * h + 1) is False
+    assert daemon._warp_ip_is_blocked("ip-bad", now + 30) is True
+    assert daemon._warp_ip_is_blocked("ip-bad", now + 61) is False
 
     # 非有限值同样是损坏台账：不能当「永久封禁」把 IP 锁死。
     for bad in (float("inf"), float("nan")):
@@ -4242,5 +4242,5 @@ def test_bad_ban_until_does_not_break_hot_path(monkeypatch):
             "ip-bad": {"ts": now, "blocked": True,
                        "blocked_ts_by_kind": {"rate429": now},
                        "ban_until": bad, "ban_kind": "rate429"}})
-        assert daemon._warp_ip_is_blocked("ip-bad", now + h) is True
-        assert daemon._warp_ip_is_blocked("ip-bad", now + 24 * h + 1) is False
+        assert daemon._warp_ip_is_blocked("ip-bad", now + 30) is True
+        assert daemon._warp_ip_is_blocked("ip-bad", now + 61) is False

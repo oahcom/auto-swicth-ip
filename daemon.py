@@ -2232,15 +2232,61 @@ def _warp_ip_last_ts(ip: str | None) -> float:
 def _warp_block_ttl(kind: str | None) -> float:
     """按烧掉该 IP 的错误类型给出惩罚期（秒）。
 
-    abuse403 六小时刷新、rate429 二十四小时刷新；kind 缺失（旧记录）按
-    24h 保守处理。两档都是出口 IP 级，换线对两者都有效。
+    abuse403 六小时刷新、rate429 默认六十秒；kind 缺失（旧记录）按 24h
+    保守处理。429 的精确恢复时刻（header/body/message 解析链）经 ban_after
+    写进 ban_until 后在这里覆盖默认值；解析失败是常态（生产库不落响应头），
+    60s 默认让 IP 尽快回池、靠 ban_until 承载长封禁。
     """
     w = _warp()
     if kind == "abuse403":
         return w["blocked_guard_sec"]
     if kind == "rate429":
         return w["rate429_guard_sec"]
+    # legacy：kind 缺失的旧账只认 blocked_ttl_sec 的 24h 保守值，不吃 429 的
+    # 60s 默认 —— 无法判别的旧记录不能因为默认缩短而被提前放回候选池。
     return w.get("blocked_ttl_sec", 86400)
+
+
+def _latest_rate429_body_since(since_ts: float) -> str | None:
+    """生产路径最近一条 rate429 行的 data 原文；窗口里没有 429 返回 None。
+
+    requestDetails 只落 status/data，不存响应头 —— 生产侧的取数只能走
+    body/message 层；header 层（Retry-After 秒数 / HTTP 日期）只在探测路径
+    `_warp_model_usable` 出现，那边直接把 parse 结果当 ban_after 传入。
+    索引预筛（timestamp >）与 _START_TS_SQL 精筛（开始时刻 >）的分工见
+    count_warp_blocked_since。LIKE 是可取数物质的关键词窄化：LIMIT 1 DESC
+    会被一段里最新的 403 顶掉，把它变成「429 里的最新一条」才能取到目标；
+    取出来仍过 _classify_egress_error 复核（分类唯一权威，LIKE 只是预筛）。
+    """
+    floor = (datetime.fromtimestamp(max(since_ts, 0.0), tz=timezone.utc)
+             .strftime("%Y-%m-%dT%H:%M:%S"))
+    try:
+        with _db_lock:
+            row = _get_db().execute(f"""
+                SELECT data FROM requestDetails
+                WHERE provider = ? AND timestamp > ? AND {_START_TS_SQL} > ?
+                  AND (data LIKE '%FreeUsageLimitError%'
+                       OR data LIKE '%Rate limit exceeded%'
+                       OR data LIKE '%Free usage limit reached%')
+                ORDER BY {_START_TS_SQL} DESC LIMIT 1
+            """, (OPENCODE_FREE_PROVIDER, floor, max(since_ts, 0.0))).fetchone()
+    except Exception as e:
+        log(f"✗ 读取最近 429 行失败: {e}")
+        return None
+    data = str(row["data"]) if row and row["data"] else None
+    return data if data and _classify_egress_error(data) == "rate429" else None
+
+
+def _parse_rate429_cooldown(body: str | None) -> int | None:
+    """429 精确冷却秒数：响应体字段 → 报错文案（网络取数层 header 优先序
+    在 probe_warp.parse_retry_after，含 header 秒数 / HTTP 日期）。
+
+    返回 None = 本条证据解析不出时长，由调用方落 config 默认
+    （rate429_guard_sec=60）。钳制 [1s, 24h] 已在 probe_warp 内完成，这里
+    不再夹一遍，避免两处上限漂移。
+    """
+    import probe_warp
+    return probe_warp.parse_retry_after(None, body or "")
 
 
 def _as_ts(value) -> float | None:
@@ -2274,8 +2320,8 @@ def _warp_block_window(entry: dict) -> float:
     """该 IP 惩罚判定的回看窗口：精确封禁优先于同类型默认值。
 
     与 `_warp_block_remaining` 用同一套取数规则。`_warp_ip_recently_used` 靠
-    这个窗口回答「窗口内是否成功过」；如果仍按 rate429 的 24h 默认值算，
-    上游给出 4.6h Retry-After 的地址会在恢复后继续被判为「窗口内用过」18h，
+    这个窗口回答「窗口内是否成功过」；如果固定按 24h 保守回看，上游给出
+    4.6h Retry-After 的地址会在恢复后继续被判为「窗口内用过」18h，
     精确封禁等于只在探测路径生效、选线路径没生效。
     """
     stamps = _warp_block_stamps(entry)
@@ -2317,15 +2363,17 @@ def _warp_block_stamps(entry: dict) -> dict[str, float]:
     kind = entry.get("blocked_kind")
     # 只读不回写：调用点有的在锁外，回写会与持锁的写入竞争、丢掉刚记的起点。
     # 旧记录不必单独迁移 —— 该 IP 下次被标记时回退链读出的结果会写成新格式。
-    return {(kind if kind in ("abuse403", "rate429") else "rate429"): float(start)}
+    # kind 缺失归到 legacy（blocked_ttl_sec 的 24h 保守档），不冒充 rate429：
+    # 60s 默认只属于「有 kind 但没解析到精确值」的新账。
+    return {(kind if kind in ("abuse403", "rate429") else "legacy"): float(start)}
 
 
 def _warp_block_remaining(entry: dict, now: float) -> float:
     """剩余惩罚期（秒），<=0 表示已恢复。多类标记取最晚解除的那一类。
 
     上游 429 带 `Retry-After` 时，探针把确切恢复时刻写进 `ban_until`；它替换
-    同类型的默认惩罚期（rate429 的 24h），不是与之取最大值 —— 24h 本就是没有
-    观测时的保守猜测。403 等其它类型仍按各自窗口并行，仍遵守「按多的来」。
+    同类型的默认惩罚期（rate429 的默认 60s），不是与之取最大值 —— 默认值只是
+    没有观测时的兜底回池节奏。403 等其它类型仍按各自窗口并行，仍遵守「按多的来」。
     """
     stamps = _warp_block_stamps(entry)
     if not stamps:
@@ -2353,7 +2401,8 @@ def _warp_ip_recently_used(ip: str | None, now: float,
     没有 last_ok_ts 的老记录退回 ts 判定（迁移期）。
 
     窗口取该 IP 记过的各类惩罚期中最长的一档：先被 403 烧过（6h）、没过多久
-    又被 429 烧过（24h）的地址按 24h 算 —— 规则是「按多的来」。过了惩罚期的
+    又被 429 烧过（默认 60s；解析到精确值时更长，上限 24h）的地址取更晚的
+    那条 —— 规则是「按多的来」。过了惩罚期的
     地址降级为**次级优质**，可以复用而不是永久排除 —— 这正是它重新进入候选池
     的路径。未被标记的地址沿用调用方给的 window。
     """
@@ -2700,7 +2749,8 @@ def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, int, 
     四档（对应「按使用来区分」）：
       0. 从未出现过 —— 最优，必然没被 opencode 见过；
       1. 次级优质 —— **真的撑过生产流量**，且已过对应的惩罚期（403 六小时 /
-         429 二十四小时）。过了惩罚期的 IP 可以复用，不是废址；档内按「距
+         429 默认六十秒；解析到精确 Retry-After/body/message 时以 ban_until
+         为准，上限 24h）。过了惩罚期的 IP 可以复用，不是废址；档内按「距
          上次成功的时长」排序，越久越靠前，这只是次级优质内部的先后，与恢复
          进度无关。已验证能服务，优先于没成功过的地址；
       2. 探针验过但从未服务生产 —— 空跑里拿到过 OK，但一次真实流量都没撑过。
@@ -2734,8 +2784,9 @@ def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, int, 
 def _warp_guard_for_reason(reason: str) -> float:
     """按触发原因给出复用窗口（秒）。
 
-    403 用 6h 窗口（出口 IP 信誉标记，六小时刷新）；429 用 24h 窗口（出口 IP
-    级限流，二十四小时刷新）。换线对两类都有效，它们都是出口 IP 级拦截。
+    403 用 6h 窗口（出口 IP 信誉标记，六小时刷新）；429 用默认冷却窗口
+    （六十秒，解析到精确 Retry-After/body/message 时由 ban_until 覆盖）。
+    换线对两类都有效，它们都是出口 IP 级拦截。
     """
     if "abuse403" in reason:
         return _warp()["blocked_guard_sec"]
@@ -2853,8 +2904,9 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
     entry["blocked"] = entry.get("blocked", False) or blocked
     w = _warp()
     cutoff = now - w["ip_reuse_guard_sec"]
-    # 被标记过的 IP 保留到惩罚期结束：取两档恢复期与 blocked_ttl_sec 的最大值，
-    # 否则 429 的 24h 条目可能在惩罚期内就被清掉，等于提前放回候选池。
+    # 被标记过的 IP 保留到惩罚期结束：取两档恢复期（403 6h）与 blocked_ttl_sec
+    # 的最大值兜底；解析到精确封禁的条目由下方 ban_until > now 单独保护，
+    # 不会因默认窗口缩短（429 现在 60s）被提前清掉放回候选池。
     blocked_cutoff = now - max(w.get("blocked_guard_sec", 86400),
                                w.get("rate429_guard_sec", 86400),
                                w.get("blocked_ttl_sec", 86400))
@@ -3936,7 +3988,8 @@ def maybe_reconnect_warp(now: float) -> None:
             float(c.get("ended_at", 0)) >= _last_warp_switch_ok_ts
             for c in _WARP_IP_CYCLES)
     # 生效窗口内、且生效之后一条错误都没有 → 本轮的触发全部来自上一段出口的
-    # 在途请求。此时标脏会把刚验证过的新出口记成坏地址 6~24h，记周期还会让本段
+    # 在途请求。此时标脏会把刚验证过的新出口记成坏地址（403 默认 6h、
+    # 429 默认 60s / 解析到精确值时最长 24h），记周期还会让本段
     # 永远采不到真正的结束点（sampled 恒真）。实测 46 次触发里 39 次是这一类。
     fresh = (count_warp_blocked_since(_last_warp_switch_ok_ts)
              if _last_warp_switch_ok_ts > 0 else {})
@@ -3946,11 +3999,19 @@ def maybe_reconnect_warp(now: float) -> None:
     if not sampled and not stale_only:
         if active:
             # 两类出口级拦截并行、各自惩罚期，解除时间取最晚（用户规则「按多的来」）。
-            # 只记一种 kind 会被后一次覆盖：403 之后再烧 429，仍按 6h 在 T+6h 解禁，
-            # 提前 18h 放回候选池。因此两类都达阈值时，各自记一次，blocked_ts_by_kind
-            # 留下两个起点，_warp_block_remaining 取 max 后正确锁到 rate429 的 24h。
+            # 只记一种 kind 会被后一次覆盖：403 之后再烧 429，仍按默认窗口解禁，
+            # 提前放回候选池。因此两类都达阈值时，各自记一次，blocked_ts_by_kind
+            # 留下两个起点，_warp_block_remaining 取 max 后锁到较晚的一个。
+            # 429 的精确冷却从本段最近一条 429 的 body/message 解析（生产库无
+            # 响应头，header 层只作用在探测路径 _warp_model_usable）；解析不到
+            # 传 None → 落 config 默认（60s）。403 不套响应时长（见 _warp_ip_used_locked）。
+            rate429_ban = None
+            if "rate429" in triggered:
+                rate429_ban = _parse_rate429_cooldown(
+                    _latest_rate429_body_since(_last_warp_reconnect_ts))
             for k in triggered:
-                _mark_warp_ip_used(active_ip, now, blocked=True, kind=k)
+                _mark_warp_ip_used(active_ip, now, blocked=True, kind=k,
+                                   ban_after=rate429_ban if k == "rate429" else None)
         # 只有成功服务过 ≥1 条的段才算「可用周期」；首请求即错的段记 ok=0。
         if active_ip and _last_warp_switch_ok_ts > 0:
             cycle = now - _last_warp_switch_ok_ts

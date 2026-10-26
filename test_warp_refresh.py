@@ -1132,7 +1132,8 @@ def test_real_error_after_new_exit_is_still_marked(monkeypatch):
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-new")
     monkeypatch.setattr(daemon, "_warp_member", lambda tag: {"tag": tag})
     monkeypatch.setattr(daemon, "_mark_warp_ip_used",
-                        lambda ip, now, blocked=False, kind=None: marked.append((ip, blocked)))
+                        lambda ip, now, blocked=False, kind=None, **k:
+                        marked.append((ip, blocked)))
     monkeypatch.setattr(daemon, "_record_warp_cycle", lambda *a, **k: None)
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda **k: pytest.fail("生效 2s 内硬闸必须拦住换线"))
