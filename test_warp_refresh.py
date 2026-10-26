@@ -613,16 +613,21 @@ def test_reconnect_now_does_not_read_error_counts():
 
     用 AST 查真实调用而非文本匹配 —— docstring 里也提到了该函数名，
     文本匹配会把说明文字误判成调用。
+
+    改查 `co_names` 而不是解析源码：源码解析要读磁盘上的 daemon.py，多个
+    session 共用一个工作区时读到半写入的文件会抛 IndentationError，把「代码里
+    有没有这个调用」的断言变成与审查对象无关的偶发失败。`co_names` 是编译产物，
+    只含真实引用的名字，docstring 文本不在其中。
     """
-    import ast
-    import inspect
-    tree = ast.parse(inspect.getsource(daemon._reconnect_warp_now))
-    names = {n.func.id for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    names |= {n.func.attr for n in ast.walk(tree)
-              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    code = daemon._reconnect_warp_now.__code__
+    names: set[str] = set()
+    stack = [code]
+    while stack:
+        c = stack.pop()
+        names |= set(c.co_names)
+        stack.extend(k for k in c.co_consts if hasattr(k, "co_names"))
     assert "count_warp_blocked_since" not in names, \
-        f"绕阈值入口不应查错误计数，实际调用: {sorted(names)}"
+        f"绕阈值入口不应查错误计数，实际引用: {sorted(names)}"
 
 
 def test_refresh_rejects_line_when_model_probe_fails(monkeypatch):

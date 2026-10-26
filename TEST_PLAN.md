@@ -1994,6 +1994,10 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | T-261 | P2 | 超时结果带可读 error | `pytest test_asip_proc.py` | `ProcResult.error == "timeout after Xs"`；映射型 env 可传入 |
 | T-262 | P2 | 错误换线候选分批实测 | `pytest test_daemon_unit.py -k slice_probe` | `probe_candidates_per_switch=2` 时单轮只测 2 条，游标轮转覆盖全池 |
 | T-263 | P1 | 未实测候选不得放行 | `pytest test_daemon_unit.py -k admit_tested` | 只放行本轮 `tested` 为真的候选；`{}`/False 均得空集（变异验证已杀） |
+| T-264 | P1 | 新鲜 OK 必须同 IP 且 ≤120s | `pytest test_warp_prober.py -k ok_fresh` | 同 IP 90s OK 为真；同 IP 130s、异 IP 90s 均为假 |
+| T-265 | P1 | 无新鲜 OK 只等不切 | `pytest test_warp_prober.py -k waits_and_does_not_switch` | `wait_switch` 返回 None；`_switch_warp` 零调用；不落 proxy |
+| T-266 | P1 | IP 未知不重启 | `pytest test_warp_prober.py -k unknown_ip_does_not_restart` | 记 `next_probe_ts=now+5`；`_warp_line_restart` 零调用 |
+| T-267 | P1 | quota 只重启非 active 线 | `pytest test_warp_prober.py -k quota_restarts_non_active_line` | active 线不重启；非 active 线重启一次且原因带 quota |
 
 **实战验证（改动合入前人工执行一次）**：
 
