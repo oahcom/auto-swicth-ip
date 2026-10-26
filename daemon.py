@@ -4853,10 +4853,13 @@ def maybe_reconnect_warp(now: float) -> None:
     # 在途请求。此时标脏会把刚验证过的新出口记成坏地址（403 默认 6h、
     # 429 默认 60s / 解析到精确值时最长 24h），记周期还会让本段
     # 永远采不到真正的结束点（sampled 恒真）。实测 46 次触发里 39 次是这一类。
+    # 旧连接豁免窗口：窗口内的 403/429 可能是上一段的在途长连接，不标脏、也不
+    # 记周期样本。但只对「新出口还没报过错」成立：一旦出现换线后开始的错误，
+    # `fresh` 非空，新出口真坏了照旧标脏（否则坏 IP 会被豁免窗口放行 2 分钟）。
     fresh = (count_warp_blocked_since(_last_warp_switch_ok_ts)
              if _last_warp_switch_ok_ts > 0 else {})
     stale_only = (now - _last_warp_switch_ok_ts
-                  < _warp().get("min_switch_gap_sec", 5)
+                  < _warp().get("switch_stale_grace_sec", 120)
                   and not (fresh.get("abuse403", 0) or fresh.get("rate429", 0)))
     if not sampled and not stale_only:
         if active:

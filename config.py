@@ -200,27 +200,27 @@ CFG = {
             {"tag": "WARP-CF-C", "port": 1082, "service": "usque-warp-c.service", "ipv6": True},
             {"tag": "WARP-CF-D", "port": 1083, "service": "usque-warp-d.service"},
             {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
-            {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service"},
-            {"tag": "WARP-CF-G", "port": 1086, "service": "usque-warp-g.service"},
+            {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service", "ipv6": True},
+            {"tag": "WARP-CF-G", "port": 1086, "service": "usque-warp-g.service", "ipv6": True},
             {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service", "ipv6": True},
             {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service", "ipv6": True},
-            {"tag": "WARP-CF-J", "port": 1089, "service": "usque-warp-j.service"},
+            {"tag": "WARP-CF-J", "port": 1089, "service": "usque-warp-j.service", "ipv6": True},
             # 2026-10-22 扩到 20 条。WHY：扩容前的实测是在排空并发上打满的 ——
             # 换线间隔 p50 8s（高频时 1.8 次/分钟），被切下的线排空 p50 68s /
             # p90 335s，任一时刻平均 4.9 条在排空（≥3 条占 84% 的时间），
             # 而池里只有 10 条、真正服务流量的只有 3 条。近 1 小时 23% 的
             # 换线时刻只剩 1 条候选。排空等的是真实在途流式响应（28 条连接
             # 180s 采样零增长占比 0.0%，不是僵尸连接），只能靠加容量吸收。
-            {"tag": "WARP-CF-11", "port": 1090, "service": "usque-warp-11.service"},
-            {"tag": "WARP-CF-12", "port": 1091, "service": "usque-warp-12.service"},
-            {"tag": "WARP-CF-13", "port": 1092, "service": "usque-warp-13.service"},
-            {"tag": "WARP-CF-14", "port": 1093, "service": "usque-warp-14.service"},
-            {"tag": "WARP-CF-15", "port": 1094, "service": "usque-warp-15.service"},
-            {"tag": "WARP-CF-16", "port": 1095, "service": "usque-warp-16.service"},
-            {"tag": "WARP-CF-17", "port": 1096, "service": "usque-warp-17.service"},
-            {"tag": "WARP-CF-18", "port": 1097, "service": "usque-warp-18.service"},
-            {"tag": "WARP-CF-19", "port": 1098, "service": "usque-warp-19.service"},
-            {"tag": "WARP-CF-20", "port": 1099, "service": "usque-warp-20.service"},
+            {"tag": "WARP-CF-11", "port": 1090, "service": "usque-warp-11.service", "ipv6": True},
+            {"tag": "WARP-CF-12", "port": 1091, "service": "usque-warp-12.service", "ipv6": True},
+            {"tag": "WARP-CF-13", "port": 1092, "service": "usque-warp-13.service", "ipv6": True},
+            {"tag": "WARP-CF-14", "port": 1093, "service": "usque-warp-14.service", "ipv6": True},
+            {"tag": "WARP-CF-15", "port": 1094, "service": "usque-warp-15.service", "ipv6": True},
+            {"tag": "WARP-CF-16", "port": 1095, "service": "usque-warp-16.service", "ipv6": True},
+            {"tag": "WARP-CF-17", "port": 1096, "service": "usque-warp-17.service", "ipv6": True},
+            {"tag": "WARP-CF-18", "port": 1097, "service": "usque-warp-18.service", "ipv6": True},
+            {"tag": "WARP-CF-19", "port": 1098, "service": "usque-warp-19.service", "ipv6": True},
+            {"tag": "WARP-CF-20", "port": 1099, "service": "usque-warp-20.service", "ipv6": True},
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
@@ -339,6 +339,9 @@ CFG = {
         # 请求都还没发就被切走。按生效起算后同口径重放：141 次触发全部真错。
         # 取 5：等于 cooldown_ok_sec，覆盖新出口首条错误延迟的 79%（p75=4.5s）。
         "min_switch_gap_sec": 5,
+        # 换线后「旧连接」豁免窗口：窗口内的 403/429 可能来自上一段的在途长连接，
+        # 一律不标脏。换线门控在下方独立生效，新出口真坏了仍会切走。
+        "switch_stale_grace_sec": 120,
         # 换线动作本身失败（两条线都不通）时的重试间隔
         # 失败也压到 3s：60s 的失败冷却会让一次换线失败后整分钟停在坏出口上。
         # 防雷暴由 `_WARP_LOCK` 的互斥 + `cooldown_fail_sec` 的短退避共同保证，

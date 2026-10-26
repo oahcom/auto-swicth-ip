@@ -79,22 +79,27 @@ http_proxy=http://lan:<password>@<主机IP>:7891 curl https://api.github.com/zen
 ```
 9router → sing-box:7890 → route: domain_suffix ["opencode.ai"]
         → selector opencode-out
-             ├── WARP-CF     socks 127.0.0.1:1080  usque-warp.service   （主, -6 → SJC）
-             ├── WARP-CF-B   socks 127.0.0.1:1081  usque-warp-b.service （备, v4 → LAX）
-             ├── WARP-CF-C   socks 127.0.0.1:1082  usque-warp-c.service （备, v4 → LAX）
-             ├── WARP-CF-D   socks 127.0.0.1:1083  usque-warp-d.service （备, v4）
-             ├── WARP-CF-E   socks 127.0.0.1:1084  usque-warp-e.service （备, v4）
-             ├── WARP-CF-F   socks 127.0.0.1:1085  usque-warp-f.service （备, v4）
-             ├── WARP-CF-G   socks 127.0.0.1:1086  usque-warp-g.service （备, v4）
-             ├── WARP-CF-H   socks 127.0.0.1:1087  usque-warp-h.service （备, v4）
-             ├── WARP-CF-I   socks 127.0.0.1:1088  usque-warp-i.service （备, v4）
-             ├── WARP-CF-J   socks 127.0.0.1:1089  usque-warp-j.service （备, v4）
-             └── proxy       轮换池（隧道全不通时兜底）
+              ├── WARP-CF     socks 127.0.0.1:1080  usque-warp.service   (-6 → SJC)
+              ├── WARP-CF-B   socks 127.0.0.1:1081  usque-warp-b.service (-6 → SJC)
+              ├── WARP-CF-C   socks 127.0.0.1:1082  usque-warp-c.service (-6 → SJC)
+              ├── WARP-CF-D   socks 127.0.0.1:1083  usque-warp-d.service (v4 → LAX，v4 双保底之一)
+              ├── WARP-CF-E   socks 127.0.0.1:1084  usque-warp-e.service (v4 → LAX，v4 双保底之一)
+              ├── WARP-CF-F   socks 127.0.0.1:1085  usque-warp-f.service (-6 → SJC)
+              ├── WARP-CF-G   socks 127.0.0.1:1086  usque-warp-g.service (-6 → SJC)
+              ├── WARP-CF-H   socks 127.0.0.1:1087  usque-warp-h.service (-6 → SJC)
+              ├── WARP-CF-I   socks 127.0.0.1:1088  usque-warp-i.service (-6 → SJC)
+              ├── WARP-CF-J   socks 127.0.0.1:1089  usque-warp-j.service (-6 → SJC)
+              ├── WARP-CF-11…20  socks 127.0.0.1:1090-1099  usque-warp-11..20.service (-6 → SJC)
+              └── proxy       轮换池（隧道全不通时兜底）
         → opencode.ai
 ```
 
-**10 条隧道各自的 Cloudflare 设备凭据独立**（`.warp/usque{,2..10}/config.json`，600，gitignored）。
-扩到 10 条的理由是「备线要跟上 IP 消耗」：24h 复用窗口下每条线用一次就脏，5 条线不足以
+**20 条隧道各自的 Cloudflare 设备凭据独立**（`.warp/usque{,2..10,11..20}/config.json`，600，gitignored）。
+2026-10-26 扩容：单元启动参数统一 `-6`（主机原生 v6 路由已就绪），仅留 D/E 两条 v4
+保底（v6 路由整体故障时仍可换出口）。台账观测：24h 内出现过 4630 个不同 v6 出口 IP、
+分布 ≥20 个 /48 网段——IPv6 池近似无上界，瓶颈在同时在线隧道数与本机 v6 路由，
+不在池子容量。
+隧道从 5 扩到 10 再到 20 的理由是「备线要跟上 IP 消耗」：24h 复用窗口下每条线用一次就脏，少数线不足以
 在换线时总有新鲜出口。**新增隧道必须同时做三件事**，缺一就是「隧道起着但用不上」——
 ①建 systemd 单元并起进程；②`.warp/warp-outbound.json` 加条目（`make_config` 据此并入
 sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 进程**（改文件不重载无效）。
