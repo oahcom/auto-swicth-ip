@@ -502,3 +502,67 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
 - 兜底路径也要有「兜底资源是否还活着」的开关；共享池全挂时，原地重连优于落池。
 - 「服务被停用」要看 journal 的 `Stopped/Started` 和 `is-enabled`，不要从日志
   空窗推断。
+
+## INC-008 — 禁令：429 不得再解释为"账号级配额"（2026-10-26）
+
+**日期**: 2026-10-26
+**等级**: P0（认知红线，反复违反）
+**现象**: 主人已无数次强调，模型仍在分析/方案中把 opencode 429
+（`FreeUsageLimitError` / `Rate limit exceeded`）解释为账号级/账户级/key 级
+配额上限，并据此提出"全池冷却""暂停轮换""等配额重置""短封禁等待退出"等
+错误方案。
+
+### 红线条文
+
+1. **禁止**把 opencode 429 判定为账号级/账户级/key 级配额。
+2. **禁止**提出依赖该前提的衍生策略：全池冷却、暂停轮换、等待配额重置、
+   短封禁等待退出。
+3. 429 的唯一判定框架：**按出口 IP（egress）判定**。治理手段只有两个：
+   出口级换线 + IP 池治理（池规模、-6 隧道扩容、出口质量）。
+4. 依据：INC-005 实测——同一 key、仅切换出口，成功率 3.5% → 9.3%；
+   若为账号级配额，换 IP 不可能提升成功率。主人 2026-10-26 原话：
+   "账号级配额是错误的，不允许再次提前（出现）。"
+   对短封禁等待退出的否决："提示非常小，大不了下次刷到再用。"
+
+### 教训
+
+- 错误文案分析要先"看证据"（响应体类型、status、出口台账），再谈配额语义。
+- 涉及 429 的任何方案，先过本条红线的 4 条禁令，再动笔。
+
+## INC-009 — 60 秒"挂起错误"实为传输层合成 503（sidecar 文案误导，2026-10-26）
+
+**日期**: 2026-10-26
+**等级**: P2（可观测性/文案误导；触发窗口内 300 条 error 一次性灌入）
+**现象**: 21:07–21:08 一批 opencode 请求记录 `status=error`、`ttft=0`、
+`total≈60004`、`tokens=0`，早期分类器把这类行标成 "other"，
+被误读成"60 秒超时"。实际响应体为：
+`503 {"type":"error","error":{"type":"UpstreamTransportError",
+"message":"OpenCode free lane requires the Bun transport; sidecar unavailable."}}`
+
+### 根因链（代码 + journal 证据）
+
+1. 21:04:30–32 全部 20 条 usque-warp 隧道被一次性重启（本轮 -6 改单的批量
+   重启窗口），所有出口同时断线重连。
+2. 窗口内 Bun sidecar 的 forward 请求上游零字节返回（`ttft=0`）。
+3. transport 自身无请求超时：`readyTimeoutMs`=8s、`failureBackoffMs`=5min、
+   `STREAM_STALL_TIMEOUT_MS`=360s，均非此 60s（open-sse/config/runtimeConfig.js:71-81）。
+4. 约 60s 无首字节，发起方中止 → `forward()` AbortError →
+   `fetchViaTransport` 返回 null（open-sse/utils/opencodeTransport.js:179-186）。
+5. executor 将 null 统一合成为上述 503（open-sse/executors/opencode.js:660-682，
+   带 `retry-after: 1`）。**"sidecar unavailable" 同时覆盖了"forward 卡死"，
+   文案误导。**
+6. 并发请求同一窗口卡住、同时到 60s 被掐、同时记错 → 短时 error 爆发。
+
+### 定性（与 429 红线的关系）
+
+- 非 429/403，非账号级配额，亦非出口封禁：上游零字节，纯传输悬挂。
+- ASIP 未换线是正确行为：503 不落 egress 标记；换 IP 救不了本地传输卡死
+  （opencode.js:654-658 `computeRetryDelay` 明确禁止进程内重试）。
+
+### 处置与待办
+
+- 批量隧道重启必须滚动/错峰，禁止把 20 条线同时停掉。
+- `[OpenCodeTransport]` 的 warn 只写 9router stdout（fd 为 socket，不落盘）
+  → 需要落盘日志/告警，否则同类故障不可观测。
+- 报错文案建议拆分 "forward hang" 与 "sidecar unavailable"（改动需 Codex 复审）。
+
