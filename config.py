@@ -76,13 +76,14 @@ def get_singbox_secret() -> str:
         if _SINGBOX_SECRET and mtime == _SINGBOX_SECRET_MTIME:
             return _SINGBOX_SECRET
         if st.st_mode & 0o077:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ Secret file loose perms ({oct(st.st_mode & 0o777)})")
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ⚠ Secret file loose perms ({oct(st.st_mode & 0o777)})",
+                  file=sys.stderr)
         with open(SECRET_FILE) as f:
             _SINGBOX_SECRET = f.read().strip()
         _SINGBOX_SECRET_MTIME = mtime
         return _SINGBOX_SECRET
     except Exception as e:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✗ 读取密钥文件失败: {e}")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ✗ 读取密钥文件失败: {e}", file=sys.stderr)
         return ""
 
 # 启动时校验密钥 (活值) — 不冻结常量, 避免 secret 轮换后失效

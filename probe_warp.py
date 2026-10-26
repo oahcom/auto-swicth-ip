@@ -458,7 +458,10 @@ def probe(port: int, timeout: float) -> tuple[str, float, str]:
     t0 = time.time()
     bun = _bun_bin()
     if not bun:
-        return "unreachable", 0.0, "bun not found (set PROBE_BUN_BIN)"
+        # 返回独立结论而不是 unreachable：没装 bun 是**探测器缺失**，不是这条线
+        # 不能出流量。混进 unreachable 会让整批隧道被判死、被反复重启（实测
+        # 每 5 分钟一轮 20 条全部 unreachable，白烧重启与配额）。
+        return "noprobe", 0.0, "bun not found (set PROBE_BUN_BIN)"
     try:
         with _LocalBridge(port) as proxy_url:
             session = _session_for(port)

@@ -15,7 +15,8 @@ UNIT_DIR="${SYSTEMD_DIR:-$HOME/.config/systemd/user}"
 # 试跑（如 /tmp 下的 clone）时若忘了设 SYSTEMD_DIR，就会把现网单元悄悄改指到副本，
 # 而副本随时可被清理 —— 服务下次重启即崩。真实事故：`--units-only` 在 /tmp 副本
 # 里跑过一次，23 个单元全被改指 /tmp/xxx，直到有人发现。
-cur="$(sed -n 's/^WorkingDirectory=//p' "$UNIT_DIR/auto-switch-ip.service" 2>/dev/null | head -1)"
+# 全新机器上单元文件还不存在；pipefail 下 sed 的 exit 2 会让 set -e 直接中断部署。
+cur="$(sed -n 's/^WorkingDirectory=//p' "$UNIT_DIR/auto-switch-ip.service" 2>/dev/null | head -1 || true)"
 if [ -z "${SYSTEMD_DIR:-}" ] && [ -n "$cur" ] && [ "$cur" != "$DIR" ] && [ -f "$cur/daemon.py" ]; then
     echo "✗ 现网单元当前指向 $cur，而本次运行的是 $DIR —— 拒绝覆盖生产单元" >&2
     echo "  试跑请设 SYSTEMD_DIR；确认要迁移到本目录请加 --adopt" >&2
@@ -70,7 +71,10 @@ fail=0
     || { echo "✗ $DIR/deploy/usque-launch.sh 不存在或不可执行（单元 ExecStart 依赖它）" >&2; fail=1; }
 [ "$fail" = 0 ] || exit 1
 
-MEMBERS="$("$PYBIN" "$DIR/deploy/members.py")"
+# 只收 5 字段的行：config.py 在 import 期会打告警，一旦漏到 stdout（历史上确有），
+# while read 会把它当节点行，凭空建出 .warp/<告警文本>/ 目录和一个非法单元名。
+MEMBERS="$("$PYBIN" "$DIR/deploy/members.py" 2>/dev/null | awk 'NF==5')"
+[ -n "$MEMBERS" ] || { echo "✗ members.py 没有输出任何节点" >&2; exit 1; }
 
 # .warp/warp-outbound.json 是 parse_subscription 生成 WARP 出口的唯一依据，且被
 # gitignore。缺了它配置里不会有 opencode-out，daemon 全部换线打空 —— 从 config 重建。
@@ -96,7 +100,10 @@ if [ "$UNITS_ONLY" = 0 ]; then
         [ "$dir" = "usque" ] || ln -sfn ../usque/usque "$DIR/.warp/$dir/usque"
         if [ ! -f "$DIR/.warp/$dir/config.json" ]; then
             echo "注册隧道 $tag → .warp/$dir"
-            ( cd "$DIR/.warp/$dir" && "$DIR/.warp/usque/usque" register --accept-tos -n "$tag" ) \
+            # 注册必须直连：本机 export 了 http(s)_proxy（如 okz）时，usque 会走代理
+            # 导致 Cloudflare 返回非 JSON 错误页（failed to parse error response）。
+            ( cd "$DIR/.warp/$dir" && env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+                "$DIR/.warp/usque/usque" register --accept-tos -n "$tag" ) \
                 || { echo "⚠ $tag 注册失败，该单元启动后会立即退出" >&2; REGISTER_FAILED=$((REGISTER_FAILED + 1)); }
         fi
         chmod 600 "$DIR/.warp/$dir/config.json" 2>/dev/null || true

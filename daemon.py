@@ -2782,6 +2782,11 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         # 照样按次级优质把它排回候选池首位。
         log(f"  ✗ {tag} 出口 {ip} 实测 {verdict} 起手早于该地址标脏，结论作废")
         return False
+    if verdict == "noprobe":
+        # 没装 bun：探测通道不存在，不是这条线不能用。当作失明处理 —— 不否决、
+        # 不写台账（写进去会把每条线都标成 unreachable，下次换线直接没候选）。
+        log(f"  ⚠ {tag} 出口 {ip} 无探测器（未装 bun），跳过实测改用历史判据")
+        return True
     _PROBE_LAST_VERDICT[tag] = verdict
     ok = verdict == "OK"
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}"
@@ -4539,6 +4544,10 @@ _restart_lock = threading.Lock()
 
 def _set_outbound_proxy(url: str = "", enabled: bool = False) -> None:
     """Atomically set 9router outboundProxyUrl + outboundProxyEnabled via json_set. Thread-safe."""
+    # blind 模式 = 9router 停用或不跑：库里没有 settings 表，写它只会每 60s 刷一条
+    # "no such table: settings"。其余 9router 写路径同样受 _observe_9router() 门控。
+    if not _observe_9router():
+        return
     try:
         with _db_lock:
             c = _get_db()
@@ -5295,8 +5304,12 @@ def main():
                     float(CFG["intervals"]["proactive_rotate_sec"]))
             else:
                 _POOL_PROACTIVE_LABEL = "不适用(WARP)"
-            if (not opencode_out_on_warp()
-                    and now - last_proactive_rotate > CFG["intervals"]["proactive_rotate_sec"]):
+            # 池轮换原本只在 opencode 落池时跑。但如果池选中的节点已经死了，
+            # 非 opencode 流量（9router 的其它 provider）走 7890 就是 100% 失败 ——
+            # 此时无论 opencode 在哪都必须换掉它。
+            _pool_current_dead = bool(cached_current_proxy) and cached_current_proxy in _DEAD_NODES
+            if (not opencode_out_on_warp() or _pool_current_dead) \
+                    and now - last_proactive_rotate > CFG["intervals"]["proactive_rotate_sec"]:
                 last_proactive_rotate = now
                 if cached_all_nodes:
                     _submit_once("pool-proactive-rotate", _rotate_pool_proactive,
