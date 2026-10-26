@@ -2604,6 +2604,17 @@ def _warp_model_test_many(pairs: list[tuple[dict, str]]) -> dict[str, bool]:
     return out
 
 
+def _admit_tested(probes: list[tuple[dict, str]],
+                  tested: dict[str, bool]) -> list[tuple[dict, str]]:
+    """只放行本轮实测通过的候选；没测到不等于可用。
+
+    WHY：分批探测为省配额只测一部分，若按「没失败」放行，未测的线会被当成
+    可用切过去 —— 配额省了，却切到一条没验证的 429 出口。
+    """
+    ok_ips = {ip for m, ip in probes if tested.get(m["tag"])}
+    return [(m, ip) for m, ip in probes if ip in ok_ips]
+
+
 def _slice_probe_batch(pairs: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
     """错误换线只取下一小批候选实测，控制单次延迟与配额消耗。
 
@@ -3837,12 +3848,11 @@ def reconnect_warp(reason: str) -> bool:
                 "（限流省配额，下一轮接着测）")
         tested = _warp_model_test_many(to_test)
         failed = [m for m, _ in to_test if not tested.get(m["tag"])]
-        ok_ips = {ip for m, ip in to_test if tested.get(m["tag"])}
         if failed:
             log(f"  ↻ {len(failed)} 条备线模型层实测不通过，重连换会话 IP")
             blocked_lines.extend(failed)
         # 本轮没测到的候选不放行：模型模式下「没测」不等于「可用」。
-        probes = [(m, ip) for m, ip in probes if ip in ok_ips]
+        probes = _admit_tested(probes, tested)
 
 
     # 备线出口全被标记时刷新一条拿新会话 IP，刷新不出才落 proxy 池 —— 池只是

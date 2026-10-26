@@ -4320,3 +4320,17 @@ def test_slice_probe_batch_all_when_unlimited(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "probe_candidates_per_switch", 0)
     pairs = [({"tag": f"T{i}"}, f"ip{i}") for i in range(5)]
     assert daemon._slice_probe_batch(pairs) == pairs
+
+
+def test_admit_tested_rejects_unprobed_candidates():
+    """分批探测后只放行实测通过的线；未测到的不得当可用。
+
+    变异：把判据改成「没测到也放行」或「只看失败」时本用例转红。
+    """
+    w2 = {"tag": "W2"}
+    w3 = {"tag": "W3"}
+    probes = [(w2, "ip-w2"), (w3, "ip-w3")]
+    assert daemon._admit_tested(probes, {"W2": True}) == [(w2, "ip-w2")]
+    assert daemon._admit_tested(probes, {"W2": False}) == []
+    assert daemon._admit_tested(probes, {"W2": True, "W3": True}) == probes
+    assert daemon._admit_tested(probes, {}) == []
