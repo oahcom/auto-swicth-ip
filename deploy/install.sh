@@ -91,6 +91,13 @@ if [ "${ASIP_SKIP_9ROUTER:-0}" != 1 ]; then
         echo "  装好后把 .env 里的 ASIP_OBSERVE_9ROUTER 改成 true 并重启 daemon" >&2
 
     }
+    # 装完还得初始化：CLI token / proxyPool 绑定 / enableObservability。
+    # 缺任何一样，9router 都是「在跑但 asip 什么都测不到」的空壳 —— 尤其
+    # enableObservability 默认 false，requestDetails 不落行，错误率恒为 0/0。
+    bash "$DIR/deploy/init-9router.sh" || {
+        echo "⚠ 9router 初始化失败 —— asip 会读不到 requestDetails" >&2
+        echo "  重跑：$DIR/deploy/init-9router.sh" >&2
+    }
 
 fi
 
