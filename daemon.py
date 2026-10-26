@@ -2198,14 +2198,31 @@ def _cached_warp_standby(standby: list[dict], now: float,
     「抢在报错之前换线」的窗口吃光了。脏线守护每 ~5s 已经探过每条非当前
     出口的线，结果就在 `_WARP_LINE_STATE` 里，直接拿来用即可。
 
+    「可信」= 两个条件同时成立，缺一不可：
+      ① `probe_ok_ttl_sec` 内模型层实测过且结论为 OK —— 只验过「能出网」不算，
+         出口此刻是否还有配额只有模型层说得准；
+      ② 同一窗口内这个 IP 没被切过去当出口 —— 切过说明它已经在服务生产流量，
+         上游随时会把它烧掉。实测出口 IP 存活中位仅 9s，一个「验过但已被切过」
+         的地址与新地址在可用性上没有差别。
+    两条件都不成立时该候选直接跳过，由调用方退回同步探测 + 实测的慢路径。
+
     TTL 取 12s：守护的探测节奏是 5s + 单次探测耗时（实测 1.2~7s），12s 覆盖
     """
     ttl = _warp().get("probe_cache_ttl_sec", 12)
+    ok_ttl = float(_warp().get("probe_ok_ttl_sec", 600))
     out: list[tuple[dict, str]] = []
     for m in standby:
         ip = _warp_line_ip(m["tag"])
         ts = _warp_line_ip_ts(m["tag"])
         if not ip or now - ts > ttl:
+            continue
+        # ① 模型层实测过且 OK。`_probe_cache_verdict` 只在 TTL 内返回结论，
+        # 故 "非 None 且 == OK" 已同时表达「验过」与「新鲜」。
+        if _probe_cache_verdict(m["tag"], ip, now) != "OK":
+            continue
+        # ② 窗口内没被切过。`_warp_ip_last_ts` 读 `ts`（最近一次被选为出口的
+        # 时刻），从未用过返回 0，`now - 0` 必然大于窗口，天然放行。
+        if now - _warp_ip_last_ts(ip) < ok_ttl:
             continue
         if _ip_disqualified(ip, now, guard):
             continue
@@ -2516,6 +2533,9 @@ def _ip_history_is_truth() -> bool:
 # 探测通道本身出了问题 —— 实测 16:50:18 一批 17 条同一秒全灭，重启换 IP 后
 # 16:50:50~52 全部 OK，期间白烧 17 条隧道的重启与配额。
 _WARP_PROBE_BLIND_SEC = 120.0
+# 「整批」的最小样本数：错误换线每轮只测 probe_candidates_per_switch(2) 条，
+# 低于这个数时 all(unreachable) 对单条恒真 —— 一次瞬断就锁死 120s 实测。
+_WARP_PROBE_BLIND_MIN_BATCH = 3
 _probe_blind_until: float = 0.0
 # 各线最近一次探测结论，供 `_note_probe_batch` 判断「整批」而非单条。
 _PROBE_LAST_VERDICT: dict[str, str] = {}
@@ -2529,9 +2549,18 @@ def _warp_probe_blind(now: float | None = None) -> bool:
 
 
 def _note_probe_batch(verdicts: list[str]) -> None:
-    """记录一批探测结论；整批 unreachable 则宣布探测器失明 `_WARP_PROBE_BLIND_SEC`。"""
+    """记录一批探测结论；**多条**同时 unreachable 才宣布探测器失明。
+
+    样本数必须够大才谈得上「整批」：`probe_candidates_per_switch` 默认 2，
+    错误换线路径每轮只测 1~2 条，单条瞬断就满足「全 unreachable」—— 那不是
+    通道坏了，是该出口此刻没打通。一次误判锁 120s，期间 `_warp_probe_blind()`
+    让 `_warp_model_usable` 直接返回 True，所有候选**跳过实测被放行**，于是
+    quota 地址被切上去、首条请求就 429。实测 2026-10-26 触发 47 次这样的放行，
+    其中一次门槛是「本批 1 条」（`all()` 对单元素恒真）。
+    """
     global _probe_blind_until
-    if verdicts and all(v == "unreachable" for v in verdicts):
+    if len(verdicts) >= _WARP_PROBE_BLIND_MIN_BATCH and all(
+            v == "unreachable" for v in verdicts):
         _probe_blind_until = time.time() + _WARP_PROBE_BLIND_SEC
         log(f"  ⚠ 本批 {len(verdicts)} 条模型层探测全 unreachable —— 判定探测通道失明，"
             f"{_WARP_PROBE_BLIND_SEC:.0f}s 内退回历史判据")
