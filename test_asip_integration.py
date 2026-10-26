@@ -71,6 +71,8 @@ def test_warp_egress_ip_returns_none_when_probe_fails(monkeypatch):
     ("line1\x85line2", "line1\\nline2"),
     ("line1\vline2", "line1\\nline2"),
     ("line1\fline2", "line1\\nline2"),
+    ("\x1b[31mred\x1b[0m", "red"),
+    ("a\x00b", "a b"),
     ("plain", "plain"),
 ])
 def test_log_message_is_single_line(raw, expected):

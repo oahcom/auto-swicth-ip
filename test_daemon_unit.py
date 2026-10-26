@@ -3769,6 +3769,29 @@ def test_ip_history_survives_hot_table_cleanup(monkeypatch, tmp_path):
     assert stats["new-ip"]["uses"] == 1
 
 
+def test_reconnect_warp_gives_up_when_selected_line_is_being_refreshed(monkeypatch):
+    """选中备线到 PUT 之间该线被 worker 拿走刷新槽：本次换线必须放弃。
+
+    否则 PUT 会切到一条正在冷启动的线，短暂可用后又掉线。
+    变异：去掉 `_acquire_refresh_slot` 守卫后本用例转红。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", False)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-w1")
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: {1080: "ip-w1",
+                                                        1081: "ip-w2"}[port])
+    monkeypatch.setattr(daemon, "_acquire_refresh_slot", lambda tag: False)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp",
+                        lambda tag, **kw: switched.append(tag) or True)
+
+    assert daemon.reconnect_warp("abuse403") is False
+    assert switched == [], f"槽被占时不得 PUT 切过去，实际 {switched}"
+
+
 def test_multiple_lines_can_hold_slots_at_once(monkeypatch):
     """全池并发放开：五条线一起刷必须全部拿到名额。
 
