@@ -975,7 +975,7 @@ def test_model_mode_selection_trusts_probe_not_history(monkeypatch):
 
     monkeypatch.setattr(daemon, "_warp_model_test_many", fake_test_many)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a: None)
     monkeypatch.setattr(daemon, "_set_warp_line_ip", lambda *a: None)
@@ -1010,7 +1010,7 @@ def _reconnect_fixture(monkeypatch, test_many, refresh_result=None):
     monkeypatch.setattr(daemon, "_schedule_idle_refresh",
                         lambda m: scheduled.append(m["tag"]))
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a: None)
     monkeypatch.setattr(daemon, "_set_warp_line_ip", lambda *a: None)
     monkeypatch.setattr(daemon, "_warp_prefix_rest", lambda ip, now: None)
@@ -1132,7 +1132,8 @@ def test_real_error_after_new_exit_is_still_marked(monkeypatch):
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-new")
     monkeypatch.setattr(daemon, "_warp_member", lambda tag: {"tag": tag})
     monkeypatch.setattr(daemon, "_mark_warp_ip_used",
-                        lambda ip, now, blocked=False, kind=None: marked.append((ip, blocked)))
+                        lambda ip, now, blocked=False, kind=None, **k:
+                        marked.append((ip, blocked)))
     monkeypatch.setattr(daemon, "_record_warp_cycle", lambda *a, **k: None)
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda **k: pytest.fail("生效 2s 内硬闸必须拦住换线"))
