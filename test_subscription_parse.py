@@ -215,6 +215,22 @@ def test_dead_source_still_writes_config(tmp_path):
     assert any("hk.example.com" in t for t in tags), f"活源节点丢失: {tags}"
 
 
+def test_long_base64_subscription_is_not_truncated(monkeypatch):
+    """大订阅（>2000 字符 base64）必须完整解码，不能被 HTTP 层截断。"""
+    import base64
+
+    from asip.http import HttpResult
+
+    urls = [f"trojan://pw@n{i}.example.com:443#node-{i}" for i in range(120)]
+    blob = base64.b64encode("\n".join(urls).encode()).decode()
+    assert len(blob) > 2000, "用例前提：订阅体必须超过旧的截断阈值"
+    monkeypatch.setattr(ps, "request_json",
+                        lambda *a, **k: HttpResult(status=200, text=blob))
+
+    nodes = ps.fetch_and_decode_sub("https://example.invalid/sub")
+    assert len(nodes) == len(urls), f"节点被截断: {len(nodes)}/{len(urls)}"
+
+
 # ============= 4. refresh_subscription 检查 returncode =============
 def test_loopback_nodes_filtered(monkeypatch):
     """订阅源套餐过期时会返回 ss://...@127.0.0.1:6666 占位节点，必须过滤。"""

@@ -42,8 +42,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
 from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, REJECT_WINDOW, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret
+from asip.atomic_io import append_line as _atomic_append_line
 from asip.atomic_io import write_json as _atomic_write_json
+from asip.atomic_io import write_text as _atomic_write_text
+from asip.clash_client import ClashClient
+from asip.egress import TRACE_URL, probe_egress
 from asip.redact import redact_secrets as _redact_secrets
+
+# Clash API 的唯一 HTTP 通道。daemon 侧保留 `singbox_api` 这个名字是因为
+# 测试与兄弟工具都以它为边界；内部实现统一到 asip，避免每个调用点各写一遍
+# 状态码/超时/JSON 解析。
+_CLASH = ClashClient(CFG["singbox"]["clash_api"], get_singbox_secret)
 
 # 全局复用连接 - 避免每次操作开/关 SQLite 连接
 _db_conn: sqlite3.Connection | None = None
@@ -366,8 +375,7 @@ def _append_warp_ip_history(ip: str, now: float, blocked: bool,
     if blocked and kind:
         rec["k"] = "403" if kind == "abuse403" else "429"
     try:
-        with open(_warp_ip_history_path(), "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        _atomic_append_line(_warp_ip_history_path(), rec)
     except Exception as e:
         log(f"✗ 写 .warp_ip_history.jsonl 失败: {e}")
 
@@ -946,13 +954,31 @@ def _init_logger():
     sh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt=LOG_FORMAT))
     _logger.addHandler(sh)
 
+_LOG_LINE_BREAKS = _re.compile(r"[\r\n\u2028\u2029\x85\v\f]+")
+_LOG_MESSAGE_MAX = 4000
+
+
+def _sanitize_log_message(msg: str) -> str:
+    """把一条消息压成单行。
+
+    WHY：日志格式是 `[时间] 消息`，消息里若带换行（节点名、上游错误体、
+    订阅响应都可能带），后半段会冒充一条独立日志行，误导按行解析的
+    运维脚本。这不是安全问题本身，但会掩盖真实的告警顺序。
+    """
+    text = msg if isinstance(msg, str) else str(msg)
+    text = _LOG_LINE_BREAKS.sub(lambda _match: "\\n", text)
+    if len(text) > _LOG_MESSAGE_MAX:
+        text = text[:_LOG_MESSAGE_MAX] + "…(truncated)"
+    return text
+
+
 def log(msg: str):
     """写日志到文件（轮转）+ stdout，线程安全"""
     global _logger
     with _log_lock:
         if _logger is None:
             _init_logger()
-    _logger.info(msg)
+    _logger.info(_sanitize_log_message(msg))
 
 def log_health(msg: str):
     """健康状态日志，每 10s 最多一条"""
@@ -970,10 +996,6 @@ def log_health(msg: str):
 # FreeUsageLimitError）。只认旧文案时实测最近 2000 条错误里 1751 条 429 全被
 # 判成「非出口级错误」→ consec_err 恒 0 → 87% 错误率下也永不换线。
 # 两个文案都留：免费层可能按账号/时间灰度高版，不是全局切换。
-_EGRESS_ERR_MARKERS = ("abusive traffic", "Rate limit exceeded",
-                       "Free usage limit reached", "FreeUsageLimitError")
-
-
 def _classify_egress_error(body: str | None) -> str | None:
     """把一条错误归为出口级拦截，返回 'abuse403' / 'rate429' / None。
 
@@ -1157,8 +1179,7 @@ def prune_egress_log():
         kept = [d for d in before if d.get("ts", 0) >= keep_after]
         if len(kept) == len(before):
             return 0
-        tmp = target + ".tmp"
-        # 写 tmp 后、rename 前，把期间追加进来的记录合并（避免丢切换记录）
+        # 构建新内容前再读一次，把窗口内追加的记录合并（避免丢切换记录）
         seen = {(d["ts"], d["node"]) for d in kept}
         for d in _read(target):
             key = (d["ts"], d["node"])
@@ -1166,10 +1187,10 @@ def prune_egress_log():
                 kept.append(d)
                 seen.add(key)
         kept.sort(key=lambda x: x["ts"])
-        with open(tmp, "w", encoding="utf-8") as f:
-            for d in kept:
-                f.write(json.dumps(d) + "\n")
-        os.replace(tmp, target)
+        _atomic_write_text(
+            target,
+            "".join(json.dumps(d) + "\n" for d in kept),
+        )
         removed = len(before) - len(kept)
         if removed > 0:
             log(f"✓ egress_log 裁剪: 移除 {removed} 条 7 天前记录")
@@ -1421,29 +1442,29 @@ def check_9router_outbound_proxy() -> bool:
 # ============= Sing-box 操作 =============
 def singbox_api(path: str, method: str = "GET", body: dict | None = None,
                 timeout: int = 3, silent: bool = False) -> tuple[int, dict | None]:
-    """通用 sing-box Clash API 调用"""
+    """通用 sing-box Clash API 调用
+
+    传输层失败返回 `(0, None)`（历史契约：调用方把 0 当「不可达」，与
+    HTTP 4xx/5xx 的状态码区分）。响应体非 JSON 时返回 `(status, None)`。
+    """
     try:
-        headers = {"Authorization": f"Bearer {get_singbox_secret()}"}
-        if body:
-            headers["Content-Type"] = "application/json"
-        r = requests.request(
-            method,
-            f'{CFG["singbox"]["clash_api"]}{path}',
-            headers=headers,
-            json=body,
-            timeout=timeout,
+        status, data = _CLASH.request_json(
+            method, path, body=body, timeout=timeout,
         )
-        if r.status_code in (200, 204):
-            return r.status_code, r.json() if r.content else None
-        return r.status_code, None
-    except requests.ConnectionError:
-        if not silent:
-            log(f"✗ Clash API 连接失败: {CFG['singbox']['clash_api']}{path}")
-        return 0, None
     except Exception as e:
         if not silent:
             log(f"✗ Clash API 异常: {e}")
+        # 已在上面记过具体原因，别让同一次失败再落一条「连接失败」。
         return 0, None
+    if status is None:
+        if not silent:
+            log(f"✗ Clash API 连接失败: {CFG['singbox']['clash_api']}{path}")
+        return 0, None
+    # 历史契约：只有 2xx（200/204）才返回响应体。4xx/5xx 的 JSON 错误页
+    # 不能被当成业务数据（调用方会读 data["now"] 之类）。
+    if status in (200, 204):
+        return status, data
+    return status, None
 
 def get_current_proxy() -> str | None:
     r, data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}')
@@ -1456,9 +1477,7 @@ def get_all_proxy_nodes() -> list[str]:
 def _record_egress(node: str) -> None:
     """切换成功后记录 (ts,node)，供 per-egress 错误率归因。append-only 原子写。"""
     try:
-        path = _egress_log_path()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": _now_ts(), "node": node}) + "\n")
+        _atomic_append_line(_egress_log_path(), {"ts": _now_ts(), "node": node})
     except Exception as e:
         log(f"✗ 写 egress_log 失败: {e}")
 
@@ -1890,20 +1909,19 @@ def _connections_json() -> dict | None:
     global _conn_snapshot
     with _conn_snapshot_lock:
         ts, data = _conn_snapshot
-        now = time.time()
-        if now - ts < _CONN_SNAPSHOT_TTL_SEC:
+        if time.time() - ts < _CONN_SNAPSHOT_TTL_SEC:
             return data
+        # 走 HTTP 客户端而不是 curl：token 放 argv 会被 `ps` 看到（同一泄漏面
+        # 在订阅刷新处已用 0600 临时文件规避）。读取失败仍缓存 None，否则
+        # Clash 挂掉时每个等待者都会各发一次请求。
         try:
-            r = subprocess.run(
-                ["curl", "-s", "--max-time", "5", "-H",
-                 f"Authorization: Bearer {get_singbox_secret()}",
-                 f'{CFG["singbox"]["clash_api"]}/connections'],
-                capture_output=True, text=True, timeout=8,
-            )
-            data = json.loads(r.stdout)
-        except Exception:
+            data = _CLASH.connections(timeout=5)
+        except Exception as e:
             data = None
-        _conn_snapshot = (now, data)
+            log_health(f"⚠ 读取 Clash 连接表失败: {e}")
+        # 时间戳取请求**完成**时刻：请求本身最长 5s，若用开始时刻入库，
+        # 返回时已超过 1s TTL，每个等待者都会立刻重发（串行风暴）。
+        _conn_snapshot = (time.time(), data)
         return data
 
 
@@ -2037,21 +2055,13 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
     起来，多等 18s 不会变好，只把换线线程钉在原处。所以刷新路径传短超时
     （见 `_refresh_idle_warp`），把单次尝试的最坏耗时从 32s 压到 19s。
     """
-    try:
-        r = subprocess.run(
-            ["curl", "-s", "--max-time", str(int(timeout_sec)), "--socks5-hostname",
-             f'{_warp()["socks_host"]}:{port}',
-             "https://www.cloudflare.com/cdn-cgi/trace"],
-            capture_output=True, text=True, timeout=timeout_sec + 5,
-        )
-    except Exception:
-        return None
-    if r.returncode != 0:
-        return None
-    trace = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
-    if trace.get("warp") != "on":
-        return None
-    return trace.get("ip") or None
+    return probe_egress(
+        socks_port=port,
+        socks_host=_warp()["socks_host"],
+        urls=(TRACE_URL,),
+        timeout=timeout_sec,
+        require_warp=True,
+    ).ip
 
 
 def _probe_refresh_egress(port: int) -> str | None:
@@ -3012,6 +3022,21 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
     return None
 
 
+def _refresh_line_serialized(member: dict) -> tuple[str | None, bool]:
+    """同步刷新一条线，与后台补刷/按线 worker 共用按线锁。
+
+    返回 ``(ip, acquired)``；``acquired=False`` 表示这条线正在别处刷新，
+    本轮不该重启它（重启只会拿到同一会话，白烧一次探测与一次在途中断）。
+    """
+    tag = member["tag"]
+    if not _acquire_refresh_slot(tag):
+        return None, False
+    try:
+        return _refresh_idle_warp(member), True
+    finally:
+        _release_refresh_slot(tag)
+
+
 _dirty_janitor_started = False
 
 
@@ -3070,6 +3095,47 @@ def _dirty_line_janitor() -> None:
         except Exception as e:
             log(f"✗ 脏线守护异常: {e}")
         time.sleep(5)
+
+
+def _line_worker_config() -> dict:
+    """warp.line_worker 的读点。每次现读 CFG，便于测试热改配置。"""
+    return _warp().get("line_worker") or {}
+
+
+def _line_worker_enabled() -> bool:
+    return bool(_line_worker_config().get("enabled"))
+
+
+def _line_worker_dry_run() -> bool:
+    """缺省 dry_run=True：没显式关掉之前，worker 只观测。"""
+    return bool(_line_worker_config().get("dry_run", True))
+
+
+def _line_worker_owns_scheduling() -> bool:
+    """worker 是否接管旧守护。dry_run 只观测，旧守护必须继续干活。
+
+    灰度期若只凭 `enabled` 就让三条旧路径让路，worker 又只打「应…」不执行，
+    窗口内就没有任何预热/补刷/脏线重连 —— 观测到了问题却没人处理。
+    """
+    return _line_worker_enabled() and not _line_worker_dry_run()
+
+
+def _start_line_workers() -> None:
+    """每条隧道起一个常驻 worker，接管「判质量 → 重启 → 验收 → 换线」。
+
+    非 dry-run 启用后旧的三个调度器会互相让路：不再起脏线抽检，主循环也不再调
+    `_prewarm_standby_warp`，`_schedule_idle_refresh` 直接返回 —— 否则同一条
+    线会被两套逻辑各重启一次，白烧一次出口探测。dry_run 期旧路径继续运行，
+    否则灰度窗口内没有任何实际维护动作。
+    """
+    import warp_line_worker
+    dry_run = _line_worker_dry_run()
+    interval = _line_worker_config().get("interval_sec", 30)
+    members = _warp()["members"]
+    warp_line_worker.start(sys.modules[__name__], members,
+                           dry_run=dry_run, interval_sec=interval)
+    log(f"✓ WARP 线 worker: {len(members)} 条, dry_run={dry_run}, "
+        f"间隔={interval}s")
 
 
 def _start_dirty_line_janitor() -> None:
@@ -3252,6 +3318,10 @@ def _schedule_idle_refresh(member: dict) -> None:
     探测+重启要 7~9s，期间流量仍停在已被标记的旧出口上 —— 实测 17:36:55 那次
     换线因此多花了 9s。预先刷好，守卫就不必在换线路径上等。
     """
+    if _line_worker_owns_scheduling():
+        # 常驻 worker 每轮都会判这条线；这里再排一次会与 worker 抢同一条隧道。
+        # dry_run 不接管：worker 只观测，旧路径继续按原语义预热/补刷。
+        return
     with _WARP_REFRESH_LOCK:
         # 只登记排队，不占名额：这条线在等到空闲之前一直能服务流量。
         if member["tag"] in _WARP_REFRESH_PENDING or member["tag"] in _WARP_REFRESHING:
@@ -3683,7 +3753,13 @@ def reconnect_warp(reason: str) -> bool:
             log("  ⚠ 脏备线均在离渠冷却中，本次换线不刷新（等下一次错误重试）")
             return False
         for m in blocked_lines[:1]:
-            ip = _refresh_idle_warp(m)
+            # 与后台补刷/按线 worker 共用同一把按线锁：同步路径不占锁时，
+            # 两条线程会同时 restart 同一条隧道（实测 #1#1#2#2#3），白烧一次
+            # 会话与探测。拿不到锁说明这条线正在别处刷新，等下一次错误重试。
+            ip, acquired = _refresh_line_serialized(m)
+            if not acquired:
+                log(f"  ⚠ 脏备线 {m['tag']} 正在后台刷新，本次换线不刷新（等下一次错误重试）")
+                return False
             if ip:
                 probes.append((m, ip))
                 break
@@ -4153,36 +4229,12 @@ def _probe_node(node: str, timeout_ms: int, strict: bool = False) -> int | None:
     Returns:
         延迟(ms) 如果成功, None 如果失败
     """
-    try:
-        r = requests.get(
-            f'{CFG["singbox"]["clash_api"]}/proxies/{node}/delay',
-            params={"timeout": timeout_ms,
-                    "url": CFG["thresholds"]["node_test_url"]},
-            headers={"Authorization": f"Bearer {get_singbox_secret()}"},
-            timeout=timeout_ms / 1000 + 2,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            delay = data.get("delay")
-            if delay is not None:
-                return delay
-    except requests.exceptions.ConnectionError:
-        if strict:
-            return None
-    except requests.exceptions.Timeout:
-        if strict:
-            return None
-    except requests.exceptions.SSLError:
-        if strict:
-            return None
-    except Exception as e:
-        err_str = str(e).lower()
-        if strict and ("dns" in err_str or "name" in err_str or "resolve" in err_str):
-            return None
-        # 宽松模式：记录日志但给机会
-        if not strict:
-            log(f"  ⚠ _probe_node {node} 异常: {e}")
-    return None
+    # `strict` 保留给调用方表达意图（严格/宽松），但两者都必须返回 None：
+    # 探测不到延迟就是探测不到，宽松模式不能把失败伪装成 0ms。失败明细由
+    # 调用方统一汇报，这里不逐条写日志——健康检查一轮会探几十个节点。
+    return _CLASH.delay(
+        node, timeout_ms, url=CFG["thresholds"]["node_test_url"],
+    )
 
 
 def test_node_delay(node: str) -> int | None:
@@ -5279,8 +5331,12 @@ def main():
     _load_warp_ip_used()
     _load_warp_ip_cycles()
     _load_node_ip_used()
-    # 脏线守护：常驻线程，脏 IP 一出现就重连换干净地址，不依赖主循环周期
-    _start_dirty_line_janitor()
+    # 脏线守护：常驻线程，脏 IP 一出现就重连换干净地址，不依赖主循环周期。
+    # line_worker 启用时由它接管同一条职责（判断与执行在同一循环）。
+    if _line_worker_enabled():
+        _start_line_workers()
+    if not _line_worker_owns_scheduling():
+        _start_dirty_line_janitor()
     # 日志标签用的当前 WARP 出口 IP：启动时探一次，之后由换线路径更新
     global _ACTIVE_WARP_IP
     _m = _warp_member(active_warp_tag())
@@ -5511,8 +5567,10 @@ def main():
             _maybe_failback_to_warp_bg(now)
 
             # 任一隧道出口疑似脏就重连；掉在 proxy 池上时也要继续，
-            # 否则池本身就是脏地址时永远回不来。
-            _prewarm_standby_warp(now)
+            # 否则池本身就是脏地址时永远回不来。line_worker 自己每轮判所有线，
+            # 两套同时跑会把同一条线重启两次。
+            if not _line_worker_owns_scheduling():
+                _prewarm_standby_warp(now)
 
             # ---- 5. 节点健康检查 (每 300s) ----
             if now - last_health_check > CFG["intervals"]["node_health_sec"]:

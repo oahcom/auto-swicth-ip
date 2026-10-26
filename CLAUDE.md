@@ -713,7 +713,9 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `deploy/members.py` | — | 把 `CFG["warp"]["members"]` 渲染成 `tag port service dir family`，供 install.sh 用 |
 | `test_portability.py` | — | 可移植性回归（4 例）：路径不越出仓库、运行期文件无硬编码家目录、成员可部署、单元渲染全覆盖 |
 | `test_asip_tools.py` | 73 | asip 工具单测（5 例）：Clash 选择码/密钥轮换、脱敏、原子写权限 |
-| `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写）、`redact`（token 脱敏）、`clash_client`、`egress`；daemon 同名门面委托 |
+| `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写、`append_line`、`update_json`）、`redact`、`clash_client`（`request_json`/`selector_state`/`delay`/`delays`/`connections`）、`egress`（`probe_egress` 保留失败原因）、`proc`（强制超时、无 shell）、`http`（`status=None` 区分传输失败）；daemon 同名门面委托 |
+| `test_asip_*.py` | — | 共享层离线单测：`test_asip_{proc,http,egress,atomic,clash}.py` + `test_asip_integration.py`（daemon 边界）；无 `test_asip_unit.py` 文件 |
+| `warp_line_worker.py` | — | 每条 WARP 隧道常驻 worker：`_plan` 决策与执行分离，`dry_run` 只读；由 `warp.line_worker` 开关接管三个旧守护 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
 
 ## 部署与可移植性（2026-10-22）
@@ -794,9 +796,9 @@ WHY 必须在单元层判：地址族是 usque 的进程启动参数，运行中
 
 1. **代码修改后** → 运行 `codex review` 对变更文件进行审查
 2. **测试文档更新** → TEST_PLAN.md 同步更新测试点
-3. **语法验证** → `python3 -m py_compile daemon.py config.py`（proxy-global.js 已移除，无 JS 侧检查）
+3. **语法验证** → `python3 -m py_compile daemon.py config.py asip/*.py warp_line_worker.py`（proxy-global.js 已移除，无 JS 侧检查）
 4. **Codex CLI 审查通过** → 输出 `PASS` 或 `PASS_WITH_NOTES` 才可合并
-5. **测试执行** → 按 TEST_PLAN.md 执行 P0/P1 测试点
+5. **测试执行** → 按 TEST_PLAN.md 执行 P0/P1 测试点；共享层改动至少跑 `pytest test_asip_*.py test_warp_line_worker.py -q`
 
 **禁止**：
 - 直接修改代码跳过 Codex CLI 审查

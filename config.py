@@ -401,6 +401,15 @@ CFG = {
         # 但错误路径上每多等一秒，坏出口就多服务一秒失败请求 —— 实测 40s 上限
         # 把「首错→换线生效」拉到 p90=25s / max=206s。
         "fallback_idle_wait_sec": 3,
+        # 每条隧道一个常驻 worker（warp_line_worker.py）：「判断→执行」同循环，
+        # 不再经预热/脏线抽检/补刷三个调度器排队。enabled=False 时完全走旧的
+        # 三守护路径，行为与之前逐字节一致，便于回滚。
+        # dry_run=True 只探出口并记录「本应换线/重启/验收」，不写台账、不动服务。
+        "line_worker": {
+            "enabled": False,
+            "dry_run": True,
+            "interval_sec": 30,
+        },
     },
     "log_file": _env_path("ASIP_LOG_FILE", os.path.join(PROJECT_DIR, "daemon.log")),
     "log_format": "%Y-%m-%d %H:%M:%S",

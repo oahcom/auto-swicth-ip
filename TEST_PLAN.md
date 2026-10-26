@@ -1946,6 +1946,54 @@ New-NetFirewallRule -DisplayName 'auto-switch-ip LAN proxy (TCP 7891)' -Directio
   而不是让单元静默起不来。
 - 密钥文件已存在时不得覆盖（覆盖会让正在跑的 sing-box 掉线）。
 
+## 13. 共享层与按线 worker（T-230~T-239）
+
+**范围**：`asip/{proc,http,egress,atomic_io,clash_client}.py`、`warp_line_worker.py`、
+daemon 的 asip 边界。全部用例离线（monkeypatch 子进程/HTTP，不访问 Clash 与订阅源），
+单文件运行 <1s。
+
+```bash
+python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
+    test_asip_atomic.py test_asip_clash.py test_asip_integration.py \
+    test_warp_line_worker.py -q
+```
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-230 | P0 | 子进程不得无超时 | `pytest test_asip_proc.py` | `timeout<=0` 抛 `ValueError`；超时返回 `timed_out=True` 且 `code=None`；二进制缺失返回 `error="binary not found: ..."` 而不抛 |
+| T-231 | P0 | 曲奇/代理参数不经 shell | `grep -n "shell=True" asip/ proc 调用点` | 全仓 0 命中；`run_curl` 的 socks/http 代理互斥，HTTP 变量为 `--proxy socks5h://<host>:<port>` |
+| T-232 | P0 | 传输失败与 HTTP 错误必须可区分 | `pytest test_asip_http.py test_asip_integration.py` | 传输失败 `status=None`；`singbox_api` 包装后为 `(0, None)`；4xx/5xx 原样返回状态码；重试仅在显式 `retries>0` 时发生 |
+| T-233 | P0 | 出口探测保留失败原因且要求 warp=on | `pytest test_asip_egress.py` | `probe_egress` 返回 `curl_missing/timeout/rc/bad_body/invalid_ip/warp_off` 优先级最高者；`warp_egress_ip` 传入 `require_warp=True` 与配置里的 `socks_host` |
+| T-234 | P0 | JSONL 追加不得交错 | `pytest test_asip_atomic.py -k concurrent` | 8 线程 × 50 行后 400 行全部可 `json.loads`；文件权限 0600（已存在的 0644 会被收紧） |
+| T-235 | P0 | read-modify-write 必须持锁且失败不落盘 | `pytest test_asip_atomic.py -k update_json` | 有 `lock_path` 时全程持 `flock`；`merge` 抛异常后原文件字节不变 |
+| T-236 | P1 | Clash 节点名必须 URL 编码 | `pytest test_asip_clash.py` | 含 `/` 或空格的节点名在 `select/delay/selector_state` 中 `quote(name, safe="")`；`delays` 对重复节点只请求一次且保序归因 |
+| T-237 | P0 | 日志不得被消息内换行伪造 | `pytest test_asip_integration.py -k log_message` | `\n`/`\r\n` 压成字面 `\n`；超长消息截断并带 `…(truncated)` |
+| T-238 | P0 | worker 默认不接管，灰度期旧路径继续干活 | `pytest test_asip_integration.py -k "line_worker or schedule_idle"` | 默认 `enabled=False`；`enabled+not dry_run` 时 `_prewarm_standby_warp` 不调、`_schedule_idle_refresh` 不登记、脏线守护不起；`dry_run=True` 时 worker 只观测，三条旧路径仍运行 |
+| T-239 | P0 | dry_run 不得产生副作用 | `pytest test_warp_line_worker.py`；`python3 warp_line_worker.py` | dry-run 下不调 `_warp_model_usable`（会真实扣配额并写 `.probe_sessions.json`）、`_mark_warp_ip_used`/`_set_warp_line_ip`/`_restart_service`/`_reconnect_warp_now`，只记 `[dry-run] 应换线/应模型验收`；自检 `selftest OK (9 cases)` |
+| T-240 | P0 | 大订阅不得被 HTTP 层截断 | `pytest test_asip_http.py test_subscription_parse.py -k "text_limit or truncated"` | `request_json(text_limit=None)` 返回全文；120 节点（>2000 字符 base64）订阅解码后节点数不丢 |
+| T-241 | P0 | 决策后线被选为当前出口必须放弃重启/换线 | `pytest test_warp_line_worker.py -k stale` | 观测后 `active_warp_tag` 变为本线时，不调 `_restart_service`/`_set_warp_line_ip`；变为其他线时不调 `_reconnect_warp_now`，日志含「取消 restart」/「取消换线」 |
+| T-242 | P1 | 日志检查不得把 grep 失败当「无匹配」 | `pytest test_self_evolve_checkpoint.py` | grep rc=1 视为正常无匹配；超时/rc>1/启动失败返回 `unavailable`（`ok=False, metric=None`） |
+| T-243 | P1 | Clash API 非 2xx 不返回错误页 | `pytest test_asip_integration.py -k "error_body or pass_through"` | 200 返回解析体；401/500 返回 `(status, None)`；传输失败 `(0, None)` |
+| T-244 | P1 | 子进程超时必须回收整个进程组 | `pytest test_asip_proc.py -k grandchild` | 子进程再 spawn 孙进程时，`timeout` 到期后两者都被杀；孙进程 2s 内消失 |
+| T-245 | P2 | Clash 连接表读取异常不得冒泡 | `pytest test_asip_integration.py -k connections_json` | 客户端抛任意异常时 `_connections_json()` 返回 `None` 并缓存，调用方不崩 |
+| T-246 | P2 | 日志注入覆盖 Unicode 行分隔符 | `pytest test_asip_integration.py -k log_message` | `\n`/`\r\n`/`\u2028`/`\u2029`/`\x85`/`\v`/`\f` 都压成字面 `\n` |
+| T-247 | P1 | 同步刷新与后台补刷/按线 worker 共用按线锁 | `pytest test_asip_integration.py -k refresh_line_serialized` | 锁被占时返回 `(None, False)` 且不调 `_refresh_idle_warp`；`_refresh_idle_warp` 抛异常时仍释放锁 |
+| T-248 | P2 | 任意 2xx 视为成功（与 raise_for_status 一致） | `pytest test_asip_http.py -k 2xx` | 200/206/299 `ok=True`；300/`None` `ok=False` |
+| T-249 | P2 | 非法轮询间隔启动即拒绝 | `pytest test_warp_line_worker.py -k interval` | `interval_sec` 为 0 或负数时 `start` 抛 `ValueError` |
+| T-250 | P2 | 出口探测统一走 `asip.proc` | `pytest test_asip_egress.py`；`grep -n "subprocess" asip/egress.py` | 无直接 `subprocess.run`；超时/启动失败/非零退出按 `ProcResult` 分类 |
+| T-251 | P2 | 验收脚本不得把「读不到日志」当「无异常」 | `pytest test_verify_rotation.py` | journalctl 超时/rc≠0 时 `JournalLines.error` 非空，调用方报失败而非通过 |
+| T-252 | P2 | 子进程输出解码失败不得外抛 | `pytest test_asip_proc.py -k invalid_utf8` | 非 UTF-8 字节以替换符解码，`run` 仍返回 `ProcResult` |
+| T-253 | P2 | text_limit 负数必须拒绝 | `pytest test_asip_http.py -k negative_text_limit` | `text_limit=-1` 抛 `ValueError`，不静默截错 |
+
+**实战验证（改动合入前人工执行一次）**：
+
+1. `python3 verify_rotation.py --quick` —— 端口/IP 切换正常，结束时恢复原选择。
+2. `python3 switch-proxy.py status` / `list` —— 节点列表与当前选择可读，无 401。
+3. `python3 probe_warp.py`（只读探测）—— 返回各线出口地址，不重启隧道。
+4. `warp_line_worker` 灰度：把 `warp.line_worker` 设为 `{"enabled": true, "dry_run": true}` 并重启
+   daemon，观察 `daemon.log` 只有 `[dry-run] 应…`，20 条线的 `systemctl` 重启次数不增；
+   确认无异常后再关 `dry_run`。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
@@ -1990,3 +2038,6 @@ New-NetFirewallRule -DisplayName 'auto-switch-ip LAN proxy (TCP 7891)' -Directio
 | v1.33 | 2026-10-22 | 可移植性与部署 (T-212~T-215)：路径改为项目内相对 `config.py`、项目外以 `pwd` 家目录为基准 + 环境变量覆盖（订阅地址与 7 个路径键），删掉全部 `/home/administrator` 硬编码；新增 `deploy/install.sh` + `deploy/members.py`，由 `CFG["warp"]["members"]` 推导 23 个 systemd 单元（含 20 条隧道与地址族开关 `ipv6`）；`.warp/warp-outbound.json` 缺失时自动重建 —— 它被 gitignore 却是 WARP 出口的唯一依据，缺了全部换线打空；`parse_subscription.py` 无参数时回退到 CFG 全部订阅源（原来只认 `OKZ_SUB_URL`）；新增 `requirements.txt` / `.env.example` / `test_portability.py`。验证：`test_daemon_unit` + `test_subscription_parse` + `test_warp_refresh` + `test_portability` 共 **277 passed**（31.06s）；副本目录 + 假 HOME 下路径仍指向副本 | - |
 | v1.34 | 2026-10-22 | 自对抗审查补 5 项 (T-216~T-219)：**3 项是上一轮我自己引入的 P0** —— ①`_env_path` 不展开，而 systemd `EnvironmentFile` 实测不展开 `$HOME`（`journalctl` 里原样是 `$HOME/.some/path`），start 脚本 source 却展开，同一份 `.env` 两条路径两种结果 → 展开移进 `_env_path`；②README 的 `for d in .warp/usque*/` 匹配到主目录自身，沙箱实测把唯一二进制换成自指链接（`Too many levels of symbolic links`），20 条隧道全灭 → `install.sh` 建链接时排除 `usque/` 并加「主二进制不得是链接」前置检查；③`PYBIN` 用 `command -v python3`，conda shell 下生成 `miniforge3/bin/python3`，与现网 `/usr/bin/env python3` 不符且换 shell 就变 → 钉死 `/usr/bin/python3`（`PYTHON=` 可覆盖）。另两项：README 自述「仓库不含二进制」但 `sing-box` 实际被 git 跟踪（57MB）→ 更正为「usque 需自备、sing-box 随仓库」；`parse_subscription.py` 无参回退此前只认 `OKZ_SUB_URL`，与 Q1 记的「四条订阅源」不符 → 复核为已覆盖并写进用例。变异验证：撤掉展开 → T-216 红；去掉 `[ "$dir" = "usque" ]` 排除 → T-217 红；恢复后 `test_portability.py` 7 passed，四文件混跑 **284 passed** | 自对抗 |
 | v1.35 | 2026-10-22 | 补 T-219 落地：首版隧道注册失败只打 `⚠` 仍继续 `enable`，注册失败的单元启动即退出并无脑重启，而部署退出码为 0（假成功）。改为计数并在末尾非零退出；同时在 `--units-only` 的检查里加「主二进制存在且不是链接」 | 自对抗 |
+| v1.36 | 2026-10-26 | ASIP 分层重构（R165）§13 与审查回归：T-240 订阅全文（修 HTTP 层 2000 字符截断导致节点丢失）、T-241 陈旧观测竞态、T-242 grep 失败语义、T-243 Clash 非 2xx 不返回错误页；T-239 补齐「dry-run 跳过模型验收」 | codex 20 维 review |
+| v1.38 | 2026-10-26 | 第二轮审查修复：T-244 `asip.proc` 超时改杀进程组（孙进程不再泄漏）、T-245 Clash 连接表异常不外抛、T-246 日志注入覆盖 Unicode 行分隔符、T-241 扩展到「决策后已非当前出口则取消换线」、T-247 同步刷新改走按线锁、T-248~T-250 补齐 2xx/间隔/进程组 | codex 20 维 review |
+| v1.40 | 2026-10-26 | 第三轮整改：T-238 灰度期旧守护继续运行（dry_run 只观测不接管）、T-251 验收脚本 journal 失败语义、T-252 非 UTF-8 输出解码兜底、T-253 负数 text_limit 拒绝；`singbox_api` 异常只记一条日志 | 三方五维审查 |

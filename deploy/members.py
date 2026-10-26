@@ -11,6 +11,7 @@ import sys
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT)
+from asip.atomic_io import write_text  # noqa: E402
 from config import CFG  # noqa: E402
 
 
@@ -23,13 +24,9 @@ def write_warp_outbound(path: str) -> None:
     host = CFG["warp"]["socks_host"]
     data = [{"type": "socks", "tag": m["tag"], "server": host,
              "server_port": m["port"], "version": "5"} for m in CFG["warp"]["members"]]
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    # write_json 不追加末尾换行，而本文件此前带一个；内容必须逐字节等价，
+    # 所以序列化到字符串后用 write_text。
+    write_text(path, json.dumps(data, indent=2) + "\n", mode=0o600)
 
 
 if __name__ == "__main__":

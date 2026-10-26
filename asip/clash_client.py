@@ -9,11 +9,14 @@ contract is the same.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
+from urllib.parse import quote
 
 import requests
 
 DEFAULT_TIMEOUT = 5.0
+DEFAULT_TEST_URL = "https://www.gstatic.com/generate_204"
 
 
 class ClashClient:
@@ -34,23 +37,31 @@ class ClashClient:
         return {"Authorization": f"Bearer {secret}"} if secret else {}
 
     def request(self, method: str, path: str, body: Any = None,
-                timeout: float | None = None) -> requests.Response | None:
+                timeout: float | None = None,
+                params: Any = None) -> requests.Response | None:
         url = f"{self.base_url}/{path.lstrip('/')}"
+        kwargs: dict[str, Any] = {
+            "json": body,
+            "headers": self._headers(),
+            "timeout": timeout or self.timeout,
+        }
+        if params is not None:
+            kwargs["params"] = params
         try:
-            return requests.request(method, url, json=body,
-                                    headers=self._headers(),
-                                    timeout=timeout or self.timeout)
+            return requests.request(method, url, **kwargs)
         except requests.RequestException:
             return None
 
-    def get_json(self, path: str, timeout: float | None = None
-                 ) -> tuple[int | None, Any]:
-        """Return ``(status_code, parsed_json_or_None)``.
+    def request_json(self, method: str, path: str, *, body: Any = None,
+                     params: Any = None, timeout: float | None = None
+                     ) -> tuple[int | None, Any]:
+        """Return ``(status, data)``; ``(None, None)`` on transport failure.
 
-        A dedicated pair instead of a bare dict keeps "API returned 401" and
-        "API returned invalid JSON" distinguishable at the call site.
+        A non-JSON or empty response body yields ``(status, None)`` so callers
+        can tell "API returned 401" from "API returned invalid JSON".
         """
-        r = self.request("GET", path, timeout=timeout)
+        r = self.request(method, path, body=body, timeout=timeout,
+                         params=params)
         if r is None:
             return None, None
         try:
@@ -58,23 +69,77 @@ class ClashClient:
         except ValueError:
             return r.status_code, None
 
+    def get_json(self, path: str, timeout: float | None = None
+                 ) -> tuple[int | None, Any]:
+        """Return ``(status_code, parsed_json_or_None)``."""
+        return self.request_json("GET", path, timeout=timeout)
+
     def select(self, selector: str, value: str,
                timeout: float | None = None) -> bool:
         """Point ``selector`` at ``value``. 200 and 204 both mean success."""
-        r = self.request("PUT", f"proxies/{selector}", {"name": value},
-                         timeout=timeout)
-        return r is not None and r.status_code in (200, 204)
+        status, _ = self.request_json(
+            "PUT", f"proxies/{quote(selector, safe='')}",
+            body={"name": value}, timeout=timeout)
+        return status in (200, 204)
 
     def proxy_names(self, selector: str) -> list[str] | None:
-        status, data = self.get_json(f"proxies/{selector}")
+        status, data = self.get_json(f"proxies/{quote(selector, safe='')}")
         if status != 200 or not isinstance(data, dict):
             return None
         all_proxies = data.get("all")
         return [str(x) for x in all_proxies] if isinstance(all_proxies, list) else None
 
     def current(self, selector: str) -> str | None:
-        status, data = self.get_json(f"proxies/{selector}")
+        status, data = self.get_json(f"proxies/{quote(selector, safe='')}")
         if status != 200 or not isinstance(data, dict):
             return None
         now = data.get("now")
         return str(now) if now else None
+
+    def selector_state(self, selector: str
+                       ) -> tuple[list[str] | None, str | None]:
+        """Fetch ``all`` and ``now`` for ``selector`` in one GET."""
+        status, data = self.get_json(f"proxies/{quote(selector, safe='')}")
+        if status != 200 or not isinstance(data, dict):
+            return None, None
+        all_proxies = data.get("all")
+        now = data.get("now")
+        if not isinstance(all_proxies, list):
+            return None, None
+        if not isinstance(now, str) or not now:
+            return None, None
+        return [str(x) for x in all_proxies], now
+
+    def delay(self, node: str, timeout_ms: int, url: str = DEFAULT_TEST_URL,
+              *, hard_timeout: float | None = None) -> int | None:
+        """Measure ``node`` latency against ``url``; only int responses count."""
+        http_timeout = (hard_timeout if hard_timeout is not None
+                        else timeout_ms / 1000 + 2)
+        status, data = self.request_json(
+            "GET", f"proxies/{quote(node, safe='')}/delay",
+            params={"timeout": timeout_ms, "url": url},
+            timeout=http_timeout)
+        if status != 200 or not isinstance(data, dict):
+            return None
+        value = data.get("delay")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def delays(self, nodes: Any, *, workers: int = 16,
+               timeout_ms: int = 15000, url: str = DEFAULT_TEST_URL,
+               hard_timeout: float | None = None) -> dict[str, int | None]:
+        """Measure many nodes concurrently, preserving input order."""
+        unique = list(dict.fromkeys(nodes))
+        if not unique:
+            return {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                node: pool.submit(self.delay, node, timeout_ms, url,
+                                  hard_timeout=hard_timeout)
+                for node in unique
+            }
+            return {node: futures[node].result() for node in unique}
+
+    def connections(self, timeout: float | None = None) -> dict | None:
+        status, data = self.request_json("GET", "/connections",
+                                         timeout=timeout)
+        return data if status == 200 and isinstance(data, dict) else None
