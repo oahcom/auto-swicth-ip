@@ -2064,3 +2064,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.47 | 2026-10-26 | Codex 第二轮（探测器段）4 项：warming 前置检查异常泄漏→已修；陈旧 OK 被判假成功→已修；晚到 unknown 清掉新 OK→已修；invalidate 缩短退避→按设计保留（blocked 分支不打模型接口，重启受 backoff 约束），补特征化用例。3 处变异分别转红 | Codex 第二轮 |
 | v1.48 | 2026-10-26 | conftest 把 `CFG["log_file"]` 也指到 tmp：用例不再往线上 daemon.log 写「W2 重启前置检查异常」这类假事件（验证：单跑 prober 用例，产物在 basetemp，生产日志零新增用例行） | 测试基建 |
 | v1.49 | 2026-10-26 | 按主人规则「每个 IP 只探一次；重启拿回同一个 IP 基本等于该 IP 已封禁」：新增跨线复用 `_probe_cache_get_ip`（同一 /128 的持久结论不二次交学费）；同址重启命中惩罚期时按 `_line_block_remaining` 停探到确切解禁（原先 transient 结论会 5s 后再探）。2 处变异各自转红 | 主人决策 |
+| v1.50 | 2026-10-26 | 按主人澄清改正判据：脏不脏以**台账/探测结论**为准，不由「重启后还是同一个 IP」推断。`_warp_model_usable` 入口对惩罚期内地址直接跳过实测（跨线同样适用，`_PROBE_LAST_VERDICT=blocked`）；重启后地址若在惩罚期则停探到解禁（不再要求 same_ip）。删掉冗余的 `_probe_cache_get_ip`（被入口判脏覆盖）。2 处变异各自转红 | 主人澄清 |

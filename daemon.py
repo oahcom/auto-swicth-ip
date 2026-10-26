@@ -678,27 +678,6 @@ def _probe_cache_get(tag: str, ip: str, now: float | None = None) -> str | None:
         return verdict
 
 
-def _probe_cache_get_ip(ip: str, now: float | None = None) -> str | None:
-    """同一地址被**别的线**探过就复用持久结论。
-
-    配额按地址烧：两条隧道先后拿到同一个 /128 时，第二条不该再探一次。
-    """
-    if not ip:
-        return None
-    if now is None:
-        now = time.time()
-    with _WARP_REFRESH_LOCK:
-        best: tuple[float, str] | None = None
-        for (_tag, key), (verdict, ts) in _WARP_PROBE_SEEN.items():
-            if key != ip or verdict not in _WARP_PROBE_PERSISTENT:
-                continue
-            if now - ts > _probe_ttl(verdict):
-                continue
-            if best is None or ts > best[0]:
-                best = (ts, verdict)
-        return best[1] if best else None
-
-
 def _probe_cache_verdict(tag: str | None, ip: str | None,
                          now: float | None = None) -> str | None:
     """该线对这个地址的实测结论；没探过或已过期返回 None。
@@ -2697,9 +2676,9 @@ def _warp_line_restart(member: dict, reason: str) -> bool:
             return False
         ip = _probe_refresh_egress(member["port"])
         now = time.time()
-        # 同址重启拿到仍在惩罚期的地址：再探只是再确认一次，等到确切解禁。
-        block_left = (_line_block_remaining(ip, now)
-                      if ip and ip == prev_ip else 0.0)
+        # 重启后的地址若在台账里仍处惩罚期，停探到确切解禁：这条地址已经
+        # 被判脏，再探只是把同一结论再买一次。
+        block_left = _line_block_remaining(ip, now) if ip else 0.0
         with _WARP_LINE_CV:
             st = _warp_line_state_locked(tag)
             st["warming"] = False
@@ -2713,7 +2692,7 @@ def _warp_line_restart(member: dict, reason: str) -> bool:
             # 等于让惩罚失效（同址重启会立刻再烧一次配额）。
             prev_next = float(st.get("next_probe_ts") or 0.0)
             same_ip = bool(ip) and ip == prev_ip
-            if same_ip and block_left > 0:
+            if block_left > 0:
                 st["next_probe_ts"] = max(prev_next, now + block_left)
             elif (same_ip and prev_next > now
                     and st.get("last_verdict") in ("quota", "flagged", "blocked")):
@@ -3736,14 +3715,21 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     `probe_warp.py` 共用同一份指纹定义；每次探测消耗该出口一格配额。
 
     同一地址在 TTL 内只探一次：重复探测同一结论只是白烧配额（实测 26 次同一
-    IP 全是 quota）。台账按「tag + /128」键控，另有跨线复用（同一 /128 的持久
-    结论不再二次探测），TTL 按结论持久性分档。
+    IP 全是 quota）。台账按「tag + /128」键控，TTL 按结论持久性分档；已被台账
+    判脏（惩罚期内）的地址在入口处直接跳过，不再按线重探。
     """
     w = _warp()
     if not w.get("refresh_model_check", True):
         return True
     tag = member["tag"]
-    cached = _probe_cache_get(tag, ip) or _probe_cache_get_ip(ip)
+    if _warp_ip_is_blocked(ip):
+        # 台账（403/429 惩罚期）已经判这个地址脏，再探一次只是把同一个结论
+        # 再买一遍；脏 IP 不耗额度是既有事实，不是重启后的推断。
+        _PROBE_LAST_VERDICT[tag] = "blocked"
+        log(f"  · {tag} 出口 {ip} 台账已判脏，跳过实测"
+            f"{_warp_refresh_count_note(tag)}")
+        return False
+    cached = _probe_cache_get(tag, ip)
     # 只复用「地址已被上游拒绝」且封禁仍在生效的结论；OK 绝不能跳过实测。
     # OK 的 TTL 是 600s，而地址被生产流量烧掉只需几秒 —— 命中旧 OK 等于把
     # 已知会 429 的地址直接切上去，实测每轮换线后的 429 爆发都落在这种线上。
