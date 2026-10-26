@@ -400,11 +400,21 @@ def _segment_path() -> str:
     return os.environ.get("WARP_SEGMENT_FILE_PATH") or _SEGMENT_FILE
 
 
-def _save_segment_start(ts: float) -> None:
-    """段起点落盘：重启后同一出口继续按同一段累计 150 格配额。"""
+_ACTIVE_SEG_LOCK = threading.Lock()
+# 地址未知（启动补探/换线中/落池）时，下一次拿到 IP 需要按 IP 决定续算还是开新段。
+_SEGMENT_PENDING = False
+
+
+def _save_segment_start(ts: float, ip: str | None = None) -> None:
+    """段起点落盘：重启后同一出口继续按同一段累计 150 格配额。
+
+    显式传 ip，不读 `_ACTIVE_WARP_IP`：换线成功路径要先把新 IP 和段起点一起
+    落盘，读取全局会让「写盘」与「改全局」的先后顺序决定落盘内容（实测出现
+    新段配旧 IP，重启后段起点被 `_load_segment_start` 判为不同址而丢弃）。
+    """
     try:
         _write_json_atomic(_segment_path(),
-                           {"ts": float(ts), "ip": _ACTIVE_WARP_IP})
+                           {"ts": float(ts), "ip": ip})
     except Exception as e:
         log(f"✗ 段起点落盘失败: {e}")
 
@@ -433,10 +443,49 @@ def _load_segment_start(ip: str | None, now: float | None = None) -> float:
     return ts
 
 
+def _enter_segment(ts: float, ip: str | None) -> None:
+    """开始一个新段：换线/换址/落池的唯一入口（调用方已持有需要的锁）。"""
+    global _last_warp_switch_ok_ts, _ACTIVE_WARP_IP, _SEGMENT_PENDING
+    with _ACTIVE_SEG_LOCK:
+        _last_warp_switch_ok_ts = float(ts)
+        _ACTIVE_WARP_IP = ip
+        _SEGMENT_PENDING = ip is None
+        _save_segment_start(ts, ip)
+
+
+def _adopt_active_ip(ip: str, overwrite: bool = False) -> None:
+    """补探/重探拿到出口 IP 后接管：同一 IP 只补段起点，不同 IP 开新段。
+
+    overwrite=True 用于 sing-box 重启后的重探：会话已重开，即使地址恰好相同
+    也是新段（旧段的 150 格计数属于旧会话，不能顺延）。
+    """
+    global _last_warp_switch_ok_ts, _ACTIVE_WARP_IP, _SEGMENT_PENDING
+    with _ACTIVE_SEG_LOCK:
+        same = (not overwrite and ip == _ACTIVE_WARP_IP
+                and _last_warp_switch_ok_ts > 0)
+        _ACTIVE_WARP_IP = ip
+        _SEGMENT_PENDING = False
+        if same:
+            _save_segment_start(_last_warp_switch_ok_ts, ip)
+        else:
+            _last_warp_switch_ok_ts = time.time()
+            _save_segment_start(_last_warp_switch_ok_ts, ip)
+
+
+def _clear_active_ip() -> None:
+    """出口未知/在池：只清全局地址，不改段起点（等下一次补探按 IP 恢复）。"""
+    global _ACTIVE_WARP_IP, _SEGMENT_PENDING
+    with _ACTIVE_SEG_LOCK:
+        _ACTIVE_WARP_IP = None
+        _SEGMENT_PENDING = True
+
+
 def _begin_segment(ts: float) -> None:
+    """兼容入口：只换段起点，不动当前地址。"""
     global _last_warp_switch_ok_ts
-    _last_warp_switch_ok_ts = float(ts)
-    _save_segment_start(ts)
+    with _ACTIVE_SEG_LOCK:
+        _last_warp_switch_ok_ts = float(ts)
+        _save_segment_start(ts, _ACTIVE_WARP_IP)
 
 
 def _warp_ip_history_path() -> str:
@@ -2276,6 +2325,7 @@ _LINE_DEFAULTS = {
     "warming": False,
     "port_ok": False,
     "sel": 0.0,
+    "epoch": 0,
 }
 
 
@@ -2415,6 +2465,11 @@ def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
         next_ts = float(st.get("next_probe_ts") or 0.0)
+        restart_ts = float(st.get("next_restart_ts") or 0.0)
+        # 重启中的线不能派探测：`_probe_one_line` 会因 warming 立即返回，
+        # 主循环每轮又把它算进 due，形成 0.1s 级的线程自旋。
+        if st.get("warming") or now < restart_ts:
+            return False, max(next_ts, restart_ts, now + 1.0)
         if now < next_ts:
             return False, next_ts
         ip = st.get("ip")
@@ -2429,7 +2484,8 @@ def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
 
 def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
                                   ts: float | None = None,
-                                  started_at: float | None = None) -> bool:
+                                  started_at: float | None = None,
+                                  epoch: int | None = None) -> bool:
     """写入一次探测结论；返回 False 表示结论早于地址标脏，已丢弃。"""
     if ts is None:
         ts = time.time()
@@ -2440,6 +2496,10 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
     verdict = verdict or "unknown"
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
+        # 重启世代不同 = 这条结论来自旧会话。墙钟比较在回拨/长探测下都不可靠，
+        # 世代是唯一不会误收旧证据的判据。
+        if epoch is not None and int(st.get("epoch") or 0) != int(epoch):
+            return False
         # 探测启动后这条线可能已被换线路径记为 OK（`_warp_line_note_ok`）。
         # 晚到的未知结论不能把更新的 OK 清掉，否则又回到「探不到就重探」。
         if (started_at is not None
@@ -2480,22 +2540,34 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
 
 
 def _warp_line_note_ok(tag: str, ip: str, ts: float) -> None:
-    """生产成功流量也是 OK 来源；只更新内存，避免每 5s 落盘。"""
+    """生产成功流量也是 OK 来源；只更新内存，避免每 5s 落盘。
+
+    成功必须能证明「此刻的地址可用」：台账已判 blocked 的地址、重启前的
+    请求（`ts <= restart_ts`）、与线缓存地址不一致的旧连接，都不算。
+    否则一条迟到的旧成功会把刚重启的新会话拖回旧地址。
+    """
     if not tag or not ip:
+        return
+    now = time.time()
+    if _warp_ip_is_blocked(ip, now):
         return
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
-        if st.get("ip") != ip:
-            st["last_ok_ts"] = 0.0
-            st["last_ok_ip"] = None
+        cached = st.get("ip")
+        if cached and cached != ip:
+            return
+        if ts <= float(st.get("restart_ts") or 0.0):
+            return
         st["ip"] = ip
         st["ip_ts"] = max(float(st.get("ip_ts") or 0.0), ts)
         st["last_ok_ts"] = max(float(st.get("last_ok_ts") or 0.0), ts)
         st["last_ok_ip"] = ip
         st["last_verdict"] = "OK"
         st["fail_streak"] = 0
-        st["next_probe_ts"] = max(float(st.get("next_probe_ts") or 0.0),
-                                  ts + _line_fresh_sec())
+        # 真正的成功覆盖历史停车：quota/blocked 的线级停车只是 IP 惩罚的
+        # 镜像，地址已被实测服务成功就不再成立。保留 max() 会让一条 OK 线
+        # 在 16h 内「不算 OK 也不被探测」（实测 WARP-CF-I）。
+        st["next_probe_ts"] = max(float(ts), now) + _line_fresh_sec()
         _WARP_LINE_CV.notify_all()
 
 
@@ -2507,14 +2579,24 @@ def _warp_line_invalidate(ip: str | None, now: float | None = None) -> None:
         now = time.time()
     with _WARP_LINE_CV:
         for st in _WARP_LINE_STATE.values():
-            if st.get("ip") == ip or st.get("last_ok_ip") == ip:
+            if st.get("ip") == ip:
                 st["last_ok_ts"] = 0.0
                 st["last_ok_ip"] = None
-                if st.get("ip") == ip:
-                    st["last_verdict"] = "blocked"
-                    st["next_probe_ts"] = min(
-                        float(st.get("next_probe_ts") or now),
-                        now + _line_unknown_retry())
+                st["last_verdict"] = "blocked"
+                st["next_probe_ts"] = min(
+                    float(st.get("next_probe_ts") or now),
+                    now + _line_unknown_retry())
+            elif st.get("last_ok_ip") == ip:
+                # 这条线已经换到别的地址，旧证据只需作废，不能把它的
+                # 新地址也停车；但历史 16h 停车不能继续拖着一条没被证实
+                # 的新地址，收敛到一个 fresh 窗口内。
+                st["last_ok_ts"] = 0.0
+                st["last_ok_ip"] = None
+                if st.get("last_verdict") == "OK":
+                    st["last_verdict"] = "unknown"
+                st["next_probe_ts"] = min(
+                    float(st.get("next_probe_ts") or now),
+                    now + _line_fresh_sec())
         _WARP_LINE_CV.notify_all()
     _save_warp_line_state()
 
@@ -2608,6 +2690,7 @@ def _warp_line_restart(member: dict, reason: str) -> bool:
         if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
             return False
         st["warming"] = True
+        st["epoch"] = int(st.get("epoch") or 0) + 1
     got_slot = False
     try:
         busy = warp_line_busy(tag, _ERROR_PATH_BUSY_WINDOW_SEC)
@@ -2691,19 +2774,30 @@ def _warp_line_restart(member: dict, reason: str) -> bool:
             # blocked 的 6h 是上游按 IP 给出的恢复时刻，重启把它改回 +5s
             # 等于让惩罚失效（同址重启会立刻再烧一次配额）。
             prev_next = float(st.get("next_probe_ts") or 0.0)
-            same_ip = bool(ip) and ip == prev_ip
-            if block_left > 0:
-                st["next_probe_ts"] = max(prev_next, now + block_left)
-            elif (same_ip and prev_next > now
-                    and st.get("last_verdict") in ("quota", "flagged", "blocked")):
-                st["next_probe_ts"] = prev_next
-            else:
+            if not ip:
+                # 隧道重启了但出口地址拿不到：这是一次未完成的换址，不能
+                # 当成「新 IP」清掉 quota 停车（否则 5s 后重探再烧一次）。
+                # 台账里的 ban_until 仍然有效；这里只按退避排下一次重启。
                 st["last_verdict"] = "unknown"
                 st["next_probe_ts"] = now + _line_unknown_retry()
-            if ip:
+                st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+                st["next_restart_ts"] = now + _warp_line_restart_backoff(
+                    st["fail_streak"])
+            else:
+                same_ip = ip == prev_ip
+                # 台账判据优先：重启换到另一个同样被禁的地址也要停到解禁。
+                if block_left > 0:
+                    st["next_probe_ts"] = max(prev_next, now + block_left)
+                elif (same_ip and prev_next > now
+                        and st.get("last_verdict") in ("quota", "flagged", "blocked")):
+                    st["next_probe_ts"] = prev_next
+                else:
+                    st["last_verdict"] = "unknown"
+                    st["next_probe_ts"] = now + _line_unknown_retry()
                 st["ip"] = ip
                 st["ip_ts"] = now
                 st["port_ok"] = True
+                st["next_restart_ts"] = 0.0
             _WARP_LINE_CV.notify_all()
         _save_warp_line_state()
         log(f"  {'✓' if ip else '✗'} {tag} 重启后出口={ip or '探测失败'}")
@@ -2751,23 +2845,27 @@ def _probe_one_line(member: dict) -> None:
             and _warp_line_ok_fresh(tag, now)):
         return
     started_at = time.time()
+    epoch = int(_warp_line_state(tag).get("epoch") or 0)
     ip = warp_egress_ip(member["port"])
     if not ip:
-        _warp_line_record_observation(tag, None, "unknown", time.time(), started_at)
+        _warp_line_record_observation(tag, None, "unknown", time.time(),
+                                      started_at, epoch)
         return
     cur = _warp_line_state(tag)
     if tag != active and _warp_line_ok_fresh(tag, now) and cur.get("ip") == ip:
         _warp_line_update(tag, next_probe_ts=now + _line_fresh_sec())
         return
     if _warp_ip_is_blocked(ip, now):
-        _warp_line_record_observation(tag, ip, "blocked", time.time(), started_at)
+        _warp_line_record_observation(tag, ip, "blocked", time.time(),
+                                      started_at, epoch)
         if tag == active:
             _reconnect_warp_now("探测发现当前出口处于惩罚期", time.time())
         else:
             _warp_line_restart(member, "出口处于惩罚期")
         return
     if _warp_probe_blind(now):
-        _warp_line_record_observation(tag, ip, "blind", time.time(), started_at)
+        _warp_line_record_observation(tag, ip, "blind", time.time(),
+                                      started_at, epoch)
         return
     if not _probe_rate_allow():
         _warp_line_update(tag, next_probe_ts=now + 5.0)
@@ -2784,7 +2882,7 @@ def _probe_one_line(member: dict) -> None:
         # 沿用上一次残留的 OK 会把失败记成假成功。
         verdict = "err"
     if not _warp_line_record_observation(tag, ip, verdict,
-                                         time.time(), started_at):
+                                         time.time(), started_at, epoch):
         return
     if verdict == "OK":
         return
@@ -3369,11 +3467,10 @@ def _maybe_init_active_ip(now: float) -> None:
     _ACTIVE_IP_INIT_TS = now
 
     def _probe() -> None:
-        global _ACTIVE_WARP_IP
         tag = active_warp_tag()
         ip = _probe_active_ip(tag) if tag else None
         if ip:
-            _ACTIVE_WARP_IP = ip
+            _adopt_active_ip(ip)
             log(f"  · 当前出口 IP 补探成功: {ip}（启动时探测未就绪）")
 
     threading.Thread(target=_probe, daemon=True, name="active-ip-init").start()
@@ -3388,16 +3485,15 @@ def _refresh_active_warp_ip() -> None:
     调用方本来就在重启路径上，不阻塞主循环。
     """
     def _probe() -> None:
-        global _ACTIVE_WARP_IP
         tag = active_warp_tag()
         if tag is None:
             # 重启后落在池里（或还没恢复线路），旧 IP 不属于任何出口。
             if _current_mode()[0] == "proxy":
-                _ACTIVE_WARP_IP = None
+                _clear_active_ip()
             return
         ip = _probe_active_ip(tag)
         if ip:
-            _ACTIVE_WARP_IP = ip
+            _adopt_active_ip(ip, overwrite=True)
 
     threading.Thread(target=_probe, daemon=True, name="active-ip-refresh").start()
 
@@ -4393,7 +4489,7 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
                 continue
             if not _port_open(m["port"]) or not _switch_warp(m["tag"]):
                 continue
-            _begin_segment(time.time())
+            _enter_segment(time.time(), None)
             _proxy_dwell_since = 0
             log(f"↻ 轮换池冷却中（剩 {remain_min}min），改切 WARP 隧道 {m['tag']}")
             return True
@@ -4416,7 +4512,7 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
     # 错误触发的换线同样是一次「本段结束」：主动轮换的计时起点必须重置，
     # 否则刚落池就按上一段的已服务时长判到寿，秒级再切一次（实测 00:12:00
     # 落池后 22s 就报了 27s≥27s）。
-    _begin_segment(landed)
+    _enter_segment(landed, None)
     _proxy_dwell_since = landed     # 落池时刻：回切判据只统计此后的拦截
     log("✓ 已切到轮换池 proxy（WARP 隧道全部不可用）")
     return True
@@ -4443,8 +4539,7 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
                 log(f"✓ WARP 出口已更换: {old_ip or '未知'} -> {new_ip}")
                 # selector 没变（还是在同一条线上），但会话地址换了：不更新的话
                 # 健康行会一直显示旧 IP，成功流量打点也记在旧地址上。
-                _ACTIVE_WARP_IP = new_ip
-                _begin_segment(now)  # 本段结束：主动轮换计时重新开始
+                _enter_segment(now, new_ip)  # 本段结束：主动轮换计时重新开始
                 return True
             log(f"  ✗ {member['tag']} 出口不新鲜: {new_ip or '探测失败'}")
         else:
@@ -4493,8 +4588,7 @@ def _reconnect_warp_by_table(reason: str) -> bool:
             switched_at = time.time()
             _mark_warp_ip_used(ip, switched_at)
             _warp_line_selected(m["tag"], ip, switched_at)
-            _ACTIVE_WARP_IP = ip
-            _begin_segment(switched_at)
+            _enter_segment(switched_at, ip)
             _proxy_dwell_since = 0
             _from = active["tag"] if active else "proxy"
             log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip})")
@@ -4776,8 +4870,7 @@ def reconnect_warp(reason: str) -> bool:
     switched_at = time.time()
     _warp_line_selected(m["tag"], ip, switched_at)  # 轮转公平性
     _set_warp_line_ip(m["tag"], ip)  # 刚验证过：刷新缓存时刻，供下次快速选线
-    _ACTIVE_WARP_IP = ip
-    _begin_segment(switched_at)
+    _enter_segment(switched_at, ip)
     _proxy_dwell_since = 0          # 回到 WARP，驻留计时清零
     _from = active["tag"] if active else "proxy"
     log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip}, "
@@ -5716,6 +5809,25 @@ def _set_outbound_proxy(url: str = "", enabled: bool = False,
     return False
 
 
+def _reset_all_lines_after_session_restart() -> None:
+    """sing-box 重开所有隧道会话：旧世代/旧地址证据一次性作废。
+
+    只清当前线的地址不够：所有线的底层连接都已重建，重启前发出的探测无论
+    何时返回都属于旧会话。世代 +1 让晚到结论在 `_warp_line_record_observation`
+    处直接丢弃；清 ip/last_ok 让换线路径不会把旧地址当新鲜候选。
+    """
+    with _WARP_LINE_CV:
+        for st in _WARP_LINE_STATE.values():
+            st["epoch"] = int(st.get("epoch") or 0) + 1
+            st.pop("ip", None)
+            st.pop("ip_ts", None)
+            st["last_ok_ts"] = 0.0
+            st["last_ok_ip"] = None
+            st["warming"] = False
+        _WARP_LINE_CV.notify_all()
+    _save_warp_line_state()
+
+
 def restart_singbox() -> bool:
     """重启 sing-box，互斥锁防止并发调用。停服前绕过代理，启动后恢复。"""
     global _RESTART_COUNT, _ACTIVE_WARP_IP
@@ -5789,13 +5901,17 @@ def restart_singbox() -> bool:
                 # 重启前停在轮换池，重启后 selector 回到 default(WARP-CF)：
                 # 不切回去等于静默改变出口模式，落池冷却也就白等了。
                 _switch_warp("proxy")
-                _ACTIVE_WARP_IP = None   # 会话已重开，旧 IP 不再属于任何线路
+                _clear_active_ip()   # 会话已重开，旧 IP 不再属于任何线路
             elif prev_mode == "proxy":
                 # 落池已禁用：保持 default(WARP-CF)，不把流量送回死池。
-                _ACTIVE_WARP_IP = None
+                _clear_active_ip()
                 log("  ⚠ 落池已禁用，重启后保持默认 WARP 出口")
             elif prev_mode == "unknown":
                 log("  ⚠ 重启前查不到出口模式，selector 停在 default，交由下次换线校正")
+            # 所有隧道都是新会话：旧世代/旧地址证据一次性作废，再从新会话
+            # 补探出口并按 IP 决定「续算还是新段」。
+            _reset_all_lines_after_session_restart()
+            _enter_segment(time.time(), None)
             if prev_warp:
                 # sing-box 重启会重开隧道会话，出口 IP 可能已变；不重探的话健康行
                 # 会一直把旧 IP 配在新 tag 上，直到下一次换线。
@@ -6266,29 +6382,24 @@ def main():
     _load_warp_ip_cycles()
     _load_warp_line_state()
     _load_node_ip_used()
-    # 单实例探测器接管所有线路的探测/状态写入；旧守护仅在回滚开关下启动。
+    # 探测线程晚于「出口 IP + 段起点」恢复再启动：先启动会让首轮探测
+    # 在 `_ACTIVE_WARP_IP` 还是 None 时把当前线当备线，重启正在服务的隧道。
     prober_enabled = bool(_warp().get("prober_enabled", True))
-    if prober_enabled:
-        _start_warp_prober()
-    else:
-        # 脏线守护：常驻线程，脏 IP 一出现就重连换干净地址，不依赖主循环周期。
-        if _line_worker_enabled():
-            _start_line_workers()
-        if not _line_worker_owns_scheduling():
-            _start_dirty_line_janitor()
     # 日志标签用的当前 WARP 出口 IP：启动时探一次，之后由换线路径更新
-    global _ACTIVE_WARP_IP, _last_warp_switch_ok_ts
+    global _ACTIVE_WARP_IP, _last_warp_switch_ok_ts, _SEGMENT_PENDING
     _m = _warp_member(active_warp_tag())
-    if _m:
-        _ACTIVE_WARP_IP = warp_egress_ip(_m["port"])
-        if not prober_enabled:
-            _validate_startup_egress(_m)
-    else:
+    _startup_ip = warp_egress_ip(_m["port"]) if _m else None
+    if _m and not prober_enabled:
+        _validate_startup_egress(_m)
+    elif not _m:
         # 启动时就停在 proxy 上：落池时刻从此刻算，否则「落池后仍拦截」
         # 判据会拿 0 当起点，把落池前的旧 403/429 也算进去。
         global _proxy_dwell_since
         _proxy_dwell_since = time.time()
-    _last_warp_switch_ok_ts = _load_segment_start(_ACTIVE_WARP_IP)
+    with _ACTIVE_SEG_LOCK:
+        _ACTIVE_WARP_IP = _startup_ip
+        _last_warp_switch_ok_ts = _load_segment_start(_startup_ip)
+        _SEGMENT_PENDING = _startup_ip is None
 
     # 状态
     cooldown_until = 0
@@ -6379,6 +6490,15 @@ def main():
     # 一个 15s 的探测后面才被看到，而那段时间每个请求都在失败。
     # 现在循环体只剩三件事：读一个 int 水位线、按定时器派发后台任务、写日志。
     _start_clash_snapshot_loop()
+    # 单实例探测器接管所有线路的探测/状态写入；旧守护仅在回滚开关下启动。
+    if prober_enabled:
+        _start_warp_prober()
+    else:
+        # 脏线守护：常驻线程，脏 IP 一出现就重连换干净地址，不依赖主循环周期。
+        if _line_worker_enabled():
+            _start_line_workers()
+        if not _line_worker_owns_scheduling():
+            _start_dirty_line_janitor()
     last_watermark = -1
     next_error_eval = 0.0
     total = errors = consecutive_errors = 0

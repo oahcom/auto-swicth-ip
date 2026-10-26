@@ -253,3 +253,107 @@ def test_restart_to_another_banned_ip_parks_until_unban(monkeypatch):
     st = daemon._warp_line_state("W2")
     assert st["ip"] == "2.2.2.2"
     assert st["next_probe_ts"] >= now + 3500
+# ---- 段起点 / 世代 / 空地址重启 / 成功打点 的状态机单元测试 ----
+
+def test_enter_segment_persists_ip_and_load_requires_same_ip(monkeypatch):
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
+    daemon._enter_segment(1_700_000_000.0, "1.1.1.1")
+    assert daemon._ACTIVE_WARP_IP == "1.1.1.1"
+    assert daemon._load_segment_start("1.1.1.1", now=1_700_000_100.0) == pytest.approx(1_700_000_000.0)
+    assert daemon._load_segment_start("2.2.2.2", now=1_700_000_100.0) == 0.0
+
+
+def test_adopt_active_ip_keeps_segment_for_same_ip(monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "1.1.1.1")
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", now - 600)
+    daemon._adopt_active_ip("1.1.1.1")
+    assert daemon._last_warp_switch_ok_ts == pytest.approx(now - 600)
+    daemon._adopt_active_ip("2.2.2.2")
+    assert daemon._last_warp_switch_ok_ts > now - 5
+
+
+def test_record_observation_drops_stale_epoch(monkeypatch):
+    now = time.time()
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            epoch=2, ip="1.1.1.1", last_verdict="OK", last_ok_ts=now)
+    assert daemon._warp_line_record_observation(
+        "W2", "1.1.1.1", "quota", now, now, epoch=1) is False
+    st = daemon._warp_line_state("W2")
+    assert st["last_verdict"] == "OK"
+    assert st["last_ok_ts"] == pytest.approx(now)
+
+
+def test_note_ok_clears_persistent_park_after_real_success():
+    now = time.time()
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            ip="1.1.1.1", last_verdict="quota", last_ok_ts=0.0,
+            next_probe_ts=now + 16 * 3600)
+    daemon._warp_line_note_ok("W2", "1.1.1.1", now)
+    st = daemon._warp_line_state("W2")
+    assert st["last_verdict"] == "OK"
+    assert st["last_ok_ts"] == pytest.approx(now)
+    assert st["next_probe_ts"] - now <= daemon._line_fresh_sec() + 2
+
+
+def test_note_ok_ignores_blocked_ledger_ip(monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: True)
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            ip="1.1.1.1", last_verdict="quota", last_ok_ts=0.0)
+    daemon._warp_line_note_ok("W2", "1.1.1.1", now)
+    st = daemon._warp_line_state("W2")
+    assert st["last_verdict"] == "quota"
+    assert st["last_ok_ts"] == 0.0
+
+
+def test_invalidate_clears_stale_ok_without_parking_new_ip(monkeypatch):
+    now = time.time()
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            ip="1.1.1.1", last_ok_ip="1.1.1.1", last_ok_ts=now,
+            last_verdict="OK", next_probe_ts=now + 16 * 3600)
+        daemon._warp_line_state_locked("W3").update(
+            ip="9.9.9.9", last_ok_ip="1.1.1.1", last_ok_ts=now,
+            last_verdict="OK", next_probe_ts=now + 16 * 3600)
+    daemon._warp_line_invalidate("1.1.1.1", now)
+    holder = daemon._warp_line_state("W2")
+    other = daemon._warp_line_state("W3")
+    assert holder["last_verdict"] == "blocked"
+    assert holder["next_probe_ts"] - now <= daemon._line_unknown_retry() + 1
+    assert other["last_verdict"] == "unknown"
+    assert other["next_probe_ts"] - now <= daemon._line_fresh_sec() + 1
+
+
+def test_needs_probe_suppressed_while_warming_or_restart_backoff():
+    now = time.time()
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            warming=True, next_probe_ts=now - 1)
+    due, nxt = daemon._warp_line_needs_probe("W2", now)
+    assert due is False and nxt >= now
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            warming=False, next_restart_ts=now + 60, next_probe_ts=now - 1)
+    due, nxt = daemon._warp_line_needs_probe("W2", now)
+    assert due is False and nxt >= now + 59
+
+
+def test_restart_without_egress_ip_sets_backoff_and_unknown(monkeypatch):
+    _stub_restart(monkeypatch, None)
+    now = time.time()
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            ip="1.1.1.1", last_verdict="quota", epoch=0,
+            next_probe_ts=now + 16 * 3600)
+    assert daemon._warp_line_restart(_member(), "模型层 quota") is False
+    st = daemon._warp_line_state("W2")
+    assert st["last_verdict"] == "unknown"
+    assert st["epoch"] == 1
+    assert st["next_restart_ts"] > now
+    assert st["next_probe_ts"] - now <= daemon._line_unknown_retry() + 1
+    assert st["fail_streak"] >= 1
+

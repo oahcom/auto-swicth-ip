@@ -22,6 +22,14 @@ def _isolate_live_state_files(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_segment_globals(monkeypatch):
+    """段起点是模块级全局：上一个用例（如 sing-box 重启）会把「现在」写进去，
+    下一个用例再用合成时钟 1000.0 就会被判成「刚换过线」而拒绝换线。"""
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 0.0)
+    monkeypatch.setattr(daemon, "_SEGMENT_PENDING", False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_live_log_file(tmp_path, monkeypatch):
     """日志同样指到 tmp：`CFG["log_file"]` 是绝对路径，测试跑在哪个 worktree
     都会往线上 daemon.log 里写用例产生的假事件。"""
