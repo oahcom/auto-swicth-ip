@@ -403,6 +403,25 @@ CFG = {
         "probe_transient_ttl_sec": 120,
         "probe_ok_ttl_sec": 600,
         "probe_persistent_ttl_sec": 21600,
+        # 单实例探测器：所有线路的出口/模型探测都由唯一后台线程写入状态表，
+        # 换线只读表 + 条件变量等待，不再在 reconnect_warp 里同步探测。
+        # prober_enabled=False 只用于回滚到旧路径（测试默认不会启动探测器）。
+        "prober_enabled": True,
+        "line_fresh_sec": 120,
+        "probe_unknown_retry_sec": 5,
+        "probe_transient_retry_sec": 120,
+        "probe_transient_retry_max_sec": 600,
+        "probe_persistent_retry_sec": 21600,
+        "probe_concurrency": 32,
+        "model_probe_concurrency": 32,
+        "probe_max_per_min": 600,
+        "prober_idle_wait_sec": 30,
+        "switch_wait_sec": 20,
+        "restart_cooldown_sec": 5,
+        "restart_backoff_sec": [2, 5, 10, 20, 60],
+        "restart_backoff_max_sec": 120,
+        "restart_concurrency": 4,
+        "ip_observe_sec": 120,
         # fixed 模式的提前量：换线从发起到达生效 p50=2s / p90=7s，等满
         # proactive_fixed_sec 再发起就赶不上节律，必须提前这个时长。
         # requests 模式不用它：配额是离散格数，没有「生效延迟」可提前。

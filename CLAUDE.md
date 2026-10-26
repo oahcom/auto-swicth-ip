@@ -122,7 +122,8 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   - 实测 16:24 切 WARP 成员后成功率 3.5% → 9.3%（90s 窗口），429 换线确有效。
   - 两类同时达阈值只换一次线，理由串成 `"abuse403 ×N + rate429 ×M"`。
 - **判定不受节点切换时间戳约束**：主循环的主动轮换（每 60s）会刷新 `_last_successful_switch_ts`，若拿它当窗口起点，爆发期间 403 会被整段吞掉（实测 15:47~15:52 共 252 条 403 零换线）。
-- **换线前校验目标出口 IP**：`_WARP_IP_USED` 记录每个出口 IP 最后一次使用时间，窗口
+- **旧路径换线前校验目标出口 IP（新探测器路径不重启目标线，靠 120s 内模型 OK 兜底）**：
+  `_WARP_IP_USED` 记录每个出口 IP 最后一次使用时间，窗口
   `ip_reuse_guard_sec`（默认 **86400s = 24h**，`blocked_ttl_sec` 同步）内用过的地址必须先重启目标隧道换会话 IP 再切 ——
   否则等于从一个被限流的出口切到另一个同样被限流的出口，白换一次（实测 16:53:59
   WARP-CF-B 刷出 `19c0:10::3ff:6d`，16:59:27 又切回同一地址，随之 429 爆发）。
@@ -134,13 +135,21 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   25.2 / 28.3 / 49.1 分钟的复用间隔都真的发生过，而 8~11 分钟复用的那些几乎立刻爆发
   （18:58:05 用过的 `2a09:bac5:1efb:281e::3ff:42` 在 10.6 分钟后被原样切回，53 秒后爆发）。
   记录落盘 `.warp_ip_used.json`，跨重启保留。
-- 动作：探测备线连通性 → `PUT /proxies/opencode-out` 切过去（`interrupt_exist_connections: false`，在途请求不断）→ 后台重连刚被换下的那条，刷新其会话 IP，下次可原样切回。
-- 备线不通时先拉起；所有备线都不可用时**原地重连当前 WARP 线**（`max_attempts`=3，
-  间隔 `retry_backoff_sec` 2/5/10s）。2026-10-26 起**不再落轮换池 `proxy`**
-  （`warp.proxy_fallback_enabled=false`）：池内 anytls 节点全部 connection reset，
-  落池等于断流（02:57 实测落池后 egress_log 停在 `pq.aws67.yydjc.top:443-vl`）。
-  历史上切 proxy 是为了避免 D-Bus 不可用时原地重连必败（2026-10-19 19:09），
-  但池已整体失效，这个兜底不再成立；要恢复把开关改回 `true`。
+- 动作（2026-10-26 起）：`warp-prober` 是唯一探测器，持续把每条线的
+  `last_ok_ts/last_ok_ip` 写进 per-line 状态表；`reconnect_warp` **只读表**。
+  120s 内 OK 的线直接 `PUT /proxies/opencode-out` 切过去；没有新鲜 OK 就在条件变量
+  上等 `switch_wait_sec`(20s)，超时本次放弃，不现场探测、不盲切、不原地重连、
+  不落 proxy。换线路径不再重启目标线；重启只由探测器在**确定失败**时触发。
+- 确定失败才重启：`quota/flagged/unreachable/err` 且非整批 `unreachable`（整批视为
+  探测通道失明）才走 `_warp_line_restart`。active 线永不重启，只换线。重启入口有
+  per-line 锁、5s 冷却、`2/5/10/20/60s` 指数退避（上限 120s）、每小时 20 次上限。
+  重启成功只把 IP 写回表，等 5s 后的模型层探测给出 OK 才算新鲜。
+- 状态表落盘 `.warp_line_state.json`（`WARP_LINE_STATE_FILE_PATH` 可覆盖），启动加载
+  并丢弃过期 OK。`prober_enabled=false` 才回滚到旧 `_start_line_workers` /
+  `_start_dirty_line_janitor` 路径。
+- 2026-10-26 起**不再落轮换池 `proxy`**（`warp.proxy_fallback_enabled=false`）：
+  池内 anytls 节点全部 connection reset，落池等于断流（02:57 实测落池后 egress_log
+  停在 `pq.aws67.yydjc.top:443-vl`）。新换线路径根本不会走到落池；旧路径保留仅作回滚。
 - **主动轮换两种判据，`proactive_mode` 二选一（互斥，只有一个生效）**：`requests`（**当前生效**，
   当前出口上**成功的 dsv4 调用**累计满 `proactive_after_dsv4_ok`=150 格）与 `fixed`
   （每 `proactive_fixed_sec`=60s）。配置只能是 `fixed`/`requests`；导入时会校验，
@@ -191,12 +200,12 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   实测依据：2026-10-22 08:03~17:59 共 817 次换线里 **111 次（13.7%）新出口 ==
   旧出口**，全部由 rate429 触发 —— 每一笔都白重启了一条隧道。当前 20 条隧道
   活探 19 条（1 条瞬时探测失败），IP 全不相同。
-- **启动时必须校验当前出口是否可用 (T-199)**：sing-box 重启后 selector 复位到
-  配置 default（主隧道 WARP-CF），它可能正处 429 惩罚期或被模型层判 quota。
-  `main()` 启动即调 `_validate_startup_egress()`：低质则立刻换线，不校验就等于
-  「重启后先白烧一段 IP，等第一条 429 才纠正」（实测 13:45 重启后 WARP-CF
-  立即 429 ×3 才被换走）。换线是异步线程，校验后不得复探 `active_warp_tag()`
-  —— 读到的是旧线，白等 20s 还会把低质 IP 写回去。
+- **启动时由探测器接管，不再同步校验出口 (T-199 / 2026-10-26)**：sing-box 重启后
+  selector 复位到配置 default（主隧道 WARP-CF），它可能正处 429 惩罚期或被模型层
+  判 quota。`prober_enabled=true` 时 `main()` 启动探测器后直接进主循环，由首轮探测
+  决定是否换线；`_validate_startup_egress()` 只在 `prober_enabled=false` 的旧路径执行。
+  换线是异步线程，校验后不得复探 `active_warp_tag()` —— 读到的是旧线，白等 20s
+  还会把低质 IP 写回去。
 - **刷新路径的「探测失败」必须复探一次 (T-200)**：短预算（`refresh_probe_timeout_sec`=7s）
   的本意是「刚重启的隧道要么立刻通、要么没起来」，但漏了**首探冷**：实测
   `usque-warp-20` 重启后端口 0.12s 就绪，7s 预算首探 7.01s 到点 rc=28，紧接着同预算
@@ -624,10 +633,28 @@ warp.proactive_after_dsv4_ok: 150              # requests：满 N 格成功的 d
 warp.proactive_quota_model: "deepseek-v4.1-flash-free"
 warp.proxy_fallback_cooldown_sec: 10800        # 落池冷却（3h）
 warp.proxy_fallback_enabled: false             # 落池开关（2026-10-26 关闭，池节点全挂）
-warp.probe_cache_ttl_sec: 12                   # 探测缓存 TTL（出口 IP 新鲜度）
+warp.probe_cache_ttl_sec: 12                   # 旧路径探测缓存 TTL（出口 IP 新鲜度）
 warp.probe_transient_ttl_sec: 120                 # 探测结论 TTL：OK/unreachable/err（瞬时档）
 warp.probe_persistent_ttl_sec: 21600              # 探测结论 TTL：quota/flagged（与 403 惩罚期同量级）
-warp.fallback_idle_wait_sec: 3                 # 错误路径等备线空闲上限
+warp.fallback_idle_wait_sec: 3                 # 旧路径错误换线等备线空闲上限
+# 单实例探测器（2026-10-26，prober_enabled=false 时才走旧路径）
+warp.prober_enabled: true                      # 唯一后台探测器 + 状态表驱动换线
+warp.line_fresh_sec: 120                       # per-line OK 新鲜窗口
+warp.probe_unknown_retry_sec: 5                # IP 未知 / 重启成功后重探间隔
+warp.probe_transient_retry_sec: 120            # 瞬时失败重探间隔
+warp.probe_transient_retry_max_sec: 600        # 瞬时失败退避上限
+warp.probe_persistent_retry_sec: 21600         # quota/flagged 重探间隔（6h）
+warp.probe_concurrency: 4                      # 每轮并发探测线数
+warp.model_probe_concurrency: 2                # 模型层并发探测数（每格配额都是钱）
+warp.probe_max_per_min: 30                     # 全局探测速率上限
+warp.prober_idle_wait_sec: 30                  # 探测器空闲等待
+warp.switch_wait_sec: 20                       # 无新鲜 OK 时换线等待上限
+warp.restart_cooldown_sec: 5                   # 同一线重启冷却
+warp.restart_backoff_sec: [2, 5, 10, 20, 60]   # 重启失败指数退避
+warp.restart_backoff_max_sec: 120              # 退避上限
+warp.restart_max_per_hour_per_line: 20         # 每线每小时重启上限
+warp.restart_concurrency: 4                    # 全局并发重启上限
+warp.ip_observe_sec: 120                       # 换线后出口观察窗
 # 连错门控不是配置项，是代码常量：consec_err < 3 → 不换线（daemon.py maybe_reconnect_warp）
 # _DEAD_TTL_STAGES: _generate_ttl_stages() 算法生成（30s→7d），非手写列表
 _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（daemon.py 常量）

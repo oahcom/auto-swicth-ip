@@ -21,6 +21,7 @@ singbox-config.json.tmp
 .daemon.lock
 .warp_ip_cycles.json
 .warp_ip_history.jsonl
+.warp_line_state.json
 .warp_proxy_fallback.json
 # 部署密钥（订阅 token、路径覆盖）；模板见 .env.example
 .env

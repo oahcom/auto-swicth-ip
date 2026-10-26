@@ -303,7 +303,20 @@ _POOL_RECLAIM_MIN_GAP_SEC = 10.0
 # 选线要挑「最久没被选过」的线：只看 IP 使用表不行 —— 出窗口的条目会被
 # 清理，清理后所有备线并列最老，又退化成 members 顺序（实测 D/E 被选中 0 次）。
 _WARP_LINE_STATE: dict[str, dict] = {}
-_WARP_LINE_LOCK = threading.Lock()   # 主循环 / 换线线程 / 补刷线程三方读写
+# 主循环 / 换线线程 / 探测器 / 补刷线程多方读写。用 RLock + Condition：
+# 换线只读表并等待探测器写入，不能再自己探测；状态层函数可重入获取。
+_WARP_LINE_LOCK = threading.RLock()
+_WARP_LINE_CV = threading.Condition(_WARP_LINE_LOCK)
+_WARP_LINE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     ".warp_line_state.json")
+_WARP_LINE_SAVE_LOCK = threading.Lock()
+_WARP_LINE_LAST_SAVE: float = 0.0
+_PROBER_STARTED = False
+_PROBER_THREAD: threading.Thread | None = None
+_MODEL_PROBE_SEM: threading.BoundedSemaphore | None = None
+_RESTART_SEM: threading.BoundedSemaphore | None = None
+_PROBE_RATE_LOCK = threading.Lock()
+_PROBE_RATE_TIMES: deque[float] = deque()
 _last_proactive_warp_check: float = 0  # 主动轮换判据的上次查询时刻
 # 健康摘要里展示的主动轮换进度。由判决函数写入，避免摘要再查一次库，
 # 也保证日志显示的就是判据当时看到的数。
@@ -363,8 +376,67 @@ def _write_json_atomic(path: str, payload: dict) -> None:
 
 
 def _save_warp_ip_used() -> None:
-    """把 IP 使用记录落盘。"""
-    _write_json_atomic(_warp_ip_used_path(), {"used": _WARP_IP_USED})
+    """把 IP 使用记录落盘。
+
+    进程内为空但盘上已有台账时拒绝写入：并发跑的测试进程/误启动的实例
+    用空内存覆盖会把 16h 的 ban_until 全抹掉（已实际发生过）。
+    """
+    path = _warp_ip_used_path()
+    if not _WARP_IP_USED:
+        try:
+            if os.path.getsize(path) > 2:
+                log(f"  · 跳过空台账覆盖 {path}（盘上已有记录）")
+                return
+        except OSError:
+            pass
+    _write_json_atomic(path, {"used": _WARP_IP_USED})
+
+
+_SEGMENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              ".warp_segment.json")
+
+
+def _segment_path() -> str:
+    return os.environ.get("WARP_SEGMENT_FILE_PATH") or _SEGMENT_FILE
+
+
+def _save_segment_start(ts: float) -> None:
+    """段起点落盘：重启后同一出口继续按同一段累计 150 格配额。"""
+    try:
+        _write_json_atomic(_segment_path(),
+                           {"ts": float(ts), "ip": _ACTIVE_WARP_IP})
+    except Exception as e:
+        log(f"✗ 段起点落盘失败: {e}")
+
+
+def _load_segment_start(ip: str | None, now: float | None = None) -> float:
+    """只在出口 IP 未变时恢复段起点；换了地址就是新段。"""
+    if not ip:
+        return 0.0
+    try:
+        with open(_segment_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return 0.0
+    except Exception as e:
+        log(f"✗ 读取段起点失败: {e}")
+        return 0.0
+    if not isinstance(data, dict) or data.get("ip") != ip:
+        return 0.0
+    try:
+        ts = float(data.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    now = time.time() if now is None else now
+    if ts <= 0 or now < ts - 60 or now - ts > 24 * 3600:
+        return 0.0
+    return ts
+
+
+def _begin_segment(ts: float) -> None:
+    global _last_warp_switch_ok_ts
+    _last_warp_switch_ok_ts = float(ts)
+    _save_segment_start(ts)
 
 
 def _warp_ip_history_path() -> str:
@@ -1911,7 +1983,7 @@ def _reclaim_foreign_pool(now: float | None = None) -> bool:
     target = _LAST_WARP_TAG if _warp_member(_LAST_WARP_TAG) else _warp()["members"][0]["tag"]
     _LAST_POOL_RECLAIM_TS = now
     log(f"⚠ 检测到外部落池（opencode-out=proxy），回收至 {target}")
-    return _switch_warp(target, interrupt=True)
+    return _switch_warp(target)
 
 
 def _restart_service(service: str, tag: str | None = None) -> bool:
@@ -2175,11 +2247,586 @@ def _invalidate_warp_line_ip(tag: str) -> None:
     只清时间戳不够：`ip` 留着但 `ip_ts=0` 会让读方把它当成「刚验证过」的反面
     （时间戳为 0 时 `now - ts` 极大，天然被 TTL 挡掉）。两个都清更直白。
     """
-    with _WARP_LINE_LOCK:
+    with _WARP_LINE_CV:
         st = _WARP_LINE_STATE.get(tag)
         if st:
             st.pop("ip", None)
             st.pop("ip_ts", None)
+            st["last_ok_ts"] = 0.0
+            st["last_ok_ip"] = None
+        _WARP_LINE_CV.notify_all()
+
+
+# ---------------------------------------------------------------------------
+# 出口状态表：唯一探测器写，换线路径只读 + 等待。
+# 旧字段（ip/ip_ts）保留兼容旧守护/测试；新路径只信 last_ok_ip/last_ok_ts。
+# ---------------------------------------------------------------------------
+_LINE_DEFAULTS = {
+    "ip": None,
+    "ip_ts": 0.0,
+    "last_ok_ts": 0.0,
+    "last_ok_ip": None,
+    "last_verdict": "",
+    "last_probe_ts": 0.0,
+    "next_probe_ts": 0.0,
+    "fail_streak": 0,
+    "restart_count": 0,
+    "restart_ts": 0.0,
+    "next_restart_ts": 0.0,
+    "warming": False,
+    "port_ok": False,
+    "sel": 0.0,
+}
+
+
+def _warp_line_state_path() -> str:
+    return (os.environ.get("WARP_LINE_STATE_FILE_PATH")
+            or _WARP_LINE_STATE_FILE)
+
+
+def _warp_line_state_locked(tag: str) -> dict:
+    st = _WARP_LINE_STATE.get(tag)
+    if not isinstance(st, dict):
+        st = _WARP_LINE_STATE[tag] = {}
+    for k, v in _LINE_DEFAULTS.items():
+        st.setdefault(k, v)
+    return st
+
+
+def _warp_line_update_locked(tag: str, **fields) -> dict:
+    st = _warp_line_state_locked(tag)
+    st.update(fields)
+    return st
+
+
+def _warp_line_update(tag: str, **fields) -> dict:
+    with _WARP_LINE_CV:
+        st = _warp_line_update_locked(tag, **fields)
+        _WARP_LINE_CV.notify_all()
+    return st
+
+
+def _warp_line_state(tag: str) -> dict:
+    with _WARP_LINE_CV:
+        return dict(_warp_line_state_locked(tag))
+
+
+def _save_warp_line_state(force: bool = False) -> None:
+    global _WARP_LINE_LAST_SAVE
+    now = time.time()
+    with _WARP_LINE_SAVE_LOCK:
+        if not force and now - _WARP_LINE_LAST_SAVE < 5.0:
+            return
+        _WARP_LINE_LAST_SAVE = now
+    with _WARP_LINE_CV:
+        payload = {"version": 1,
+                   "lines": {t: dict(s) for t, s in _WARP_LINE_STATE.items()}}
+    path = _warp_line_state_path()
+    if not payload["lines"]:
+        try:
+            if os.path.getsize(path) > 2:
+                log(f"  · 跳过空状态表覆盖 {path}（盘上已有记录）")
+                return
+        except OSError:
+            pass
+    _write_json_atomic(path, payload)
+
+
+def _load_warp_line_state() -> None:
+    """恢复状态表；过期 OK 在启动时直接作废，避免拿重启前的证据选线。"""
+    try:
+        with open(_warp_line_state_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log(f"✗ 加载 .warp_line_state.json 失败: {e}")
+        return
+    lines = data.get("lines", data) if isinstance(data, dict) else {}
+    if not isinstance(lines, dict):
+        return
+    now = time.time()
+    fresh = _line_fresh_sec()
+    with _WARP_LINE_CV:
+        for tag, raw in lines.items():
+            if not isinstance(raw, dict):
+                continue
+            st = _warp_line_state_locked(tag)
+            st.update({k: v for k, v in raw.items() if k in _LINE_DEFAULTS})
+            if (st.get("last_ok_ip") != st.get("ip")
+                    or now - float(st.get("last_ok_ts") or 0) > fresh):
+                st["last_ok_ts"] = 0.0
+                st["last_ok_ip"] = None
+            st["warming"] = False
+        _WARP_LINE_CV.notify_all()
+    log(f"✓ 已恢复 {len(lines)} 条 WARP 线路状态")
+
+
+def _line_fresh_sec() -> float:
+    return float(_warp().get("line_fresh_sec",
+                             _warp().get("probe_transient_ttl_sec", 120)))
+
+
+def _line_unknown_retry() -> float:
+    return float(_warp().get("probe_unknown_retry_sec", 5))
+
+
+def _line_transient_retry(fail_streak: int = 1) -> float:
+    base = float(_warp().get("probe_transient_retry_sec",
+                             _warp().get("probe_transient_ttl_sec", 120)))
+    cap = float(_warp().get("probe_transient_retry_max_sec", 600))
+    return min(base * (2 ** max(0, fail_streak - 1)), cap)
+
+
+def _line_persistent_retry() -> float:
+    return float(_warp().get("probe_persistent_retry_sec",
+                             _warp().get("probe_persistent_ttl_sec", 21600)))
+
+
+def _line_block_remaining(ip: str | None, now: float) -> float:
+    if not ip:
+        return 0.0
+    with _WARP_IP_LOCK:
+        entry = _WARP_IP_USED.get(ip)
+    if not isinstance(entry, dict) or not entry.get("blocked"):
+        return 0.0
+    try:
+        return max(0.0, float(_warp_block_remaining(entry, now)))
+    except Exception:
+        return 0.0
+
+
+def _warp_line_ok_fresh(tag: str, now: float | None = None,
+                        fresh_sec: float | None = None) -> bool:
+    if now is None:
+        now = time.time()
+    if fresh_sec is None:
+        fresh_sec = _line_fresh_sec()
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        ip = st.get("ip")
+        if not ip or st.get("last_ok_ip") != ip:
+            return False
+        return now - float(st.get("last_ok_ts") or 0.0) <= fresh_sec
+
+
+def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
+    """是否需要探测，以及下一次最早该看的时刻。"""
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        next_ts = float(st.get("next_probe_ts") or 0.0)
+        if now < next_ts:
+            return False, next_ts
+        ip = st.get("ip")
+        if not ip:
+            return True, now
+        last_ok = float(st.get("last_ok_ts") or 0.0)
+        if (st.get("last_ok_ip") == ip
+                and now - last_ok <= _line_fresh_sec()):
+            return False, last_ok + _line_fresh_sec()
+        return True, now
+
+
+def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
+                                  ts: float | None = None,
+                                  started_at: float | None = None) -> bool:
+    """写入一次探测结论；返回 False 表示结论早于地址标脏，已丢弃。"""
+    if ts is None:
+        ts = time.time()
+    if ip and started_at is not None:
+        with _WARP_REFRESH_LOCK:
+            if started_at <= _PROBE_BLOCKED_AT.get(ip, 0.0):
+                return False
+    verdict = verdict or "unknown"
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        old_ip = st.get("ip")
+        if ip:
+            if old_ip and old_ip != ip:
+                st["last_ok_ts"] = 0.0
+                st["last_ok_ip"] = None
+            st["ip"] = ip
+            st["ip_ts"] = ts
+            st["port_ok"] = True
+        st["last_verdict"] = verdict
+        st["last_probe_ts"] = ts
+        if verdict == "OK":
+            st["fail_streak"] = 0
+            st["last_ok_ts"] = ts
+            st["last_ok_ip"] = st.get("ip")
+            st["next_probe_ts"] = ts + _line_fresh_sec()
+        else:
+            st["last_ok_ts"] = 0.0
+            st["last_ok_ip"] = None
+            st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+            if verdict == "unknown":
+                wait = _line_unknown_retry()
+            elif verdict in ("quota", "flagged", "blocked"):
+                wait = max(_line_persistent_retry(),
+                           _line_block_remaining(st.get("ip"), ts))
+            elif verdict == "blind":
+                wait = _line_transient_retry(1)
+            else:
+                wait = _line_transient_retry(st["fail_streak"])
+            st["next_probe_ts"] = ts + wait
+        _WARP_LINE_CV.notify_all()
+    _save_warp_line_state()
+    return True
+
+
+def _warp_line_note_ok(tag: str, ip: str, ts: float) -> None:
+    """生产成功流量也是 OK 来源；只更新内存，避免每 5s 落盘。"""
+    if not tag or not ip:
+        return
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        if st.get("ip") != ip:
+            st["last_ok_ts"] = 0.0
+            st["last_ok_ip"] = None
+        st["ip"] = ip
+        st["ip_ts"] = max(float(st.get("ip_ts") or 0.0), ts)
+        st["last_ok_ts"] = max(float(st.get("last_ok_ts") or 0.0), ts)
+        st["last_ok_ip"] = ip
+        st["last_verdict"] = "OK"
+        st["fail_streak"] = 0
+        st["next_probe_ts"] = max(float(st.get("next_probe_ts") or 0.0),
+                                  ts + _line_fresh_sec())
+        _WARP_LINE_CV.notify_all()
+
+
+def _warp_line_invalidate(ip: str | None, now: float | None = None) -> None:
+    """某地址被生产流量标脏：所有持有它的线立即失去 OK，等待重探。"""
+    if not ip:
+        return
+    if now is None:
+        now = time.time()
+    with _WARP_LINE_CV:
+        for st in _WARP_LINE_STATE.values():
+            if st.get("ip") == ip or st.get("last_ok_ip") == ip:
+                st["last_ok_ts"] = 0.0
+                st["last_ok_ip"] = None
+                if st.get("ip") == ip:
+                    st["last_verdict"] = "blocked"
+                    st["next_probe_ts"] = min(
+                        float(st.get("next_probe_ts") or now),
+                        now + _line_unknown_retry())
+        _WARP_LINE_CV.notify_all()
+    _save_warp_line_state()
+
+
+def _warp_line_fresh_candidates(exclude_tag: str | None,
+                                now: float | None = None) -> list[tuple[dict, str]]:
+    if now is None:
+        now = time.time()
+    with _WARP_REFRESH_LOCK:
+        refreshing = set(_WARP_REFRESHING)
+    fresh = _line_fresh_sec()
+    guard = float(_warp()["ip_reuse_guard_sec"])
+    out: list[tuple[dict, str]] = []
+    with _WARP_LINE_CV:
+        for m in _warp()["members"]:
+            tag = m["tag"]
+            if tag == exclude_tag or tag in refreshing:
+                continue
+            st = _warp_line_state_locked(tag)
+            ip = st.get("ip")
+            if not ip or st.get("warming"):
+                continue
+            if (st.get("last_ok_ip") != ip
+                    or now - float(st.get("last_ok_ts") or 0.0) > fresh):
+                continue
+            out.append((m, ip))
+    out = [(m, ip) for m, ip in out if not _warp_ip_is_blocked(ip, now)]
+    seen: set[str] = set()
+    deduped: list[tuple[dict, str]] = []
+    for m, ip in out:
+        if ip in seen:
+            continue
+        seen.add(ip)
+        deduped.append((m, ip))
+    deduped.sort(key=lambda p: _warp_ip_rank(p[1], now, guard))
+    return deduped
+
+
+def _warp_line_wait_fresh(exclude_tag: str | None,
+                          deadline: float) -> list[tuple[dict, str]]:
+    while True:
+        now = time.time()
+        cands = _warp_line_fresh_candidates(exclude_tag, now)
+        if cands:
+            return cands
+        if now >= deadline:
+            return []
+        next_due = deadline
+        with _WARP_LINE_CV:
+            for tag, st in _WARP_LINE_STATE.items():
+                if tag == exclude_tag:
+                    continue
+                due = float(st.get("next_probe_ts") or 0.0)
+                if not due:
+                    due = now + _line_unknown_retry()
+                next_due = min(next_due, due)
+                last_ok = float(st.get("last_ok_ts") or 0.0)
+                if st.get("last_ok_ip") == st.get("ip") and last_ok:
+                    next_due = min(next_due, last_ok + _line_fresh_sec())
+        timeout = min(max(0.05, deadline - now),
+                      max(0.05, next_due - now), 1.0)
+        with _WARP_LINE_CV:
+            _WARP_LINE_CV.wait(timeout=timeout)
+
+
+def _warp_line_selected(tag: str, ip: str, ts: float) -> None:
+    with _WARP_LINE_CV:
+        _warp_line_update_locked(tag, sel=ts, ip=ip, ip_ts=ts)
+        _WARP_LINE_CV.notify_all()
+    _save_warp_line_state()
+
+
+def _warp_line_restart_backoff(fail_streak: int) -> float:
+    seq = _warp().get("restart_backoff_sec", [2, 5, 10, 20, 60])
+    if not isinstance(seq, list) or not seq:
+        seq = [2, 5, 10, 20, 60]
+    base = float(seq[min(max(0, fail_streak - 1), len(seq) - 1)])
+    cap = float(_warp().get("restart_backoff_max_sec", 120))
+    return min(base, cap)
+
+
+def _warp_line_restart(member: dict, reason: str) -> bool:
+    """统一重启入口：只有确定失败才走到这里，且 active 线永不重启。"""
+    tag = member["tag"]
+    if tag == active_warp_tag():
+        log(f"  · 当前出口 {tag} 不重启（失败时换线，{reason}）")
+        return False
+    now = time.time()
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
+            return False
+        st["warming"] = True
+    busy = warp_line_busy(tag, _ERROR_PATH_BUSY_WINDOW_SEC)
+    if busy is not False:
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            st["warming"] = False
+            st["next_restart_ts"] = now + float(
+                _warp().get("restart_cooldown_sec", 5))
+            st["next_probe_ts"] = st["next_restart_ts"]
+        return False
+    if not _acquire_refresh_slot(tag):
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            st["warming"] = False
+            st["next_probe_ts"] = now + float(
+                _warp().get("restart_cooldown_sec", 5))
+        return False
+    if tag == active_warp_tag():
+        _release_refresh_slot(tag)
+        with _WARP_LINE_CV:
+            _warp_line_state_locked(tag)["warming"] = False
+        return False
+    restart_sem = _RESTART_SEM
+    got_restart_slot = False
+    if restart_sem is not None:
+        got_restart_slot = restart_sem.acquire(timeout=5)
+        if not got_restart_slot:
+            _release_refresh_slot(tag)
+            with _WARP_LINE_CV:
+                st = _warp_line_state_locked(tag)
+                st["warming"] = False
+                st["next_restart_ts"] = now + float(
+                    _warp().get("restart_cooldown_sec", 5))
+                st["next_probe_ts"] = st["next_restart_ts"]
+            return False
+    log(f"↻ 重启 {tag}（{reason}）")
+    prev_ip = _warp_line_state(tag).get("ip")
+    try:
+        _invalidate_warp_line_ip(tag)
+        ok = (_restart_service(member["service"], tag)
+              and _wait_port_ready(member["port"],
+                                   _warp()["ready_timeout_sec"]))
+        if not ok:
+            with _WARP_LINE_CV:
+                st = _warp_line_state_locked(tag)
+                st["warming"] = False
+                st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+                st["next_restart_ts"] = time.time() + _warp_line_restart_backoff(
+                    st["fail_streak"])
+                st["next_probe_ts"] = st["next_restart_ts"]
+            log(f"  ✗ {tag} 重启后未就绪（{reason}）")
+            return False
+        ip = _probe_refresh_egress(member["port"])
+        now = time.time()
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            st["warming"] = False
+            st["restart_count"] = int(st.get("restart_count") or 0) + 1
+            st["restart_ts"] = now
+            st["next_restart_ts"] = 0.0
+            st["last_ok_ts"] = 0.0
+            st["last_ok_ip"] = None
+            # 重启只换地址，不撤销该线已记录在案的惩罚：quota 的 16h /
+            # blocked 的 6h 是上游按 IP 给出的恢复时刻，重启把它改回 +5s
+            # 等于让惩罚失效（同址重启会立刻再烧一次配额）。
+            prev_next = float(st.get("next_probe_ts") or 0.0)
+            same_ip = bool(ip) and ip == prev_ip
+            if (same_ip and prev_next > now
+                    and st.get("last_verdict") in ("quota", "flagged", "blocked")):
+                st["next_probe_ts"] = prev_next
+            else:
+                st["last_verdict"] = "unknown"
+                st["next_probe_ts"] = now + _line_unknown_retry()
+            if ip:
+                st["ip"] = ip
+                st["ip_ts"] = now
+                st["port_ok"] = True
+            _WARP_LINE_CV.notify_all()
+        _save_warp_line_state()
+        log(f"  {'✓' if ip else '✗'} {tag} 重启后出口={ip or '探测失败'}")
+        return bool(ip)
+    except Exception as e:
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            st["warming"] = False
+            st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+            st["next_restart_ts"] = time.time() + _warp_line_restart_backoff(
+                st["fail_streak"])
+            st["next_probe_ts"] = st["next_restart_ts"]
+        log(f"  ✗ {tag} 重启异常: {e}")
+        return False
+    finally:
+        _release_refresh_slot(tag)
+        if got_restart_slot and restart_sem is not None:
+            restart_sem.release()
+
+
+def _probe_rate_allow() -> bool:
+    limit = int(_warp().get("probe_max_per_min", 30))
+    if limit <= 0:
+        return True
+    now = time.time()
+    with _PROBE_RATE_LOCK:
+        while _PROBE_RATE_TIMES and now - _PROBE_RATE_TIMES[0] > 60:
+            _PROBE_RATE_TIMES.popleft()
+        if len(_PROBE_RATE_TIMES) >= limit:
+            return False
+        _PROBE_RATE_TIMES.append(now)
+        return True
+
+
+def _probe_one_line(member: dict) -> None:
+    tag = member["tag"]
+    now = time.time()
+    st = _warp_line_state(tag)
+    if st.get("warming"):
+        return
+    active = active_warp_tag()
+    if (tag == active and st.get("ip")
+            and now - float(st.get("ip_ts") or 0.0)
+            < float(_warp().get("ip_observe_sec", 120))
+            and _warp_line_ok_fresh(tag, now)):
+        return
+    started_at = time.time()
+    ip = warp_egress_ip(member["port"])
+    if not ip:
+        _warp_line_record_observation(tag, None, "unknown", time.time(), started_at)
+        return
+    cur = _warp_line_state(tag)
+    if tag != active and _warp_line_ok_fresh(tag, now) and cur.get("ip") == ip:
+        _warp_line_update(tag, next_probe_ts=now + _line_fresh_sec())
+        return
+    if _warp_ip_is_blocked(ip, now):
+        _warp_line_record_observation(tag, ip, "blocked", time.time(), started_at)
+        if tag == active:
+            _reconnect_warp_now("探测发现当前出口处于惩罚期", time.time())
+        else:
+            _warp_line_restart(member, "出口处于惩罚期")
+        return
+    if _warp_probe_blind(now):
+        _warp_line_record_observation(tag, ip, "blind", time.time(), started_at)
+        return
+    if not _probe_rate_allow():
+        _warp_line_update(tag, next_probe_ts=now + 5.0)
+        return
+    sem = _MODEL_PROBE_SEM
+    if sem is None:
+        ok = _warp_model_usable(member, ip)
+    else:
+        with sem:
+            ok = _warp_model_usable(member, ip)
+    verdict = "OK" if ok else (_PROBE_LAST_VERDICT.get(tag) or "err")
+    if not _warp_line_record_observation(tag, ip, verdict,
+                                         time.time(), started_at):
+        return
+    if verdict == "OK":
+        return
+    if tag == active:
+        _reconnect_warp_now(f"探测失败 {verdict}", time.time())
+    else:
+        _warp_line_restart(member, f"模型层 {verdict}")
+
+
+def _warp_prober_loop() -> None:
+    while True:
+        now = time.time()
+        active = active_warp_tag()
+        due: list[tuple[float, dict]] = []
+        for m in _warp()["members"]:
+            tag = m["tag"]
+            with _WARP_LINE_CV:
+                if tag in _WARP_PROBING:
+                    continue
+            needs, due_ts = _warp_line_needs_probe(tag, now)
+            if needs:
+                due.append((due_ts, m))
+        free = int(_warp().get("probe_concurrency", 4)) - len(_WARP_PROBING)
+        if due and free > 0:
+            due.sort(key=lambda p: p[0])
+            for _, m in due[:free]:
+                tag = m["tag"]
+                with _WARP_LINE_CV:
+                    if tag in _WARP_PROBING:
+                        continue
+                    _WARP_PROBING.add(tag)
+
+                def _run(member: dict = m, tag: str = tag) -> None:
+                    try:
+                        _probe_one_line(member)
+                    except Exception as e:
+                        log(f"  ✗ 探测 {tag} 异常: {e}")
+                    finally:
+                        with _WARP_LINE_CV:
+                            _WARP_PROBING.discard(tag)
+                            _WARP_LINE_CV.notify_all()
+
+                threading.Thread(target=_run, daemon=True,
+                                 name=f"warp-probe-{tag}").start()
+            continue
+        if free <= 0:
+            time.sleep(0.2)
+            continue
+        next_due = now + float(_warp().get("prober_idle_wait_sec", 30))
+        with _WARP_LINE_CV:
+            for tag, st in _WARP_LINE_STATE.items():
+                next_due = min(next_due,
+                               float(st.get("next_probe_ts") or 0.0) or next_due)
+        with _WARP_LINE_CV:
+            _WARP_LINE_CV.wait(timeout=max(0.1, next_due - time.time()))
+
+
+def _start_warp_prober() -> None:
+    global _PROBER_STARTED, _PROBER_THREAD, _MODEL_PROBE_SEM, _RESTART_SEM
+    with _WARP_REFRESH_LOCK:
+        if _PROBER_STARTED:
+            return
+        _PROBER_STARTED = True
+    _MODEL_PROBE_SEM = threading.BoundedSemaphore(
+        max(1, int(_warp().get("model_probe_concurrency", 2))))
+    _RESTART_SEM = threading.BoundedSemaphore(
+        max(1, int(_warp().get("restart_concurrency", 4))))
+    _PROBER_THREAD = threading.Thread(target=_warp_prober_loop,
+                                      daemon=True, name="warp-prober")
+    _PROBER_THREAD.start()
+    log("✓ WARP 单实例探测器已启动（状态表驱动换线）")
 
 
 def _port_open(port: int) -> bool:
@@ -2280,11 +2927,6 @@ def _exclude_active_ip(pairs: list[tuple[dict, str]],
         seen.add(ip)
         out.append((m, ip))
     return out or pairs
-
-
-def _warp_line_selected(tag: str, ip: str, ts: float) -> None:
-    with _WARP_LINE_LOCK:
-        _WARP_LINE_STATE[tag] = {"sel": ts, "ip": ip}
 
 
 def _warp_ip_last_ts(ip: str | None) -> float:
@@ -2806,6 +3448,9 @@ def _record_active_ip_success(total: int, errors: int) -> None:
             entry["first_ok_ts"] = min(fresh)
         entry["last_ok_ts"] = max(float(entry.get("last_ok_ts") or 0), max(fresh))
         _save_warp_ip_used()
+    tag = active_warp_tag()
+    if tag:
+        _warp_line_note_ok(tag, ip, max(fresh))
 
 
 def _warp_ip_never_used(ip: str | None) -> bool:
@@ -2936,6 +3581,8 @@ def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
     # 的 IP→CYCLES 顺序交叉成环。
     if blocked and forget_probe:
         _probe_cache_forget(ip)
+    if blocked:
+        _warp_line_invalidate(ip, now)
     # 历史记在锁外：只追加文件，不碰 _WARP_IP_USED，让磁盘 I/O 不挡换线线程。
     # 只有本函数写历史 —— 每请求成功采样路径也调 _warp_ip_used_locked（为补
     # last_ok_ts），记在那里会让日志按请求量爆炸。
@@ -3707,16 +4354,16 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
         for m in _warp()["members"]:
             if active is not None and m["tag"] == active["tag"]:
                 continue
-            if not _port_open(m["port"]) or not _switch_warp(m["tag"], interrupt=True):
+            if not _port_open(m["port"]) or not _switch_warp(m["tag"]):
                 continue
-            _last_warp_switch_ok_ts = time.time()
+            _begin_segment(time.time())
             _proxy_dwell_since = 0
             log(f"↻ 轮换池冷却中（剩 {remain_min}min），改切 WARP 隧道 {m['tag']}")
             return True
         if active is None:
             return False
         return _restart_warp_inplace(active, old_ip)
-    if not _switch_warp("proxy", interrupt=True):
+    if not _switch_warp("proxy"):
         log("  ✗ 切轮换池失败，退回原地重连")
         if active is None:
             return False
@@ -3732,7 +4379,7 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
     # 错误触发的换线同样是一次「本段结束」：主动轮换的计时起点必须重置，
     # 否则刚落池就按上一段的已服务时长判到寿，秒级再切一次（实测 00:12:00
     # 落池后 22s 就报了 27s≥27s）。
-    _last_warp_switch_ok_ts = landed
+    _begin_segment(landed)
     _proxy_dwell_since = landed     # 落池时刻：回切判据只统计此后的拦截
     log("✓ 已切到轮换池 proxy（WARP 隧道全部不可用）")
     return True
@@ -3757,15 +4404,67 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
                                              _warp()["ip_reuse_guard_sec"])
                     and _warp_model_usable(member, new_ip)):
                 log(f"✓ WARP 出口已更换: {old_ip or '未知'} -> {new_ip}")
-                _last_warp_switch_ok_ts = now   # 本段结束：主动轮换计时重新开始
                 # selector 没变（还是在同一条线上），但会话地址换了：不更新的话
                 # 健康行会一直显示旧 IP，成功流量打点也记在旧地址上。
                 _ACTIVE_WARP_IP = new_ip
+                _begin_segment(now)  # 本段结束：主动轮换计时重新开始
                 return True
             log(f"  ✗ {member['tag']} 出口不新鲜: {new_ip or '探测失败'}")
         else:
             log(f"  ✗ {member['tag']} {_warp()['ready_timeout_sec']}s 内未就绪")
         time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
+    return False
+
+
+def _reconnect_warp_by_table(reason: str) -> bool:
+    """只读状态表换线：无 120s 内 OK 就等待，不现场探测、不重启、不落池。"""
+    global _ACTIVE_WARP_IP, _proxy_dwell_since, _last_warp_switch_ok_ts
+    now = time.time()
+    active = _warp_member(active_warp_tag())
+    old_ip = _ACTIVE_WARP_IP if active else None
+    if active:
+        _mark_warp_ip_used(old_ip, now)
+        log(f"↻ WARP 换线 ({reason})：当前 {active['tag']} 出口={old_ip or '未知'}")
+    else:
+        log(f"↻ WARP 换线 ({reason})：当前在轮换池 proxy，尝试切回 WARP 隧道")
+    cands = _warp_line_fresh_candidates(
+        active["tag"] if active else None, now)
+    if not cands:
+        deadline = now + float(_warp().get("switch_wait_sec", 20))
+        log("  · 暂无 120s 内 OK 的备线，等待探测器写入")
+        cands = _warp_line_wait_fresh(
+            active["tag"] if active else None, deadline)
+    if not cands:
+        log("  ⚠ 等待超时仍无新鲜备线，本次不切（不重启、不落池）")
+        return False
+    cands = [(m, ip) for m, ip in cands if ip != old_ip]
+    if not cands:
+        log("  ⚠ 新鲜备线均与当前出口同址，本次不切")
+        return False
+    for m, ip in cands:
+        if not _acquire_refresh_slot(m["tag"]):
+            continue
+        try:
+            if not _warp_line_ok_fresh(m["tag"], time.time()):
+                continue
+            if _warp_ip_is_blocked(ip, time.time()):
+                continue
+            if m["tag"] == active_warp_tag():
+                continue
+            if not _switch_warp(m["tag"]):
+                continue
+            switched_at = time.time()
+            _mark_warp_ip_used(ip, switched_at)
+            _warp_line_selected(m["tag"], ip, switched_at)
+            _ACTIVE_WARP_IP = ip
+            _begin_segment(switched_at)
+            _proxy_dwell_since = 0
+            _from = active["tag"] if active else "proxy"
+            log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip})")
+            return True
+        finally:
+            _release_refresh_slot(m["tag"])
+    log("  ⚠ 新鲜备线切换均失败，本次不切")
     return False
 
 
@@ -3778,6 +4477,8 @@ def reconnect_warp(reason: str) -> bool:
 
     不刷新刚换下的那条：在途请求仍走它，重启会掐断连接。
     """
+    if _PROBER_STARTED:
+        return _reconnect_warp_by_table(reason)
     global _ACTIVE_WARP_IP, _proxy_dwell_since, _last_warp_switch_ok_ts
     members = _warp()["members"]
     now = time.time()
@@ -4025,7 +4726,7 @@ def reconnect_warp(reason: str) -> bool:
         log(f"  ⚠ 选中备线 {m['tag']} 正在被刷新，本次换线放弃（等下一次错误重试）")
         return False
     try:
-        switched = _switch_warp(m["tag"], interrupt=True)
+        switched = _switch_warp(m["tag"])
     finally:
         _release_refresh_slot(m["tag"])
     if not switched:
@@ -4038,8 +4739,8 @@ def reconnect_warp(reason: str) -> bool:
     switched_at = time.time()
     _warp_line_selected(m["tag"], ip, switched_at)  # 轮转公平性
     _set_warp_line_ip(m["tag"], ip)  # 刚验证过：刷新缓存时刻，供下次快速选线
-    _last_warp_switch_ok_ts = switched_at
     _ACTIVE_WARP_IP = ip
+    _begin_segment(switched_at)
     _proxy_dwell_since = 0          # 回到 WARP，驻留计时清零
     _from = active["tag"] if active else "proxy"
     log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip}, "
@@ -5523,24 +6224,31 @@ def main():
     # 恢复跨重启的出口 IP 使用/污染记录与可用周期样本
     _load_warp_ip_used()
     _load_warp_ip_cycles()
+    _load_warp_line_state()
     _load_node_ip_used()
-    # 脏线守护：常驻线程，脏 IP 一出现就重连换干净地址，不依赖主循环周期。
-    # line_worker 启用时由它接管同一条职责（判断与执行在同一循环）。
-    if _line_worker_enabled():
-        _start_line_workers()
-    if not _line_worker_owns_scheduling():
-        _start_dirty_line_janitor()
+    # 单实例探测器接管所有线路的探测/状态写入；旧守护仅在回滚开关下启动。
+    prober_enabled = bool(_warp().get("prober_enabled", True))
+    if prober_enabled:
+        _start_warp_prober()
+    else:
+        # 脏线守护：常驻线程，脏 IP 一出现就重连换干净地址，不依赖主循环周期。
+        if _line_worker_enabled():
+            _start_line_workers()
+        if not _line_worker_owns_scheduling():
+            _start_dirty_line_janitor()
     # 日志标签用的当前 WARP 出口 IP：启动时探一次，之后由换线路径更新
-    global _ACTIVE_WARP_IP
+    global _ACTIVE_WARP_IP, _last_warp_switch_ok_ts
     _m = _warp_member(active_warp_tag())
     if _m:
         _ACTIVE_WARP_IP = warp_egress_ip(_m["port"])
-        _validate_startup_egress(_m)
+        if not prober_enabled:
+            _validate_startup_egress(_m)
     else:
         # 启动时就停在 proxy 上：落池时刻从此刻算，否则「落池后仍拦截」
         # 判据会拿 0 当起点，把落池前的旧 403/429 也算进去。
         global _proxy_dwell_since
         _proxy_dwell_since = time.time()
+    _last_warp_switch_ok_ts = _load_segment_start(_ACTIVE_WARP_IP)
 
     # 状态
     cooldown_until = 0
@@ -5760,9 +6468,9 @@ def main():
             _maybe_failback_to_warp_bg(now)
 
             # 任一隧道出口疑似脏就重连；掉在 proxy 池上时也要继续，
-            # 否则池本身就是脏地址时永远回不来。line_worker 自己每轮判所有线，
-            # 两套同时跑会把同一条线重启两次。
-            if not _line_worker_owns_scheduling():
+            # 否则池本身就是脏地址时永远回不来。单实例探测器启用后由它独占
+            # 探测/重启，旧补刷与 line_worker 都不再参与，避免同线双刷。
+            if not prober_enabled and not _line_worker_owns_scheduling():
                 _prewarm_standby_warp(now)
 
             # ---- 5. 节点健康检查 (每 300s) ----
