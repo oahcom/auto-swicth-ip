@@ -1992,6 +1992,8 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | T-259 | P2 | 锁文件权限与账本一致 | `pytest test_asip_atomic.py -k lock_file_is_private` | `chmod 0600`；`append_line` 恒 `fsync` |
 | T-260 | P2 | Clash 返回值逐字段校验 | `pytest test_asip_clash.py` | `all`/`now` 独立降级；`delay` 拒 bool/NaN/inf 并归一为 int |
 | T-261 | P2 | 超时结果带可读 error | `pytest test_asip_proc.py` | `ProcResult.error == "timeout after Xs"`；映射型 env 可传入 |
+| T-262 | P2 | 错误换线候选分批实测 | `pytest test_daemon_unit.py -k slice_probe` | `probe_candidates_per_switch=2` 时单轮只测 2 条，游标轮转覆盖全池 |
+| T-263 | P1 | 未实测候选不得放行 | `pytest test_daemon_unit.py -k admit_tested` | 只放行本轮 `tested` 为真的候选；`{}`/False 均得空集（变异验证已杀） |
 
 **实战验证（改动合入前人工执行一次）**：
 
@@ -2050,3 +2052,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.38 | 2026-10-26 | 第二轮审查修复：T-244 `asip.proc` 超时改杀进程组（孙进程不再泄漏）、T-245 Clash 连接表异常不外抛、T-246 日志注入覆盖 Unicode 行分隔符、T-241 扩展到「决策后已非当前出口则取消换线」、T-247 同步刷新改走按线锁、T-248~T-250 补齐 2xx/间隔/进程组 | codex 20 维 review |
 | v1.40 | 2026-10-26 | 第三轮整改：T-238 灰度期旧守护继续运行（dry_run 只观测不接管）、T-251 验收脚本 journal 失败语义、T-252 非 UTF-8 输出解码兜底、T-253 负数 text_limit 拒绝；`singbox_api` 异常只记一条日志 | 三方五维审查 |
 | v1.41 | 2026-10-26 | 第四轮整改：T-254 选线到 PUT 占按线锁、T-255 bad_nodes 跨进程共用 flock、T-256 日志剥 ANSI/C0；附 T-257 有界回收、T-258 恢复失败可见、T-259 锁文件 0600、T-260 Clash 字段校验、T-261 超时 error 文案 | 三方五维审查 |
+| v1.42 | 2026-10-26 | 限流省配额：T-262 错误换线单轮实测 N 条并轮转游标；T-263 抽出 `_admit_tested` 锁住「没测到 ≠ 可用」，补变异验证（放行未测→转红）。全量 532 passed | 实战配额风暴 + 自对抗 |
