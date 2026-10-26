@@ -2055,3 +2055,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.42 | 2026-10-26 | 限流省配额：T-262 错误换线单轮实测 N 条并轮转游标；T-263 抽出 `_admit_tested` 锁住「没测到 ≠ 可用」，补变异验证（放行未测→转红）。全量 532 passed | 实战配额风暴 + 自对抗 |
 | v1.43 | 2026-10-26 | 自查补测试（变异验证驱动）：T-256 增 ANSI/C0 用例（删 `_LOG_ANSI` 即转红）、T-254 增「选中线刷新槽被占则放弃换线」用例（去守卫即转红）；另修 workspace 文档中 `HttpResult.ok`/`text_limit`/`ProcResult.error` 等过期契约。全量待跑 | 三方 10 维自查 |
 | v1.44 | 2026-10-26 | Codex 第二轮 P1：`_admit_tested` 由「按出口 IP 放行」改为「按 tag 放行」——同址另一条线可能隧道已坏，仅 IP 相同不证明可用；用例补同 IP 双线，变异（改回 IP 过滤）转红。全量待跑 | Codex 第二轮 |
+| v1.45 | 2026-10-26 | 预热同样分批：`prewarm_max_per_round`(4) + `_PREWARM_CURSOR` 轮转；用例断言三轮切片顺序，变异（关闭切片）转红。Codex 单提交审查：e31faca PASS、7322c26 PASS、6ea3cf2 FAIL(P1 按 IP 放行)→已修(6d1ce68) | Codex 第二轮 |

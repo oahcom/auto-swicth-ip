@@ -1961,6 +1961,38 @@ def test_prewarm_batches_all_stale_standby_lines(monkeypatch):
     assert scheduled == ["W2"], f"新鲜线应跳过，实际 {scheduled}"
 
 
+def test_prewarm_slices_per_round_and_rotates_cursor(monkeypatch):
+    """配额风暴下预热也要分批：每轮最多 prewarm_max_per_round 条，游标轮转。
+
+    WHY：全量 18 条/轮会自己烧掉备线配额（与错误换线同理）。少了游标，
+    排在后面的脏线永远轮不到 —— 旧实现就只预热过固定的两三条。
+    """
+    members = [{"tag": "W1", "port": 1080, "service": "a.service"}] + [
+        {"tag": f"W{i}", "port": 1079 + i, "service": "a.service"}
+        for i in range(2, 6)]
+    _warp_env(monkeypatch, members)
+    monkeypatch.setitem(daemon.CFG, "warp", {
+        **daemon.CFG["warp"], "prewarm_sec": 120,
+        "prewarm_max_per_round": 2})
+    monkeypatch.setattr(daemon, "_last_warp_prewarm_ts", 0.0)
+    monkeypatch.setattr(daemon, "_PREWARM_CURSOR", 0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "count_opencode_since", lambda ts: 100)
+    monkeypatch.setattr(daemon, "_warp_ip_needs_refresh",
+                        lambda ip, now, tag: True)
+    scheduled = []
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh",
+                        lambda m: scheduled.append(m["tag"]))
+
+    rounds = []
+    for now in (1000.0, 2000.0, 3000.0):
+        scheduled.clear()
+        daemon._last_warp_prewarm_ts = 0.0
+        daemon._prewarm_standby_warp(now)
+        rounds.append(list(scheduled))
+    assert rounds == [["W2", "W3"], ["W4", "W5"], ["W2", "W3"]], rounds
+
+
 def test_prewarm_skips_only_the_line_already_being_refreshed(monkeypatch):
     """正在刷的那条线不重复排队，其余照排 —— 并发不设全池上限。
 

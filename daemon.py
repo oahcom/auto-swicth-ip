@@ -315,6 +315,8 @@ _last_warp_prewarm_ts: float = 0      # 上次预热备线的时刻
 # 错误换线时的候选探测游标：每轮只实测前 N 条，下一轮从上次停下的位置继续。
 # 全量探测 17 条要 15s，且每条烧一格配额 —— 换线越勤，池越快被烧空。
 _PROBE_SLICE_CURSOR: int = 0
+# 预热同样分轮：每轮只排 N 条，游标轮转覆盖全池。
+_PREWARM_CURSOR: int = 0
 # 出口 IP 可用周期样本：每段 = 换线生效 → 首次被 403/429 判不可用。
 # {"ip", "cycle", "ended_at", "ok"}，只保留 24h。落盘跨重启保留。
 _WARP_IP_CYCLES: list[dict] = []
@@ -4336,9 +4338,10 @@ def _prewarm_standby_warp(now: float) -> None:
     WARP-CF-B 之间往返。另一类脏线是 403/429 标记过的地址：它可能从没有过成功
     流量，只看「窗口内有无成功」会把它当新鲜线跳过，脏 IP 永远刷不掉。
 
-    一轮把所有低质备线**全部**排进补刷队列：池内各线互不依赖，全部并发刷即可，
-    只有同一条线内部互斥。旧实现每轮只取一条最久没被选中的，实测全库只预热过
-    11 次且集中在两三条线上，脏线永远轮不完。
+    每轮最多排 `prewarm_max_per_round` 条（默认 4），游标轮转覆盖全池：池内各线
+    互不依赖，同一条线内部互斥；但全量 18 条/轮会自己烧掉备线配额，与错误换线
+    同理。旧实现每轮只取一条最久没被选中的，实测全库只预热过 11 次且集中在两三条
+    线上，脏线永远轮不完 —— 故用「小批 + 轮转」而不是「一条」或「全部」。
     """
     global _last_warp_prewarm_ts
     if now - _last_warp_prewarm_ts < _warp()["prewarm_sec"]:
@@ -4363,6 +4366,13 @@ def _prewarm_standby_warp(now: float) -> None:
              and _warp_ip_needs_refresh(_warp_line_ip(m["tag"]), now, m["tag"])]
     if not cands:
         return
+    limit = int(_warp().get("prewarm_max_per_round", 0) or 0)
+    if limit > 0 and limit < len(cands):
+        global _PREWARM_CURSOR
+        total = len(cands)
+        start = _PREWARM_CURSOR % total
+        _PREWARM_CURSOR = (start + limit) % total
+        cands = (cands + cands)[start:start + limit]
     for m in cands:
         _schedule_idle_refresh(m)
     whys = "; ".join(
