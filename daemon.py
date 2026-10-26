@@ -2609,10 +2609,10 @@ def _admit_tested(probes: list[tuple[dict, str]],
     """只放行本轮实测通过的候选；没测到不等于可用。
 
     WHY：分批探测为省配额只测一部分，若按「没失败」放行，未测的线会被当成
-    可用切过去 —— 配额省了，却切到一条没验证的 429 出口。
+    可用切过去 —— 配额省了，却切到一条没验证的 429 出口。放行按 tag 而非
+    出口 IP：同址的其它线可能隧道已坏，仅凭 IP 相同不能证明它可用。
     """
-    ok_ips = {ip for m, ip in probes if tested.get(m["tag"])}
-    return [(m, ip) for m, ip in probes if ip in ok_ips]
+    return [(m, ip) for m, ip in probes if tested.get(m["tag"])]
 
 
 def _slice_probe_batch(pairs: list[tuple[dict, str]]) -> list[tuple[dict, str]]:

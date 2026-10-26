@@ -4357,3 +4357,9 @@ def test_admit_tested_rejects_unprobed_candidates():
     assert daemon._admit_tested(probes, {"W2": False}) == []
     assert daemon._admit_tested(probes, {"W2": True, "W3": True}) == probes
     assert daemon._admit_tested(probes, {}) == []
+
+    # 两条线共用出口 IP：只测了 W2，W3 不得因「IP 通过」被放行。
+    # 变异：把实现改回按 IP 集合过滤时本段转红（Codex 20 维第二轮 P1）。
+    shared = [(w2, "ip-same"), (w3, "ip-same")]
+    assert daemon._admit_tested(shared, {"W2": True}) == [(w2, "ip-same")]
+    assert daemon._admit_tested(shared, {"W3": True}) == [(w3, "ip-same")]

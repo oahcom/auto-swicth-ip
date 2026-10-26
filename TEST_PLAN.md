@@ -2054,3 +2054,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.41 | 2026-10-26 | 第四轮整改：T-254 选线到 PUT 占按线锁、T-255 bad_nodes 跨进程共用 flock、T-256 日志剥 ANSI/C0；附 T-257 有界回收、T-258 恢复失败可见、T-259 锁文件 0600、T-260 Clash 字段校验、T-261 超时 error 文案 | 三方五维审查 |
 | v1.42 | 2026-10-26 | 限流省配额：T-262 错误换线单轮实测 N 条并轮转游标；T-263 抽出 `_admit_tested` 锁住「没测到 ≠ 可用」，补变异验证（放行未测→转红）。全量 532 passed | 实战配额风暴 + 自对抗 |
 | v1.43 | 2026-10-26 | 自查补测试（变异验证驱动）：T-256 增 ANSI/C0 用例（删 `_LOG_ANSI` 即转红）、T-254 增「选中线刷新槽被占则放弃换线」用例（去守卫即转红）；另修 workspace 文档中 `HttpResult.ok`/`text_limit`/`ProcResult.error` 等过期契约。全量待跑 | 三方 10 维自查 |
+| v1.44 | 2026-10-26 | Codex 第二轮 P1：`_admit_tested` 由「按出口 IP 放行」改为「按 tag 放行」——同址另一条线可能隧道已坏，仅 IP 相同不证明可用；用例补同 IP 双线，变异（改回 IP 过滤）转红。全量待跑 | Codex 第二轮 |
