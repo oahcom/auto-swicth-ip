@@ -4303,3 +4303,20 @@ def test_bad_ban_until_does_not_break_hot_path(monkeypatch):
                        "ban_until": bad, "ban_kind": "rate429"}})
         assert daemon._warp_ip_is_blocked("ip-bad", now + 30) is True
         assert daemon._warp_ip_is_blocked("ip-bad", now + 61) is False
+
+
+def test_slice_probe_batch_rotates_and_wraps(monkeypatch):
+    """换线探测只取一小批，且游标轮转，几轮覆盖全池。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_candidates_per_switch", 2)
+    monkeypatch.setattr(daemon, "_PROBE_SLICE_CURSOR", 0)
+    pairs = [({"tag": f"T{i}"}, f"ip{i}") for i in range(5)]
+    assert [m["tag"] for m, _ in daemon._slice_probe_batch(pairs)] == ["T0", "T1"]
+    assert [m["tag"] for m, _ in daemon._slice_probe_batch(pairs)] == ["T2", "T3"]
+    assert [m["tag"] for m, _ in daemon._slice_probe_batch(pairs)] == ["T4", "T0"]
+    assert [m["tag"] for m, _ in daemon._slice_probe_batch(pairs)] == ["T1", "T2"]
+
+
+def test_slice_probe_batch_all_when_unlimited(monkeypatch):
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_candidates_per_switch", 0)
+    pairs = [({"tag": f"T{i}"}, f"ip{i}") for i in range(5)]
+    assert daemon._slice_probe_batch(pairs) == pairs

@@ -312,6 +312,9 @@ _proactive_progress: str = "-"
 # 摘要直接展示判据当时算出的时刻，不重算也不重查。
 _POOL_PROACTIVE_LABEL: str = "-"
 _last_warp_prewarm_ts: float = 0      # 上次预热备线的时刻
+# 错误换线时的候选探测游标：每轮只实测前 N 条，下一轮从上次停下的位置继续。
+# 全量探测 17 条要 15s，且每条烧一格配额 —— 换线越勤，池越快被烧空。
+_PROBE_SLICE_CURSOR: int = 0
 # 出口 IP 可用周期样本：每段 = 换线生效 → 首次被 403/429 判不可用。
 # {"ip", "cycle", "ended_at", "ok"}，只保留 24h。落盘跨重启保留。
 _WARP_IP_CYCLES: list[dict] = []
@@ -2601,6 +2604,24 @@ def _warp_model_test_many(pairs: list[tuple[dict, str]]) -> dict[str, bool]:
     return out
 
 
+def _slice_probe_batch(pairs: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
+    """错误换线只取下一小批候选实测，控制单次延迟与配额消耗。
+
+    WHY：全量实测 14~19 条约 15s，且每条探针都占该出口一格免费配额。错误风暴里
+    每 10~25s 换一次线，等于自己把池里的配额烧光，之后无论切到哪条都 429 —— 这
+    正是「明明在换线，却要 2 分钟才恢复」的机制。游标让下一轮从上次停下的位置
+    继续，几轮内仍能覆盖全池。
+    """
+    limit = int(_warp().get("probe_candidates_per_switch", 0) or 0)
+    if limit <= 0 or limit >= len(pairs):
+        return pairs
+    global _PROBE_SLICE_CURSOR
+    start = _PROBE_SLICE_CURSOR % len(pairs)
+    batch = (pairs + pairs)[start:start + limit]
+    _PROBE_SLICE_CURSOR = (start + limit) % len(pairs)
+    return batch
+
+
 _last_success_probe: tuple[int, int] | None = None
 
 
@@ -3809,14 +3830,19 @@ def reconnect_warp(reason: str) -> bool:
     if not _ip_history_is_truth() and probes:
         # 同一 IP 可能被多条线持有，先按 IP 去重；当前出口马上要被排除，也不再
         # 为它烧一格配额。结论按 IP 生效：同址的其它线即使没被测到也要一起丢弃。
-        to_test = _dedupe_probe_pairs(probes, old_ip)
+        to_test_all = _dedupe_probe_pairs(probes, old_ip)
+        to_test = _slice_probe_batch(to_test_all)
+        if len(to_test) < len(to_test_all):
+            log(f"  ↻ 本轮实测 {len(to_test)}/{len(to_test_all)} 条候选"
+                "（限流省配额，下一轮接着测）")
         tested = _warp_model_test_many(to_test)
         failed = [m for m, _ in to_test if not tested.get(m["tag"])]
-        failed_ips = {ip for m, ip in to_test if not tested.get(m["tag"])}
+        ok_ips = {ip for m, ip in to_test if tested.get(m["tag"])}
         if failed:
             log(f"  ↻ {len(failed)} 条备线模型层实测不通过，重连换会话 IP")
             blocked_lines.extend(failed)
-        probes = [(m, ip) for m, ip in probes if ip not in failed_ips]
+        # 本轮没测到的候选不放行：模型模式下「没测」不等于「可用」。
+        probes = [(m, ip) for m, ip in probes if ip in ok_ips]
 
 
     # 备线出口全被标记时刷新一条拿新会话 IP，刷新不出才落 proxy 池 —— 池只是
