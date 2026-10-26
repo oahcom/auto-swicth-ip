@@ -607,7 +607,7 @@ def test_restart_singbox_resets_count_on_success():
     # 重启成功后 daemon 会恢复重启前的出口（_switch_warp → PUT selector）。
     # 测试不得写到真实 sing-box，此处打桩。
     calls = []
-    daemon._switch_warp = lambda tag: calls.append(tag) or True
+    daemon._switch_warp = lambda tag, **kw: calls.append(tag) or True
     # 重启前停在轮换池：selector 会回到 default(WARP-CF)，必须切回 proxy，
     # 否则一次重启就把出口静默从池换成 WARP。本用例显式打开落池开关。
     orig_fallback_enabled = daemon.CFG["warp"]["proxy_fallback_enabled"]
@@ -657,7 +657,7 @@ def test_restart_singbox_keeps_mode_when_previous_unknown():
     daemon._set_outbound_proxy = lambda *a, **k: None
     daemon.is_singbox_alive = lambda: True
     daemon.time.sleep = lambda *a, **k: None
-    daemon._switch_warp = lambda tag: calls.append(tag) or True
+    daemon._switch_warp = lambda tag, **kw: calls.append(tag) or True
     daemon._current_mode = lambda: ("unknown", None)
     try:
         assert daemon.restart_singbox() is True, "重启后探测成功应返回 True"
@@ -1301,7 +1301,7 @@ def test_failover_switches_to_standby_and_refreshes_idle(monkeypatch):
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: {1080: "1.1.1.1", 1081: "2.2.2.2"}[port])
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: pytest.fail("换线成功不应重启隧道"))
     monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m, **kw: None)
     assert daemon.reconnect_warp("test") is True
@@ -1319,7 +1319,7 @@ def test_failover_skips_dead_standby(monkeypatch):
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1" if port == 1080 else None)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: False)
     assert daemon.reconnect_warp("test") is True
@@ -1333,7 +1333,7 @@ def test_failover_without_standby_falls_back_to_proxy(monkeypatch):
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=20.0: "1.1.1.1")
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     monkeypatch.setattr(daemon, "_wait_port_ready", lambda p, t: True)
     assert daemon.reconnect_warp("test") is True
@@ -1347,7 +1347,7 @@ def test_proxy_fallback_respects_cooldown(monkeypatch):
     monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 1000.0)
     monkeypatch.setattr(daemon, "_port_open", lambda p: False)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     restarted = []
     monkeypatch.setattr(daemon, "_restart_warp_inplace",
                         lambda m, ip: restarted.append(m["tag"]) or True)
@@ -1364,7 +1364,7 @@ def test_proxy_fallback_cooldown_switches_other_warp_line(monkeypatch):
     monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 1000.0)
     monkeypatch.setattr(daemon, "_port_open", lambda p: True)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_restart_warp_inplace",
                         lambda m, ip: pytest.fail("有可用备线时不应原地重连"))
     assert daemon._fallback_to_proxy(WARP_TWO[0], "1.1.1.1", 2000.0) is True
@@ -1380,7 +1380,7 @@ def test_proxy_fallback_updates_cooldown_after_success(monkeypatch):
     monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 0.0)
     monkeypatch.setattr(daemon.time, "time", lambda: 5000.0)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     assert daemon._fallback_to_proxy(None, None, 20000.0) is True
     assert switched == ["proxy"], f"冷却通过应落池, 实际 {switched}"
     assert daemon._last_proxy_fallback_ts == 5000.0
@@ -1393,7 +1393,7 @@ def test_proxy_fallback_disabled_restarts_inplace(monkeypatch):
     monkeypatch.setattr(daemon, "_proxy_fallback_ts_loaded", True)
     monkeypatch.setattr(daemon, "_last_proxy_fallback_ts", 0.0)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     restarted = []
     monkeypatch.setattr(daemon, "_restart_warp_inplace",
                         lambda m, ip: restarted.append(m["tag"]) or True)
@@ -1407,9 +1407,46 @@ def test_proxy_fallback_disabled_without_active_gives_up(monkeypatch):
     _warp_env(monkeypatch, WARP_TWO)
     monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", False)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     assert daemon._fallback_to_proxy(None, None, 20000.0) is False
     assert switched == [], f"落池禁用时不得切任何出口, 实际 {switched}"
+
+
+def test_reclaim_foreign_pool_switches_back_when_disabled(monkeypatch):
+    """外部把 opencode-out 翻到 proxy 时，主循环必须拉回最近的 WARP 线。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", False)
+    monkeypatch.setattr(daemon, "_current_mode", lambda: ("proxy", None))
+    monkeypatch.setattr(daemon, "_LAST_WARP_TAG", "W2")
+    monkeypatch.setattr(daemon, "_LAST_POOL_RECLAIM_TS", 0.0)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
+    assert daemon._reclaim_foreign_pool(1000.0) is True
+    assert switched == ["W2"], f"应回收至最近的 WARP 线, 实际 {switched}"
+
+
+def test_reclaim_foreign_pool_noop_when_fallback_enabled(monkeypatch):
+    """启用落池兜底时，停在 proxy 是合法状态，不得抢切。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
+    monkeypatch.setattr(daemon, "_current_mode", lambda: ("proxy", None))
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
+    assert daemon._reclaim_foreign_pool(1000.0) is False
+    assert switched == [], f"启用兜底时不得回收, 实际 {switched}"
+
+
+def test_reclaim_foreign_pool_respects_gap(monkeypatch):
+    """10s 内不重复回收，避免与换线线程互相覆盖。"""
+    _warp_env(monkeypatch, WARP_TWO)
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", False)
+    monkeypatch.setattr(daemon, "_current_mode", lambda: ("proxy", None))
+    monkeypatch.setattr(daemon, "_LAST_WARP_TAG", "W1")
+    monkeypatch.setattr(daemon, "_LAST_POOL_RECLAIM_TS", 995.0)
+    switched = []
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
+    assert daemon._reclaim_foreign_pool(1000.0) is False
+    assert switched == [], f"冷却期内不得回收, 实际 {switched}"
 
 
 def test_inplace_restart_gives_up_after_max_attempts(monkeypatch):
@@ -1620,7 +1657,7 @@ def test_warp_failover_refreshes_target_ip_before_switch(monkeypatch):
 
     monkeypatch.setattr(daemon, "_restart_service", fake_restart)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     assert daemon.reconnect_warp("test") is True
     assert refreshed == ["usque-warp-b.service"], "目标 IP 用过就必须先刷新该隧道"
@@ -1637,7 +1674,7 @@ def test_warp_failover_skips_refresh_for_fresh_ip(monkeypatch):
     monkeypatch.setattr(daemon, "_restart_service",
                         lambda service, tag=None: restarted.append(service) or True)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     assert daemon.reconnect_warp("test") is True
     assert "usque-warp-b.service" not in restarted, "新鲜 IP 不该触发备线重启"
@@ -1672,7 +1709,7 @@ def test_sync_path_refreshes_at_most_one_blocked_line(monkeypatch):
     scheduled = []
     monkeypatch.setattr(daemon, "_schedule_idle_refresh",
                         lambda m: scheduled.append(m["tag"]))
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: True)
 
     daemon.reconnect_warp("rate429 ×1")
     assert len(refreshed) == 1, f"同步路径只该刷一条，实际刷了 {refreshed}"
@@ -1688,7 +1725,7 @@ def test_warp_failover_skips_target_when_refresh_keeps_stale_ip(monkeypatch):
     daemon._WARP_IP_USED["stale-ip"] = {"ts": 900.0, "blocked": False, "last_ok_ts": 900.0}
     monkeypatch.setattr(daemon, "_restart_service", lambda service, tag=None: True)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     assert daemon.reconnect_warp("test") is True
     assert switched == ["proxy"], f"不得切到仍是旧 IP 的备线，应切 proxy，实际 {switched}"
@@ -1715,7 +1752,7 @@ def test_failover_excludes_line_under_refresh(monkeypatch):
     monkeypatch.setattr(daemon, "_wait_warp_idle", lambda m: False)
     monkeypatch.setattr(daemon, "_refresh_idle_warp", lambda m, **kw: None)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     daemon.reconnect_warp("test")
     assert "W2" not in switched, f"补刷中的线不得被切过去，实际 {switched}"
@@ -1750,7 +1787,7 @@ def test_reconnect_warp_refreshes_blocked_standby_before_fallback(monkeypatch):
     monkeypatch.setattr(daemon, "_restart_service",
                         lambda s, tag=None: restarted.append(s) or True)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     assert daemon.reconnect_warp("abuse403") is True
     assert restarted == ["usque-warp-b.service"], f"应刷新被标记的备线，实际 {restarted}"
@@ -1784,7 +1821,7 @@ def test_reconnect_warp_prefers_longest_unselected_fresh_line(monkeypatch):
     })
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     assert daemon.reconnect_warp("test") is True
     assert switched == ["W3"], f"应选最久没被用过的 W3，实际 {switched}"
@@ -1854,7 +1891,7 @@ def test_reconnect_warp_records_switch_effective_time(monkeypatch):
                         lambda port, timeout_sec=20.0: {1080: "ip-w1", 1081: "ip-w2"}[port])
     monkeypatch.setattr(daemon.time, "time", lambda: 7_000_000.0)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: True)
 
     assert daemon.reconnect_warp("test") is True
     assert daemon._last_warp_switch_ok_ts == 7_000_000.0
@@ -2044,7 +2081,7 @@ def test_reconnect_warp_schedules_refresh_for_blocked_standbys(monkeypatch):
     scheduled = []
     monkeypatch.setattr(daemon, "_schedule_idle_refresh",
                         lambda m: scheduled.append(m["tag"]))
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: True)
 
     assert daemon.reconnect_warp("abuse403") is True
     assert scheduled == ["W1", "W2"], \
@@ -2200,6 +2237,28 @@ def test_switch_warp_logs_mode_transition_only(monkeypatch):
     daemon._switch_warp("proxy")
     assert len(logs) == 2 and "warp -> proxy" in logs[1], f"实际 {logs}"
 
+
+def test_switch_warp_interrupt_closes_old_connections(monkeypatch):
+    """错误触发的换线必须带 interrupt_exist_connections。
+
+    9router/opencode 用 HTTP/2 长连接，只改 selector 不会迁移已建连接：旧连接
+    继续走烧掉的出口，实测换线后还会再报 2 分钟 429，而探针（新连接）全 OK。
+    """
+    _warp_env(monkeypatch, WARP_TWO)
+    bodies = []
+    monkeypatch.setattr(daemon, "_current_mode", lambda: ("warp", "W1"))
+    monkeypatch.setattr(daemon, "_publish_clash_snapshot", lambda *a, **kw: None)
+
+    def fake_api(path, method="GET", body=None, **kw):
+        bodies.append(body)
+        return 200, {"now": "W2"}
+
+    monkeypatch.setattr(daemon, "singbox_api", fake_api)
+    daemon._switch_warp("W2")
+    assert bodies[-1] == {"name": "W2"}, f"默认不得中断在途连接: {bodies[-1]}"
+    daemon._switch_warp("W2", interrupt=True)
+    assert bodies[-1] == {"name": "W2", "interrupt_exist_connections": True}, bodies[-1]
+
 def test_warp_failover_refreshes_blocked_line_instead_of_proxy(monkeypatch):
     """备线出口全被标记 → 刷新一条拿新 IP 再切，不直接落 proxy 池。
 
@@ -2230,7 +2289,7 @@ def test_warp_failover_refreshes_blocked_line_instead_of_proxy(monkeypatch):
         "burned-c": {"ts": 1000.0, "blocked": True},
     })
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     assert daemon.reconnect_warp("abuse403") is True
     assert len(restarted) == 1, f"只刷新一条备线即可，实际 {restarted}"
@@ -2251,7 +2310,7 @@ def test_warp_failover_falls_back_when_blocked_refresh_fails(monkeypatch):
     })
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     assert daemon.reconnect_warp("abuse403") is True
     assert switched == ["proxy"], f"刷新不出新地址才落 proxy，实际 {switched}"
@@ -2274,7 +2333,7 @@ def test_warp_failover_uses_unblocked_line_when_mixed(monkeypatch):
     })
     monkeypatch.setattr(daemon, "_restart_service", lambda s, tag=None: True)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
 
     assert daemon.reconnect_warp("test") is True
     assert switched == ["W2"], f"应切到未标记的 W2，实际 {switched}"
@@ -2463,7 +2522,7 @@ def test_switch_stamps_ip_with_actual_switch_time(monkeypatch):
         1080: "ip-w1", 1081: "ip-w2"}[port])
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon.time, "time", lambda: 9_000_000.0)
 
@@ -2495,7 +2554,7 @@ def test_fallback_stamps_actual_landing_time_not_stale_caller_now(monkeypatch):
     """
     monkeypatch.setattr(daemon, "opencode_out_on_warp", lambda: True)
     monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon, "_proxy_dwell_since", 0.0)
     monkeypatch.setattr(daemon.time, "time", lambda: 5_000_000.0)
@@ -2650,7 +2709,7 @@ def test_reconnect_warp_picks_longest_rest_when_none_fresh(monkeypatch):
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
                         lambda m: refreshed.append(m["tag"]) or f"fresh-{m['tag']}")
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
 
     assert daemon.reconnect_warp("test") is True
@@ -2688,7 +2747,7 @@ def test_fallback_selection_prefers_non_cooling_line(monkeypatch):
     monkeypatch.setattr(daemon, "_refresh_idle_warp",
                         lambda m, **kw: f"fresh-{m['tag']}")
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
 
     assert daemon.reconnect_warp("test") is True
@@ -2752,7 +2811,7 @@ def test_cached_standby_skips_probe_when_fresh(monkeypatch):
 
     monkeypatch.setattr(daemon, "_probe_warp_egress", _probe)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
 
     assert daemon.reconnect_warp("test") is True
@@ -2788,7 +2847,7 @@ def test_cached_standby_keeps_all_candidates_not_just_first(monkeypatch):
     monkeypatch.setattr(daemon, "_probe_warp_egress",
                         lambda ms: egress)  # 不应被调用
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
 
     # 直接盯选线日志里的「备线 N 条」：这是候选池大小，唯一能区分
@@ -2832,7 +2891,7 @@ def test_single_cached_candidate_probes_remainder(monkeypatch):
     monkeypatch.setattr(daemon, "_probe_warp_egress", _probe)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp",
-                        lambda tag: switched.append(tag) or True)
+                        lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     lines = []
     monkeypatch.setattr(daemon, "log", lambda msg: lines.append(msg))
@@ -2890,7 +2949,7 @@ def test_error_switch_resets_proactive_timer(monkeypatch):
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 1000.0)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda ip, ts, **k: None)
     monkeypatch.setattr(daemon.time, "time", lambda: 5000.0)
 
@@ -3419,7 +3478,7 @@ def test_reconnect_prefers_never_used_over_recently_used(monkeypatch):
                         lambda port, timeout_sec=20.0: {"1080": "ip-old", "1081": "ip-new"}.get(str(port)))
     monkeypatch.setattr(daemon, "_WARP_REFRESHING", set())
     picked = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: picked.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: picked.append(tag) or True)
     monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda ip, ts, blocked=False: None)
     monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda *a: None)

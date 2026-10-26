@@ -292,6 +292,12 @@ _WARP_IP_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      ".warp_ip_history.jsonl")
 # 当前 WARP 出口 IP，仅供日志标签用（健康行每 10s 打一条，不能现场探测）。
 _ACTIVE_WARP_IP: str | None = None
+# 最近一次成功切到的 WARP tag。外部进程（测试/手工/其他 agent）直接 PUT
+# opencode-out=proxy 时没有日志、也不经过 _fallback_to_proxy 闸门；落池即断流，
+# 主循环发现后用它回收。
+_LAST_WARP_TAG: str | None = None
+_LAST_POOL_RECLAIM_TS: float = 0.0
+_POOL_RECLAIM_MIN_GAP_SEC = 10.0
 # tag -> {"sel": 上次被选为出口的时刻, "ip": 已知的当前出口 IP}。
 # 选线要挑「最久没被选过」的线：只看 IP 使用表不行 —— 出窗口的条目会被
 # 清理，清理后所有备线并列最老，又退化成 members 顺序（实测 D/E 被选中 0 次）。
@@ -1833,8 +1839,13 @@ def _current_mode() -> tuple[str, str | None]:
     return ("warp", now) if _warp_member(now) else ("proxy", None)
 
 
-def _switch_warp(tag: str) -> bool:
-    """翻转 opencode-out selector。interrupt_exist_connections=false，在途请求不断。
+def _switch_warp(tag: str, interrupt: bool = False) -> bool:
+    """翻转 opencode-out selector。interrupt=False 时在途请求不断。
+
+    interrupt=True 用于错误触发的换线：9router / opencode 用 HTTP/2 长连接，
+    只改 selector 不会迁移已建立的连接，旧连接继续走烧掉的出口 —— 实测换线
+    后 429 还要再报 2 分钟才恢复，期间探针（新连接）却全是 OK。换线时一并
+    请求 sing-box 断开旧连接，下一次请求才会真正落到新线。
 
     成功后立即把快照的 now 改写为 tag：判定（尤其是补刷前的「这条线是不是
     已经成为出口」）读的就是快照，晚 0.5s 看到就可能重启一条正在服务的隧道。
@@ -1846,7 +1857,10 @@ def _switch_warp(tag: str) -> bool:
     滞后 0.5s，连切两次时会漏打一次模式日志。
     """
     before = _current_mode()
-    r, _ = singbox_api(f'/proxies/{_warp()["selector"]}', method="PUT", body={"name": tag})
+    body = {"name": tag}
+    if interrupt:
+        body["interrupt_exist_connections"] = True
+    r, _ = singbox_api(f'/proxies/{_warp()["selector"]}', method="PUT", body=body)
     if r not in (200, 204):
         log(f"✗ 切换 WARP 线路失败 ({tag}): status={r}")
         return False
@@ -1859,7 +1873,33 @@ def _switch_warp(tag: str) -> bool:
     # 用户口径：刷新次数从「离开主渠道」起算到 OK。切到别处即开始计时，
     # 切回这条线（成为当前出口）即结束并把计数清零 —— 下次离渠重新从 0 数。
     _track_offline_refresh(before[1], after[1] if after[0] == "warp" else None)
+    if after[0] == "warp":
+        global _LAST_WARP_TAG
+        _LAST_WARP_TAG = tag
     return True
+
+
+def _reclaim_foreign_pool(now: float | None = None) -> bool:
+    """把外部写入的 opencode-out=proxy 拉回 WARP。
+
+    禁用落池后，selector 只应由本进程改。但测试进程、手工 curl、其他 agent
+    都能直连 Clash API 静默翻转（实测 06:14/06:16/06:26/07:02 各一次，都没有
+    `⇄ 出口模式切换` 日志，`落池已禁用` 计数为 0）。落池即断流，所以每个主
+    循环 tick 校验一次；发现即切回最近使用的 WARP 线。
+    """
+    global _LAST_POOL_RECLAIM_TS
+    if _warp().get("proxy_fallback_enabled", False):
+        return False
+    now = time.time() if now is None else now
+    if now - _LAST_POOL_RECLAIM_TS < _POOL_RECLAIM_MIN_GAP_SEC:
+        return False
+    mode, _tag = _current_mode()
+    if mode != "proxy":
+        return False
+    target = _LAST_WARP_TAG if _warp_member(_LAST_WARP_TAG) else _warp()["members"][0]["tag"]
+    _LAST_POOL_RECLAIM_TS = now
+    log(f"⚠ 检测到外部落池（opencode-out=proxy），回收至 {target}")
+    return _switch_warp(target, interrupt=True)
 
 
 def _restart_service(service: str, tag: str | None = None) -> bool:
@@ -3597,7 +3637,7 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
         for m in _warp()["members"]:
             if active is not None and m["tag"] == active["tag"]:
                 continue
-            if not _port_open(m["port"]) or not _switch_warp(m["tag"]):
+            if not _port_open(m["port"]) or not _switch_warp(m["tag"], interrupt=True):
                 continue
             _last_warp_switch_ok_ts = time.time()
             _proxy_dwell_since = 0
@@ -3606,7 +3646,7 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
         if active is None:
             return False
         return _restart_warp_inplace(active, old_ip)
-    if not _switch_warp("proxy"):
+    if not _switch_warp("proxy", interrupt=True):
         log("  ✗ 切轮换池失败，退回原地重连")
         if active is None:
             return False
@@ -3904,7 +3944,7 @@ def reconnect_warp(reason: str) -> bool:
         log("  ⚠ 无可用备线，切轮换池兜底")
         return _fallback_to_proxy(active, old_ip, now)
 
-    if not _switch_warp(m["tag"]):
+    if not _switch_warp(m["tag"], interrupt=True):
         return _fallback_to_proxy(active, old_ip, now)
     # 静置时长要在标记本次使用之前算：标完再看恒为 0，日志就成了「/64 静置 0min」。
     rest = _warp_prefix_rest(ip, now)
@@ -5668,6 +5708,11 @@ def main():
             if now - _last_wal_checkpoint > 300:
                 _last_wal_checkpoint = now
                 _submit_once("wal-checkpoint", _wal_checkpoint)
+
+            # ---- 8c. 回收外部落池 ----
+            # 禁用落池后 selector 只应由本进程改；外部写入没有日志可追，
+            # 只能每 tick 对账一次（内部自限 10s）。
+            _reclaim_foreign_pool(now)
 
             # ---- 9. 健康摘要（每 10s 最多一条） ----
             with _state_lock:

@@ -975,7 +975,7 @@ def test_model_mode_selection_trusts_probe_not_history(monkeypatch):
 
     monkeypatch.setattr(daemon, "_warp_model_test_many", fake_test_many)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a: None)
     monkeypatch.setattr(daemon, "_set_warp_line_ip", lambda *a: None)
@@ -1010,7 +1010,7 @@ def _reconnect_fixture(monkeypatch, test_many, refresh_result=None):
     monkeypatch.setattr(daemon, "_schedule_idle_refresh",
                         lambda m: scheduled.append(m["tag"]))
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a: None)
     monkeypatch.setattr(daemon, "_set_warp_line_ip", lambda *a: None)
     monkeypatch.setattr(daemon, "_warp_prefix_rest", lambda ip, now: None)
