@@ -2440,6 +2440,11 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
     verdict = verdict or "unknown"
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
+        # 探测启动后这条线可能已被换线路径记为 OK（`_warp_line_note_ok`）。
+        # 晚到的未知结论不能把更新的 OK 清掉，否则又回到「探不到就重探」。
+        if (started_at is not None
+                and float(st.get("last_ok_ts") or 0.0) > started_at):
+            return False
         old_ip = st.get("ip")
         if ip:
             if old_ip and old_ip != ip:
@@ -2603,26 +2608,41 @@ def _warp_line_restart(member: dict, reason: str) -> bool:
         if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
             return False
         st["warming"] = True
-    busy = warp_line_busy(tag, _ERROR_PATH_BUSY_WINDOW_SEC)
-    if busy is not False:
-        with _WARP_LINE_CV:
-            st = _warp_line_state_locked(tag)
-            st["warming"] = False
-            st["next_restart_ts"] = now + float(
-                _warp().get("restart_cooldown_sec", 5))
-            st["next_probe_ts"] = st["next_restart_ts"]
-        return False
-    if not _acquire_refresh_slot(tag):
+    got_slot = False
+    try:
+        busy = warp_line_busy(tag, _ERROR_PATH_BUSY_WINDOW_SEC)
+        if busy is not False:
+            with _WARP_LINE_CV:
+                st = _warp_line_state_locked(tag)
+                st["warming"] = False
+                st["next_restart_ts"] = now + float(
+                    _warp().get("restart_cooldown_sec", 5))
+                st["next_probe_ts"] = st["next_restart_ts"]
+            return False
+        got_slot = _acquire_refresh_slot(tag)
+        if not got_slot:
+            with _WARP_LINE_CV:
+                st = _warp_line_state_locked(tag)
+                st["warming"] = False
+                st["next_probe_ts"] = now + float(
+                    _warp().get("restart_cooldown_sec", 5))
+            return False
+        if tag == active_warp_tag():
+            _release_refresh_slot(tag)
+            got_slot = False
+            with _WARP_LINE_CV:
+                _warp_line_state_locked(tag)["warming"] = False
+            return False
+    except Exception as e:
+        # 判忙/拿槽异常若把 warming 留在 True，这条线会被所有探测路径永久跳过。
+        if got_slot:
+            _release_refresh_slot(tag)
         with _WARP_LINE_CV:
             st = _warp_line_state_locked(tag)
             st["warming"] = False
             st["next_probe_ts"] = now + float(
                 _warp().get("restart_cooldown_sec", 5))
-        return False
-    if tag == active_warp_tag():
-        _release_refresh_slot(tag)
-        with _WARP_LINE_CV:
-            _warp_line_state_locked(tag)["warming"] = False
+        log(f"  ✗ {tag} 重启前置检查异常: {e}")
         return False
     restart_sem = _RESTART_SEM
     got_restart_slot = False
@@ -2754,6 +2774,10 @@ def _probe_one_line(member: dict) -> None:
         with sem:
             ok = _warp_model_usable(member, ip)
     verdict = "OK" if ok else (_PROBE_LAST_VERDICT.get(tag) or "err")
+    if not ok and verdict == "OK":
+        # `_warp_model_usable` 的「证据比事实旧」等早退路径给不出本次结论，
+        # 沿用上一次残留的 OK 会把失败记成假成功。
+        verdict = "err"
     if not _warp_line_record_observation(tag, ip, verdict,
                                          time.time(), started_at):
         return

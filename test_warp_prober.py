@@ -144,3 +144,65 @@ def test_restart_new_ip_clears_park_for_untested_ip(monkeypatch):
     assert st["ip"] == "9.9.9.9"
     assert st["last_verdict"] == "unknown"
     assert st["next_probe_ts"] - time.time() < 10
+
+
+def test_restart_clears_warming_when_busy_check_raises(monkeypatch):
+    """判忙异常不得把 warming 留在 True：那会让这条线被永久跳过。"""
+    m = _member()
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_line_busy",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("clash down")))
+    assert daemon._warp_line_restart(m, "test") is False
+    assert daemon._warp_line_state("W2")["warming"] is False
+
+
+def test_probe_ignores_stale_ok_verdict_when_usable_reports_failure(monkeypatch):
+    """失败结论不得复用上一次残留的 OK：那会把坏线记成假成功。"""
+    now = time.time()
+    m = _member()
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            ip="1.1.1.1", ip_ts=now, port_ok=True)
+    daemon._PROBE_LAST_VERDICT["W2"] = "OK"
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: "1.1.1.1")
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: False)
+    monkeypatch.setattr(daemon, "_warp_probe_blind", lambda now=None: False)
+    monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda member, ip: False)
+    monkeypatch.setattr(daemon, "_warp_line_restart", lambda mm, r: False)
+    daemon._probe_one_line(m)
+    st = daemon._warp_line_state("W2")
+    assert st["last_verdict"] != "OK", st
+    assert not st["last_ok_ts"], "失败后不得保留 OK 时间戳"
+
+
+def test_late_unknown_does_not_clear_newer_ok():
+    """早启动、晚返回的 unknown 不得清掉期间刚记下的 OK。"""
+    daemon._warp_line_note_ok("W2", "1.1.1.1", 200.0)
+    kept = daemon._warp_line_record_observation(
+        "W2", None, "unknown", ts=210.0, started_at=100.0)
+    assert kept is False
+    st = daemon._warp_line_state("W2")
+    assert st["last_ok_ts"] == 200.0
+    assert st["last_ok_ip"] == "1.1.1.1"
+
+
+def test_blocked_ip_probe_restarts_without_burning_model_quota(monkeypatch):
+    """已判 blocked 的出口只重启换地址，不再打模型接口（不烧配额）。"""
+    m = _member()
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            ip="1.1.1.1", next_probe_ts=time.time() + 5)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=20.0: "1.1.1.1")
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: True)
+    calls = []
+    monkeypatch.setattr(daemon, "_warp_model_usable",
+                        lambda *a: calls.append(a) or True)
+    monkeypatch.setattr(daemon, "_warp_line_restart", lambda mm, r: True)
+    daemon._probe_one_line(m)
+    assert calls == [], "blocked 判定后不得再烧模型配额"

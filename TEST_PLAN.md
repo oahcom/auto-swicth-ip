@@ -2061,3 +2061,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.44 | 2026-10-26 | Codex 第二轮 P1：`_admit_tested` 由「按出口 IP 放行」改为「按 tag 放行」——同址另一条线可能隧道已坏，仅 IP 相同不证明可用；用例补同 IP 双线，变异（改回 IP 过滤）转红。全量待跑 | Codex 第二轮 |
 | v1.45 | 2026-10-26 | 预热同样分批：`prewarm_max_per_round`(4) + `_PREWARM_CURSOR` 轮转；用例断言三轮切片顺序，变异（关闭切片）转红。Codex 单提交审查：e31faca PASS、7322c26 PASS、6ea3cf2 FAIL(P1 按 IP 放行)→已修(6d1ce68) | Codex 第二轮 |
 | v1.46 | 2026-10-26 | 收尾三个 P2：①line worker 成员从配置移除即退出、异常日志 60s 节流；②`proc.run` 非超时异常先杀组再抛（不留孤儿）；③日志剥离 ST 结尾的 OSC。4 个新用例，四处变异分别转红 | 自查 P2 收口 |
+| v1.47 | 2026-10-26 | Codex 第二轮（探测器段）4 项：warming 前置检查异常泄漏→已修；陈旧 OK 被判假成功→已修；晚到 unknown 清掉新 OK→已修；invalidate 缩短退避→按设计保留（blocked 分支不打模型接口，重启受 backoff 约束），补特征化用例。3 处变异分别转红 | Codex 第二轮 |
