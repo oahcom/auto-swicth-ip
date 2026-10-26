@@ -2,13 +2,14 @@
 
 Four tools (daemon, switch-proxy, verify_rotation, self-check) each grew their
 own requests call with a different timeout, status-code policy and secret
-lookup. This is the shared implementation for the operator tools. The daemon
-keeps its own wrapper because it adds a serialised snapshot thread; the wire
-contract is the same.
+lookup. This is the shared implementation for the operator tools and the
+daemon (``daemon._CLASH``); the daemon adds a serialised connection snapshot
+on top, the wire contract is the same.
 """
 
 from __future__ import annotations
 
+import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 from urllib.parse import quote
@@ -98,21 +99,30 @@ class ClashClient:
 
     def selector_state(self, selector: str
                        ) -> tuple[list[str] | None, str | None]:
-        """Fetch ``all`` and ``now`` for ``selector`` in one GET."""
+        """Fetch ``all`` and ``now`` for ``selector`` in one GET.
+
+        Each side is validated independently: an unusable ``all`` does not hide
+        a valid ``now`` and vice versa.
+        """
         status, data = self.get_json(f"proxies/{quote(selector, safe='')}")
         if status != 200 or not isinstance(data, dict):
             return None, None
         all_proxies = data.get("all")
         now = data.get("now")
-        if not isinstance(all_proxies, list):
-            return None, None
-        if not isinstance(now, str) or not now:
-            return None, None
-        return [str(x) for x in all_proxies], now
+        names = ([str(x) for x in all_proxies]
+                 if isinstance(all_proxies, list) else None)
+        current = now if isinstance(now, str) and now else None
+        return names, current
 
     def delay(self, node: str, timeout_ms: int, url: str = DEFAULT_TEST_URL,
               *, hard_timeout: float | None = None) -> int | None:
-        """Measure ``node`` latency against ``url``; only int responses count."""
+        """Measure ``node`` latency against ``url``.
+
+        Only a 200 response carrying a finite int/float ``delay`` counts; the
+        value is normalised to ``int``. Booleans are rejected despite being
+        ``int`` subclasses, and NaN/inf are rejected because ``int()`` on them
+        would raise.
+        """
         http_timeout = (hard_timeout if hard_timeout is not None
                         else timeout_ms / 1000 + 2)
         status, data = self.request_json(
@@ -122,12 +132,20 @@ class ClashClient:
         if status != 200 or not isinstance(data, dict):
             return None
         value = data.get("delay")
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return int(value)
 
     def delays(self, nodes: Any, *, workers: int = 16,
                timeout_ms: int = 15000, url: str = DEFAULT_TEST_URL,
                hard_timeout: float | None = None) -> dict[str, int | None]:
-        """Measure many nodes concurrently, preserving input order."""
+        """Measure many nodes concurrently and return ``{node: delay}``.
+
+        The mapping is keyed by node, so callers must not depend on iteration
+        order. Duplicate inputs collapse to one key.
+        """
         unique = list(dict.fromkeys(nodes))
         if not unique:
             return {}

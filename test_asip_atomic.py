@@ -123,3 +123,10 @@ def test_write_read_json_old_behavior_unchanged(tmp_path):
     assert read_json(str(tmp_path / "absent.json"), "fallback") == "fallback"
     assert os.stat(path).st_mode & 0o777 == 0o600
     assert not list(tmp_path.glob("state.json.*.tmp"))
+
+
+def test_update_json_lock_file_is_private(tmp_path):
+    path = tmp_path / "state.json"
+    lock_path = tmp_path / "state.lock"
+    update_json(str(path), lambda old: [1], default=[], lock_path=str(lock_path))
+    assert os.stat(lock_path).st_mode & 0o777 == 0o600

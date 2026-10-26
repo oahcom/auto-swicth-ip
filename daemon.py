@@ -44,6 +44,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, REJECT_WINDOW, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret
 from asip.atomic_io import append_line as _atomic_append_line
 from asip.atomic_io import write_json as _atomic_write_json
+from asip.atomic_io import update_json as _atomic_update_json
 from asip.atomic_io import write_text as _atomic_write_text
 from asip.clash_client import ClashClient
 from asip.egress import TRACE_URL, probe_egress
@@ -932,6 +933,10 @@ def _init_logger():
     _logger.addHandler(sh)
 
 _LOG_LINE_BREAKS = _re.compile(r"[\r\n\u2028\u2029\x85\v\f]+")
+# 上游错误体/节点名可能带 ANSI 转义或其它 C0 控制符，能操纵终端显示或让
+# 按行解析的脚本看到假内容。先剥 CSI/OSC 序列，再把剩余控制符换成空格。
+_LOG_ANSI = _re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+_LOG_CONTROL = _re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 _LOG_MESSAGE_MAX = 4000
 
 
@@ -943,7 +948,9 @@ def _sanitize_log_message(msg: str) -> str:
     运维脚本。这不是安全问题本身，但会掩盖真实的告警顺序。
     """
     text = msg if isinstance(msg, str) else str(msg)
+    text = _LOG_ANSI.sub("", text)
     text = _LOG_LINE_BREAKS.sub(lambda _match: "\\n", text)
+    text = _LOG_CONTROL.sub(" ", text)
     if len(text) > _LOG_MESSAGE_MAX:
         text = text[:_LOG_MESSAGE_MAX] + "…(truncated)"
     return text
@@ -3829,7 +3836,17 @@ def reconnect_warp(reason: str) -> bool:
         log("  ⚠ 无可用备线，切轮换池兜底")
         return _fallback_to_proxy(active, old_ip, now)
 
-    if not _switch_warp(m["tag"]):
+    # 探测/选线耗时数秒，按线 worker 可能已拿到这条线的刷新槽并开始重启。
+    # 此时 PUT 切过去会切到一条正在冷启动的线。选中后占住按线锁到 PUT 完成；
+    # 切过去之后 worker 会看到本线是 active，不会再重启它。
+    if not _acquire_refresh_slot(m["tag"]):
+        log(f"  ⚠ 选中备线 {m['tag']} 正在被刷新，本次换线放弃（等下一次错误重试）")
+        return False
+    try:
+        switched = _switch_warp(m["tag"])
+    finally:
+        _release_refresh_slot(m["tag"])
+    if not switched:
         return _fallback_to_proxy(active, old_ip, now)
     # 静置时长要在标记本次使用之前算：标完再看恒为 0，日志就成了「/64 静置 0min」。
     rest = _warp_prefix_rest(ip, now)
@@ -4419,20 +4436,20 @@ def _export_dead_nodes_locked(total_count: int = 0):
             log(f"  ⚠ 跳过 bad_nodes 导出: {len(_DEAD_NODES)}/{total_count} 死节点 >60%")
             return
 
-        shared = {}
-        if os.path.exists(_BAD_NODES_FILE):
-            with open(_BAD_NODES_FILE) as f:
-                shared = json.load(f)
+        def _merge(shared):
+            if not isinstance(shared, dict):
+                shared = {}
+            # 只追加 daemon 发现的死节点，不覆盖 proxy-global/cron 已有的条目
+            for n in _DEAD_NODES:
+                if n not in shared:
+                    shared[n] = {"expire": _DEAD_NODES_RELEASE_TS.get(n, _now_ts() + BAD_NODES_TTL),
+                                 "reason": "daemon_dead"}
+            return shared
 
-        # 只追加 daemon 发现的死节点，不覆盖 proxy-global 已有的条目
-        for n in _DEAD_NODES:
-            if n not in shared:
-                shared[n] = {"expire": _DEAD_NODES_RELEASE_TS.get(n, _now_ts() + BAD_NODES_TTL), "reason": "daemon_dead"}
-
-        tmp = _BAD_NODES_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(shared, f)
-        os.replace(tmp, _BAD_NODES_FILE)
+        # 与 self_evolve_checkpoint 共用同一把 flock：两边都做 read-modify-write，
+        # 无锁并发会互相覆盖（cron 刚写进的坏节点被 daemon 的旧快照抹掉）。
+        _atomic_update_json(_BAD_NODES_FILE, _merge, default={},
+                            lock_path=_BAD_NODES_FILE + ".lock")
     except Exception:
         pass  # 写失败不影响主逻辑
 

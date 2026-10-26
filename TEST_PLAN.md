@@ -1984,6 +1984,14 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | T-251 | P2 | 验收脚本不得把「读不到日志」当「无异常」 | `pytest test_verify_rotation.py` | journalctl 超时/rc≠0 时 `JournalLines.error` 非空，调用方报失败而非通过 |
 | T-252 | P2 | 子进程输出解码失败不得外抛 | `pytest test_asip_proc.py -k invalid_utf8` | 非 UTF-8 字节以替换符解码，`run` 仍返回 `ProcResult` |
 | T-253 | P2 | text_limit 负数必须拒绝 | `pytest test_asip_http.py -k negative_text_limit` | `text_limit=-1` 抛 `ValueError`，不静默截错 |
+| T-254 | P1 | 选中备线到 PUT 之间不得被 worker 重启 | `grep -n "_acquire_refresh_slot(m\[\"tag\"\])" daemon.py`；`pytest test_asip_integration.py` | `_switch_warp` 前占按线锁、finally 释放；拿不到锁放弃本次换线 |
+| T-255 | P1 | daemon 与 cron 共用 `.bad_nodes.json` 锁 | `pytest test_asip_integration.py -k dead_nodes_export` | 写路径用 `update_json(lock_path=".bad_nodes.json.lock")`；外来条目保留 |
+| T-256 | P2 | 日志剥离 ANSI/C0 控制符 | `pytest test_asip_integration.py -k log_message` | `ESC[31m` 被移除，`\x00` 变空格 |
+| T-257 | P2 | killpg 后等待有上界 | `pytest test_asip_proc.py -k pipe_holding_descendant` | 孙进程逃逸时最多再等 5s，返回 `timed_out` 而非阻塞 |
+| T-258 | P2 | 恢复原选择失败必须可见 | 审查 `verify_rotation.py` | `switch(original)` 返回 False 时打印 `⚠ 恢复原选择失败` |
+| T-259 | P2 | 锁文件权限与账本一致 | `pytest test_asip_atomic.py -k lock_file_is_private` | `chmod 0600`；`append_line` 恒 `fsync` |
+| T-260 | P2 | Clash 返回值逐字段校验 | `pytest test_asip_clash.py` | `all`/`now` 独立降级；`delay` 拒 bool/NaN/inf 并归一为 int |
+| T-261 | P2 | 超时结果带可读 error | `pytest test_asip_proc.py` | `ProcResult.error == "timeout after Xs"`；映射型 env 可传入 |
 
 **实战验证（改动合入前人工执行一次）**：
 
@@ -2041,3 +2049,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.36 | 2026-10-26 | ASIP 分层重构（R165）§13 与审查回归：T-240 订阅全文（修 HTTP 层 2000 字符截断导致节点丢失）、T-241 陈旧观测竞态、T-242 grep 失败语义、T-243 Clash 非 2xx 不返回错误页；T-239 补齐「dry-run 跳过模型验收」 | codex 20 维 review |
 | v1.38 | 2026-10-26 | 第二轮审查修复：T-244 `asip.proc` 超时改杀进程组（孙进程不再泄漏）、T-245 Clash 连接表异常不外抛、T-246 日志注入覆盖 Unicode 行分隔符、T-241 扩展到「决策后已非当前出口则取消换线」、T-247 同步刷新改走按线锁、T-248~T-250 补齐 2xx/间隔/进程组 | codex 20 维 review |
 | v1.40 | 2026-10-26 | 第三轮整改：T-238 灰度期旧守护继续运行（dry_run 只观测不接管）、T-251 验收脚本 journal 失败语义、T-252 非 UTF-8 输出解码兜底、T-253 负数 text_limit 拒绝；`singbox_api` 异常只记一条日志 | 三方五维审查 |
+| v1.41 | 2026-10-26 | 第四轮整改：T-254 选线到 PUT 占按线锁、T-255 bad_nodes 跨进程共用 flock、T-256 日志剥 ANSI/C0；附 T-257 有界回收、T-258 恢复失败可见、T-259 锁文件 0600、T-260 Clash 字段校验、T-261 超时 error 文案 | 三方五维审查 |

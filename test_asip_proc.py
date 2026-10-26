@@ -49,7 +49,7 @@ def test_run_timeout_marks_timed_out_and_clears_code():
     assert result.timed_out is True
     assert result.code is None
     assert result.ok is False
-    assert result.error is None
+    assert result.error == "timeout after 0.3s"
 
 
 def test_run_timeout_reaps_grandchildren(tmp_path):
@@ -81,6 +81,8 @@ def test_run_timeout_survives_process_exiting_before_kill(monkeypatch):
     class RacyChild:
         pid = 424242
         returncode = None
+        stdout = None
+        stderr = None
 
         def communicate(self, timeout=None):
             if timeout is not None:
@@ -90,6 +92,9 @@ def test_run_timeout_survives_process_exiting_before_kill(monkeypatch):
         def kill(self):
             raise ProcessLookupError
 
+        def wait(self, timeout=None):
+            return 0
+
     monkeypatch.setattr(proc.subprocess, "Popen",
                         lambda *a, **k: RacyChild())
     monkeypatch.setattr(proc.os, "getpgid",
@@ -97,6 +102,47 @@ def test_run_timeout_survives_process_exiting_before_kill(monkeypatch):
     result = run(["x"], timeout=1)
     assert result.timed_out is True
     assert result.code is None
+
+
+def test_run_timeout_does_not_block_on_pipe_holding_descendant(monkeypatch):
+    """孙进程逃出进程组仍持有管道时，二次 communicate 必须有上限。"""
+    import subprocess
+
+    class StuckChild:
+        pid = 424243
+        returncode = None
+        stdout = open(os.devnull, "r")
+        stderr = open(os.devnull, "r")
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1 or timeout is None:
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout or 0)
+            return "", ""
+
+        def wait(self, timeout=None):
+            return 0
+
+    child = StuckChild()
+    monkeypatch.setattr(proc.subprocess, "Popen", lambda *a, **k: child)
+    monkeypatch.setattr(proc.os, "getpgid", lambda pid: 1)
+    monkeypatch.setattr(proc.os, "killpg", lambda pgid, sig: None)
+    started = time.time()
+    result = run(["x"], timeout=0.1)
+    assert time.time() - started < 10
+    assert result.timed_out is True
+    assert result.error == "timeout after 0.1s"
+    child.stdout.close()
+    child.stderr.close()
+
+
+def test_run_accepts_mapping_env():
+    result = run(_py("import os; print(os.environ.get('ASIP_X', ''))"),
+                 timeout=10, env={"ASIP_X": "1", "PATH": os.environ.get("PATH", "")})
+    assert result.stdout.strip() == "1"
 
 
 def test_run_missing_binary_returns_error_instead_of_raising():

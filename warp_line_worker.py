@@ -207,7 +207,7 @@ def _plan(member: dict, ip: str | None, acc: tuple | None, active: bool,
           probe: bool = True) -> tuple[str, str] | None:
     """把观测映射成一个待执行动作，本身不做任何写操作。
 
-    action 取 restart/switch/accept/probe/none，无需动作时返回 None。执行交给
+    action 取 restart/switch/accept/probe，无需动作时返回 None。执行交给
     tick，这样 dry_run 只需跳过执行即可保证零副作用。
 
     ``probe=False``（dry-run）时不对未验收地址做模型探测：`_warp_model_usable`

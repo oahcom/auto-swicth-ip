@@ -78,13 +78,14 @@ def read_json(path: str, default: Any = None) -> Any:
         return default
 
 
-def append_line(path: str, obj: Any, *, mode: int = 0o600,
-                fsync: bool = False) -> None:
+def append_line(path: str, obj: Any, *, mode: int = 0o600) -> None:
     """Append ``obj`` to ``path`` as one compact JSON line.
 
     The line is serialized in full before opening the file, so the bytes handed
     to ``os.write`` always form a complete record. Append mode means concurrent
-    writers add at the end instead of racing on an offset.
+    writers add at the end instead of racing on an offset. ``fsync`` runs
+    before returning so a crash cannot drop a record the caller thought was
+    durable.
     """
     data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n") \
         .encode("utf-8")
@@ -101,8 +102,7 @@ def append_line(path: str, obj: Any, *, mode: int = 0o600,
         while view:
             written = os.write(fd, view)
             view = view[written:]
-        if fsync:
-            os.fsync(fd)
+        os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -118,6 +118,13 @@ def update_json(path: str, merge: Callable[[Any], Any], *, default: Any = None,
     if lock_path:
         lock_file = open(lock_path, "a+")
         try:
+            # ``open`` applies the process umask, so a fresh lock is often
+            # 0644. The lock sits next to ledgers that carry tokens, so pin it
+            # to the same private mode. Best effort mirrors ``append_line``.
+            try:
+                os.chmod(lock_path, 0o600)
+            except OSError:
+                pass
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             old = read_json(path, default)
             new = merge(old)

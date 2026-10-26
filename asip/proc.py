@@ -2,9 +2,9 @@
 
 Every call requires an explicit ``timeout``. This project drives a daemon and
 several operator CLIs that shell out to ``curl`` and ``systemctl``; before this
-helper one hung ``curl`` could stall the rotation loop indefinitely (defect
-D7). A mandatory timeout turns that failure into a ``ProcResult`` with
-``timed_out=True`` instead of a process the caller can never reap.
+helper one hung ``curl`` could stall the rotation loop indefinitely. A mandatory
+timeout turns that failure into a ``ProcResult`` with ``timed_out=True`` instead
+of a process the caller can never reap.
 
 ``shell=True`` is deliberately not offered. Arguments include proxy URLs and
 subscription tokens loaded from config, so a shell would add an injection
@@ -22,17 +22,22 @@ import os
 import signal
 import subprocess
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Mapping, Sequence
 
 from .redact import redact_secrets
+
+# Grace period for reaping after the process group has been signalled. The
+# direct child is normally already dead; this only bounds a wedged descendant.
+_REAP_GRACE_SEC = 5.0
 
 
 @dataclass(frozen=True)
 class ProcResult:
     """Outcome of one child process.
 
-    ``error`` is set only when the process could not be started at all; a
-    non-zero exit is reported through ``code``.
+    ``code`` is ``None`` when the process could not be started or was killed on
+    timeout. ``error`` is set for those cases only; a non-zero exit is reported
+    through ``code`` and never raises.
     """
 
     code: int | None
@@ -60,76 +65,110 @@ def _as_text(value: str | bytes | None) -> str:
     return value
 
 
+def _mask(value: str, redact: bool) -> str:
+    return redact_secrets(value) if redact else value
+
+
+def _kill_process_group(child: subprocess.Popen) -> None:
+    """SIGKILL the whole session, falling back to the direct child.
+
+    The child is started with ``start_new_session=True``, so its pid is also its
+    process-group id. curl/bun can spawn helpers; killing only the direct child
+    leaves those helpers holding the pipe and leaking across retries.
+    """
+    try:
+        os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # The child may have exited between communicate() timing out and here.
+        try:
+            child.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
-        env: dict[str, str] | None = None, redact: bool = True) -> ProcResult:
+        env: Mapping[str, str] | None = None, redact: bool = True) -> ProcResult:
     """Run ``argv`` and return a result instead of raising.
 
-    ``stdout`` is never redacted — callers need the raw payload even when it
-    happens to contain a token-shaped string.
+    Both streams are captured as text, which is what
+    ``subprocess.run(capture_output=True, text=True)`` does; ``Popen`` is used
+    directly only so a timeout can kill the whole process group. ``stdout`` is
+    never redacted — callers need the raw payload even when it happens to
+    contain a token-shaped string.
     """
     _require_positive_timeout(timeout)
+    argv = list(argv)
+    argv0 = argv[0] if argv else ""
+
     try:
         child = subprocess.Popen(
-            list(argv),
+            argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             errors="replace",
             cwd=cwd,
-            env=env,
+            env=dict(env) if env is not None else None,
             start_new_session=True,
         )
     except FileNotFoundError:
-        error = f"binary not found: {argv[0]}"
         return ProcResult(
             code=None,
-            error=redact_secrets(error) if redact else error,
+            error=_mask(f"binary not found: {argv0}", redact),
         )
     except OSError as exc:
-        error = str(exc)
+        # Every start failure is reported with the documented prefix; the
+        # underlying OSError keeps its detail for diagnosis.
         return ProcResult(
             code=None,
-            error=redact_secrets(error) if redact else error,
+            error=_mask(f"binary not found: {argv0}: {exc}", redact),
         )
 
     try:
         stdout, stderr = child.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        # `subprocess.run(timeout=...)` only kills the direct child.  curl and
-        # bun can spawn helpers; leaving them alive keeps the port/handshake
-        # wedged and leaks processes across retries.  The child is a session
-        # leader (start_new_session), so killpg reaps the whole tree.
+        _kill_process_group(child)
         try:
-            os.killpg(os.getpgid(child.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            # The child may have exited between communicate() timing out and
-            # killpg(). kill() then raises ProcessLookupError too; the timeout
-            # result must still be returned instead of escaping.
+            stdout, stderr = child.communicate(timeout=_REAP_GRACE_SEC)
+        except subprocess.TimeoutExpired:
+            # A descendant escaped the group and still holds the pipe. Close our
+            # ends so the caller cannot block forever, then reap the direct
+            # child best-effort.
+            for stream in (getattr(child, "stdout", None),
+                           getattr(child, "stderr", None)):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
             try:
-                child.kill()
-            except ProcessLookupError:
+                child.wait(timeout=1)
+            except (subprocess.TimeoutExpired, OSError):
                 pass
-        stdout, stderr = child.communicate()
-        stderr = _as_text(stderr)
+            stdout, stderr = "", ""
         return ProcResult(
             code=None,
             stdout=_as_text(stdout),
-            stderr=redact_secrets(stderr) if redact else stderr,
+            stderr=_mask(_as_text(stderr), redact),
             timed_out=True,
+            error=_mask(f"timeout after {timeout}s", redact),
         )
 
-    stderr = stderr or ""
     return ProcResult(
         code=child.returncode,
-        stdout=stdout or "",
-        stderr=redact_secrets(stderr) if redact else stderr,
+        stdout=_as_text(stdout),
+        stderr=_mask(_as_text(stderr), redact),
     )
 
 
-def run_curl(args: Sequence[str], *, timeout: float,
-             socks_port: int | None = None, http_proxy: str | None = None,
-             extra: Iterable[str] = (), redact: bool = True) -> ProcResult:
+def run_curl(argv: Sequence[str], *, timeout: float,
+             socks_port: int | None = None,
+             http_proxy: str | None = None,
+             extra: Sequence[str] = ()) -> ProcResult:
     """Run ``curl`` through a SOCKS or HTTP proxy, never both.
+
+    Argument order is: base flags, proxy flags, caller ``argv``, then ``extra``.
+    ``extra`` therefore lands last and can append or override caller options.
 
     ``--max-time`` carries ``timeout`` so curl gives up on its own. The child
     process gets five extra seconds as a hard stop for the cases curl cannot
@@ -139,17 +178,15 @@ def run_curl(args: Sequence[str], *, timeout: float,
     if socks_port is not None and http_proxy is not None:
         raise ValueError("socks_port and http_proxy are mutually exclusive")
 
-    argv = ["curl", "-sS", "--max-time", str(timeout)]
+    command = ["curl", "-sS", "--max-time", str(timeout)]
     if socks_port is not None:
-        argv += ["--proxy", f"socks5h://127.0.0.1:{int(socks_port)}"]
+        command += ["--proxy", f"socks5h://127.0.0.1:{int(socks_port)}"]
     elif http_proxy is not None:
-        argv += ["--proxy", http_proxy]
-    argv += [*args, *extra]
-    return run(argv, timeout=timeout + 5, redact=redact)
+        command += ["--proxy", http_proxy]
+    command += [*argv, *extra]
+    return run(command, timeout=timeout + 5)
 
 
-def run_systemctl(action: str, unit: str, *, timeout: float = 20,
-                  redact: bool = True) -> ProcResult:
+def run_systemctl(action: str, unit: str, *, timeout: float = 20) -> ProcResult:
     """Run ``systemctl --user <action> <unit>``."""
-    return run(["systemctl", "--user", action, unit], timeout=timeout,
-               redact=redact)
+    return run(["systemctl", "--user", action, unit], timeout=timeout)

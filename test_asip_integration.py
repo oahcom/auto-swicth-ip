@@ -199,3 +199,41 @@ def test_connections_json_caches_failures_by_completion_time(monkeypatch):
     assert daemon._connections_json() is None
     assert daemon._connections_json() is None
     assert len(calls) == 1
+
+
+def test_line_worker_dry_run_keeps_legacy_scheduling(monkeypatch):
+    """灰度 dry_run 只观测：旧守护必须继续预热/补刷，否则窗口内无人修复。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "line_worker",
+                        {"enabled": True, "dry_run": True, "interval_sec": 30})
+    assert daemon._line_worker_owns_scheduling() is False
+    monkeypatch.setitem(daemon.CFG["warp"], "line_worker",
+                        {"enabled": True, "dry_run": False, "interval_sec": 30})
+    assert daemon._line_worker_owns_scheduling() is True
+    monkeypatch.setitem(daemon.CFG["warp"], "line_worker",
+                        {"enabled": False, "dry_run": False, "interval_sec": 30})
+    assert daemon._line_worker_owns_scheduling() is False
+
+
+def test_dead_nodes_export_shares_lock_and_keeps_foreign_entries(monkeypatch, tmp_path):
+    """daemon 与 cron 都读改写 .bad_nodes.json，必须共用同一把锁且不覆盖。"""
+    import json as _json
+
+    target = tmp_path / ".bad_nodes.json"
+    target.write_text(_json.dumps({"from-cron": {"expire": 999, "reason": "x"}}))
+    monkeypatch.setattr(daemon, "_BAD_NODES_FILE", str(target))
+    monkeypatch.setattr(daemon, "_DEAD_NODES", {"from-daemon"})
+    monkeypatch.setattr(daemon, "_DEAD_NODES_RELEASE_TS", {})
+    monkeypatch.setattr(daemon, "_now_ts", lambda: 1000)
+
+    seen = {}
+
+    def fake_update(path, merge, **kwargs):
+        seen["path"] = path
+        seen["lock"] = kwargs.get("lock_path")
+        seen["data"] = merge(_json.loads(target.read_text()))
+
+    monkeypatch.setattr(daemon, "_atomic_update_json", fake_update)
+    daemon._export_dead_nodes_locked(10)
+    assert seen["path"] == str(target)
+    assert seen["lock"] == str(target) + ".lock"
+    assert set(seen["data"]) == {"from-cron", "from-daemon"}

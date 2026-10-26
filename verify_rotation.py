@@ -166,8 +166,9 @@ def verify_switch(samples: int, quick: bool) -> list[str]:
         if original:
             try:
                 if current() != original:
-                    print(f"  恢复原选择: {original}")
-                    switch(original)
+                    ok = switch(original)
+                    print(("  恢复原选择: " if ok else "  ⚠ 恢复原选择失败: ")
+                          + original)
             except ClashUnreachable:
                 print("  ⚠ Clash API 不可达，未能恢复原选择")
 
