@@ -819,6 +819,23 @@ def test_partial_unreachable_is_not_blindness(monkeypatch):
     assert daemon._ip_history_is_truth() is False, "未失明时仍以实测为准"
 
 
+def test_single_unreachable_batch_is_not_blindness(monkeypatch):
+    """只测 1 条且 unreachable 不得判失明 —— `all()` 对单元素恒真，会误锁 120s。
+
+    回归 2026-10-26：`probe_candidates_per_switch`=2 时错误换线每轮只测 1~2 条，
+    日志实测出现「本批 1 条模型层探测全 unreachable → 判定通道失明」，随后 47 次
+    候选跳过实测被放行。放行的正是 quota 地址：切上去首条请求就 429。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    daemon._note_probe_batch(["unreachable"])
+    assert daemon._warp_probe_blind() is False, "单条 unreachable 不足以判通道失明"
+    daemon._note_probe_batch(["unreachable", "unreachable"])
+    assert daemon._warp_probe_blind() is False, "2 条样本同样不足以判定"
+    daemon._note_probe_batch(["unreachable"] * 3)
+    assert daemon._warp_probe_blind() is True, "达到最小样本数才判定失明"
+
+
 def test_blind_channel_does_not_restart_line_on_stale_unreachable(monkeypatch):
     """失明期间缓存的 unreachable 不得驱动重启：它不是「地址被拒」。"""
     monkeypatch.setattr(daemon, "_probe_blind_until", time.time() + 60)

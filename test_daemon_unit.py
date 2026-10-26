@@ -2802,6 +2802,11 @@ def test_cached_standby_skips_probe_when_fresh(monkeypatch):
                         {"W2": {"ip": "ip-b", "ip_ts": now - 2}})
     monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT",
                         {"W2": (now - 2, "ip-b")})  # Must match _WARP_LINE_STATE for consistency check
+    # 快路径要求模型层给过 OK：只探到「能出网」不算数，出口此刻有没有配额
+    # 只有模型层说得准。台账走真实全局，_WARP_IP_USED 已被 _reuse_env 清空，
+    # 故「窗口内没被切过」那条自动成立。
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN",
+                        {("W2", "ip-b"): ("OK", now - 2)})
     monkeypatch.setattr(daemon, "_port_open", lambda p: True)
     probed = []
 
@@ -2843,6 +2848,11 @@ def test_cached_standby_keeps_all_candidates_not_just_first(monkeypatch):
         "W2": (now - 2, "ip-b"),
         "W3": (now - 2, "ip-c"),
     })
+    # 两条都要有模型层 OK 才进快路径；只验「能出网」不算。
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {
+        ("W2", "ip-b"): ("OK", now - 2),
+        ("W3", "ip-c"): ("OK", now - 2),
+    })
     monkeypatch.setattr(daemon, "_port_open", lambda p: True)
     monkeypatch.setattr(daemon, "_probe_warp_egress",
                         lambda ms: egress)  # 不应被调用
@@ -2881,6 +2891,9 @@ def test_single_cached_candidate_probes_remainder(monkeypatch):
                         {"W2": {"ip": "ip-b", "ip_ts": now - 2}})
     monkeypatch.setattr(daemon, "_WARP_LAST_ACCEPT",
                         {"W2": (now - 2, "ip-b")})
+    # W2 命中快路径的前提是模型层验过；W3 没有台账 → 必须补探。
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN",
+                        {("W2", "ip-b"): ("OK", now - 2)})
     monkeypatch.setattr(daemon, "_port_open", lambda p: True)
     probed = []
 
@@ -3862,10 +3875,58 @@ def test_cached_warp_standby_dedups_same_ip(monkeypatch):
     monkeypatch.setattr(daemon, "_ip_disqualified", lambda ip, now, guard: False)
     monkeypatch.setattr(daemon, "_port_open", lambda port: True)
     monkeypatch.setattr(daemon, "_warp_ip_rank", lambda ip, now, window: (0, 0, 0.0))
+    monkeypatch.setattr(daemon, "_probe_cache_verdict",
+                        lambda tag, ip, now=None: "OK")
+    monkeypatch.setattr(daemon, "_warp_ip_last_ts", lambda ip: 0.0)
     out = daemon._cached_warp_standby(members, 1000.0, guard=86400)
     got = [ip for _, ip in out]
     assert len(got) == len(set(got)), f"候选里出现重复 IP: {got}"
     assert got == ["1.1.1.1", "2.2.2.2"], f"去重后应各留一条: {got}"
+
+
+def test_cached_warp_standby_requires_model_ok(monkeypatch):
+    """快路径只放行「模型层实测过且 OK」的地址。
+
+    只验过能出网不算：出口此刻是否还有 opencode 配额，只有模型层说得准。
+    探出 quota / 未探过（None）都必须跳过，退回慢路径实测。
+    """
+    members = [{"tag": "W-A", "port": 1080}, {"tag": "W-B", "port": 1081}]
+    ips = {"W-A": "1.1.1.1", "W-B": "2.2.2.2"}
+    verdicts = {"1.1.1.1": "quota", "2.2.2.2": None}
+    monkeypatch.setattr(daemon, "_warp_line_ip", lambda tag: ips[tag])
+    monkeypatch.setattr(daemon, "_warp_line_ip_ts", lambda tag: 1000.0)
+    monkeypatch.setattr(daemon, "_ip_disqualified", lambda ip, now, guard: False)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
+    monkeypatch.setattr(daemon, "_warp_ip_rank", lambda ip, now, window: (0, 0, 0.0))
+    monkeypatch.setattr(daemon, "_warp_ip_last_ts", lambda ip: 0.0)
+    monkeypatch.setattr(daemon, "_probe_cache_verdict",
+                        lambda tag, ip, now=None: verdicts[ip])
+    assert daemon._cached_warp_standby(members, 1000.0, guard=86400) == [], \
+        "quota 与未探过的地址都不得走快路径"
+
+
+def test_cached_warp_standby_rejects_recently_switched(monkeypatch):
+    """`probe_ok_ttl_sec` 内被切过的 IP 不得走快路径。
+
+    切过说明它已在服务生产流量，上游随时烧掉它；实测出口 IP 存活中位仅 9s，
+    「验过但已被切过」的地址与新地址在可用性上没有差别。
+    """
+    members = [{"tag": "W-A", "port": 1080}, {"tag": "W-B", "port": 1081}]
+    ips = {"W-A": "1.1.1.1", "W-B": "2.2.2.2"}
+    now = 10_000.0
+    # W-A 刚被切过（窗口内），W-B 很久没被切过
+    last = {"1.1.1.1": now - 30, "2.2.2.2": now - 3600}
+    monkeypatch.setattr(daemon, "_warp_line_ip", lambda tag: ips[tag])
+    monkeypatch.setattr(daemon, "_warp_line_ip_ts", lambda tag: now - 1.0)
+    monkeypatch.setattr(daemon, "_ip_disqualified", lambda ip, now, guard: False)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
+    monkeypatch.setattr(daemon, "_warp_ip_rank", lambda ip, now, window: (0, 0, 0.0))
+    monkeypatch.setattr(daemon, "_probe_cache_verdict", lambda tag, ip, now=None: "OK")
+    monkeypatch.setattr(daemon, "_warp_ip_last_ts", lambda ip: last[ip])
+    monkeypatch.setitem(daemon.CFG["warp"], "probe_ok_ttl_sec", 600)
+    out = daemon._cached_warp_standby(members, now, guard=86400)
+    assert [ip for _, ip in out] == ["2.2.2.2"], \
+        "窗口内被切过的地址必须让出快路径"
 
 
 def test_startup_switches_away_from_low_quality_egress(monkeypatch):
