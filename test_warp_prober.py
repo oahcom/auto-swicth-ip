@@ -253,3 +253,20 @@ def test_restart_to_another_banned_ip_parks_until_unban(monkeypatch):
     st = daemon._warp_line_state("W2")
     assert st["ip"] == "2.2.2.2"
     assert st["next_probe_ts"] >= now + 3500
+
+
+def test_stale_verdict_after_line_restart_is_dropped():
+    """探测起手后该线已重启换址：旧地址结论不得写回。
+
+    WHY：写回会把 st["ip"] 退回旧地址，并按旧地址的 quota/flagged 惩罚期
+    把整条线停探（最长 16h），新地址一个请求都没被评估过。
+    """
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            ip="2.2.2.2", ip_ts=200.0, last_ok_ts=0.0, last_verdict="unknown")
+    kept = daemon._warp_line_record_observation(
+        "W2", "1.1.1.1", "quota", ts=210.0, started_at=100.0)
+    assert kept is False
+    st = daemon._warp_line_state("W2")
+    assert st["ip"] == "2.2.2.2", st
+    assert st["last_verdict"] == "unknown", st

@@ -2498,6 +2498,13 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
         if (started_at is not None
                 and float(st.get("last_ok_ts") or 0.0) > started_at):
             return False
+        # 探测期间这条线可能已重启换了地址（`_warp_line_restart` 会把 ip_ts
+        # 推到 now）。旧地址的结论对新地址无效：写回去等于把 st["ip"] 退回旧值，
+        # 再按旧地址的惩罚期把整条线停探（quota 16h），新地址白等了。
+        if (ip and started_at is not None
+                and float(st.get("ip_ts") or 0.0) > started_at
+                and st.get("ip") != ip):
+            return False
         old_ip = st.get("ip")
         if ip:
             if old_ip and old_ip != ip:
@@ -4383,7 +4390,7 @@ def _maybe_failback_to_warp(now: float) -> bool:
         blocked = count_warp_blocked_since(since, limit=200)
     else:
         blocked = {"abuse403": 0, "rate429": 0, "ok": 0, "other_err": 0,
-                   "consec_err": 0, "full_err": False}
+                   "consec_err": 0, "full_err": False, "transport": 0}
     still_limited = (blocked["abuse403"] + blocked["rate429"]
                      >= CFG["intervals"]["proxy_blocked_threshold"])
 
@@ -4902,13 +4909,19 @@ def _transport_probe_worker(tag: str, port: int, count: int) -> None:
 
 def _verify_transport_failure(tag: str, port: int, count: int) -> None:
     """探当前出口：通 → 判为 9router 侧故障不换线；不通 → 换线。"""
+    global _LAST_TRANSPORT_PROBE_SIG
     ip = warp_egress_ip(port, timeout_sec=8.0)
     if ip:
         log(f"⚠ 传输层 503 ×{count}，但 {tag} 出口探测正常（{ip}）"
             f" → 判为 9router 侧故障，不换线")
         return
     log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
-    _reconnect_warp_now(f"transport ×{count}（出口探测失败）", _now_ts())
+    if _reconnect_warp_now(f"transport ×{count}（出口探测失败）", _now_ts()):
+        return
+    # 冷却/闸门拒了这次换线：旧签名会把「同一批 503」锁死成不再探，出口已死
+    # 却永远等不到下一次机会。撤掉签名，下一批证据到达时再试。
+    _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
+    log("  · 传输层换线被冷却/闸门拒绝，已解除签名等待重试")
 
 
 def maybe_reconnect_warp(now: float) -> None:

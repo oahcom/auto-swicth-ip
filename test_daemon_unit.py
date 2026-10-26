@@ -4594,3 +4594,18 @@ def test_transport_probe_rearmed_after_rotation(monkeypatch):
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 500.0)
     daemon._maybe_verify_transport_failures(5, 2000.0)
     assert calls == [5, 5], calls
+
+
+def test_verify_transport_failure_rearms_when_rotation_refused(monkeypatch):
+    """换线被冷却/闸门拒绝时撤掉探测签名，否则同一批 503 会把死出口锁死在停探态。"""
+    logs = []
+    monkeypatch.setattr(daemon, "log", logs.append)
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port, timeout_sec=8.0: None)
+    monkeypatch.setattr(daemon, "_reconnect_warp_now",
+                        lambda reason, now, ignore_cooldown=False: False)
+    monkeypatch.setattr(daemon, "_LAST_TRANSPORT_PROBE_SIG", (100.0, 5))
+
+    daemon._verify_transport_failure("WARP-CF-X", 1080, 5)
+
+    assert daemon._LAST_TRANSPORT_PROBE_SIG == (0.0, 0), daemon._LAST_TRANSPORT_PROBE_SIG
+    assert any("拒绝" in m for m in logs), logs
