@@ -383,7 +383,10 @@ class _LocalBridge:
 
 
 def _bun_bin() -> str | None:
-    """Bun binary: env override → PATH → ~/.bun → nvm (systemd PATH has no nvm)."""
+    """Bun binary: env override → PATH → ~/.bun → ~/.local/bin → nvm.
+
+    systemd 的 PATH 没有 nvm/~/.local/bin，所以这里按家目录兜底找。
+    """
     for name in ("PROBE_BUN_BIN", "OPENCODE_BUN_BIN"):
         value = os.environ.get(name)
         if value and os.path.exists(value):
@@ -393,7 +396,8 @@ def _bun_bin() -> str | None:
         return found
     homes = {os.path.expanduser("~"), pwd.getpwuid(os.getuid()).pw_dir}
     for home in homes:
-        for pattern in (".bun/bin/bun", ".nvm/versions/node/*/bin/bun"):
+        for pattern in (".bun/bin/bun", ".local/bin/bun",
+                        ".nvm/versions/node/*/bin/bun"):
             hits = sorted(glob.glob(os.path.join(home, pattern)))
             if hits:
                 return hits[-1]

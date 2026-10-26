@@ -1,0 +1,10 @@
+# WSL 全局引导配置模板（复制到 /etc/wsl.conf，Windows 侧 wsl --shutdown 后生效）
+# 注意：这是 WSL 的机器级配置，不是项目文件；不要提交带真实用户/路径的副本。
+[boot]
+systemd=true
+# 可选兜底：不依赖 systemd 时在开机后拉起。把 <user> 与 <path> 换成实际值。
+# 推荐优先用 systemd 用户单元 + `loginctl enable-linger <user>`。
+# command = "sudo -u <user> bash /path/to/auto-switch-ip/start-auto-switch-ip.sh"
+
+[network]
+generateResolvConf = false

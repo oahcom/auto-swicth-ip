@@ -57,6 +57,7 @@ _CLASH = ClashClient(CFG["singbox"]["clash_api"], get_singbox_secret)
 
 # 全局复用连接 - 避免每次操作开/关 SQLite 连接
 _db_conn: sqlite3.Connection | None = None
+_db_file_id: tuple[int, int] | None = None
 _db_lock = threading.RLock()  # RLock: init_node_info_db 里 _get_db 需重入
 _BAD_NODES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bad_nodes.json")
 # 出口节点归属日志：每次成功切换追加 (ts,node)，供 per-egress 错误率归因用。
@@ -123,9 +124,30 @@ _shared_bad_loaded: bool = False
 def _now_ts() -> int:
     return int(time.time())
 
+def _db_file_identity() -> tuple[int, int] | None:
+    try:
+        st = os.stat(NODE_INFO_DB)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
 def _get_db() -> sqlite3.Connection:
-    """获取模块级 SQLite 连接（惰性初始化，WAL 模式）"""
-    global _db_conn
+    """获取模块级 SQLite 连接（惰性初始化，WAL 模式）。
+
+    9router 重启/迁移可能用 rename/VACUUM INTO 替换 data.sqlite；旧连接会继续
+    读被删除的 inode，导致错误率与配额计数永久冻结。这里按文件身份检测并重开。
+    """
+    global _db_conn, _db_file_id
+    file_id = _db_file_identity()
+    if (_db_conn is not None and file_id is not None
+            and _db_file_id is not None and file_id != _db_file_id):
+        with _db_lock:
+            if _db_conn is not None and file_id != _db_file_id:
+                try:
+                    _db_conn.close()
+                except sqlite3.Error:
+                    pass
+                _db_conn = None
     if _db_conn is None:
         with _db_lock:
             if _db_conn is None:  # double-checked locking
@@ -133,6 +155,7 @@ def _get_db() -> sqlite3.Connection:
                 _db_conn.row_factory = sqlite3.Row
                 _db_conn.execute("PRAGMA journal_mode=WAL")
                 _db_conn.execute("PRAGMA busy_timeout=5000")
+                _db_file_id = _db_file_identity()
     return _db_conn
 
 def init_node_info_db():

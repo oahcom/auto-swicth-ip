@@ -169,6 +169,36 @@ def test_错误率_全成功返回零(monkeypatch):
     assert total == 10 and errors == 0 and consecutive == 0, (total, errors, consecutive)
 
 
+def test_get_db_重开被替换的数据库文件(monkeypatch, tmp_path):
+    """9router 重启/迁移替换 data.sqlite 后，旧连接会读已删除的 inode。
+
+    现象：错误率与配额计数永久冻结（2026-10-26 实测 total=10/errors=2、
+    轮换W=0/150 连续 20 分钟不变）。按文件身份检测并重开。
+    """
+    a = tmp_path / "a.sqlite"
+    b = tmp_path / "b.sqlite"
+    ca = sqlite3.connect(a)
+    ca.execute("CREATE TABLE old_marker(x)")
+    ca.commit()
+    ca.close()
+    cb = sqlite3.connect(b)
+    cb.execute("CREATE TABLE new_marker(x)")
+    cb.commit()
+    cb.close()
+
+    monkeypatch.setattr(daemon, "NODE_INFO_DB", str(a))
+    monkeypatch.setattr(daemon, "_db_conn", None)
+    monkeypatch.setattr(daemon, "_db_file_id", None)
+
+    old_conn = daemon._get_db()
+    assert old_conn.execute("SELECT name FROM sqlite_master WHERE name='old_marker'").fetchone()
+
+    os.replace(b, a)  # 新文件换入同一路径，旧连接仍持有被删 inode
+
+    new_conn = daemon._get_db()
+    assert new_conn is not old_conn, "文件被替换后必须重开连接"
+    assert new_conn.execute("SELECT name FROM sqlite_master WHERE name='new_marker'").fetchone()
+
 
 def test_错误率_切换点过滤_旧节点错误不背锅(monkeypatch):
     """新节点上线后，切换点之前的旧节点错误不应触发拉黑"""
