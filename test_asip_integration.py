@@ -131,6 +131,22 @@ def test_line_worker_dry_run_keeps_legacy_schedulers(monkeypatch):
     assert daemon._line_worker_enabled() is True
     assert daemon._line_worker_owns_scheduling() is False
 
+    started = []
+
+    class NoopThread:
+        def __init__(self, target=None, *a, **k):
+            self.target = target
+
+        def start(self):
+            started.append(self.target)
+
+    monkeypatch.setattr(daemon.threading, "Thread", NoopThread)
+    daemon._WARP_REFRESH_PENDING.discard("W1")
+    daemon._schedule_idle_refresh({"tag": "W1", "port": 1080})
+    assert "W1" in daemon._WARP_REFRESH_PENDING
+    assert started
+    daemon._WARP_REFRESH_PENDING.discard("W1")
+
 
 def test_connections_json_swallows_client_exceptions(monkeypatch):
     """读取失败必须缓存 None；旧实现吞掉所有异常，新通道不能把异常抛给调用方。"""

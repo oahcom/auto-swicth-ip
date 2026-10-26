@@ -298,6 +298,24 @@ def test_start_rejects_non_positive_interval(bad):
         w.start(Fake("ip1", ("ip1",)), members=[M], interval_sec=bad)
 
 
+@pytest.mark.parametrize("active,verified,ip,probe,usable,needs", [
+    (True, True, "ip1", True, True, False),
+    (True, False, "ip1", True, True, False),
+    (False, True, "ip1", True, True, False),
+    (False, False, "ip1", False, True, False),
+    (False, False, "ip1", True, True, False),
+    (False, False, "ip1", True, False, False),
+])
+def test_plan_never_returns_removed_none_action(
+        active, verified, ip, probe, usable, needs):
+    """_plan 的契约只有 None/restart/switch/accept/probe，不再有 none。"""
+    fake = Fake(ip, ("ip1",), active="T" if active else "OTHER",
+                usable=usable, needs=needs)
+    w._host = fake
+    plan = w._plan(M, ip, fake.acc, active, verified, 1000.0, probe=probe)
+    assert plan is None or plan[0] in {"restart", "switch", "accept", "probe"}
+
+
 def test_start_empty_members_no_threads():
     fake = Fake(None, None)
     w.start(fake, members=[])

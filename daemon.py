@@ -3074,9 +3074,18 @@ def _dirty_line_janitor() -> None:
         time.sleep(5)
 
 
+def _line_worker_config() -> dict:
+    """warp.line_worker 的读点。每次现读 CFG，便于测试热改配置。"""
+    return _warp().get("line_worker") or {}
+
+
 def _line_worker_enabled() -> bool:
-    """warp.line_worker.enabled 的读点。每次现读 CFG，便于测试热改配置。"""
-    return bool((_warp().get("line_worker") or {}).get("enabled"))
+    return bool(_line_worker_config().get("enabled"))
+
+
+def _line_worker_dry_run() -> bool:
+    """缺省 dry_run=True：没显式关掉之前，worker 只观测。"""
+    return bool(_line_worker_config().get("dry_run", True))
 
 
 def _line_worker_owns_scheduling() -> bool:
@@ -3085,21 +3094,20 @@ def _line_worker_owns_scheduling() -> bool:
     灰度期若只凭 `enabled` 就让三条旧路径让路，worker 又只打「应…」不执行，
     窗口内就没有任何预热/补刷/脏线重连 —— 观测到了问题却没人处理。
     """
-    cfg = _warp().get("line_worker") or {}
-    return bool(cfg.get("enabled")) and not bool(cfg.get("dry_run", True))
+    return _line_worker_enabled() and not _line_worker_dry_run()
 
 
 def _start_line_workers() -> None:
     """每条隧道起一个常驻 worker，接管「判质量 → 重启 → 验收 → 换线」。
 
-    启用后旧的三个调度器会互相让路：不再起脏线抽检，主循环也不再调
+    非 dry-run 启用后旧的三个调度器会互相让路：不再起脏线抽检，主循环也不再调
     `_prewarm_standby_warp`，`_schedule_idle_refresh` 直接返回 —— 否则同一条
-    线会被两套逻辑各重启一次，白烧一次出口探测。
+    线会被两套逻辑各重启一次，白烧一次出口探测。dry_run 期旧路径继续运行，
+    否则灰度窗口内没有任何实际维护动作。
     """
-    cfg = _warp().get("line_worker") or {}
     import warp_line_worker
-    dry_run = bool(cfg.get("dry_run", True))
-    interval = cfg.get("interval_sec", 30)
+    dry_run = _line_worker_dry_run()
+    interval = _line_worker_config().get("interval_sec", 30)
     members = _warp()["members"]
     warp_line_worker.start(sys.modules[__name__], members,
                            dry_run=dry_run, interval_sec=interval)
