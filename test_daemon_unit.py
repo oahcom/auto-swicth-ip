@@ -4674,3 +4674,79 @@ def test_cleanup_worker_logs_instead_of_raising(monkeypatch):
     monkeypatch.setattr(daemon, "_close_opencode_connections", boom)
     daemon._cleanup_connection_worker("WARP-CF-X", 120.0, "旧链")
     assert any("clash api down" in m for m in logs), logs
+
+
+def _one_503_db(now: float, body: str):
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.execute("CREATE TABLE requestDetails "
+                "(provider TEXT, model TEXT, status TEXT, timestamp TEXT, data TEXT)")
+    ts = (datetime.fromtimestamp(now, tz=timezone.utc)
+          .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+    mem.execute("INSERT INTO requestDetails (provider,model,status,timestamp,data) "
+                "VALUES (?,?,?,?,?)",
+                ("opencode", "m", "error", ts,
+                 json.dumps({"response": {"error": body, "status": 503}})))
+    return mem
+
+
+def test_unclassified_503_warns_instead_of_silent_zero(monkeypatch):
+    """503 存在但认不出 UpstreamTransportError → 必须告警，不能静默显示 503=0。"""
+    logs = []
+    monkeypatch.setattr(daemon, "log", logs.append)
+    monkeypatch.setattr(daemon, "_LAST_503_CLASSIFY_WARN", 0.0)
+    mem = _one_503_db(time.time(), "some new sidecar wording")
+    orig = daemon._get_db
+    daemon._get_db = lambda: mem
+    try:
+        win = daemon.get_9router_error_rate()
+    finally:
+        daemon._get_db = orig
+        mem.close()
+    assert win.transport_errors == 0
+    assert any("未被识别为传输层" in m for m in logs), logs
+
+
+def test_classified_503_does_not_trigger_unclassified_warning(monkeypatch):
+    logs = []
+    monkeypatch.setattr(daemon, "log", logs.append)
+    monkeypatch.setattr(daemon, "_LAST_503_CLASSIFY_WARN", 0.0)
+    mem = _one_503_db(time.time(), '{"error":{"type":"UpstreamTransportError"}}')
+    orig = daemon._get_db
+    daemon._get_db = lambda: mem
+    try:
+        win = daemon.get_9router_error_rate()
+    finally:
+        daemon._get_db = orig
+        mem.close()
+    assert win.transport_errors == 1
+    assert not any("未被识别为传输层" in m for m in logs), logs
+
+
+def test_connection_cleanup_single_flight(monkeypatch):
+    """清理任务单飞：已在跑时不再起第二个线程（429 风暴期换线最短 5s）。"""
+    started = []
+
+    class _Thread:
+        def __init__(self, *a, **k):
+            started.append(1)
+
+        def start(self):
+            raise AssertionError("已在清理时不得再起线程")
+
+    monkeypatch.setattr(daemon.threading, "Thread", _Thread)
+    monkeypatch.setattr(daemon, "_CLEANUP_RUNNING", True)
+    daemon._schedule_connection_cleanup("WARP-CF-X", 120.0, "旧链")
+    assert started == [], started
+
+
+def test_connection_cleanup_flag_released_on_error(monkeypatch):
+    monkeypatch.setattr(daemon, "log", lambda m: None)
+    monkeypatch.setattr(daemon, "_CLEANUP_RUNNING", True)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("clash api down")
+
+    monkeypatch.setattr(daemon, "_close_opencode_connections", boom)
+    daemon._cleanup_connection_worker("WARP-CF-X", 120.0, "旧链")
+    assert daemon._CLEANUP_RUNNING is False

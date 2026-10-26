@@ -41,7 +41,7 @@ from typing import NamedTuple
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
-from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, REJECT_WINDOW, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret
+from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, REJECT_WINDOW, TRANSPORT_LOOKBACK_SEC, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret
 from asip.atomic_io import append_line as _atomic_append_line
 from asip.atomic_io import write_json as _atomic_write_json
 from asip.atomic_io import update_json as _atomic_update_json
@@ -1133,6 +1133,34 @@ def _warn_transport_503(consecutive: int) -> None:
         f"等待出口探测：不通则换线，通则清理僵死连接（见 transport-probe）")
 
 
+_LAST_503_CLASSIFY_WARN = 0.0
+
+
+def _response_status(body: str | None) -> int | None:
+    """从 requestDetails.data 里取上游 HTTP 状态码；取不到返回 None。"""
+    try:
+        resp = (json.loads(body or "{}") or {}).get("response") or {}
+        return int(resp.get("status"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _warn_unclassified_503(unclassified: int) -> None:
+    """503 存在却一条都没被认成传输层 → 分类器可能已失效，10 分钟节流告警。
+
+    WHY 要这条：`_classify_transport_error` 靠 body 里的
+    "UpstreamTransportError" 字面量。9router 一改文案，503 就静默回落
+    other_err，健康摘要 503 归零 —— 观测失效比故障本身更难发现。
+    """
+    global _LAST_503_CLASSIFY_WARN
+    now = time.time()
+    if now - _LAST_503_CLASSIFY_WARN < 600.0:
+        return
+    _LAST_503_CLASSIFY_WARN = now
+    log(f"⚠ [OpenCode Free] 最近 {unclassified} 条 503 未被识别为传输层故障 —— "
+        f"9router 文案可能已变，`_classify_transport_error` 需更新")
+
+
 class ErrorWindow(NamedTuple):
     """`get_9router_error_rate` 的返回结构（保持 tuple 解包兼容）。"""
 
@@ -1181,6 +1209,22 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> ErrorWindow:
                 WHERE provider = ?
                 ORDER BY timestamp DESC LIMIT ?
             """, (OPENCODE_FREE_PROVIDER, REJECT_WINDOW)).fetchall()
+            # 传输层错误按**时间**回看，不按行数：高流量时 RECENT_WINDOW(5) 条
+            # 只覆盖 ~2s，503 在 10s tick 前就被新行挤出窗口，检测永远为 0，
+            # 僵死连接就不会被清理。LIKE 走全表但有 timestamp 索引先缩小范围。
+            transport_cutoff = (datetime.now(timezone.utc)
+                                - timedelta(seconds=TRANSPORT_LOOKBACK_SEC)
+                                ).strftime("%Y-%m-%dT%H:%M:%S")
+            if max_backoff_ts is not None:
+                backoff_cutoff = datetime.fromtimestamp(
+                    max_backoff_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                if backoff_cutoff > transport_cutoff:
+                    transport_cutoff = backoff_cutoff
+            transport_recent = c.execute("""
+                SELECT COUNT(*) FROM requestDetails
+                WHERE provider = ? AND timestamp >= ?
+                  AND data LIKE '%UpstreamTransportError%'
+            """, (OPENCODE_FREE_PROVIDER, transport_cutoff)).fetchone()[0]
         if max_backoff_ts is not None:
             # 9router timestamp 为 ISO UTC 字符串，词典序比较等价于时间序
             cutoff = datetime.fromtimestamp(max_backoff_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -1218,6 +1262,8 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> ErrorWindow:
         # 能拿到 429 说明 sidecar 活着，故障已结束。
         transport_errors = sum(1 for r in recent
                                if _classify_transport_error(r.get("data")))
+        # 窗口内可能一条都没有（见 transport_cutoff 注释），取时间回看的最大值。
+        transport_errors = max(transport_errors, int(transport_recent or 0))
         if transport_errors:
             consecutive_503 = 0
             for r in recent:
@@ -1230,6 +1276,11 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> ErrorWindow:
                     break
             if consecutive_503 >= 3:
                 _warn_transport_503(consecutive_503)
+        else:
+            unclassified_503 = sum(1 for r in recent
+                                   if _response_status(r.get("data")) == 503)
+            if unclassified_503:
+                _warn_unclassified_503(unclassified_503)
 
         rejected_403 = reject_errors = 0
         for r in reject_rows:
@@ -1656,29 +1707,68 @@ def _close_opencode_connections(chain_tag: str | None, min_age_sec: float,
     return closed
 
 
+_CLEANUP_LOCK = threading.Lock()
+_CLEANUP_RUNNING = False
+
+
 def _cleanup_connection_worker(chain_tag: str | None, min_age_sec: float,
                                reason: str) -> None:
     """线程体：清理异常必须落日志。线程里抛异常只会进 stderr，
     daemon.log 里看不到，等于清理静默失效。"""
+    global _CLEANUP_RUNNING
     try:
         _close_opencode_connections(chain_tag, min_age_sec, reason)
     except Exception as e:
         log(f"✗ 连接清理异常（{chain_tag or '当前链'}）: {e}")
+    finally:
+        with _CLEANUP_LOCK:
+            _CLEANUP_RUNNING = False
 
 
 def _schedule_connection_cleanup(chain_tag: str | None, min_age_sec: float,
                                  reason: str = "") -> None:
-    """清理走线程：一次 /connections + N 次 DELETE，不占主循环。"""
+    """清理走线程：一次 /connections + N 次 DELETE，不占主循环。
+
+    单飞：429 风暴期换线最短 5s 一次，每次起线程会导致 /connections 扫描
+    与 DELETE 叠加；同一时刻只保留一个清理任务，后来的直接跳过（下一轮
+    换线/探针会再触发）。
+    """
+    global _CLEANUP_RUNNING
+    with _CLEANUP_LOCK:
+        if _CLEANUP_RUNNING:
+            return
+        _CLEANUP_RUNNING = True
     try:
         threading.Thread(target=_cleanup_connection_worker,
                          args=(chain_tag, min_age_sec, reason),
                          daemon=True, name="conn-cleanup").start()
     except Exception as e:
+        with _CLEANUP_LOCK:
+            _CLEANUP_RUNNING = False
         log(f"✗ 连接清理线程启动失败: {e}")
 
 
-def _after_warp_switch(old_tag: str | None) -> None:
-    """换线成功后清掉旧链上的僵尸 opencode 连接（age >= 配置阈值）。"""
+def _after_warp_switch(old_tag: str | None, interrupt: bool = False) -> None:
+    """换线后清掉旧链上的 opencode 长连接。interrupt=False 时不清理。
+
+    interrupt 是清理开关，不是 sing-box 的参数（那个字段不存在，见
+    `_switch_warp` 的 docstring）。语义：「这次换线要不要把在途请求打断」。
+
+    - 错误触发（403/429/探测判死/transport 503）→ True。旧出口已被判死，
+      留在它上面的每条请求都在白等超时，断掉让 9router 重连到新出口才是止损。
+    - 主动轮换（配额用满 150 格 / fixed 周期）→ False。旧出口是健康的，
+      在途请求应当跑完；实测主动轮换从不报 429，没有需要打断的东西。
+
+    WHY 不能一律清理：age 筛不出僵尸。实测 age>=120s 的连接 **85% 仍在传
+    字节**（age>=180s 时 100%，最长 242s 仍在传），清它们等于掐断在途请求。
+    所以只在旧出口确定不可用时才做。
+
+    old_tag 为 None 表示换线前停在轮换池 proxy：此时没有「旧 WARP 链」可清，
+    而 `_close_opencode_connections` 把 None 当通配符（清全部链），会连刚切
+    过去的新链一起清 —— 直接跳过。
+    """
+    if not interrupt or old_tag is None:
+        return
     _schedule_connection_cleanup(
         old_tag,
         float(_warp().get("cleanup_old_chain_age_sec", 120)),
@@ -2060,13 +2150,19 @@ def _current_mode() -> tuple[str, str | None]:
     return ("warp", now) if _warp_member(now) else ("proxy", None)
 
 
-def _switch_warp(tag: str, interrupt: bool = False) -> bool:
-    """翻转 opencode-out selector。interrupt=False 时在途请求不断。
+def _switch_warp(tag: str) -> bool:
+    """翻转 opencode-out selector。在途请求不会因换线而断。
 
-    interrupt=True 用于错误触发的换线：9router / opencode 用 HTTP/2 长连接，
-    只改 selector 不会迁移已建立的连接，旧连接继续走烧掉的出口 —— 实测换线
-    后 429 还要再报 2 分钟才恢复，期间探针（新连接）却全是 OK。换线时一并
-    请求 sing-box 断开旧连接，下一次请求才会真正落到新线。
+    只改 selector 不会迁移已建立的连接：9router / opencode 用 HTTP/2 长连接，
+    旧连接继续走烧掉的出口 —— 实测换线后 429 还要再报 2 分钟才恢复，期间
+    探针（新连接）却全是 OK。真正的断连由 `_after_warp_switch` 调
+    `DELETE /connections/{id}` 完成，见 `_close_opencode_connections`。
+
+    不在此处发 `interrupt_exist_connections`：sing-box v1.13 的 Clash API
+    `UpdateProxyRequest` 只有 `name` 一个字段（experimental/clashapi/
+    proxies.go:158），`SelectOutbound(tag)` 也不收这个开关，它读的是构造时的
+    配置值；且 inbound 连接经 `NewConnectionEx` 派发时根本不登记 interrupt 组。
+    实测传 true 与不传，换线前 12 条连接均 12/12 存活。
 
     成功后立即把快照的 now 改写为 tag：判定（尤其是补刷前的「这条线是不是
     已经成为出口」）读的就是快照，晚 0.5s 看到就可能重启一条正在服务的隧道。
@@ -2078,10 +2174,7 @@ def _switch_warp(tag: str, interrupt: bool = False) -> bool:
     滞后 0.5s，连切两次时会漏打一次模式日志。
     """
     before = _current_mode()
-    body = {"name": tag}
-    if interrupt:
-        body["interrupt_exist_connections"] = True
-    r, _ = singbox_api(f'/proxies/{_warp()["selector"]}', method="PUT", body=body)
+    r, _ = singbox_api(f'/proxies/{_warp()["selector"]}', method="PUT", body={"name": tag})
     if r not in (200, 204):
         log(f"✗ 切换 WARP 线路失败 ({tag}): status={r}")
         return False
@@ -4597,7 +4690,7 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
     return False
 
 
-def _reconnect_warp_by_table(reason: str) -> bool:
+def _reconnect_warp_by_table(reason: str, interrupt: bool = True) -> bool:
     """只读状态表换线：无 120s 内 OK 就等待，不现场探测、不重启、不落池。"""
     global _ACTIVE_WARP_IP, _proxy_dwell_since, _last_warp_switch_ok_ts
     now = time.time()
@@ -4642,7 +4735,7 @@ def _reconnect_warp_by_table(reason: str) -> bool:
             _proxy_dwell_since = 0
             _from = active["tag"] if active else "proxy"
             log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip})")
-            _after_warp_switch(active["tag"] if active else None)
+            _after_warp_switch(active["tag"] if active else None, interrupt)
             return True
         finally:
             _release_refresh_slot(m["tag"])
@@ -4650,7 +4743,7 @@ def _reconnect_warp_by_table(reason: str) -> bool:
     return False
 
 
-def reconnect_warp(reason: str) -> bool:
+def reconnect_warp(reason: str, interrupt: bool = True) -> bool:
     """把 opencode 流量换到另一条出口新鲜（窗口外）的隧道上。
 
     备线在窗口内用过就先重启它换会话 IP（此时它闲置，重启安全），再切过去
@@ -4660,7 +4753,7 @@ def reconnect_warp(reason: str) -> bool:
     不刷新刚换下的那条：在途请求仍走它，重启会掐断连接。
     """
     if _PROBER_STARTED:
-        return _reconnect_warp_by_table(reason)
+        return _reconnect_warp_by_table(reason, interrupt)
     global _ACTIVE_WARP_IP, _proxy_dwell_since, _last_warp_switch_ok_ts
     members = _warp()["members"]
     now = time.time()
@@ -4942,12 +5035,13 @@ def reconnect_warp(reason: str) -> bool:
     return True
 
 
-def _warp_reconnect_worker(reason: str, cooldown_on_ok: float):
+def _warp_reconnect_worker(reason: str, cooldown_on_ok: float,
+                           interrupt: bool = True):
     """cooldown_on_ok 由调度处算好（含退避），这里不重算，否则会覆盖掉放大的冷却。"""
     global _warp_cooldown_until
     ok = False
     try:
-        ok = reconnect_warp(reason)
+        ok = reconnect_warp(reason, interrupt)
     except Exception as e:
         log(f"✗ WARP 重连异常: {e}")
     finally:
@@ -5133,7 +5227,8 @@ def maybe_reconnect_warp(now: float) -> None:
     )
 
 
-def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) -> bool:
+def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False,
+                        interrupt: bool = True) -> bool:
     """立刻发起一次换线，绕开 403/429 阈值。返回是否真的发起了。
 
     WHY 需要绕开阈值：`maybe_reconnect_warp()` 的触发依赖
@@ -5143,6 +5238,10 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) 
     ignore_cooldown 仅供主动轮换：计算出的最小周期可能短于 cooldown_ok_sec(20s)，
     受冷却约束就永远等不到触发。`_WARP_LOCK` 无论如何都要抢到 —— 那是并发换线
     的互斥，不是节流。错误触发路径保持受冷却约束。
+
+    interrupt 决定换线后是否清理旧链在途连接（见 `_after_warp_switch`）。
+    默认 True —— 调用方几乎都是错误触发（出口已判死，留着旧连接只是在等超时）。
+    只有主动轮换传 False：旧出口健康，在途请求该跑完。
     """
     global _last_warp_reconnect_ts, _warp_cooldown_until
     if not ignore_cooldown and now < _warp_cooldown_until:
@@ -5155,7 +5254,7 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False) 
     _warp_cooldown_until = now + delay  # 先占位，防 tick 重入
     try:
         threading.Thread(target=_warp_reconnect_worker,
-                         args=(reason, delay),
+                         args=(reason, delay, interrupt),
                          daemon=True, name="warp-reconnect").start()
     except Exception as e:
         # 线程没起来，worker 的 finally 不会跑：不还锁会让后续换线永久被拒。
@@ -6629,6 +6728,10 @@ def main():
                     # 会被误算成成功）。成功数直接数 status，才是这个出口真的served 的流量。
                     ok_count = sum(1 for r in details if r.get("status") == "success")
                     _record_active_ip_success(total, total - ok_count)
+            # 传输层 503 的自愈入口：窗口判据看不清（5 条 ~2s），用回看计数驱动
+            # 探针 → 出口通就清僵死连接，僵死 socket 才会被强制重建。
+            if observe and transport_errors > 0:
+                _maybe_verify_transport_failures(transport_errors, now)
             # 出口 IP 补探与观测开关无关：WARP 主动轮换的段起点恢复要用
             # `_ACTIVE_WARP_IP`，函数自带 30s 节流，每 tick 调用一次没有成本。
             _maybe_init_active_ip(now)
