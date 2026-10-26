@@ -1337,33 +1337,44 @@ def check_9router_outbound_proxy() -> bool:
         with _db_lock:
             c = _get_db()
             # 获取 opencode 的 proxyPoolId
+            # 全新 9router 的 settings 表是空的：initDatabase 只建表，默认值由
+            # mergeWithDefaults 在内存里补。以前这里直接 return False，于是下面的
+            # 全局 outboundProxyUrl 永远不会被写 —— 表现为「部署脚本说指到 7890 了」，
+            # 实际 9router 一直走直连。只写我们关心的两个键，其余交给 9router 自己的
+            # DEFAULT_SETTINGS 合并（不在这里复制一份，避免上游加字段后漂移）。
             row = c.execute('SELECT data FROM settings WHERE id=1').fetchone()
             if not row:
-                log("⚠ settings 表无数据")
-                return False
-            s = json.loads(row[0])
+                log("ℹ settings 表无行，写入 outboundProxy 初值")
+                c.execute("INSERT INTO settings(id, data) VALUES(1, '{}')")
+                row = ("{}",)
+            s = json.loads(row[0]) if row and row[0] else {}
             pool_id = s.get("providerStrategies", {}).get(OPENCODE_FREE_PROVIDER, {}).get("proxyPoolId")
             if not pool_id:
-                log(f"⚠ 未找到 {OPENCODE_FREE_PROVIDER} proxyPool 配置")
-                return False
+                # 没有 per-provider pool 不代表全局出站代理没生效：outboundProxyUrl
+                # 是设置级的，opencode 未单独绑定 pool 时走它。缺 pool 只提示，不早退。
+                log(f"ℹ {OPENCODE_FREE_PROVIDER} 未绑定 proxyPool（走全局 outboundProxy）")
 
-            # 1. 检查 proxyPool 当前代理地址
-            pool_row = c.execute('SELECT data FROM proxyPools WHERE id=?', (pool_id,)).fetchone()
-            if not pool_row:
-                log(f"⚠ proxyPool {pool_id} 不存在")
-                return False
+            # 1. 检查 proxyPool 当前代理地址（仅在 provider 真的绑定了 pool 时）
+            if pool_id:
+                pool_row = c.execute('SELECT data FROM proxyPools WHERE id=?', (pool_id,)).fetchone()
+                if not pool_row:
+                    log(f"⚠ proxyPool {pool_id} 不存在，跳过池地址校验")
+                else:
+                    pool = json.loads(pool_row[0])
+                    url = pool.get("proxyUrl", "")
+                    if url != expected_url:
+                        log(f"⚠ opencode proxyPool 异常 (url={url})，修复为 {expected_url}...")
+                        pool["proxyUrl"] = expected_url
+                        c.execute('UPDATE proxyPools SET data = ? WHERE id = ?', (json.dumps(pool), pool_id))
+                        changed = True
 
-            pool = json.loads(pool_row[0])
-            url = pool.get("proxyUrl", "")
-            if url != expected_url:
-                log(f"⚠ opencode proxyPool 异常 (url={url})，修复为 {expected_url}...")
-                pool["proxyUrl"] = expected_url
-                c.execute('UPDATE proxyPools SET data = ? WHERE id = ?', (json.dumps(pool), pool_id))
-                changed = True
-
-            # 2. 恢复 outboundProxyEnabled（before proxy-global.js: bypass left outboundProxyEnabled=False）
-            if not s.get("outboundProxyEnabled", True):
-                log("⚠ outboundProxyEnabled=False，恢复为 True")
+            # 2. 全局 outboundProxyUrl / outboundProxyEnabled
+            # 默认值是 false + 空串（见 9router DEFAULT_SETTINGS），所以首次部署必然
+            # 走进这里。这一条才是「把 9router 出口指到 7890」真正的落点。
+            if s.get("outboundProxyUrl") != expected_url or not s.get("outboundProxyEnabled"):
+                log(f"⚠ outboundProxy 异常 (url={s.get('outboundProxyUrl')!r}, "
+                    f"enabled={s.get('outboundProxyEnabled')})，修复为 {expected_url}")
+                s["outboundProxyUrl"] = expected_url
                 s["outboundProxyEnabled"] = True
                 c.execute('UPDATE settings SET data=? WHERE id=1', (json.dumps(s),))
                 changed = True
@@ -4552,13 +4563,20 @@ def _set_outbound_proxy(url: str = "", enabled: bool = False) -> None:
         with _db_lock:
             c = _get_db()
             enabled_int = 1 if enabled else 0
-            c.execute("""
+            # 全新 9router 的 settings 表是**空的**（初始化时 mergeWithDefaults 走内存
+            # 默认值，不落行）。纯 UPDATE 在这种情况下静默影响 0 行、json_set 也不报错，
+            # 于是「已把 9router 出口指到 7890」是一句假话 —— 实测首次部署后 rowcount=0。
+            # 先确保种子行存在，再 UPDATE。
+            c.execute("INSERT OR IGNORE INTO settings(id, data) VALUES(1, '{}')")
+            cur = c.execute("""
                 UPDATE settings SET data = json_set(COALESCE(data, '{}'),
                     '$.outboundProxyUrl', ?,
                     '$.outboundProxyEnabled', ?
                 ) WHERE id=1
             """, (url, enabled_int))
             c.commit()
+            if cur.rowcount == 0:
+                log(f"⚠ 设置 outboundProxy 影响 0 行 (settings 无 id=1 行)")
     except Exception as e:
         log(f"✗ 设置 outboundProxy 失败: {e}")
 

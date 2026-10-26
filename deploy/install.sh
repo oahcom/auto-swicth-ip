@@ -73,6 +73,27 @@ fail=0
 
 # 只收 5 字段的行：config.py 在 import 期会打告警，一旦漏到 stdout（历史上确有），
 # while read 会把它当节点行，凭空建出 .warp/<告警文本>/ 目录和一个非法单元名。
+
+# ---- 9Router：asip 的观测与出口都依赖它 ----------------
+
+# asip 有两种活法：没有 9router 时只能 blind（按时间盲换线），有它才能按，
+
+# requestDetails 的 403/429 换线。装它不该是让人自己去翻文档的额外步骤。
+
+# 已装好时脚本幂等跳过；ASIP_SKIP_9ROUTER=1 可跳过（只想要 sing-box + WARP 的场景）。
+
+if [ "${ASIP_SKIP_9ROUTER:-0}" != 1 ]; then
+
+    bash "$DIR/deploy/install-9router.sh" || {
+
+        echo "⚠ 9router 安装失败 —— asip 仍可运行，但只能 blind 模式（按时间换线）" >&2
+
+        echo "  装好后把 .env 里的 ASIP_OBSERVE_9ROUTER 改成 true 并重启 daemon" >&2
+
+    }
+
+fi
+
 MEMBERS="$("$PYBIN" "$DIR/deploy/members.py" 2>/dev/null | awk 'NF==5')"
 [ -n "$MEMBERS" ] || { echo "✗ members.py 没有输出任何节点" >&2; exit 1; }
 
