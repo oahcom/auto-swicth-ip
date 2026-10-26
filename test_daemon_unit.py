@@ -4544,3 +4544,53 @@ def test_verify_transport_failure_rotates_only_when_egress_dead(monkeypatch):
                         lambda port, timeout_sec=8.0: None)
     daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
     assert rotations and "transport" in rotations[0], rotations
+
+
+class _FakeThread:
+    def __init__(self, target=None, args=(), **_):
+        self._target, self._args = target, args
+
+    def start(self):
+        self._target(*self._args)
+
+
+def test_transport_probe_not_repeated_for_same_evidence(monkeypatch):
+    """同一换线窗口内 transport 计数不变 → 证据未变，不再重复探出口。
+
+    WHY：sidecar 故障期间 503 是存量行，计数不变也会每 15s 触发一次；实测
+    22:08 起每 10~20s 一条「出口探测正常」刷屏，每次还实打实查一次 CF trace。
+    """
+    calls = []
+    monkeypatch.setattr(daemon, "_transport_probe_worker",
+                        lambda tag, port, n: calls.append((tag, port, n)))
+    monkeypatch.setattr(daemon.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-1")
+    monkeypatch.setattr(daemon, "_warp_member", lambda tag: {"port": 1080})
+    monkeypatch.setattr(daemon, "_LAST_TRANSPORT_PROBE_TS", 0.0)
+    monkeypatch.setattr(daemon, "_LAST_TRANSPORT_PROBE_SIG", (0.0, 0))
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 100.0)
+
+    daemon._maybe_verify_transport_failures(5, 1000.0)
+    daemon._maybe_verify_transport_failures(5, 2000.0)
+    assert calls == [("WARP-CF-1", 1080, 5)], calls
+
+    daemon._maybe_verify_transport_failures(6, 3000.0)
+    assert len(calls) == 2 and calls[-1][2] == 6, calls
+
+
+def test_transport_probe_rearmed_after_rotation(monkeypatch):
+    """换线后窗口起点变了，同样的计数也要允许再探一次。"""
+    calls = []
+    monkeypatch.setattr(daemon, "_transport_probe_worker",
+                        lambda tag, port, n: calls.append(n))
+    monkeypatch.setattr(daemon.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WARP-CF-1")
+    monkeypatch.setattr(daemon, "_warp_member", lambda tag: {"port": 1080})
+    monkeypatch.setattr(daemon, "_LAST_TRANSPORT_PROBE_TS", 0.0)
+    monkeypatch.setattr(daemon, "_LAST_TRANSPORT_PROBE_SIG", (0.0, 0))
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 100.0)
+
+    daemon._maybe_verify_transport_failures(5, 1000.0)
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 500.0)
+    daemon._maybe_verify_transport_failures(5, 2000.0)
+    assert calls == [5, 5], calls

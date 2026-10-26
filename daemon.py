@@ -4865,6 +4865,9 @@ def _warp_reconnect_worker(reason: str, cooldown_on_ok: float):
 
 
 _LAST_TRANSPORT_PROBE_TS = 0.0
+# (换线窗口起点, transport 计数)：同一窗口内计数没变就说明证据没变，不再重复探。
+# 窗口起点一起进签名，换线后窗口重置能自动重新获得一次探测机会。
+_LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
 
 
 def _maybe_verify_transport_failures(count: int, now: float) -> None:
@@ -4875,15 +4878,19 @@ def _maybe_verify_transport_failures(count: int, now: float) -> None:
     出口通 → 问题在 9router 侧（不换）；出口不通 → 换线（不标脏，503 不是
     出口级证据）。探针节流，避免 503 批量落库时每秒起一个线程。
     """
-    global _LAST_TRANSPORT_PROBE_TS
+    global _LAST_TRANSPORT_PROBE_TS, _LAST_TRANSPORT_PROBE_SIG
     gap = float(_warp().get("transport_probe_gap_sec", 15))
     if now - _LAST_TRANSPORT_PROBE_TS < gap:
+        return
+    sig = (_last_warp_reconnect_ts, count)
+    if sig == _LAST_TRANSPORT_PROBE_SIG:
         return
     tag = active_warp_tag()
     member = _warp_member(tag)
     if not member:
         return
     _LAST_TRANSPORT_PROBE_TS = now
+    _LAST_TRANSPORT_PROBE_SIG = sig
     threading.Thread(target=_transport_probe_worker,
                      args=(tag, member["port"], count),
                      daemon=True, name="transport-probe").start()
