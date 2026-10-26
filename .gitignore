@@ -31,3 +31,4 @@ singbox-config.json.tmp
 
 # 池节点 IP 使用台账（运行时状态）
 .node_ip_used.json
+.warp_segment.json
