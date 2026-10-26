@@ -472,6 +472,9 @@ BAD_NODES_MAX_TTL = CFG["bad_nodes"]["max_ttl_sec"]
 LOG_FORMAT = CFG["log_format"]
 RECENT_WINDOW = CFG["thresholds"]["recent_window"]
 REJECT_WINDOW = CFG["thresholds"]["reject_window"]
+# 传输层错误的回看秒数。不能用 RECENT_WINDOW 条（默认 5）：高流量下 ~2s 就滚出
+# 窗口，503 在 10s tick 前早被挤出，检测不到 → 僵死连接永远不清。
+TRANSPORT_LOOKBACK_SEC = 180
 
 # 订阅源顺序即合并优先级（okz 主力，其余补充）。值为空表示未配置。
 SUBSCRIPTION_KEYS = ("okz", "hd23n", "dasho", "dasho_alt")
