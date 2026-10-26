@@ -104,6 +104,41 @@ def test_run_timeout_survives_process_exiting_before_kill(monkeypatch):
     assert result.code is None
 
 
+def test_run_reaps_child_when_communicate_raises(monkeypatch):
+    """communicate 非超时异常：先杀进程组再抛出，不留孤儿。"""
+    class BrokenChild:
+        pid = 424244
+        returncode = None
+        stdout = None
+        stderr = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("pipe broke")
+            return "", ""
+
+        def kill(self):
+            raise AssertionError("应走 killpg")
+
+        def wait(self, timeout=None):
+            return 0
+
+    child = BrokenChild()
+    monkeypatch.setattr(proc.subprocess, "Popen", lambda *a, **k: child)
+    monkeypatch.setattr(proc.os, "getpgid", lambda pid: pid)
+    killed = []
+    monkeypatch.setattr(proc.os, "killpg",
+                        lambda pgid, sig: killed.append(pgid))
+    with pytest.raises(OSError, match="pipe broke"):
+        run(["x"], timeout=1)
+    assert killed == [424244]
+    assert child.calls == 2, "异常后必须再回收一次"
+
+
 def test_run_timeout_does_not_block_on_pipe_holding_descendant(monkeypatch):
     """孙进程逃出进程组仍持有管道时，二次 communicate 必须有上限。"""
     import subprocess

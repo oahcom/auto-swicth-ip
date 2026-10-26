@@ -356,6 +356,45 @@ class StopLoop(Exception):
     pass
 
 
+def test_loop_stops_when_member_removed_from_config(monkeypatch):
+    """配置移除后线程必须退出：否则会继续重启一个已删除的 unit。"""
+    other = {"tag": "NEW", "port": 1099, "service": "n.service"}
+    fake = Fake(None, None, members=[other])
+    w._host = fake
+    w._threads["T"] = object()
+    w._LAST_ERR["T"] = (1.0, "old")
+    ticked = []
+    monkeypatch.setattr(w, "tick", lambda m, **k: ticked.append(m["tag"]))
+    # 正常路径在 sleep 前 return；变异（去掉移除检查）会落到 sleep 抛错，
+    # 用例立刻变红而不是挂 12.5s。
+    monkeypatch.setattr(w.time, "sleep", lambda s: (_ for _ in ()).throw(StopLoop))
+    w._loop(M, False, 12.5)
+    assert ticked == [], "移除后不得再 tick"
+    assert "T" not in w._threads and "T" not in w._LAST_ERR
+    assert any("已从配置移除" in msg for kind, msg in fake.calls)
+
+
+def test_loop_throttles_repeated_error_logs(monkeypatch):
+    """同一异常每 5s 一条会刷满日志；60s 内只记一次。"""
+    fake = Fake(None, None, members=[M])
+    w._host = fake
+    w._LAST_ERR.clear()
+    monkeypatch.setattr(w, "tick", lambda m, **k: (_ for _ in ()).throw(
+        RuntimeError("boom")))
+    sleeps = []
+
+    def fake_sleep(sec):
+        sleeps.append(sec)
+        if len(sleeps) >= 3:
+            raise StopLoop
+
+    monkeypatch.setattr(w.time, "sleep", fake_sleep)
+    with pytest.raises(StopLoop):
+        w._loop(M, False, 5.0)
+    errs = [msg for kind, msg in fake.calls if "线程异常" in msg]
+    assert len(errs) == 1, f"3 轮只应记 1 条，实际 {errs}"
+
+
 def test_loop_uses_interval_sec(monkeypatch):
     fake = Fake(None, None)
     w._host = fake

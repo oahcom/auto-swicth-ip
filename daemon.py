@@ -969,7 +969,7 @@ def _init_logger():
 _LOG_LINE_BREAKS = _re.compile(r"[\r\n\u2028\u2029\x85\v\f]+")
 # 上游错误体/节点名可能带 ANSI 转义或其它 C0 控制符，能操纵终端显示或让
 # 按行解析的脚本看到假内容。先剥 CSI/OSC 序列，再把剩余控制符换成空格。
-_LOG_ANSI = _re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+_LOG_ANSI = _re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _LOG_CONTROL = _re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
 _LOG_MESSAGE_MAX = 4000
 

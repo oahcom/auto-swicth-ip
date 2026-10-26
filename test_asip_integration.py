@@ -72,6 +72,7 @@ def test_warp_egress_ip_returns_none_when_probe_fails(monkeypatch):
     ("line1\vline2", "line1\\nline2"),
     ("line1\fline2", "line1\\nline2"),
     ("\x1b[31mred\x1b[0m", "red"),
+    ("\x1b]0;title\x1b\\after", "after"),
     ("a\x00b", "a b"),
     ("plain", "plain"),
 ])

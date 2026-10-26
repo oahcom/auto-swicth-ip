@@ -112,14 +112,37 @@ def start(host: DaemonHost, members: list[dict] | None = None, *,
         t.start()
 
 
+_LAST_ERR: dict[str, tuple[float, str]] = {}
+
+
 def _loop(member: dict, dry_run: bool = False,
           interval_sec: float | None = None) -> None:
     interval = INTERVAL_SEC if interval_sec is None else interval_sec
+    tag = member["tag"]
     while True:
+        # 配置里已经移除的线不再守护：否则线程会拿着旧 member 继续重启一个
+        # 已删除的 unit，日志也会一直指向不存在的隧道（只有重启 daemon 才清）。
+        try:
+            members = _host._warp()["members"]
+        except Exception:
+            members = None
+        if members and all(m.get("tag") != tag for m in members):
+            _host.log(f"  ⏹ {tag} 已从配置移除，停止守护")
+            _threads.pop(tag, None)
+            _LAST_ERR.pop(tag, None)
+            return
         try:
             tick(member, dry_run=dry_run)
+            _LAST_ERR.pop(tag, None)
         except Exception as e:
-            _host.log(f"  ✗ {member['tag']} 线程异常: {e}")
+            # 同一异常每 interval 打一条会把日志刷满（实测 5s 一条），60s 或
+            # 消息变化时才记。
+            text = f"  ✗ {tag} 线程异常: {e}"
+            last_ts, last_text = _LAST_ERR.get(tag, (0.0, ""))
+            now = time.monotonic()
+            if text != last_text or now - last_ts >= 60:
+                _host.log(text)
+                _LAST_ERR[tag] = (now, text)
         time.sleep(interval)
 
 

@@ -153,6 +153,16 @@ def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
             timed_out=True,
             error=_mask(f"timeout after {timeout}s", redact),
         )
+    except BaseException:
+        # communicate() can fail for reasons other than timeout (closed pipe,
+        # broken decoder). Reap the group before propagating so a failing wait
+        # does not leak the child; the exception still belongs to the caller.
+        _kill_process_group(child)
+        try:
+            child.communicate(timeout=_REAP_GRACE_SEC)
+        except Exception:
+            pass
+        raise
 
     return ProcResult(
         code=child.returncode,
