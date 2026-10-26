@@ -71,6 +71,30 @@ fail=0
     || { echo "✗ $DIR/deploy/usque-launch.sh 不存在或不可执行（单元 ExecStart 依赖它）" >&2; fail=1; }
 [ "$fail" = 0 ] || exit 1
 
+# ---- bun：probe_warp 的探测器 ----
+# 缺 bun 时 probe_warp 一律返回 noprobe：不是「这条线不能用」，而是「没有探测
+# 能力」。daemon 会退回历史判据，段级静置就拦不住已烧毁的 /64 段，每个新 /128
+# 都要白烧一格配额才被认出来（实测 94% 判 quota）。装不上不阻塞部署，只告警。
+BUN_BIN=""
+for c in "${PROBE_BUN_BIN:-}" "$(command -v bun 2>/dev/null)" "$HOME/.bun/bin/bun"; do
+    [ -n "$c" ] && [ -x "$c" ] && { BUN_BIN="$c"; break; }
+done
+if [ -z "$BUN_BIN" ] && command -v npm >/dev/null 2>&1; then
+    echo "→ 未找到 bun，尝试 npm i -g bun（probe_warp 的探测器）"
+    npm i -g bun --no-audit --no-fund >/dev/null 2>&1 || true
+    [ -x "$HOME/.bun/bin/bun" ] && BUN_BIN="$HOME/.bun/bin/bun"
+    [ -z "$BUN_BIN" ] && BUN_BIN="$(command -v bun 2>/dev/null || true)"
+fi
+if [ -n "$BUN_BIN" ]; then
+    # systemd EnvironmentFile 不做变量展开，必须写绝对路径。
+    grep -q '^PROBE_BUN_BIN=' "$DIR/.env" 2>/dev/null \
+        || echo "PROBE_BUN_BIN=$BUN_BIN" >> "$DIR/.env"
+    echo "✓ bun: $BUN_BIN"
+else
+    echo "⚠ 未装 bun：probe_warp 会退化成 noprobe（只按历史判据选线，白烧配额）" >&2
+    echo "  装：npm i -g bun，或 curl -fsSL https://bun.sh/install | bash" >&2
+fi
+
 # 只收 5 字段的行：config.py 在 import 期会打告警，一旦漏到 stdout（历史上确有），
 # while read 会把它当节点行，凭空建出 .warp/<告警文本>/ 目录和一个非法单元名。
 

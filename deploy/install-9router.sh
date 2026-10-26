@@ -124,6 +124,11 @@ WorkingDirectory=$SRC
 Environment=PATH=$(dirname "$NODE_BIN"):/usr/local/bin:/usr/bin:/bin
 Environment=NODE_ENV=production
 Environment=NEXT_TELEMETRY_DISABLED=1
+# 冷却按 proxy URL 记账（egress.js 的 hashEgress("proxy", proxyUrl)），而 asip
+# 换的是同一个 URL 后面的 WARP 出口。默认上限 24h 会把 asip 的换线整段罩死：
+# 请求根本不出门，9router 本地合成 429，asip 读到 429 再换线 —— 死循环。
+# 压到 2s，让每个请求都真的发往 asip 当下指的那个出口。
+Environment=EGRESS_MAX_COOLDOWN_MS=2000
 ExecStart=$NODE_BIN $SRC/custom-server.js --port $PORT
 Restart=always
 RestartSec=10
