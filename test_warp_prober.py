@@ -206,3 +206,43 @@ def test_blocked_ip_probe_restarts_without_burning_model_quota(monkeypatch):
     monkeypatch.setattr(daemon, "_warp_line_restart", lambda mm, r: True)
     daemon._probe_one_line(m)
     assert calls == [], "blocked 判定后不得再烧模型配额"
+
+
+def test_same_ip_verdict_is_reused_across_lines_without_probe(monkeypatch):
+    """同一 /128 被另一条线探过（持久结论）就不再探：配额按地址烧。"""
+    import sys
+    import types
+
+    ip = "1.1.1.1"
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    with daemon._WARP_REFRESH_LOCK:
+        daemon._WARP_PROBE_SEEN[("W1", ip)] = ("quota", time.time())
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked",
+                        lambda ip, now=None: True)
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setitem(sys.modules, "probe_warp", types.SimpleNamespace(
+        probe=lambda *a, **k: pytest.fail("同一 IP 不应二次探测")))
+    assert daemon._warp_model_usable(_member("W2"), ip) is False
+    assert daemon._PROBE_LAST_VERDICT["W2"] == "quota"
+
+
+def test_restart_same_blocked_ip_parks_until_unban(monkeypatch):
+    """重启拿回同一个仍在惩罚期的 IP：停探到确切解禁，而不是 5s 后再探。"""
+    m = _member()
+    now = time.time()
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            ip="1.1.1.1", next_probe_ts=now + 5, last_verdict="err")
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_line_busy", lambda *a, **k: False)
+    monkeypatch.setattr(daemon, "_acquire_refresh_slot", lambda tag: True)
+    monkeypatch.setattr(daemon, "_release_refresh_slot", lambda tag: None)
+    monkeypatch.setattr(daemon, "_RESTART_SEM", None)
+    monkeypatch.setattr(daemon, "_restart_service", lambda svc, tag=None: True)
+    monkeypatch.setattr(daemon, "_wait_port_ready", lambda port, t: True)
+    monkeypatch.setattr(daemon, "_probe_refresh_egress", lambda port: "1.1.1.1")
+    monkeypatch.setattr(daemon, "_invalidate_warp_line_ip", lambda tag: None)
+    monkeypatch.setattr(daemon, "_line_block_remaining",
+                        lambda ip, ts: 3600.0)
+    assert daemon._warp_line_restart(m, "test") is True
+    assert daemon._warp_line_state("W2")["next_probe_ts"] >= now + 3500

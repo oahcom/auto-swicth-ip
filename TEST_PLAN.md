@@ -2063,3 +2063,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.46 | 2026-10-26 | 收尾三个 P2：①line worker 成员从配置移除即退出、异常日志 60s 节流；②`proc.run` 非超时异常先杀组再抛（不留孤儿）；③日志剥离 ST 结尾的 OSC。4 个新用例，四处变异分别转红 | 自查 P2 收口 |
 | v1.47 | 2026-10-26 | Codex 第二轮（探测器段）4 项：warming 前置检查异常泄漏→已修；陈旧 OK 被判假成功→已修；晚到 unknown 清掉新 OK→已修；invalidate 缩短退避→按设计保留（blocked 分支不打模型接口，重启受 backoff 约束），补特征化用例。3 处变异分别转红 | Codex 第二轮 |
 | v1.48 | 2026-10-26 | conftest 把 `CFG["log_file"]` 也指到 tmp：用例不再往线上 daemon.log 写「W2 重启前置检查异常」这类假事件（验证：单跑 prober 用例，产物在 basetemp，生产日志零新增用例行） | 测试基建 |
+| v1.49 | 2026-10-26 | 按主人规则「每个 IP 只探一次；重启拿回同一个 IP 基本等于该 IP 已封禁」：新增跨线复用 `_probe_cache_get_ip`（同一 /128 的持久结论不二次交学费）；同址重启命中惩罚期时按 `_line_block_remaining` 停探到确切解禁（原先 transient 结论会 5s 后再探）。2 处变异各自转红 | 主人决策 |
