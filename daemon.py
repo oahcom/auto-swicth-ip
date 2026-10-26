@@ -6444,7 +6444,7 @@ def main():
                     _, errors_after_switch, _, _, _ = get_9router_error_rate(
                         max_backoff_ts=_last_successful_switch_ts or None
                     )
-                    if errors_after_switch >= 1:
+                    if errors_after_switch >= 3:
                         _submit_once("pool-rotate-on-error", _rotate_on_error_bg,
                                      errors, total, cached_all_nodes, now)
 
