@@ -230,6 +230,12 @@ CFG = {
         # 换线成本远低于等待成本。
         "block_threshold": 1,
         "rate429_threshold": 1,
+        # 传输层 503（9router Bun 传输悬挂，无上游字节）：不是出口级拦截，
+        # 不进惩罚台账，也不计入 consec/full_err。达到阈值后先经当前隧道探
+        # 出口：探通判为 9router 侧故障不换线，探不通才换线。
+        # gap 是探针节流——503 批量落库时每秒都会重触，不能每次起线程。
+        "transport_fail_threshold": 1,
+        "transport_probe_gap_sec": 15,
         # 主动轮换判据二选一（互斥，只有选中的那个生效）：
         #   fixed    — 无论流量快慢，每 proactive_fixed_sec 秒换一次；
         #   requests — 当前出口上成功的 dsv4 调用累计满 proactive_after_dsv4_ok

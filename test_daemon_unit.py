@@ -141,7 +141,7 @@ def test_错误率两层检测_窗口与连续(monkeypatch):
     orig = daemon._get_db
     daemon._get_db = lambda: mem
     try:
-        total, errors, _, consecutive, _ = daemon.get_9router_error_rate()
+        total, errors, _, consecutive, _, _ = daemon.get_9router_error_rate()
     finally:
         daemon._get_db = orig
 
@@ -163,7 +163,7 @@ def test_错误率_全成功返回零(monkeypatch):
     orig = daemon._get_db
     daemon._get_db = lambda: mem
     try:
-        total, errors, _, consecutive, _ = daemon.get_9router_error_rate()
+        total, errors, _, consecutive, _, _ = daemon.get_9router_error_rate()
     finally:
         daemon._get_db = orig
     assert total == 10 and errors == 0 and consecutive == 0, (total, errors, consecutive)
@@ -227,10 +227,10 @@ def test_错误率_切换点过滤_旧节点错误不背锅(monkeypatch):
     daemon._get_db = lambda: mem
     try:
         # 不过滤：5 条中 3 error
-        total_all, errors_all, _, _, _ = daemon.get_9router_error_rate()
+        total_all, errors_all, _, _, _, _ = daemon.get_9router_error_rate()
         assert errors_all == 3, f"无过滤应 3 errors, got {errors_all}"
         # 过滤切换点后：只剩切换后的 3 条，其中 1 error
-        total_f, errors_f, _, _, _ = daemon.get_9router_error_rate(max_backoff_ts=switch_ts)
+        total_f, errors_f, _, _, _, _ = daemon.get_9router_error_rate(max_backoff_ts=switch_ts)
         assert total_f == 3, f"过滤后应 3 条, got {total_f}"
         assert errors_f == 1, f"过滤后应 1 error, got {errors_f}"
     finally:
@@ -264,7 +264,7 @@ def test_error_rate_counts_403_client_rejections(monkeypatch):
     orig = daemon._get_db
     daemon._get_db = lambda: mem
     try:
-        total, errors, _, _, rejected = daemon.get_9router_error_rate()
+        total, errors, _, _, rejected, _ = daemon.get_9router_error_rate()
     finally:
         daemon._get_db = orig
     assert total == 4 and errors == 3, (total, errors)
@@ -294,7 +294,7 @@ def test_error_rate_upstream_402_does_not_count_as_error(monkeypatch):
     orig = daemon._get_db
     daemon._get_db = lambda: mem
     try:
-        total, errors, _, consecutive, _ = daemon.get_9router_error_rate()
+        total, errors, _, consecutive, _, _ = daemon.get_9router_error_rate()
     finally:
         daemon._get_db = orig
     assert total == 5, f"total 应为 5，实际 {total}"
@@ -4456,3 +4456,91 @@ def test_admit_tested_rejects_unprobed_candidates():
     shared = [(w2, "ip-same"), (w3, "ip-same")]
     assert daemon._admit_tested(shared, {"W2": True}) == [(w2, "ip-same")]
     assert daemon._admit_tested(shared, {"W3": True}) == [(w3, "ip-same")]
+
+
+def _transport_rows_db(now: float):
+    """三条错误行：传输 503 / 429 / 与出口无关的超长。"""
+    mem = sqlite3.connect(":memory:")
+    mem.row_factory = sqlite3.Row
+    mem.execute("CREATE TABLE requestDetails "
+                "(provider TEXT, model TEXT, status TEXT, timestamp TEXT, data TEXT)")
+
+    def iso(offset: float) -> str:
+        return (datetime.fromtimestamp(now - offset, tz=timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+
+    rows = [
+        ("opencode", "m", "error", iso(3), json.dumps({"response": {
+            "error": '{"type":"error","error":{"type":"UpstreamTransportError",'
+                     '"message":"OpenCode free lane requires the Bun transport; '
+                     'sidecar unavailable."}}', "status": 503}})),
+        ("opencode", "m", "error", iso(2), json.dumps({"response": {
+            "error": '{"error":{"type":"FreeUsageLimitError",'
+                     '"message":"Rate limit exceeded"}}'}})),
+        ("opencode", "m", "error", iso(1), json.dumps({"response": {
+            "error": "maximum context length exceeded"}})),
+    ]
+    mem.executemany("INSERT INTO requestDetails "
+                    "(provider,model,status,timestamp,data) VALUES (?,?,?,?,?)", rows)
+    return mem
+
+
+def test_count_warp_blocked_since_counts_transport_separately(monkeypatch):
+    """传输层 503 单独计数，但不改变 other_err/full_err 语义。
+
+    WHY：503 只说明「这条路径拿不到上游字节」，sidecar 全局故障也会产生；
+    把它当出口级证据（或从 other_err 里摘走）会让 full_err 误判为真，
+    进而绕过冷却、切走一条干净出口。
+    """
+    now = time.time()
+    mem = _transport_rows_db(now)
+    orig = daemon._get_db
+    daemon._get_db = lambda: mem
+    try:
+        counts = daemon.count_warp_blocked_since(now - 10)
+    finally:
+        daemon._get_db = orig
+        mem.close()
+
+    assert counts["transport"] == 1
+    assert counts["rate429"] == 1
+    assert counts["abuse403"] == 0
+    assert counts["other_err"] == 2, "transport 仍按 other_err 口径计入"
+    assert counts["full_err"] is False, "other_err > 0 时不得判成出口风暴"
+
+
+def test_maybe_reconnect_warp_verifies_transport_before_rotating(monkeypatch):
+    """传输层 503 达阈值时只触发出口验证，不得直接按出口级错误换线。"""
+    seen = []
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 0, "ok": 0,
+                                    "other_err": 2, "consec_err": 0,
+                                    "full_err": False, "transport": 2})
+    monkeypatch.setattr(daemon, "_maybe_verify_transport_failures",
+                        lambda n, now: seen.append(n))
+    monkeypatch.setattr(daemon, "_reconnect_warp_now",
+                        lambda *a, **k: seen.append("rotate"))
+    daemon.maybe_reconnect_warp(1000.0)
+    assert seen == [2], f"应先验证出口而不是直接换线: {seen}"
+
+
+def test_verify_transport_failure_rotates_only_when_egress_dead(monkeypatch):
+    """出口探通 → 判为 9router 侧故障不换线；探不通 → 换线。"""
+    monkeypatch.setattr(daemon, "log", lambda msg: None)
+    rotations = []
+
+    def fake_rotate(reason, now, ignore_cooldown=False):
+        rotations.append(reason)
+        return True
+
+    monkeypatch.setattr(daemon, "_reconnect_warp_now", fake_rotate)
+
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=8.0: "2a09:bac5::1")
+    daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
+    assert rotations == [], "出口探通时换线无效，不得切走干净出口"
+
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=8.0: None)
+    daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
+    assert rotations and "transport" in rotations[0], rotations

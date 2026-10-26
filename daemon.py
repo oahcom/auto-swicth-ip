@@ -1105,6 +1105,31 @@ def _classify_egress_error(body: str | None) -> str | None:
     return None
 
 
+def _classify_transport_error(body: str | None) -> bool:
+    """9router 自身传输层故障（Bun sidecar 被杀/冷却）产生的 503。
+
+    与出口无关——换线/轮换对它无效，所以不计进出口级 errors，也绝不能记
+    惩罚台账。但 2026-10-26 实测 1338 条 503 爆发期间健康摘要恒显「错误=0/5」，
+    主人看到的不是无错，而是 asip 失明——必须单独计数并告警。
+    """
+    return bool(body) and "UpstreamTransportError" in body
+
+
+_LAST_503_WARN = 0.0
+
+
+def _warn_transport_503(consecutive: int) -> None:
+    """sidecar 故障告警，10 分钟节流（503 批量落库下每秒都会重触）。"""
+    global _LAST_503_WARN
+    now = time.time()
+    if now - _LAST_503_WARN < 600.0:
+        return
+    _LAST_503_WARN = now
+    log(f"⚠ [OpenCode Free] 连续 {consecutive} 条 503 UpstreamTransportError —— "
+        f"9router Bun sidecar 故障，换线/轮换对此无效，asip 不动作；需修 9router "
+        f"（sidecar 一次失败即 SIGKILL + 5min backoff，期间全部请求 503）")
+
+
 class ErrorWindow(NamedTuple):
     """`get_9router_error_rate` 的返回结构（保持 tuple 解包兼容）。"""
 
@@ -1113,6 +1138,8 @@ class ErrorWindow(NamedTuple):
     details: list[dict]
     consecutive_errors: int
     reject_ratio: float
+    # 尾部带默认值：`ErrorWindow(0, 0, [], 0, 0.0)` 的早退构造无需同步。
+    transport_errors: int = 0
 
 
 def get_9router_error_rate(max_backoff_ts: int | None = None) -> ErrorWindow:
@@ -1183,6 +1210,24 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> ErrorWindow:
             if _classify_egress_error(r.get("data")):
                 consecutive_errors += 1
 
+        # 503 单独观测：不计入 errors（换线无效），但连续 ≥3 必须告警。
+        # 连续性判定：503 之外遇任何其他行（success 或真 429/403）都断——
+        # 能拿到 429 说明 sidecar 活着，故障已结束。
+        transport_errors = sum(1 for r in recent
+                               if _classify_transport_error(r.get("data")))
+        if transport_errors:
+            consecutive_503 = 0
+            for r in recent:
+                if r.get("status") == "success" or \
+                        _classify_egress_error(r.get("data")):
+                    break
+                if _classify_transport_error(r.get("data")):
+                    consecutive_503 += 1
+                else:
+                    break
+            if consecutive_503 >= 3:
+                _warn_transport_503(consecutive_503)
+
         rejected_403 = reject_errors = 0
         for r in reject_rows:
             if r.get("status") == "success":
@@ -1205,7 +1250,8 @@ def get_9router_error_rate(max_backoff_ts: int | None = None) -> ErrorWindow:
             tail = f"（另 {other} 条非出口错误不计）" if other else ""
             log(f"  [OpenCode Free] {errors}/{total} 出口级错误{tail} | 连续失败={consecutive_errors} | 403占比={reject_ratio:.0%} | 失败模型: {', '.join(sorted(err_models))}")
 
-        return ErrorWindow(total, errors, recent, consecutive_errors, reject_ratio)
+        return ErrorWindow(total, errors, recent, consecutive_errors, reject_ratio,
+                           transport_errors)
     except Exception as e:
         log(f"✗ 读 SQLite 失败: {e}")
         return ErrorWindow(0, 0, [], 0, 0.0)
@@ -1730,6 +1776,9 @@ def count_warp_blocked_since(ts: float, limit: int | None = None) -> dict[str, i
 
     - abuse403：IP 信誉拦截（"abusive traffic from this IP"）
     - rate429：IP 级限流（FreeUsageLimitError "Rate limit exceeded"）
+    - transport：9router Bun 传输悬挂产生的 503（无上游字节）。不是出口级
+      证据（sidecar 全局故障也会产生），单独计数供「先探出口再换线」使用，
+      不进 consec_err/full_err。
     - ok：窗口内的成功数，供调用方判断当前出口是否还在服务流量
     - other_err：与出口无关的失败（上游 402、请求超长），仅供诊断
     - consec_err：窗口内从最新一条往前数连续**出口级**失败数，0 表示最新一条成功
@@ -1768,9 +1817,9 @@ def count_warp_blocked_since(ts: float, limit: int | None = None) -> dict[str, i
     except Exception as e:
         log(f"✗ 统计 WARP 拦截失败: {e}")
         return {"abuse403": 0, "rate429": 0, "ok": 0, "other_err": 0,
-                "consec_err": 0, "full_err": False}
+                "consec_err": 0, "full_err": False, "transport": 0}
     counts = {"abuse403": 0, "rate429": 0, "ok": 0, "other_err": 0,
-              "consec_err": 0, "full_err": False}
+              "consec_err": 0, "full_err": False, "transport": 0}
     kinds = []
     for r in rows:
         if r["status"] == "success":
@@ -1787,6 +1836,10 @@ def count_warp_blocked_since(ts: float, limit: int | None = None) -> dict[str, i
             counts[kind] += 1
         else:
             counts["other_err"] += 1
+            # 仍算 other_err（full_err 语义要求「全窗都是出口级错误」），
+            # 但额外记一份 transport 计数，供探出口后再决定是否换线。
+            if _classify_transport_error(r["data"]):
+                counts["transport"] += 1
     # rows 按开始时刻倒序：从最新一条往前数连续**出口级**失败。换线门用的语义是
     # 「最近 RECENT_WINDOW 条里连续几条说明这个出口不能用了」，与回切的累计计数
     # 无关——传 limit 的调用方（回切）不用 consec_err/full_err。
@@ -4811,6 +4864,46 @@ def _warp_reconnect_worker(reason: str, cooldown_on_ok: float):
 
 
 
+_LAST_TRANSPORT_PROBE_TS = 0.0
+
+
+def _maybe_verify_transport_failures(count: int, now: float) -> None:
+    """传输层 503 出现后异步验证当前出口是否真的死了，再决定换线。
+
+    WHY 不能见 503 就换：sidecar 全局故障（spawn 失败 / 5min backoff）时换线
+    无效，只会制造 churn。区分办法是绕开 9router、直接经当前隧道查 CF trace：
+    出口通 → 问题在 9router 侧（不换）；出口不通 → 换线（不标脏，503 不是
+    出口级证据）。探针节流，避免 503 批量落库时每秒起一个线程。
+    """
+    global _LAST_TRANSPORT_PROBE_TS
+    gap = float(_warp().get("transport_probe_gap_sec", 15))
+    if now - _LAST_TRANSPORT_PROBE_TS < gap:
+        return
+    tag = active_warp_tag()
+    member = _warp_member(tag)
+    if not member:
+        return
+    _LAST_TRANSPORT_PROBE_TS = now
+    threading.Thread(target=_transport_probe_worker,
+                     args=(tag, member["port"], count),
+                     daemon=True, name="transport-probe").start()
+
+
+def _transport_probe_worker(tag: str, port: int, count: int) -> None:
+    _verify_transport_failure(tag, port, count)
+
+
+def _verify_transport_failure(tag: str, port: int, count: int) -> None:
+    """探当前出口：通 → 判为 9router 侧故障不换线；不通 → 换线。"""
+    ip = warp_egress_ip(port, timeout_sec=8.0)
+    if ip:
+        log(f"⚠ 传输层 503 ×{count}，但 {tag} 出口探测正常（{ip}）"
+            f" → 判为 9router 侧故障，不换线")
+        return
+    log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
+    _reconnect_warp_now(f"transport ×{count}（出口探测失败）", _now_ts())
+
+
 def maybe_reconnect_warp(now: float) -> None:
     """累计到阈值就异步换线，避免阻塞主循环（探测最长 ~40s）。
 
@@ -4824,9 +4917,17 @@ def maybe_reconnect_warp(now: float) -> None:
     曾用 2^n 退避"避免隧道反复重启"，实测在 429 风暴期退避会一路涨到 600s 封顶
     且永不回落，17:02~17:09 九分钟零换线、1752 条请求全废 —— 抑制换线比换线本身
     代价更大。
+
+    传输层 503（9router Bun 传输悬挂）不走这条阈值路径：它不是出口级证据，
+    先经当前隧道探出口，探不通才换线（见 `_maybe_verify_transport_failures`）。
     """
     global _last_warp_reconnect_ts, _warp_cooldown_until
     blocked = count_warp_blocked_since(_last_warp_reconnect_ts)
+    # 传输层 503 不走上面的出口级阈值（它不是出口被限流/拉黑的证据）。
+    # 达到阈值后先异步探当前出口，探不通才换线，见 _maybe_verify_transport_failures。
+    transport_fail = int(blocked.get("transport", 0))
+    if transport_fail >= int(_warp().get("transport_fail_threshold", 1)):
+        _maybe_verify_transport_failures(transport_fail, now)
     triggered = [k for k, thr in (("abuse403", _warp()["block_threshold"]),
                                   ("rate429", _warp()["rate429_threshold"]))
                  if blocked[k] >= thr]
@@ -6382,6 +6483,7 @@ def main():
     last_watermark = -1
     next_error_eval = 0.0
     total = errors = consecutive_errors = 0
+    transport_errors = 0
     reject_ratio = 0.0
     cached_all_nodes, cached_current_proxy = _pool_snapshot()
     while True:
@@ -6400,7 +6502,8 @@ def main():
                 new_rows = wm != last_watermark
                 if new_rows:
                     last_watermark = wm
-                    total, errors, details, consecutive_errors, reject_ratio = get_9router_error_rate()
+                    total, errors, details, consecutive_errors, reject_ratio, \
+                        transport_errors = get_9router_error_rate()
                     # errors 只数出口级拦截，不能拿 total-errors 当成功数（402/超长
                     # 会被误算成成功）。成功数直接数 status，才是这个出口真的served 的流量。
                     ok_count = sum(1 for r in details if r.get("status") == "success")
@@ -6564,6 +6667,7 @@ def main():
             cool_until = max(_warp_cooldown_until, _pool_cooldown_until)
             log_health(f"出口={_egress_label(cached_current_proxy)} "
                        f"节点={len(cached_all_nodes)} 错误={errors}/{total} "
+                       f"503={transport_errors} "
                        f"err>{(err_threshold*100):.0f}%→切"
                        f"冷却至={time.strftime('%H:%M:%S', time.localtime(cool_until)) if cool_until>now else '-'}"
                        f" dead={dead_count} cool={cool_count} 策略={_strategy_mode}"
