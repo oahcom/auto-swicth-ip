@@ -1119,15 +1119,18 @@ _LAST_503_WARN = 0.0
 
 
 def _warn_transport_503(consecutive: int) -> None:
-    """sidecar 故障告警，10 分钟节流（503 批量落库下每秒都会重触）。"""
+    """sidecar 挂起告警，10 分钟节流（503 批量落库下每秒都会重触）。
+
+    处理路径见 `_verify_transport_failure`：先探出口，探不通换线，探通则清理
+    僵死的 opencode 连接（换线后旧链的 keep-alive 连接会被继续复用）。
+    """
     global _LAST_503_WARN
     now = time.time()
     if now - _LAST_503_WARN < 600.0:
         return
     _LAST_503_WARN = now
     log(f"⚠ [OpenCode Free] 连续 {consecutive} 条 503 UpstreamTransportError —— "
-        f"9router Bun sidecar 故障，换线/轮换对此无效，asip 不动作；需修 9router "
-        f"（sidecar 一次失败即 SIGKILL + 5min backoff，期间全部请求 503）")
+        f"等待出口探测：不通则换线，通则清理僵死连接（见 transport-probe）")
 
 
 class ErrorWindow(NamedTuple):
@@ -1601,6 +1604,87 @@ def singbox_api(path: str, method: str = "GET", body: dict | None = None,
     if status in (200, 204):
         return status, data
     return status, None
+
+
+def _opencode_connection_started_at(conn: dict) -> float | None:
+    """Clash API 的 start 是 ISO8601；解析失败返回 None（这条不动）。"""
+    raw = (conn or {}).get("start")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _close_opencode_connections(chain_tag: str | None, min_age_sec: float,
+                                reason: str = "") -> int:
+    """关闭指定链上已僵死的 opencode 长连接（age >= min_age_sec）。
+
+    WHY 只动 opencode、且要卡 age：换线后旧链上的在途请求本应跑完，立即
+    全关会掐断它们；而被复用的僵尸连接（隧道静默死亡、本地 socket 仍
+    ESTAB、数据黑洞）不关就会让后续每条请求白等满超时。正常请求 p50 6.5s，
+    120s 以上的连接已不可能是在途请求，关掉是安全的。
+    """
+    status, data = singbox_api("/connections", silent=True)
+    if status != 200 or not isinstance(data, dict):
+        return 0
+    now = time.time()
+    closed = 0
+    for conn in data.get("connections") or []:
+        meta = conn.get("metadata") or {}
+        host = str(meta.get("host") or meta.get("destinationIP") or "")
+        # 必须是 opencode.ai 本身或其子域：`endswith("opencode.ai")` 会连
+        # `evilopencode.ai` 一起关掉，误伤别的服务的长连接。
+        if not (host == "opencode.ai" or host.endswith(".opencode.ai")):
+            continue
+        chains = conn.get("chains") or []
+        if chain_tag and (not chains or chains[0] != chain_tag):
+            continue
+        started = _opencode_connection_started_at(conn)
+        if started is None or now - started < min_age_sec:
+            continue
+        cid = conn.get("id")
+        if not cid:
+            continue
+        st, _ = singbox_api(f"/connections/{cid}", method="DELETE", silent=True)
+        if st in (200, 204):
+            closed += 1
+    if closed:
+        log(f"✓ 清理 {closed} 条{reason}连接（{chain_tag or '当前链'}，"
+            f"≥{min_age_sec:.0f}s）")
+    return closed
+
+
+def _cleanup_connection_worker(chain_tag: str | None, min_age_sec: float,
+                               reason: str) -> None:
+    """线程体：清理异常必须落日志。线程里抛异常只会进 stderr，
+    daemon.log 里看不到，等于清理静默失效。"""
+    try:
+        _close_opencode_connections(chain_tag, min_age_sec, reason)
+    except Exception as e:
+        log(f"✗ 连接清理异常（{chain_tag or '当前链'}）: {e}")
+
+
+def _schedule_connection_cleanup(chain_tag: str | None, min_age_sec: float,
+                                 reason: str = "") -> None:
+    """清理走线程：一次 /connections + N 次 DELETE，不占主循环。"""
+    try:
+        threading.Thread(target=_cleanup_connection_worker,
+                         args=(chain_tag, min_age_sec, reason),
+                         daemon=True, name="conn-cleanup").start()
+    except Exception as e:
+        log(f"✗ 连接清理线程启动失败: {e}")
+
+
+def _after_warp_switch(old_tag: str | None) -> None:
+    """换线成功后清掉旧链上的僵尸 opencode 连接（age >= 配置阈值）。"""
+    _schedule_connection_cleanup(
+        old_tag,
+        float(_warp().get("cleanup_old_chain_age_sec", 120)),
+        reason="旧链",
+    )
+
 
 def get_current_proxy() -> str | None:
     r, data = singbox_api(f'/proxies/{CFG["singbox"]["selector"]}')
@@ -4558,6 +4642,7 @@ def _reconnect_warp_by_table(reason: str) -> bool:
             _proxy_dwell_since = 0
             _from = active["tag"] if active else "proxy"
             log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip})")
+            _after_warp_switch(active["tag"] if active else None)
             return True
         finally:
             _release_refresh_slot(m["tag"])
@@ -4842,6 +4927,7 @@ def reconnect_warp(reason: str) -> bool:
     _from = active["tag"] if active else "proxy"
     log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip}, "
         f"{'新段' if rest is None else f'/64 静置 {rest/60:.0f}min'})")
+    _after_warp_switch(active["tag"] if active else None)
     # 延迟刷新刚换下的线：立即重启会掐断仍在走它的在途请求，延迟到连接
     # 自然结束；预先刷好则下次切回时无需在换线路径上同步等 7~9s。
     if active is not None:
@@ -4875,6 +4961,8 @@ _LAST_TRANSPORT_PROBE_TS = 0.0
 # (换线窗口起点, transport 计数)：同一窗口内计数没变就说明证据没变，不再重复探。
 # 窗口起点一起进签名，换线后窗口重置能自动重新获得一次探测机会。
 _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
+# 出口正常时的僵死连接清理节流：清理本身便宜，但 503 风暴期每秒都会触发。
+_LAST_STALE_SWEEP_TS = 0.0
 
 
 def _maybe_verify_transport_failures(count: int, now: float) -> None:
@@ -4908,20 +4996,33 @@ def _transport_probe_worker(tag: str, port: int, count: int) -> None:
 
 
 def _verify_transport_failure(tag: str, port: int, count: int) -> None:
-    """探当前出口：通 → 判为 9router 侧故障不换线；不通 → 换线。"""
-    global _LAST_TRANSPORT_PROBE_SIG
+    """探当前出口：不通 → 换线；通 → 清理当前链上的僵死连接。
+
+    WHY 探通也要动作：2026-10-26 22:00 的故障里出口是好的（新连接 1~6s
+    拿到 429），挂死的是 sidecar 复用的 45 分钟旧连接。只探不清理的话，
+    这条僵死连接会被一直复用，503 持续到它自然断开。
+    """
+    global _LAST_STALE_SWEEP_TS, _LAST_TRANSPORT_PROBE_SIG
     ip = warp_egress_ip(port, timeout_sec=8.0)
-    if ip:
-        log(f"⚠ 传输层 503 ×{count}，但 {tag} 出口探测正常（{ip}）"
-            f" → 判为 9router 侧故障，不换线")
+    if not ip:
+        log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
+        if _reconnect_warp_now(f"transport ×{count}（出口探测失败）", _now_ts()):
+            return
+        # 冷却/闸门拒了这次换线：旧签名会把「同一批 503」锁死成不再探，出口已死
+        # 却永远等不到下一次机会。撤掉签名，下一批证据到达时再试。
+        _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
+        log("  · 传输层换线被冷却/闸门拒绝，已解除签名等待重试")
         return
-    log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
-    if _reconnect_warp_now(f"transport ×{count}（出口探测失败）", _now_ts()):
+    now = time.time()
+    gap = float(_warp().get("transport_stale_gap_sec", 600))
+    if now - _LAST_STALE_SWEEP_TS < gap:
+        log(f"⚠ 传输层 503 ×{count}，{tag} 出口正常（{ip}）"
+            f" → 连接池僵死，清理节流中（<{gap:.0f}s）")
         return
-    # 冷却/闸门拒了这次换线：旧签名会把「同一批 503」锁死成不再探，出口已死
-    # 却永远等不到下一次机会。撤掉签名，下一批证据到达时再试。
-    _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
-    log("  · 传输层换线被冷却/闸门拒绝，已解除签名等待重试")
+    _LAST_STALE_SWEEP_TS = now
+    log(f"⚠ 传输层 503 ×{count}，{tag} 出口正常（{ip}）→ 清理当前链僵死连接")
+    _schedule_connection_cleanup(
+        tag, float(_warp().get("transport_stale_age_sec", 300)), reason="僵死")
 
 
 def maybe_reconnect_warp(now: float) -> None:

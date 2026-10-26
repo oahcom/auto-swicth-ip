@@ -566,3 +566,42 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
   → 需要落盘日志/告警，否则同类故障不可观测。
 - 报错文案建议拆分 "forward hang" 与 "sidecar unavailable"（改动需 Codex 复审）。
 
+
+## INC-010 — 传输 503 真因：换线后僵尸 CONNECT + 9router 生产构建未重建（2026-10-26）
+
+**日期**: 2026-10-26
+**等级**: P1（21:51–22:12 期间 opencode free 100% 失败，每条挂满 60s）
+**现象**: 21:51 起 `transport503` 连续出现，`ttft=0`、`total≈60-65s`、
+`tokens=0`；重启 9router 后立刻恢复 37/39。
+
+### 真因链（证据）
+
+1. 9router sidecar（bun pid 215307）自 21:07 起持有 3 条到 `opencode.ai` 的
+   HTTP CONNECT 长连接（CF-C 出口，累计 up 54.8/38.6/29.4MB）。
+2. 21:46:13 ASIP 把出口 WARP-CF-C 换到 WARP-CF-16；这些连接每个请求仍走
+   `chains[0]=WARP-CF-C` 的僵尸隧道——本地 socket 仍 ESTAB，但黑洞无 RST。
+3. 同一时刻经 7890 的新连接 1.0–6.3s 就拿到 429 FreeUsageLimitError，
+   证明**出口是好的**，坏的是被复用的旧连接。
+4. 旧构建无请求超时（readyTimeout=8s / stall=360s 都不是 60s），故每条复用
+   请求挂满调用方 60s 上限 → 合成 503。
+5. 另发现: `npm run start` 跑的是 `.next` 生产构建（06:08），而 21:28/22:28
+   的 JS 改动从未 build；`.next` 内搜不到 `OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS`。
+   即「20s 超时 + alternate 换线」此前只在源码/测试里，线上未生效。
+
+### 处置
+
+- ASIP：换线成功后异步清理旧链 `age>=120s` 的 opencode 连接；传输 503 且出口
+  探测正常时，清理当前链 `age>=300s` 的连接（10 分钟节流）。实测 23:31:15
+  换线后输出「✓ 清理 6 条旧链连接（WARP-CF，≥120s）」。
+- 9router：`headerTimeoutMs=20s`（`OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS`）、
+  503+UpstreamTransportError 换 alternate 重试一次；`oc/deepseek-v4.1-flash-free`
+  上限 330k。**必须 `npm run build` 后重启才生效**。
+- 构建离线化：`next/font/google` 改为 `next/font/local`（自托管 Inter latin），
+  否则本机出口到 fonts.googleapis.com 不可达，`next build` 直接失败。
+
+### 教训
+
+- 重启「止血」不等于修复上线：先确认运行产物（`.next` BUILD_ID/mtime）是否
+  包含改动，再看源码。
+- 换线只切换 selector 出口，不会迁移已建立的长连接；长连接池必须按链清理。
+- 清理必须带 age 过滤，禁止 kill-all（在途流仍可能是好请求）。

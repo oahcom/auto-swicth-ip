@@ -4525,25 +4525,77 @@ def test_maybe_reconnect_warp_verifies_transport_before_rotating(monkeypatch):
 
 
 def test_verify_transport_failure_rotates_only_when_egress_dead(monkeypatch):
-    """出口探通 → 判为 9router 侧故障不换线；探不通 → 换线。"""
+    """出口探通 → 清理僵死连接不换线；探不通 → 换线。"""
     monkeypatch.setattr(daemon, "log", lambda msg: None)
     rotations = []
+    sweeps = []
 
     def fake_rotate(reason, now, ignore_cooldown=False):
         rotations.append(reason)
         return True
 
     monkeypatch.setattr(daemon, "_reconnect_warp_now", fake_rotate)
+    monkeypatch.setattr(daemon, "_schedule_connection_cleanup",
+                        lambda tag, age, reason="": sweeps.append((tag, age, reason)))
+    monkeypatch.setattr(daemon, "_LAST_STALE_SWEEP_TS", 0.0)
 
     monkeypatch.setattr(daemon, "warp_egress_ip",
                         lambda port, timeout_sec=8.0: "2a09:bac5::1")
     daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
     assert rotations == [], "出口探通时换线无效，不得切走干净出口"
+    assert sweeps == [("WARP-CF-X", 300.0, "僵死")], "出口正常时应清僵死连接"
+
+    # 节流窗口内不重复全表扫描
+    daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
+    assert len(sweeps) == 1
 
     monkeypatch.setattr(daemon, "warp_egress_ip",
                         lambda port, timeout_sec=8.0: None)
     daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
     assert rotations and "transport" in rotations[0], rotations
+
+
+def test_close_opencode_connections_filters_chain_host_and_age(monkeypatch):
+    """只关「指定链 + opencode.ai + 足够老」的连接；其它一律不动。"""
+    now = time.time()
+
+    def iso(age: float) -> str:
+        return datetime.fromtimestamp(now - age, tz=timezone.utc).isoformat()
+
+    conns = [
+        {"id": "old-stale", "metadata": {"host": "opencode.ai"},
+         "chains": ["WARP-CF-C", "proxy"], "start": iso(600)},
+        {"id": "old-fresh", "metadata": {"host": "opencode.ai"},
+         "chains": ["WARP-CF-C", "proxy"], "start": iso(5)},
+        {"id": "new-stale", "metadata": {"host": "opencode.ai"},
+         "chains": ["WARP-CF-16", "proxy"], "start": iso(600)},
+        {"id": "other-host", "metadata": {"host": "example.com"},
+         "chains": ["WARP-CF-C", "proxy"], "start": iso(600)},
+        {"id": "no-start", "metadata": {"host": "opencode.ai"},
+         "chains": ["WARP-CF-C", "proxy"]},
+    ]
+    deleted = []
+
+    def fake_api(path, method="GET", body=None, timeout=3, silent=False):
+        if path == "/connections":
+            return 200, {"connections": conns}
+        deleted.append((method, path))
+        return 204, None
+
+    monkeypatch.setattr(daemon, "singbox_api", fake_api)
+    monkeypatch.setattr(daemon, "log", lambda msg: None)
+
+    assert daemon._close_opencode_connections("WARP-CF-C", 120) == 1
+    assert deleted == [("DELETE", "/connections/old-stale")]
+
+
+def test_after_warp_switch_cleans_old_chain(monkeypatch):
+    """换线成功钩子必须把旧链交给异步清理，且用配置的 age 阈值。"""
+    calls = []
+    monkeypatch.setattr(daemon, "_schedule_connection_cleanup",
+                        lambda tag, age, reason="": calls.append((tag, age, reason)))
+    daemon._after_warp_switch("WARP-CF-C")
+    assert calls == [("WARP-CF-C", 120.0, "旧链")]
 
 
 class _FakeThread:
@@ -4609,3 +4661,16 @@ def test_verify_transport_failure_rearms_when_rotation_refused(monkeypatch):
 
     assert daemon._LAST_TRANSPORT_PROBE_SIG == (0.0, 0), daemon._LAST_TRANSPORT_PROBE_SIG
     assert any("拒绝" in m for m in logs), logs
+
+
+def test_cleanup_worker_logs_instead_of_raising(monkeypatch):
+    """清理线程里的异常必须落日志：线程异常只进 stderr，daemon.log 看不到。"""
+    logs = []
+    monkeypatch.setattr(daemon, "log", logs.append)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("clash api down")
+
+    monkeypatch.setattr(daemon, "_close_opencode_connections", boom)
+    daemon._cleanup_connection_worker("WARP-CF-X", 120.0, "旧链")
+    assert any("clash api down" in m for m in logs), logs
