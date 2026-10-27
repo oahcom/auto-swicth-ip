@@ -4565,6 +4565,7 @@ def test_verify_transport_failure_rotates_only_when_egress_dead(monkeypatch):
     monkeypatch.setattr(daemon, "_schedule_connection_cleanup",
                         lambda tag, age, reason="": sweeps.append((tag, age, reason)))
     monkeypatch.setattr(daemon, "_LAST_STALE_SWEEP_TS", 0.0)
+    monkeypatch.setitem(daemon.CFG["warp"], "cleanup_enabled", True)
 
     monkeypatch.setattr(daemon, "warp_egress_ip",
                         lambda port, timeout_sec=8.0: "2a09:bac5::1")
@@ -4598,6 +4599,39 @@ def test_verify_transport_failure_rotates_only_when_egress_dead(monkeypatch):
     daemon._verify_transport_failure("WARP-CF-X", 1080, 5)
     assert "悬挂" in rotations[-1], rotations
     assert daemon._LANE_FAIL_STREAK == 0, "换线后确认计数应归零"
+
+
+def test_verify_transport_failure_cleanup_disabled_does_not_sweep_or_throttle(
+        monkeypatch):
+    """cleanup_enabled=false 时不应清连接，也不应推进节流时间戳。"""
+    sweeps = []
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=8.0: "2a09:bac5::1")
+    monkeypatch.setattr(daemon, "_opencode_lane_alive",
+                        lambda port, timeout_sec=6.0: True)
+    monkeypatch.setattr(daemon, "_schedule_connection_cleanup",
+                        lambda tag, age, reason="": sweeps.append(tag))
+    monkeypatch.setitem(daemon.CFG["warp"], "cleanup_enabled", False)
+    monkeypatch.setattr(daemon, "_LAST_STALE_SWEEP_TS", 0.0)
+    monkeypatch.setattr(daemon, "_LANE_FAIL_STREAK", 0)
+
+    daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
+
+    assert sweeps == [], "禁用时不得触发连接清理"
+    assert daemon._LAST_STALE_SWEEP_TS == 0.0, "禁用时不得推进节流"
+
+
+def test_transport_probe_worker_swallows_exception_and_rearms(monkeypatch):
+    """探针抛异常时必须清签名，否则同批 503 永远不会再被验证。"""
+    monkeypatch.setattr(daemon, "_LAST_TRANSPORT_PROBE_SIG", (1.0, 9))
+
+    def boom(tag, port, count):
+        raise RuntimeError("curl missing")
+
+    monkeypatch.setattr(daemon, "_verify_transport_failure", boom)
+    daemon._transport_probe_worker("WARP-CF-X", 1080, 9)
+
+    assert daemon._LAST_TRANSPORT_PROBE_SIG == (0.0, 0)
 
 
 def test_opencode_lane_alive_treats_any_http_status_as_alive(monkeypatch):

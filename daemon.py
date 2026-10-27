@@ -2227,10 +2227,28 @@ def _reclaim_foreign_pool(now: float | None = None) -> bool:
     return _switch_warp(target)
 
 
+def _systemctl_scope() -> list[str]:
+    """隧道单元装在哪个总线：系统级优先，没有才用用户级。
+
+    daemon 自身可能跑在系统总线（无 user bus，`--user` 直接报
+    "Failed to connect to bus: No medium found"），也可能跑在用户级。
+    按单元是否存在分别判断，不靠 daemon 自己的 cgroup —— 隧道和 daemon
+    不必同总线，迁移期间两者会短暂并存。
+    """
+    try:
+        r = subprocess.run(["systemctl", "cat", "usque-warp.service"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return ["systemctl"]
+    except Exception:
+        pass
+    return ["systemctl", "--user"]
+
+
 def _restart_service(service: str, tag: str | None = None) -> bool:
     try:
         r = subprocess.run(
-            ["systemctl", "--user", "restart", service],
+            [*_systemctl_scope(), "restart", service],
             capture_output=True, text=True, timeout=20,
         )
         if r.returncode != 0:
@@ -5072,6 +5090,7 @@ _LAST_STALE_SWEEP_TS = 0.0
 # 避免把一条正常但偶发超时的出口切走（K8s/CF LB 的 consecutive_down 同思路）。
 _LANE_FAIL_STREAK = 0
 _LANE_FAIL_TS = 0.0
+_LANE_LOCK = threading.Lock()
 LANE_FAIL_CONFIRM = 2
 LANE_FAIL_WINDOW_SEC = 120.0
 
@@ -5097,9 +5116,14 @@ def _maybe_verify_transport_failures(count: int, now: float) -> None:
         return
     _LAST_TRANSPORT_PROBE_TS = now
     _LAST_TRANSPORT_PROBE_SIG = sig
-    threading.Thread(target=_transport_probe_worker,
-                     args=(tag, member["port"], count),
-                     daemon=True, name="transport-probe").start()
+    try:
+        threading.Thread(target=_transport_probe_worker,
+                         args=(tag, member["port"], count),
+                         daemon=True, name="transport-probe").start()
+    except Exception as e:  # 线程起不来时证据签名必须回滚，否则这批 503 永不再探
+        _LAST_TRANSPORT_PROBE_TS = 0.0
+        _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
+        log(f"✗ 传输层探针线程启动失败: {e}")
 
 
 OPENCODE_LANE_URL = "https://opencode.ai/inference/v1/chat/completions"
@@ -5155,7 +5179,12 @@ def _opencode_lane_alive(port: int, timeout_sec: float = 6.0) -> bool:
 
 
 def _transport_probe_worker(tag: str, port: int, count: int) -> None:
-    _verify_transport_failure(tag, port, count)
+    global _LAST_TRANSPORT_PROBE_SIG
+    try:
+        _verify_transport_failure(tag, port, count)
+    except Exception as e:  # 探针崩了不能留下「已探过」的签名，否则同批证据永不重探
+        _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
+        log(f"✗ 传输层探针异常: {e}")
 
 
 def _verify_transport_failure(tag: str, port: int, count: int) -> None:
@@ -5171,6 +5200,8 @@ def _verify_transport_failure(tag: str, port: int, count: int) -> None:
     if not ip:
         log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
         if _reconnect_warp_now(f"transport ×{count}（出口探测失败）", _now_ts()):
+            with _LANE_LOCK:  # 新出口的第一条证据不该继承旧线上的计数
+                _LANE_FAIL_STREAK = 0
             return
         # 冷却/闸门拒了这次换线：旧签名会把「同一批 503」锁死成不再探，出口已死
         # 却永远等不到下一次机会。撤掉签名，下一批证据到达时再试。
@@ -5179,26 +5210,34 @@ def _verify_transport_failure(tag: str, port: int, count: int) -> None:
         return
     if not _opencode_lane_alive(MIXED_PORT):
         probe_now = time.time()
-        if probe_now - _LANE_FAIL_TS > LANE_FAIL_WINDOW_SEC:
-            _LANE_FAIL_STREAK = 0
-        _LANE_FAIL_STREAK += 1
-        _LANE_FAIL_TS = probe_now
-        if _LANE_FAIL_STREAK < LANE_FAIL_CONFIRM:
-            # 留观一次：把签名清掉，下一批 503 到达时立刻再探，而不是等 15s 节流。
+        with _LANE_LOCK:
+            if probe_now - _LANE_FAIL_TS > LANE_FAIL_WINDOW_SEC:
+                _LANE_FAIL_STREAK = 0
+            _LANE_FAIL_STREAK += 1
+            _LANE_FAIL_TS = probe_now
+            streak = _LANE_FAIL_STREAK
+        if streak < LANE_FAIL_CONFIRM:
+            # 留观一次：清掉签名，下一批 503 到达时再探（仍受 15s 探针节流约束）。
             log(f"⚠ 传输层 503 ×{count}，{tag} 出口可达（{ip}）"
-                f"但 opencode 链路悬挂（{_LANE_FAIL_STREAK}/{LANE_FAIL_CONFIRM}），留观")
+                f"但 opencode 链路悬挂（{streak}/{LANE_FAIL_CONFIRM}），留观")
             _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
             return
         log(f"⚠ 传输层 503 ×{count}，{tag} 出口可达（{ip}）"
-            f"但 opencode 链路连续 {_LANE_FAIL_STREAK} 次悬挂 → 换线")
+            f"但 opencode 链路连续 {streak} 次悬挂 → 换线")
         if _reconnect_warp_now(f"transport ×{count}（opencode 链路连续悬挂）", _now_ts()):
-            _LANE_FAIL_STREAK = 0
+            with _LANE_LOCK:
+                _LANE_FAIL_STREAK = 0
             return
         _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
         log("  · 传输层换线被冷却/闸门拒绝，已解除签名等待重试")
         return
-    _LANE_FAIL_STREAK = 0
+    with _LANE_LOCK:
+        _LANE_FAIL_STREAK = 0
     now = time.time()
+    if not _warp().get("cleanup_enabled", False):
+        log(f"⚠ 传输层 503 ×{count}，{tag} 出口正常（{ip}）"
+            f" → 连接清理已禁用（cleanup_enabled=false），仅记录")
+        return
     gap = float(_warp().get("transport_stale_gap_sec", 600))
     if now - _LAST_STALE_SWEEP_TS < gap:
         log(f"⚠ 传输层 503 ×{count}，{tag} 出口正常（{ip}）"
@@ -6737,9 +6776,10 @@ def main():
             time.sleep(3)
             if not check_9router_health():
                 log("✗ 9router 仍不可达，尝试重启...")
-                # Try to restart 9router via systemd if available
+                # 实际托管 9router 的是系统级 `9router.service`；
+                # `nine-router-src.service` 已 masked，且用户总线在此不可达。
                 try:
-                    subprocess.run(["systemctl", "--user", "restart", "nine-router-src.service"], timeout=30)
+                    subprocess.run(["systemctl", "restart", "9router.service"], timeout=30)
                 except Exception:
                     pass
                 time.sleep(5)
