@@ -1,0 +1,30 @@
+#!/bin/bash
+# 系统级单元的特权包装：daemon 以 administrator 运行，但重启的是系统单元。
+#
+# WHY 需要这个：auto-switch-ip / 9router / 20 条隧道全部改成系统级单元后，
+# 重启它们就是 root 操作。而 daemon 本身不能以 root 跑 —— config.py 用
+# pwd.getpwuid(os.getuid()).pw_dir 取家目录，root 会得到 /root，于是 9router
+# 的库、.env、.warp 目录全找不到（实测直接崩在启动路径解析）。
+#
+# WHY 不用 polkit：本机 polkit.service 是 inactive，且要为「无交互的服务进程」
+# 配 polkit 规则，比一条 sudoers 更难审计。
+#
+# WHY 白名单收在这里而不写进 sudoers：sudoers 的命令参数**不允许通配符**
+# （visudo 直接报 "wildcards are not allowed in command arguments"），
+# 而 daemon 要重启的正是 usque-warp-11/b/c/... 这二十个名字。
+set -euo pipefail
+
+cmd=${1:?用法: asip-unit <restart|start|stop|is-active> <单元名>}
+unit=${2:?缺少单元名}
+
+case $unit in
+    usque-warp*.service|nine-router-src.service) ;;
+    *) echo "✗ 拒绝：$unit 不在白名单" >&2; exit 2 ;;
+esac
+
+case $cmd in
+    restart|start|stop|is-active) ;;
+    *) echo "✗ 拒绝：$cmd 不在白名单" >&2; exit 2 ;;
+esac
+
+exec /usr/bin/systemctl "$cmd" "$unit"

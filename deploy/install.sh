@@ -10,7 +10,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UNIT_DIR="${SYSTEMD_DIR:-$HOME/.config/systemd/user}"
+UNIT_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 # 写进 $UNIT_DIR 的单元会把 ExecStart 钉成**本次运行的这个 DIR**。所以拿一份副本
 # 试跑（如 /tmp 下的 clone）时若忘了设 SYSTEMD_DIR，就会把现网单元悄悄改指到副本，
 # 而副本随时可被清理 —— 服务下次重启即崩。真实事故：`--units-only` 在 /tmp 副本
@@ -24,6 +24,9 @@ if [ -z "${SYSTEMD_DIR:-}" ] && [ -n "$cur" ] && [ "$cur" != "$DIR" ] && [ -f "$
 fi
 # 单元里的解释器写绝对路径，所以必须钉死"给这份代码用的那个 python"，不能是
 # 临时 shell 里碰巧在 PATH 首位的那个（conda 用户会拿到 miniforge，重启后不同）。
+# 单元以哪个用户跑。必须是该仓库的属主：daemon 要读写 .warp/.env/日志，
+# 而 config.py 的家目录也是按 uid 推的。
+RUN_USER="${ASIP_RUN_USER:-$(id -un)}"
 PYBIN="${PYTHON:-/usr/bin/python3}"
 [ -x "$PYBIN" ] || { echo "✗ 解释器不存在：$PYBIN（用 PYTHON=... 指定）" >&2; exit 1; }
 UNITS_ONLY=0; ADOPT=0
@@ -162,8 +165,24 @@ if [ "$UNITS_ONLY" = 0 ]; then
     done <<< "$MEMBERS"
 fi
 
-# ---- 单元文件：一律绝对路径 + 当前用户 ----
-mkdir -p "$UNIT_DIR"
+# ---- 单元文件：系统级 ----
+# 写 /etc/systemd/system 需要 root；本脚本自身以 administrator 跑（家目录、
+# .warp 属主都在它名下），只在写单元与 systemctl 这几步提权。
+need_root() {
+    if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@" || { echo "✗ 需要 root：$*" >&2; exit 1; }; fi
+}
+need_root mkdir -p "$UNIT_DIR"
+
+# ---- 特权包装：daemon 以非 root 运行，但要重启系统级单元 ----
+# 见 deploy/asip-unit 的注释：sudoers 不允许命令参数带通配符，白名单只能
+# 收在脚本里；polkit 在本机 inactive，也不适合给无交互服务进程配规则。
+need_root install -m 0755 "$DIR/deploy/asip-unit" /usr/local/bin/asip-unit
+SUDOERS_FILE=/etc/sudoers.d/auto-switch-ip
+if [ ! -f "$SUDOERS_FILE" ]; then
+    printf '# 由 deploy/install.sh 生成。只放行 asip-unit 一个入口，白名单在它内部。\n%s ALL=(root) NOPASSWD: /usr/local/bin/asip-unit\n' "$RUN_USER"         | need_root tee "$SUDOERS_FILE" >/dev/null
+    need_root chmod 0440 "$SUDOERS_FILE"
+    need_root visudo -c -f "$SUDOERS_FILE" >/dev/null         || { echo "✗ $SUDOERS_FILE 语法错误" >&2; exit 1; }
+fi
 cat > "$UNIT_DIR/auto-switch-ip.service" <<EOF
 [Unit]
 Description=auto-switch-ip daemon — monitor 9router errors + rotate sing-box proxy nodes
@@ -172,6 +191,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# 以 administrator 而非 root 运行：config.py 用 pwd.getpwuid(os.getuid()).pw_dir
+# 取家目录，root 会得到 /root，9router 的库、.env、.warp 全部找不到。
+# 代价是重启系统级单元要提权，走 /usr/local/bin/asip-unit（sudoers 白名单）。
+User=$RUN_USER
+Group=$RUN_USER
 ExecStart=$PYBIN $DIR/daemon.py
 WorkingDirectory=$DIR
 Restart=always
@@ -185,23 +209,25 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
 cat > "$UNIT_DIR/asi-selfcheck.service" <<EOF
 [Unit]
 Description=auto-switch-ip 自检引擎 — 巡检并写入 .monitor_state.json
-After=default.target
+After=multi-user.target
 
 [Service]
 Type=oneshot
+User=$RUN_USER
+Group=$RUN_USER
 ExecStart=$PYBIN $DIR/self_evolve_checkpoint.py
 WorkingDirectory=$DIR
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
 cat > "$UNIT_DIR/asi-selfcheck.timer" <<'EOF'
@@ -214,7 +240,7 @@ Persistent=true
 RandomizedDelaySec=60
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
 # 单元名必须与 config.py 的 warp.members[].service 一致，否则 daemon 的
@@ -231,19 +257,21 @@ After=network-online.target
 
 [Service]
 Type=simple
+User=$RUN_USER
+Group=$RUN_USER
 WorkingDirectory=$DIR/.warp/$dir
 ExecStart=$DIR/deploy/usque-launch.sh $port $fam
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 done <<< "$MEMBERS"
 
-systemctl --user daemon-reload
+need_root systemctl daemon-reload
 if [ "$UNITS_ONLY" = 0 ]; then
-    systemctl --user enable --now auto-switch-ip.service asi-selfcheck.timer $SERVICES
+    need_root systemctl enable --now auto-switch-ip.service asi-selfcheck.timer $SERVICES
     echo "已启用 auto-switch-ip + asi-selfcheck.timer +$(echo $SERVICES | wc -w)条隧道单元"
     # 注册失败的隧道单元会立刻退出并无限重启：宁可让部署返回失败，也别让人以为成了。
     [ "$REGISTER_FAILED" = 0 ] || { echo "✗ $REGISTER_FAILED 条隧道注册失败，见上方 ⚠" >&2; exit 1; }

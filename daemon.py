@@ -1819,12 +1819,35 @@ def _switch_warp(tag: str) -> bool:
     return True
 
 
-def _restart_service(service: str, tag: str | None = None) -> bool:
-    try:
-        r = subprocess.run(
-            ["systemctl", "--user", "restart", service],
+# 本 daemon 跑在系统级单元里，但以 User=administrator 运行：config.py 用
+# pwd.getpwuid(os.getuid()).pw_dir 取家目录，以 root 跑会指向 /root，
+# 9router 的库、.env、.warp 全部找不到。代价是非 root 进程重启不了系统单元，
+# 于是走 /usr/local/bin/asip-unit（sudoers 里 NOPASSWD 放行的白名单包装，
+# 只认 usque-warp*.service 与 nine-router-src.service）。sudoers 不允许命令
+# 参数带通配符，所以白名单只能收在那个脚本里，不能写在这。
+_UNIT_CTL = "/usr/local/bin/asip-unit"
+
+
+def _unit_ctl(action: str, service: str) -> subprocess.CompletedProcess:
+    """对系统级单元执行 action。
+
+    优先用 asip-unit（sudo 免密白名单）；它不存在时退回直接 systemctl ——
+    没装 sudoers 规则的机器上至少给出一条清楚的报错，而不是 FileNotFoundError。
+    """
+    if os.path.exists(_UNIT_CTL):
+        return subprocess.run(
+            ["sudo", "-n", _UNIT_CTL, action, service],
             capture_output=True, text=True, timeout=20,
         )
+    return subprocess.run(
+        ["systemctl", action, service],
+        capture_output=True, text=True, timeout=20,
+    )
+
+
+def _restart_service(service: str, tag: str | None = None) -> bool:
+    try:
+        r = _unit_ctl("restart", service)
         if r.returncode != 0:
             log(f"✗ 重启 {service} 失败: {r.stderr.strip()[:200]}")
         elif tag:
@@ -5156,7 +5179,7 @@ def main():
                 log("✗ 9router 仍不可达，尝试重启...")
                 # Try to restart 9router via systemd if available
                 try:
-                    subprocess.run(["systemctl", "--user", "restart", "nine-router-src.service"], timeout=30)
+                    _unit_ctl("restart", "nine-router-src.service")
                 except Exception:
                     pass
                 time.sleep(5)

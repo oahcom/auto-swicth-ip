@@ -14,7 +14,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="${NINE_ROUTER_SRC:-$HOME/9router}"
 REPO="${NINE_ROUTER_REPO:-https://github.com/oahcom/9router.git}"
-UNIT_DIR="${SYSTEMD_DIR:-$HOME/.config/systemd/user}"
+UNIT_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 SVC=nine-router-src.service
 PORT="${NINE_ROUTER_PORT:-20127}"
 # 与 fork 的 .nvmrc 一致。只在系统 node 太旧或缺失时下载。
@@ -111,7 +111,14 @@ fi
 
 # ---- 4. unit ----
 # DATA_DIR 不设 = 9router 自己取 ~/.9router，正好是 asip 的默认 db 路径。
+# /etc/systemd/system 需要 root，单元的写入与 systemctl 都提权。
+need_root() {
+    if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@" || { echo "✗ 需要 root：$*" >&2; exit 1; }; fi
+}
 mkdir -p "$UNIT_DIR"
+
+# 以 administrator 而非 root 运行（config.py 按 uid 取家目录；root 会指 /root）。
+RUN_USER="${ASIP_RUN_USER:-$(id -un)}"
 cat > "$UNIT_DIR/$SVC" <<EOF
 [Unit]
 Description=9Router (source build) — AI router / token saver
@@ -120,6 +127,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=$RUN_USER
+Group=$RUN_USER
 WorkingDirectory=$SRC
 # bun 必须在 PATH 里：[OpenCodeTransport] 用 subprocess 直接 spawn bun，
 # ENOENT 时它退回直连 —— 流量绕过 sing-box，出口是真实 IP，必定 429。
@@ -143,11 +152,11 @@ StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
-systemctl --user daemon-reload
-systemctl --user enable --now "$SVC"
+need_root systemctl daemon-reload
+need_root systemctl enable --now "$SVC"
 
 # ---- 5. 等端口起来 ----
 # 只认 HTTP 200/307：进程活着不等于 router 就绪（Next 编译首帧要几百 ms）。
@@ -158,5 +167,5 @@ for i in $(seq 1 30); do
     esac
     sleep 1
 done
-systemctl --user --no-pager status "$SVC" | head -15 >&2 || true
+need_root systemctl --no-pager status "$SVC" | head -15 >&2 || true
 die "9router 在 30s 内没起来（journalctl --user -u $SVC -n 50）"
