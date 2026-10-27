@@ -24,6 +24,9 @@ import requests
 import subprocess
 import concurrent.futures
 import socket
+import secrets
+import socketserver
+import http.server
 import traceback
 import urllib3
 from collections import deque
@@ -4854,7 +4857,8 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
     return False
 
 
-def _reconnect_warp_by_table(reason: str, interrupt: bool = True) -> bool:
+def _reconnect_warp_by_table(reason: str, interrupt: bool = True,
+                              out: dict | None = None) -> bool:
     """只读状态表换线：无 120s 内 OK 就等待，不现场探测、不重启、不落池。"""
     global _ACTIVE_WARP_IP, _proxy_dwell_since, _last_warp_switch_ok_ts
     now = time.time()
@@ -4903,6 +4907,11 @@ def _reconnect_warp_by_table(reason: str, interrupt: bool = True) -> bool:
             _begin_segment(switched_at)
             _proxy_dwell_since = 0
             _from = active["tag"] if active else "proxy"
+            if out is not None:
+                out["tag"] = m["tag"]
+                out["ip"] = ip
+                out["switched_at"] = switched_at
+                out["old_tag"] = active["tag"] if active else None
             log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip})")
             _after_warp_switch(active["tag"] if active else None, interrupt)
             return True
@@ -6877,6 +6886,199 @@ def _log_startup_banner(all_nodes: list[str]) -> None:
     log("=" * 50)
 
 
+
+# ===== 同步轮换接口（/rotate，Unix domain socket）=====
+#
+# 为什么要有：9router 的两个 proxy pool 内容完全相同（都指向 127.0.0.1:7890），
+# 它的 selectAlternateProxy 永远返回 null —— 撞 429 时它自己换不出任何东西，
+# 只能就地合成一个 429 回去。真正能改变出口的只有本进程（它持有 selector）。
+#
+# 不开 TCP：WSL 镜像网络下 127.0.0.1 与 Windows 宿主共享，开端口等于把「换
+# 出口」这个动作暴露给宿主上任意进程。UDS 靠文件 0600 + 目录 0700 保护。
+_API_LOCK = threading.Lock()
+_API_TOKEN = ""
+_last_rotate_ts: float = 0.0
+_api_stats = {"calls": 0, "switched": 0, "coalesced": 0,
+              "too_frequent": 0, "no_standby": 0, "failed": 0}
+
+_REASON_WHITELIST = {"rate429": "rate429", "abuse403": "abuse403",
+                     "proactive": "proactive"}
+
+
+def _api_cfg() -> dict:
+    return CFG.get("api") or {}
+
+
+def _ensure_api_token() -> str:
+    """首次启动生成 32 字节随机 token，写 0600。"""
+    path = _api_cfg()["token_path"]
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    tok = secrets.token_urlsafe(32)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(tok)
+    return tok
+
+
+def _normalize_rotate_reason(raw) -> str:
+    """白名单收敛：429/quota 归 rate429，403/abuse 归 abuse403。
+
+    未知原因按 rate429 处理 —— 宁可多记一次限流，也不要把一个真的被拦过的
+    地址当成干净地址放回候选池。
+    """
+    v = str(raw or "").strip().lower()
+    if v in _REASON_WHITELIST:
+        return _REASON_WHITELIST[v]
+    if "403" in v or "abuse" in v:
+        return "abuse403"
+    if "proactive" in v:
+        return "proactive"
+    return "rate429"
+
+
+def _rotate_once(reason: str) -> dict:
+    """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
+
+    换线本体复用 _reconnect_warp_by_table：只读状态表、不现场探测、不重启、
+    不落池。那条路径本来就是为「主循环要换线」写的，语义与这里完全一致。
+
+    已知局限：与主循环自己的换线调用没有共用一把锁。两条同时发生时结果为
+    最后写入者胜，记账各自完整但可能指向不同的线。两者都罕见，代价是一次
+    多余的切换。
+    """
+    global _last_rotate_ts
+    cfg = _api_cfg()
+    t0 = time.time()
+    with _API_LOCK:
+        _api_stats["calls"] += 1
+        # 并发去重：同一次故障的多发请求只切一次，其余拿同一个 switched_at 回去重试。
+        if t0 - _last_rotate_ts < cfg["coalesce_ms"] / 1000.0:
+            _api_stats["coalesced"] += 1
+            return {"ok": True, "switched": False, "reason": "coalesced",
+                    "switched_at": _last_rotate_ts,
+                    "ms": int((time.time() - t0) * 1000)}
+        gap = float(cfg["min_gap_verified_sec"])
+        if _last_rotate_ts and t0 - _last_rotate_ts < gap:
+            _api_stats["too_frequent"] += 1
+            return {"ok": False, "reason": "too_frequent",
+                    "switched_at": _last_rotate_ts,
+                    "ms": int((time.time() - t0) * 1000)}
+        out: dict = {}
+        ok = _reconnect_warp_by_table(reason, interrupt=False, out=out)
+        if not ok:
+            _api_stats["no_standby"] += 1
+            return {"ok": False, "reason": "no_warm_standby",
+                    "switched_at": _last_rotate_ts,
+                    "ms": int((time.time() - t0) * 1000)}
+        _last_rotate_ts = float(out.get("switched_at") or t0)
+        _api_stats["switched"] += 1
+        return {"ok": True, "switched": True,
+                "tag": out.get("tag"), "egress": out.get("ip"),
+                "closed": 0,
+                "switched_at": _last_rotate_ts,
+                "ms": int((time.time() - t0) * 1000)}
+
+
+def _api_debug_state() -> dict:
+    """测试与排障用的状态快照。"""
+    return {
+        "ok": True,
+        "active_tag": active_warp_tag(),
+        "active_ip": _ACTIVE_WARP_IP,
+        "line_ip": {m["tag"]: _warp_line_ip(m["tag"])
+                    for m in _warp()["members"]},
+        "last_rotate_ts": _last_rotate_ts,
+        "stats": dict(_api_stats),
+    }
+
+
+class _RotateHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "asip/1"
+
+    def _send(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authed(self) -> bool:
+        return self.headers.get("X-Asip-Token") == _API_TOKEN
+
+    def do_GET(self):
+        if self.path != "/debug/state":
+            self._send(404, {"ok": False, "reason": "not_found"})
+            return
+        if not self._authed():
+            self._send(401, {"ok": False, "reason": "unauthorized"})
+            return
+        self._send(200, _api_debug_state())
+
+    def do_POST(self):
+        if self.path != "/rotate":
+            self._send(404, {"ok": False, "reason": "not_found"})
+            return
+        if not self._authed():
+            self._send(401, {"ok": False, "reason": "unauthorized"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n > 0 else b"{}"
+            req = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            req = {}
+        try:
+            self._send(200, _rotate_once(
+                _normalize_rotate_reason(req.get("reason"))))
+        except Exception as e:
+            log(f"✗ /rotate 异常: {e}")
+            self._send(500, {"ok": False, "reason": "internal_error"})
+
+    def log_message(self, fmt, *a):
+        pass
+
+
+def _start_rotate_server() -> None:
+    """启动 UDS 接口线程。失败不影响主循环 —— 接口是增强，不是命脉。"""
+    global _API_TOKEN
+    cfg = _api_cfg()
+    if not cfg.get("enabled"):
+        log("⇄ rotate 接口未启用")
+        return
+    path = cfg["socket_path"]
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"✗ 清理残留 socket 失败: {e}")
+        return
+    _API_TOKEN = _ensure_api_token()
+
+    class _Srv(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+    try:
+        srv = _Srv(path, _RotateHandler)
+    except Exception as e:
+        log(f"✗ rotate 接口启动失败: {e}")
+        return
+    os.chmod(path, 0o600)
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="rotate-api").start()
+    log(f"⇄ rotate 接口就绪: {path}")
+
+
 def main():
     _acquire_single_instance_lock()
     # Log first, then fetch (avoid hanging before any output)
@@ -6885,6 +7087,8 @@ def main():
 
     all_nodes = get_all_proxy_nodes()
     _log_startup_banner(all_nodes)
+    # 同步轮换接口：9router 撞 429 时会调它换出口（见 _rotate_once）。
+    _start_rotate_server()
 
     # 初始化 node_info 表
     init_node_info_db()

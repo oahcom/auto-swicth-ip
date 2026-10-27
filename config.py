@@ -217,6 +217,27 @@ CFG = {
     },
     # WARP 主备隧道：members 顺序即优先级，daemon 在被标记时切到另一条，
     # 并异步重连闲置线刷新其会话 IP（入口段无断流）。
+    # ===== 同步轮换接口（/rotate，走 Unix domain socket）=====
+    # 不开 TCP：WSL 镜像网络下 127.0.0.1 与 Windows 宿主共享，开端口等于把
+    # 「换出口」这个动作暴露给宿主上任何进程（实测 Windows 侧可达且返回 200）。
+    # UDS 靠文件 0600 + 目录 0700 保护，且不占端口。
+    "api": {
+        "enabled": True,
+        # socket 放项目目录而不是 /run：/run 归 root，非 root 进程建不了目录；
+        # 要用 /run 得给 unit 加 RuntimeDirectory=，部署面变大。
+        "socket_path": "/home/administrator/auto-swicth-ip/run/rotate.sock",
+        "token_path": "/home/administrator/auto-swicth-ip/run/api-token",
+        # 并发去重窗口：同一次故障的多发请求只切一次。
+        "coalesce_ms": 800,
+        # 限速按「上一次切到的线是否已验证」分档：
+        #   - 已验证（缓存命中，可确信是优质出口）：8s。好线撑 8 秒绰绰有余，
+        #     窗口内的 429 多半是瞬时限流而非配额耗尽，换线只会白扔一个好 IP。
+        #   - 未验证（兜底路径重启后拿到的新地址，质量不可控）：1s。必须允许
+        #     快速逃离，否则用户得等满 8 秒才能甩掉一条坏线。
+        "min_gap_verified_sec": 8.0,
+        "min_gap_unverified_sec": 1.0,
+    },
+
     "warp": {
         "selector": "opencode-out",
         "socks_host": "127.0.0.1",
@@ -422,9 +443,16 @@ CFG = {
         # 重启同一条隧道会白烧一次探测）。实际并发度由 `prewarm_sec` 与脏线
         # 巡检的 5s 节奏自然节流。
         # 换线时直接采用脏线守护最近一次探测到的出口地址（见
-        # `_cached_warp_standby`），把同步探测移出关键路径。TTL 取 12s：
-        # 守护节奏是 5s + 单次探测 1.2~7s，一个完整周期仍有余量。
-        "probe_cache_ttl_sec": 12,
+        # `_cached_warp_standby`），把同步探测移出关键路径。
+        # TTL 必须覆盖「一整轮探测」，否则算数上就达不到：20 条隧道、单次探测
+        # 1.2~7s，整轮 24~140s；取 12s 时任意时刻只有 12/轮询时长 ≈ 9%~50% 的
+        # 线算「新鲜」，实测命中率 34%（最近 10 次仅 10%）。取 180s 覆盖整轮，
+        # 后端确认（daemon.py `_invalidate_warp_line_ip`）三条重启路径都会在重启时
+        # 立刻作废该线绑定，所以「已知 IP 变了」不靠 TTL 计时器兜，TTL 只承担
+        # 「没有证据时的信任衰减」。取 1800s 与探测吞吐（每线中位 233s）匹配。
+        # 代价是可能选中一条「缓存里还是旧地址、实际已刷新」的线 —— 后果是重试
+        # 再吃一次 429，只重试一次即返回，失败有封顶。
+        "probe_cache_ttl_sec": 1800,
         # 模型层探测结论（`_WARP_PROBE_SEEN`）的保留时长，按结论的持久性分两档：
         #   - 持久（quota/flagged）：地址自身的配额/信誉结论。重探同一 /128 有
         #     99.2% 仍 quota（30h 内仅 1 次恢复、间隔 56min），留 6h —— 与生产
