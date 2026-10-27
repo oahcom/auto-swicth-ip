@@ -605,3 +605,52 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
   包含改动，再看源码。
 - 换线只切换 selector 出口，不会迁移已建立的长连接；长连接池必须按链清理。
 - 清理必须带 age 过滤，禁止 kill-all（在途流仍可能是好请求）。
+
+## INC-011 — 出口被上游静默悬挂 + 守护进程权限/托管缺失（2026-10-27）
+
+**日期**: 2026-10-27
+**等级**: P0（00:0x 起 opencode free 大面积失败；9router 01:49 被杀后停机 ~10h）
+**现象**: `transport503` 每 2 分钟 159 条、`ttft=0`、`total≈20s`；`/v1/models`
+每次 10s；面板/会话大量超时。ASIP 健康行长期 `503=0`，从不换线。
+
+### 真因链（证据）
+
+1. **出口被上游静默悬挂，而非出口不通**：故障链上 `warp_egress_ip` 1.2s 通、
+   `GET https://opencode.ai/` 0.6s 200，但不带指纹的 chat 探测 0.26s 返回 429，
+   带 `Bearer public` + `x-opencode-*` 指纹的同一请求挂满 30s 无响应头。
+   换到 WARP-CF-D 后同请求 0.25s 429、真实会话 5/5 成功 —— 结论：该 WARP 出口
+   被上游针对，CF 可达 ≠ 上游肯服务。
+2. **检测失明**：`get_9router_error_rate` 的 transport 计数只看最近
+   `RECENT_WINDOW=5` 条（高流量下 ~2s 就滚出窗口），10s tick 到来时恒为 0；
+   清理又被 `transport_stale_gap_sec` 节流，故障期间从未触发。
+3. **9router 无托管**：`9router.service` 处于 disabled，进程靠手工 `npm start`；
+   01:49 被 SIGKILL 后无人拉起，停机约 10 小时（`logs/server.log` 停在 23:31，
+   journal 末条 01:49:35）。
+4. **sidecar 重启风暴泄漏**：`stop()` 只杀 `active.child`，spawn 等待期间再次
+   `stop()` 会把旧 promise 的 child 复活成孤儿；实测 `bun` 进程 52→65 个、
+   合计 1.3GB RSS。
+5. **ASIP systemd 单元以 root 运行**：`/root/.singbox_secret` 缺失、
+   `NODE_INFO_DB` 打不开（`unable to open database file`），单元每 10s
+   `auto-restart` 空转；真实实例一直是手工跑的 administrator 进程。
+
+### 修复
+
+- `daemon.py`：transport 计数改为 **180s 时间回看**（`TRANSPORT_LOOKBACK_SEC`），
+  不再受 5 行窗口限制；新增 `_opencode_lane_alive()`（curl + socks5h 打一条
+  最小 free-lane 请求，任何 HTTP 状态含 429 都算活），出口可达但链路悬挂时
+  **换线**而不是清连接；主循环在 transport>0 时直接驱动探针。
+- `config.py`：新增 `TRANSPORT_LOOKBACK_SEC=180`。
+- 9router：`opencodeTransport.js` 增加 `startGen` 代号守卫（作废的 start 不得
+  写回 `active`）+ 传输超时重启 sidecar 的 30s 冷却。
+- 运维：`systemctl enable --now 9router.service`（Restart=on-failure）；
+  ASIP 单元加 drop-in `User=administrator` + `HOME=/home/administrator`。
+- 验证：全量 `test_daemon_unit.py` 230 passed；重建后 rebuild 后 5/5 会话
+  0.8–1.4s，3 分钟内 36 success / 0 error。
+
+### 教训
+
+- 「出口探通」不等于「上游可用」：健康探针必须打真实业务端点，并带上线上
+  同款指纹头；只探 CF trace 会把「IP 被针对」误判成「连接池僵死」。
+- 计数窗口必须按时间而不是条数：高流量下条数窗口只覆盖数秒。
+- 任何常驻服务都必须有 supervisor；`Restart=always` + 正确的 User/HOME 是
+  最低要求，缺一条就会静默停机或空转重启。

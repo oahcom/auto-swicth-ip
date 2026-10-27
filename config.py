@@ -242,9 +242,9 @@ CFG = {
         # 在途请求，但 45 分钟的僵尸连接会被这里清掉。
         "cleanup_old_chain_age_sec": 120,
         # 出口探测正常但仍报传输层 503 → 判为连接池僵死，清理当前链上
-        # age >= 300s 的连接（10 分钟节流，避免 503 风暴里反复全表扫描）。
+        # age >= 300s 的连接（30 秒节流，避免 503 风暴里反复全表扫描）。
         "transport_stale_age_sec": 300,
-        "transport_stale_gap_sec": 600,
+        "transport_stale_gap_sec": 30,
         # 主动轮换判据二选一（互斥，只有选中的那个生效）：
         #   fixed    — 无论流量快慢，每 proactive_fixed_sec 秒换一次；
         #   requests — 当前出口上成功的 dsv4 调用累计满 proactive_after_dsv4_ok

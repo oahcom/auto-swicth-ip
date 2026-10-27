@@ -596,7 +596,7 @@ def _record_warp_cycle(ip: str | None, cycle: float, now: float, ok: int = 0,
 _WARP_REFRESH_LOCK = threading.RLock()
 # 补刷分两段，必须拆成两个集合 —— 混在一起是候选池饿死的根因。
 #   排队段（PENDING）：等连接自然结束，最长 ip_refresh_retry_sec(600s)。这期间
-#     线**仍能服务**（interrupt_exist_connections=false，在途请求还走它），
+#     线**仍能服务**（换线只改 selector，在途请求还走它），
 #     换线也该能选中它 —— 所以不占并发名额、不参与候选排除。
 #   重启段（REFRESHING）：真正 `systemctl restart` 的那 6~9s，此时才不可用。
 # 旧实现把两段都塞进 REFRESHING，而活跃线的长连接（SSE，实测单条存活 936s）
@@ -1935,7 +1935,7 @@ def _egress_label(current_proxy: str | None = None) -> str:
 
 
 # 请求开始时刻 = 完成时刻 − 延迟。9router 在请求结束时才写行，而换线不掐断
-# 在途请求（interrupt_exist_connections=false），延迟 p50 8.8s / p90 27.9s 与换线
+# 在途请求（只改 selector，旧连接仍走旧出口），延迟 p50 8.8s / p90 27.9s 与换线
 # 间隔 p50 8s 同量级 —— 上一出口的 429 会带着新时间戳落进新窗口，被当成新出口
 # 的错再触发一次换线。重放 34 次真实触发：按完成时刻 33 次命中，按开始时刻 20 次，
 # 14 次纯误触发（都切上去就报错的那 1 条 429；该出口实际一条错都没收到）。
@@ -4393,7 +4393,7 @@ def _retry_refresh_idle_warp(member: dict) -> bool:
 def _schedule_idle_refresh(member: dict) -> None:
     """换线后延迟刷新闲置线，使其在下次需要时已是新鲜 IP。
 
-    WHY 延迟而非立即：interrupt_exist_connections=false 让在途请求仍走刚被换下的
+    WHY 延迟而非立即：换线只改 selector，在途请求仍走刚被换下的
     线，立即重启会把它们全掐断（9router 报 upstream connection lost，客户端
     表现为 API Error）。延迟到连接自然结束后再刷。
 
@@ -4415,7 +4415,7 @@ def _schedule_idle_refresh(member: dict) -> None:
         try:
             time.sleep(_warp()["refresh_delay_sec"])
             # 等到连接自然结束再重启：usque 重启会掐断所有经它的连接，
-            # 与 sing-box 的 interrupt_exist_connections 无关。
+            # 这与 selector 无关（换线本身不动已建连接）。
             # 只调补刷：它在成功时已经刷新过，再无条件刷一次等于二次重启
             # （又换一个 IP，还可能把刚刷出的好 IP 换掉），失败时强刷则
             # 违背「等空闲再刷」的初衷 —— 400s 等待白费且掐断在途连接。
@@ -5020,7 +5020,7 @@ def reconnect_warp(reason: str, interrupt: bool = True) -> bool:
     _from = active["tag"] if active else "proxy"
     log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip}, "
         f"{'新段' if rest is None else f'/64 静置 {rest/60:.0f}min'})")
-    _after_warp_switch(active["tag"] if active else None)
+    _after_warp_switch(active["tag"] if active else None, interrupt)
     # 延迟刷新刚换下的线：立即重启会掐断仍在走它的在途请求，延迟到连接
     # 自然结束；预先刷好则下次切回时无需在换线路径上同步等 7~9s。
     if active is not None:
@@ -5085,6 +5085,53 @@ def _maybe_verify_transport_failures(count: int, now: float) -> None:
                      daemon=True, name="transport-probe").start()
 
 
+OPENCODE_LANE_URL = "https://opencode.ai/inference/v1/chat/completions"
+
+
+def _opencode_lane_alive(port: int, timeout_sec: float = 6.0) -> bool:
+    """经当前隧道打一条最小 free-lane 请求，判断上游是否在静默悬挂这一出口。
+
+    WHY 不能只看 CF trace：2026-10-27 00:0x 的故障里出口探测 1.2s 通、
+    GET https://opencode.ai/ 也 0.6s 通，但带 x-opencode-* 指纹的 chat 请求
+    被挂满超时；同一端点不带指纹时 0.26s 就返回 429。CF 可达 ≠ 上游肯服务，
+    只有真打一次 free lane 才能区分「这个 IP 被针对」和「sidecar 池僵死」。
+
+    任何 HTTP 响应（含 429）都算活，只有超时/连接错才算悬挂。正常出口上这条
+    探测几乎零成本（429 不消耗配额）。
+    """
+    payload = json.dumps({
+        "model": "deepseek-v4.1-flash-free",
+        "max_tokens": 1,
+        "stream": True,
+        "messages": [{"role": "user", "content": "1"}],
+    })
+    sid = "ses_asip_lane_probe"
+    cmd = [
+        "curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+        "--max-time", str(timeout_sec),
+        "--proxy", f"socks5h://{_warp()['socks_host']}:{port}",
+        "-X", "POST", OPENCODE_LANE_URL,
+        "-H", "content-type: application/json",
+        "-H", "authorization: Bearer public",
+        "-H", "user-agent: opencode/latest/2.0.26/cli",
+        "-H", "x-opencode-client: cli",
+        "-H", f"x-opencode-session: {sid}",
+        "-H", f"x-opencode-session-id: {sid}",
+        "-H", f"x-session-affinity: {sid}",
+        "-H", f"x-session-id: {sid}",
+        "-H", "x-opencode-project: global",
+        "-H", "accept: text/event-stream",
+        "--data-binary", payload,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout_sec + 2)
+    except subprocess.TimeoutExpired:
+        return False
+    code = (r.stdout or "").strip()
+    return bool(code) and code.isdigit() and code != "000"
+
+
 def _transport_probe_worker(tag: str, port: int, count: int) -> None:
     _verify_transport_failure(tag, port, count)
 
@@ -5104,6 +5151,13 @@ def _verify_transport_failure(tag: str, port: int, count: int) -> None:
             return
         # 冷却/闸门拒了这次换线：旧签名会把「同一批 503」锁死成不再探，出口已死
         # 却永远等不到下一次机会。撤掉签名，下一批证据到达时再试。
+        _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
+        log("  · 传输层换线被冷却/闸门拒绝，已解除签名等待重试")
+        return
+    if not _opencode_lane_alive(port):
+        log(f"⚠ 传输层 503 ×{count}，{tag} 出口可达（{ip}）但 opencode 链路悬挂 → 换线")
+        if _reconnect_warp_now(f"transport ×{count}（opencode 链路悬挂）", _now_ts()):
+            return
         _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
         log("  · 传输层换线被冷却/闸门拒绝，已解除签名等待重试")
         return
@@ -5360,7 +5414,8 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
             _reconnect_warp_now(
                 f"主动轮换 固定 {elapsed:.0f}s ≥ {threshold:.0f}s"
                 f"（{target:.0f}s − 提前量 {lead:.0f}s）",
-                now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
+                now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts,
+                interrupt=False)
         return
 
     n = count_dsv4_ok_since(start)
@@ -5369,7 +5424,8 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
     if n >= target:
         _reconnect_warp_now(
             f"主动轮换 已用配额 {n} 格 dsv4 ≥ {target}",
-            now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts)
+            now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts,
+            interrupt=False)
 
 
 def _validate_startup_egress(member: dict) -> None:
@@ -6567,7 +6623,7 @@ def _log_startup_banner(all_nodes: list[str]) -> None:
     log(f"  Watchdog: 每 {CFG['intervals']['singbox_watchdog_sec']}s")
     log("  IP去重: 同出口IP保留调用次数最低的节点")
     log("  调用计数: 仅统计成功调用, 429轮换不计入")
-    log("  interrupt_exist_connections: false (不杀现有连接)")
+    log("  换线: 只改 selector 不动在途连接；错误换线额外清理旧链老化连接")
     log("=" * 50)
 
 
