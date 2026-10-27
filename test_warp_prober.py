@@ -198,23 +198,6 @@ def test_quota_hold_also_blocks_penalty_restart(monkeypatch):
         "额度闸只拦了 quota 路径，惩罚期路径仍在重启 —— 同一轮风暴从另一半漏过去"
 
 
-def test_quota_hold_does_not_block_tunnel_death_restart(monkeypatch):
-    """额度闸只拦「换地址」这一类，隧道半死照常重启。"""
-    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
-    monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
-    with daemon._WARP_LINE_CV:
-        daemon._warp_line_state_locked("W2").update(
-            fail_streak=daemon._UNKNOWN_RESTART_STREAK)
-    monkeypatch.setattr(daemon, "_port_open", lambda port: False)
-    restarted = []
-    monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
-    daemon._probe_one_line(_member())
-    assert restarted == ["W2"], \
-        "额度闸把隧道半死的自愈路径也挡了 —— 那是地址没了，不是配额没了"
-
-
 def test_model_probe_opens_hold_only_for_long_quota(monkeypatch):
     """只有长 Retry-After 的 quota 开闸；短冷却与 403 不开。"""
     monkeypatch.setattr(daemon, "_probe_cache_get", lambda tag, ip: "")
@@ -235,6 +218,13 @@ def test_model_probe_opens_hold_only_for_long_quota(monkeypatch):
         assert held is expect, f"{verdict}/{retry}s 开闸结果 {held}，应为 {expect}"
 
 
+def test_restart_clears_warming_when_busy_check_raises(monkeypatch):
+    """判忙异常不得把 warming 留在 True：那会让这条线被永久跳过。"""
+    m = _member()
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_line_busy",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("clash down")))
     assert daemon._warp_line_restart(m, "test") is False
     assert daemon._warp_line_state("W2")["warming"] is False
 

@@ -3123,6 +3123,18 @@ def _start_warp_prober() -> None:
     _RESTART_SEM = threading.BoundedSemaphore(
         max(1, int(_warp().get("restart_concurrency", 4))))
     _PROBER_THREAD = threading.Thread(target=_warp_prober_loop,
+                                      daemon=True, name="warp-prober")
+    _PROBER_THREAD.start()
+    log("✓ WARP 单实例探测器已启动（状态表驱动换线）")
+
+
+# 账号级额度闸的开闸时刻。Retry-After 很长的 quota 是账号时间窗，不是出口 IP
+# 被拦 —— 实测 1711 条 quota 反推的解禁时刻都落在 08:00:03±3 分钟，且换址后
+# 首探 1495/1519（98.4%）仍判 quota。此时重启隧道只会换个同样耗尽的地址，
+# 换来 190 次/分的重启风暴。只拦「换地址」这一动作，隧道半死照常重启。
+_QUOTA_HOLD_UNTIL: float = 0.0
+# ponytail: 闸只存内存，daemon 重启即清零（下一个 quota 结论会立刻重开）。
+# 天花板：重启瞬间可能多重启几轮。升级路径：并进 _warp_line_state 落盘。
 def _quota_hold_skips(tag: str, reason: str) -> bool:
     """额度闸生效中时，跳过「换个出口地址」这一类重启。
 
@@ -3134,11 +3146,6 @@ def _quota_hold_skips(tag: str, reason: str) -> bool:
         return False
     log(f"  · {tag} 额度闸生效中，跳过重启（{reason}）")
     return True
-
-
-                                      daemon=True, name="warp-prober")
-    _PROBER_THREAD.start()
-    log("✓ WARP 单实例探测器已启动（状态表驱动换线）")
 
 
 def _port_open(port: int) -> bool:
@@ -3552,13 +3559,6 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
     # 本线实测不通过（quota/err/unreachable）就是「此刻不能服务 opencode」，
     # 与 blocked 同义：只有重启换会话才可能好转。判据复用已有结论，不额外探测。
     # 通道失明期间例外：那批 unreachable 说的是探测器自己没打通，不是地址被拒
-# 账号级额度闸的开闸时刻。Retry-After 很长的 quota 是账号时间窗，不是出口 IP
-# 被拦 —— 实测 1711 条 quota 反推的解禁时刻都落在 08:00:03±3 分钟，且换址后
-# 首探 1495/1519（98.4%）仍判 quota。此时重启隧道只会换个同样耗尽的地址，
-# 换来 190 次/分的重启风暴。只拦「换地址」这一动作，隧道半死照常重启。
-_QUOTA_HOLD_UNTIL: float = 0.0
-# ponytail: 闸只存内存，daemon 重启即清零（下一个 quota 结论会立刻重开）。
-# 天花板：重启瞬间可能多重启几轮。升级路径：并进 _warp_line_state 落盘。
     # （见 `_warp_probe_blind`）—— 照它重启只会白烧隧道与配额。
     verdict = _probe_cache_verdict(tag, ip, now)
     if verdict in _WARP_PROBE_PERSISTENT:
@@ -4008,6 +4008,7 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     IP 全是 quota）。台账按「tag + /128」键控，TTL 按结论持久性分档；已被台账
     判脏（惩罚期内）的地址在入口处直接跳过，不再按线重探。
     """
+    global _QUOTA_HOLD_UNTIL
     w = _warp()
     if not w.get("refresh_model_check", True):
         return True
@@ -4061,6 +4062,8 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     ok = verdict == "OK"
     # 只有 quota(429) 的 Retry-After 会写进惩罚期；403 带限流头不算。
     retry_after = retry_after if verdict == "quota" else None
+    if retry_after and retry_after >= int(_warp().get("quota_hold_min_sec", 1800)):
+        _QUOTA_HOLD_UNTIL = max(_QUOTA_HOLD_UNTIL, time.time() + retry_after)
     hint = (f"（Retry-After {retry_after / 3600:.1f}h）"
             if retry_after and retry_after > 0 else "")
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}{hint}"
@@ -4070,7 +4073,6 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         # 档位 3（一次 OK 都没拿到），后台会把刚验过的线当低质反复重启，白烧配额。
         now = time.time()
         # 字典改动与落盘必须在同一把锁内：`_warp_model_test_many` 会并发调
-    global _QUOTA_HOLD_UNTIL
         # 本函数，放锁后再写会让较旧的快照覆盖较新的台账。
         with _WARP_IP_LOCK:
             entry = _WARP_IP_USED.get(ip)
@@ -4121,8 +4123,6 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
     off = _WARP_OFF_AGE.get(t)
     reason = (f"离渠刷新/{reason}" if off is not None
               else f"预热/{reason}")
-    if retry_after and retry_after >= int(_warp().get("quota_hold_min_sec", 1800)):
-        _QUOTA_HOLD_UNTIL = max(_QUOTA_HOLD_UNTIL, time.time() + retry_after)
     backoff = _warp()["retry_backoff_sec"]
     for attempt in range(1, _warp()["max_attempts"] + 1):
         _invalidate_warp_line_ip(member["tag"])  # 重启后旧地址必然失效
