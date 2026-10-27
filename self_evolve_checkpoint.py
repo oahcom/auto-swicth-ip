@@ -10,12 +10,16 @@ Meta-goal: The monitoring loop should evolve its own checks.
 
 import copy
 import json
+import os
 import re
-import time
-import subprocess
 import sys
+import time
 from pathlib import Path
 from collections import Counter
+
+from asip import proc
+from asip.atomic_io import update_json, write_json
+from asip.clash_client import ClashClient
 
 STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 PROJECT_DIR = STATE_FILE.parent
@@ -41,17 +45,20 @@ def _write_bad_nodes(bad: dict) -> None:
     daemon 的 cleanup_dead_ttl 已读取此文件并受 _POOL_MIN_RATIO 阀门保护，故写入即接入拉黑闭环。
     """
     now = int(time.time())
-    try:
-        data = json.loads(_BAD_NODES_FILE.read_text()) if _BAD_NODES_FILE.exists() else {}
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    for node in bad:
-        data[node] = {"expire": now + _BAD_NODES_TTL, "reason": "egress_error_rate"}
-    tmp = _BAD_NODES_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False))
-    tmp.replace(_BAD_NODES_FILE)
+    # read-modify-write 必须串行：两个 cron 轮次同时归因时，后写者会拿旧
+    # 快照覆盖前者刚写入的节点，等于漏拉黑。daemon 只读此文件，所以仅需
+    # 在写入方加锁。
+    lock_path = str(_BAD_NODES_FILE.with_suffix(".json.lock"))
+
+    def _merge(data):
+        if not isinstance(data, dict):
+            data = {}
+        for node in bad:
+            data[node] = {"expire": now + _BAD_NODES_TTL,
+                          "reason": "egress_error_rate"}
+        return data
+
+    update_json(str(_BAD_NODES_FILE), _merge, default={}, lock_path=lock_path)
 
 # 与 daemon.py 阀门一致：允许 70% 节点拉黑（_POOL_MIN_RATIO=0.3）。
 # 天花板从 Clash API 实时节点数 derivation，防止订阅变更后 65 这类魔表失效。
@@ -60,21 +67,89 @@ _FALLBACK_CEILING = 65  # 当 Clash API 不可达时退避（当前 93 节点池
 
 
 def _clash_pool_size():
-    """从 sing-box Clash API 读取可用节点总数；失败退为 _FALLBACK_CEILING。"""
+    """从 sing-box Clash API 读取可用节点总数；失败退为 _FALLBACK_CEILING。
+
+    失败时向 stderr 记录一次原因：静默回退会让天花板长期停在魔数上而无人
+    察觉（stdout 留给 main 的机器可读输出）。
+    """
+    reason = None
     try:
         sys.path.insert(0, str(PROJECT_DIR))
         import config  # 复用单源真值
-        import requests
-        r = requests.get(
-            config.CFG["singbox"]["clash_api"] + "/proxies/" + config.CFG["singbox"]["selector"],
-            headers={"Authorization": "Bearer " + config.get_singbox_secret()},
+        client = ClashClient(
+            config.CFG["singbox"]["clash_api"],
+            config.get_singbox_secret,
             timeout=5,
         )
-        if r.status_code == 200:
-            return len(r.json().get("all", []))
-    except Exception:
-        pass
+        names = client.proxy_names(config.CFG["singbox"]["selector"])
+        if names is not None:
+            return len(names)
+        reason = "Clash API returned no proxy list"
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+    print(
+        f"[self-check] _clash_pool_size fallback to {_FALLBACK_CEILING}: {reason}",
+        file=sys.stderr,
+    )
     return _FALLBACK_CEILING
+
+
+# 节点切换分布：从日志尾部流式取样，替代旧的四段 shell 管道（D9）。
+# 只读最后 2MiB，既避免把 4MB+ 日志整体载入，又能覆盖足够多的近期切换。
+_SWITCH_TAIL_BYTES = 2 * 1024 * 1024
+_SWITCH_SAMPLE_EVENTS = 50
+_SWITCH_EXCLUDE_MARKERS = ("冷却", "fallback", "okz", "标记死节点")
+_SWITCH_NODE_RE = re.compile(r"->\s+(\S+)")
+
+
+def _tail_lines(path, limit_bytes=_SWITCH_TAIL_BYTES):
+    """Return the last ``limit_bytes`` of ``path`` decoded into lines.
+
+    Seeking from the end bounds memory on a multi-MB log. The seek can land
+    mid-line, so the possibly truncated first line is dropped unless the
+    window started at byte 0.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - limit_bytes)
+            f.seek(start)
+            data = f.read()
+    except OSError as e:
+        return None, f"{type(e).__name__}: {e}"
+    lines = data.decode("utf-8", "replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    return lines, None
+
+
+def _node_switch_distribution(log_file, max_events=_SWITCH_SAMPLE_EVENTS,
+                              limit_bytes=_SWITCH_TAIL_BYTES):
+    """Return ``(top10, sample_count, error)`` for recent node switches.
+
+    ``top10`` is a ``Counter.most_common(10)`` list. ``sample_count`` is the
+    number of node names actually extracted; callers must treat zero as
+    "unavailable", not as a healthy zero-skew distribution (D9).
+    """
+    lines, error = _tail_lines(log_file, limit_bytes)
+    if error is not None:
+        return [], 0, error
+    recent = []
+    for line in reversed(lines):
+        if "切" not in line:
+            continue
+        if any(marker in line for marker in _SWITCH_EXCLUDE_MARKERS):
+            continue
+        recent.append(line)
+        if len(recent) >= max_events:
+            break
+    counts = Counter()
+    for line in recent:
+        match = _SWITCH_NODE_RE.search(line)
+        if match:
+            counts[match.group(1)] += 1
+    return counts.most_common(10), sum(counts.values()), None
 
 # Default check suite - evolves over time
 DEFAULT_CHECKS = [
@@ -123,7 +198,23 @@ def save_state(state):
     # Only keep last 100 rounds
     if len(state.get("history", [])) > 100:
         state["history"] = state["history"][-100:]
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    write_json(str(STATE_FILE), state, indent=2)
+
+
+def _grep_log(pattern, timeout=5):
+    """grep 日志，返回 (lines, error)。
+
+    grep 的退出码语义：0=有匹配、1=无匹配（正常）、>1=出错。把 1 当失败会
+    误报，把 >1/超时当「0 条匹配」则会让检查恒真 —— 这正是 D9 的形态。
+    """
+    out = proc.run(["grep", "-a", pattern, _LOG_FILE], timeout=timeout)
+    if out.timed_out:
+        return [], "grep timeout"
+    if out.error:
+        return [], out.error
+    if out.code not in (0, 1):
+        return [], f"grep rc={out.code}"
+    return out.stdout.splitlines(), None
 
 
 def run_check(name, context, state=None):
@@ -131,10 +222,10 @@ def run_check(name, context, state=None):
     try:
         today = time.strftime("%Y-%m-%d")
         if name == "7890_connectivity":
-            out = subprocess.run(
+            out = proc.run(
                 ["curl", "-m", "5", "-s", "-o", "/dev/null",
                  "-w", "%{http_code} %{time_total}", _MIXED_PROXY],
-                capture_output=True, text=True, timeout=10
+                timeout=10,
             )
             code = out.stdout.split()[0] if out.stdout.strip() else ""
             ok = code in ("400", "204")  # 代理端口裸 GET 返回 400/204 即连通
@@ -160,42 +251,41 @@ def run_check(name, context, state=None):
             return dead <= ceiling, dead, f"dead={dead}/{ceiling}"
 
         elif name == "bypass_events":
-            out = subprocess.run(
-                ["grep", "-a", "BYPASS\\|bypass", _LOG_FILE],
-                capture_output=True, text=True, timeout=5
-            )
-            count = len([l for l in out.stdout.splitlines() if today in l and ("enabled" in l.lower() or "BYPASS" in l.upper())][-10:])
+            lines, err = _grep_log("BYPASS\\|bypass")
+            if err:
+                return False, None, f"unavailable: {err}"
+            count = len([l for l in lines if today in l and ("enabled" in l.lower() or "BYPASS" in l.upper())][-10:])
             return count == 0, count, f"bypass_count={count}"
 
         elif name == "bounded_pool_pressure":
             # Check if _BoundedPool ever logged queue full warning
-            out = subprocess.run(
-                ["grep", "-a", "pool.*满\\|queue.*full", _LOG_FILE],
-                capture_output=True, text=True, timeout=5
-            )
-            count = len([l for l in out.stdout.splitlines() if today in l])
+            lines, err = _grep_log("pool.*满\\|queue.*full")
+            if err:
+                return False, None, f"unavailable: {err}"
+            count = len([l for l in lines if today in l])
             return count == 0, count, f"pool_warnings={count}"
 
         elif name == "node_switch_distribution":
-            out = subprocess.run(
-                ["bash", "-c", f"grep -a '切' {_LOG_FILE} 2>/dev/null | grep -v '冷却\\|fallback\\|okz\\|标记死节点' | tail -50 | grep -oP '(?<=-> ).*?(?= |$)' | sort | uniq -c | sort -rn | head -10"],
-                capture_output=True, text=True, timeout=10
-            )
-            dist = out.stdout.strip()
-            # Check if any single node dominates (>40% of switches)
-            lines = [l for l in dist.strip().splitlines() if l.split() and l.split()[0].isdigit()]
-            total = sum(int(l.split()[0]) for l in lines)
-            dominant = max((int(l.split()[0]) for l in lines), default=0)
-            skew = dominant / total if total > 0 else 0
+            # D9: 旧的四段 shell 管道只要任一环失败就返回空 stdout，
+            # 调用方据此算出 skew=0 并判定“通过”——检查恒真。现在读取/取样
+            # 失败或样本为 0 一律报告 unavailable（ok=False、metric=None），
+            # metric=None 不会触发 node_skew_spike 异常，也不会伪装成正常分布。
+            top, sampled, error = _node_switch_distribution(_LOG_FILE)
+            if error is not None:
+                return False, None, f"unavailable: cannot read log ({error})"
+            if sampled == 0:
+                return False, None, "unavailable: no switch samples in log tail"
+            dominant_count = top[0][1]
+            skew = dominant_count / sampled
             return skew < 0.4, skew, f"dominant_node_share={skew:.1%}"
 
         elif name == "response_latency_p95":
             # Quick latency check + trend detection
-            out = subprocess.run(
+            out = proc.run(
                 ["curl", "-m", "10", "-s", "-x", _MIXED_PROXY,
                  "https://www.gstatic.com/generate_204", "-o", "/dev/null",
                  "-w", "%{time_total}"],
-                capture_output=True, text=True, timeout=15
+                timeout=15,
             )
             lat = float(out.stdout.strip()) if out.stdout.strip() else 999
             # Trend detection: compare with 5-round moving average trend
@@ -211,21 +301,19 @@ def run_check(name, context, state=None):
 
         elif name == "upstream_failure_rate":
             # Check recent upstream connect failures in upstream
-            out = subprocess.run(
-                ["grep", "-a", "upstream connect fail", _LOG_FILE],
-                capture_output=True, text=True, timeout=5
-            )
-            lines = [l for l in out.stdout.splitlines() if today in l][-20:]  # last 20 today
-            return len(lines) < 10, len(lines), f"recent_upstream_fails={len(lines)}"
+            lines, err = _grep_log("upstream connect fail")
+            if err:
+                return False, None, f"unavailable: {err}"
+            today_lines = [l for l in lines if today in l][-20:]
+            return len(today_lines) < 10, len(today_lines), f"recent_upstream_fails={len(today_lines)}"
 
         elif name == "repeat_failure_nodes":
             """Detect nodes that repeatedly die (>3× in last 10 cycles)."""
-            out = subprocess.run(
-                ["grep", "-a", "死", _LOG_FILE],
-                capture_output=True, text=True, timeout=5
-            )
+            grep_lines, err = _grep_log("死")
+            if err:
+                return False, None, f"unavailable: {err}"
             nodes = Counter()
-            for line in out.stdout.splitlines():
+            for line in grep_lines:
                 if today not in line:
                     continue
                 m = re.search(r"✗\s+(.+?)\s+死", line)

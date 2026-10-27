@@ -11,6 +11,7 @@ import sys
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT)
+from asip.atomic_io import write_text  # noqa: E402
 from config import CFG  # noqa: E402
 
 
@@ -23,13 +24,9 @@ def write_warp_outbound(path: str) -> None:
     host = CFG["warp"]["socks_host"]
     data = [{"type": "socks", "tag": m["tag"], "server": host,
              "server_port": m["port"], "version": "5"} for m in CFG["warp"]["members"]]
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    # write_json 不追加末尾换行，而本文件此前带一个；内容必须逐字节等价，
+    # 所以序列化到字符串后用 write_text。
+    write_text(path, json.dumps(data, indent=2) + "\n", mode=0o600)
 
 
 if __name__ == "__main__":
@@ -38,7 +35,11 @@ if __name__ == "__main__":
         write_warp_outbound(out)
         print(out)
     else:
+        # 只渲染 usque 成员：install.sh 用这行输出注册设备、建目录、生成单元，
+        # 而 WG 线的单元由 deploy/wg-lines-install.sh 单独生成。
         for m in CFG["warp"]["members"]:
+            if m.get("kind") == "wg":
+                continue
             n = m["port"] - 1079
             print(m["tag"], m["port"], m["service"],
                   "usque" if n == 1 else f"usque{n}", "-6" if m.get("ipv6") else "-")

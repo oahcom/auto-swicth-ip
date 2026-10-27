@@ -14,11 +14,14 @@ singbox-config.json
 # 刷新写到 .tmp 再 os.replace；超时/SIGKILL 会残留（同样含凭据）
 singbox-config.json.tmp
 *.json.tmp
+*.json.*.tmp
+.bad_nodes.json.lock
 .warp/
 .warp_ip_used.json
 .daemon.lock
 .warp_ip_cycles.json
 .warp_ip_history.jsonl
+.warp_line_state.json
 .warp_proxy_fallback.json
 # 部署密钥（订阅 token、路径覆盖）；模板见 .env.example
 .env
@@ -28,3 +31,4 @@ singbox-config.json.tmp
 
 # 池节点 IP 使用台账（运行时状态）
 .node_ip_used.json
+.warp_segment.json

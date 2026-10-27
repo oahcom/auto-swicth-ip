@@ -18,6 +18,8 @@ PROJECT = Path(config.PROJECT_DIR)
 RUNTIME_FILES = [
     "config.py", "daemon.py", "parse_subscription.py", "probe_warp.py",
     "self_evolve_checkpoint.py", "start-auto-switch-ip.sh", "deploy/install.sh",
+    "deploy/preflight.sh", "deploy/wsl-boot.conf.example",
+    "deploy/asip-cli.sh", "deploy/asip-cli-conf.sh",
 ]
 
 
@@ -168,13 +170,15 @@ def test_install_refuses_to_retarget_live_units(tmp_path):
     # 新的 clone 目录，才是在"另一处 clone"里运行。
     here = tmp_path / "this-clone"
     shutil.copytree(PROJECT / "deploy", here / "deploy")
+    shutil.copytree(PROJECT / "asip", here / "asip")
     for f in ("config.py", "requirements.txt"):
         shutil.copy2(PROJECT / f, here / f)
     shutil.copy2(PROJECT / "sing-box", here / "sing-box")
 
     out = subprocess.run(["bash", str(here / "deploy/install.sh"), "--units-only"],
                          capture_output=True, text=True, timeout=60,
-                         env={**os.environ, "HOME": str(fake_home)})
+                         env={**os.environ, "HOME": str(fake_home),
+                              "ASIP_HOME_DIR": str(fake_home)})
     assert "拒绝覆盖生产单元" in out.stderr, \
         f"未触发防护（rc={out.returncode}）：{out.stderr[:300]}"
     # 关键：现网单元内容原封不动
@@ -226,3 +230,246 @@ def test_deploy_renders_every_member(tmp_path):
     for row, m in zip(rows, members):
         assert row[0] == m["tag"] and int(row[1]) == m["port"] and row[2] == m["service"]
         assert row[4] == ("-6" if m.get("ipv6") else "-")
+
+
+def test_start_script_pins_interpreter():
+    """手动启动也要钉死解释器：conda shell 的 python3 与 systemd 单元可能不同。"""
+    text = (PROJECT / "start-auto-switch-ip.sh").read_text(encoding="utf-8")
+    assert 'PYBIN="${PYTHON:-/usr/bin/python3}"' in text
+    assert 'nohup "$PYBIN" "$DAEMON"' in text
+    assert "nohup python3" not in text
+
+
+def test_preflight_covers_new_host_checks():
+    """新主机预检必须覆盖 systemd/linger/Python/Bun/订阅/9router，缺一不可。"""
+    text = (PROJECT / "deploy/preflight.sh").read_text(encoding="utf-8")
+    for token in ("systemctl --user", "loginctl", "python", "bun", "_SUB_URL",
+                  "9router", "mirrored", "fetch-binaries"):
+        assert token in text, f"preflight 缺少检查项: {token}"
+    # install.sh 必须调用它，且允许沙箱跳过
+    install = (PROJECT / "deploy/install.sh").read_text(encoding="utf-8")
+    assert "deploy/preflight.sh" in install
+    assert "SKIP_PREFLIGHT" in install
+
+
+def test_wsl_template_has_no_machine_paths():
+    """WSL 引导模板不能带真实用户/项目绝对路径：换机即失效。"""
+    text = (PROJECT / "deploy/wsl-boot.conf.example").read_text(encoding="utf-8")
+    assert "systemd=true" in text
+    assert "/home/" not in text and "/mnt/c/Users/" not in text
+
+
+def test_readme_has_no_hardcoded_home():
+    """移植文档不能把某台机器的家目录写成步骤。"""
+    text = (PROJECT / "README.md").read_text(encoding="utf-8")
+    assert "/home/administrator" not in text
+    assert "preflight.sh" in text
+
+
+def test_bun_search_includes_local_bin():
+    """systemd PATH 没有 ~/.local/bin；bun 兜底搜索必须覆盖它。"""
+    text = (PROJECT / "probe_warp.py").read_text(encoding="utf-8")
+    assert ".local/bin/bun" in text
+
+
+def test_asip_cli_follows_actual_unit_scope(tmp_path):
+    """CLI 的 systemctl 作用域必须跟着单元的落点，不能恒用 --user。
+
+    用户级单元迁到系统级后，`systemctl --user stop <unit>` 会返回 0 而什么也没做 ——
+    `asip warp stop` 报成功、隧道照跑，比报错更难查。
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    conf = tmp_path / "cli.env"
+    env = {**os.environ, "ASIP_CLI_ENV": str(conf), "ASIP_HOME_DIR": str(fake_home),
+           "PYTHON": sys.executable, "ASIP_SYSTEM_UNIT_DIR": str(tmp_path / "nope")}
+    subprocess.run(["bash", str(PROJECT / "deploy/asip-cli-conf.sh")],
+                   check=True, capture_output=True, timeout=60, env=env)
+    text = conf.read_text(encoding="utf-8")
+    assert "ASIP_SYSTEMD_SCOPE=user" in text, "单元不在 /etc 时应退回用户级作用域"
+
+    (tmp_path / "nope").mkdir()
+    (tmp_path / "nope/auto-switch-ip.service").write_text("[Service]\n")
+    subprocess.run(["bash", str(PROJECT / "deploy/asip-cli-conf.sh")],
+                   check=True, capture_output=True, timeout=60, env=env)
+    text = conf.read_text(encoding="utf-8")
+    assert "ASIP_SYSTEMD_SCOPE=system" in text, "系统级单元存在时必须用 --system"
+
+
+def test_install_renders_units_on_fresh_host(tmp_path):
+    """全新主机上 UNIT_DIR 为空时不得因 pipefail 中止（sed 读不存在的单元返回 2）。
+
+    真实回归：`SYSTEMD_DIR=/tmp/x install.sh --units-only` 首次运行时，
+    `sed ... | head -1` 在 set -euo pipefail 下直接退出 2，一个单元都没生成。
+    """
+    here = tmp_path / "clone"
+    shutil.copytree(PROJECT / "deploy", here / "deploy")
+    shutil.copytree(PROJECT / "asip", here / "asip")
+    for f in ("config.py", "requirements.txt", "sing-box"):
+        shutil.copy2(PROJECT / f, here / f)
+    unit_dir = tmp_path / "units"
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(parents=True)
+    # ASIP_HOME_DIR 而非 HOME：脚本按 passwd 取家目录，只改 HOME 挡不住它把
+    # 设置和 asip 入口装进真实用户目录。
+    env = {**os.environ, "SYSTEMD_DIR": str(unit_dir), "ASIP_HOME_DIR": str(fake_home),
+           "HOME": str(fake_home), "PYTHON": sys.executable,
+           "SKIP_PREFLIGHT": "1"}
+    out = subprocess.run(["bash", str(here / "deploy/install.sh"), "--units-only"],
+                         capture_output=True, text=True, timeout=60, env=env)
+    assert out.returncode == 0, f"rc={out.returncode}: {out.stderr[-400:]}"
+    assert (unit_dir / "auto-switch-ip.service").exists()
+    assert len(list(unit_dir.iterdir())) == len(config.CFG["warp"]["members"]) + 3
+    # 部署必须顺带产出 asip 设置与入口：CLI 不含任何站点设置，缺了它整条运维
+    # 命令链（日志/换线/隧道）都不可用，而这些正是部署后第一个要用的东西。
+    assert (tmp_path / "home/.config/asip/cli.env").exists(), "未生成 asip 设置"
+    assert (tmp_path / "home/.local/bin/asip").is_symlink(), "未安装 asip 入口"
+
+
+def test_rehearsal_settings_point_at_the_rehearsal_units(tmp_path):
+    """SYSTEMD_DIR 试跑时，生成的设置必须指向那个目录，而不是 /etc 的真实单元。
+
+    真实事故路径：`SYSTEMD_DIR=/tmp/x ./deploy/install.sh --units-only` 把单元写进
+    /tmp/x，但如果设置照旧探测 /etc（真实单元也在那），演练完随手跑一次
+    `asip warp stop` 就会去屏蔽生产单元 —— 演练反而动了生产。
+    """
+    here = tmp_path / "clone"
+    shutil.copytree(PROJECT / "deploy", here / "deploy")
+    shutil.copytree(PROJECT / "asip", here / "asip")
+    for f in ("config.py", "requirements.txt", "sing-box"):
+        shutil.copy2(PROJECT / f, here / f)
+    unit_dir = tmp_path / "rehearsal-units"
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    env = {**os.environ, "SYSTEMD_DIR": str(unit_dir), "ASIP_HOME_DIR": str(fake_home),
+           "HOME": str(fake_home), "PYTHON": sys.executable, "SKIP_PREFLIGHT": "1"}
+    out = subprocess.run(["bash", str(here / "deploy/install.sh"), "--units-only"],
+                         capture_output=True, text=True, timeout=60, env=env)
+    assert out.returncode == 0, f"rc={out.returncode}: {out.stderr[-400:]}"
+    text = (fake_home / ".config/asip/cli.env").read_text(encoding="utf-8")
+    assert f"ASIP_UNIT_DIR={unit_dir}" in text, \
+        f"设置未指向演练的单元目录，实际：{[l for l in text.splitlines() if 'UNIT_DIR' in l]}"
+    assert "ASIP_SYSTEMD_SCOPE=user" in text, \
+        "/tmp 下的单元不是系统级：作用域应为 user，否则会去 systemctl --system 操作真实单元"
+    assert "/etc/systemd/system" not in text.split("ASIP_UNIT_DIR=")[1].split("\n")[0]
+
+
+def test_asip_cli_reads_everything_from_generated_settings(tmp_path):
+    """asip CLI 不得自带路径/端口/单元清单：换目录或改 members 后必须自动跟上。
+
+    设置文件由 config.py 推导，所以断言 CLONE 目录与 CLONE 里的成员出现在产物中，
+    并且源仓库路径不出现 —— 后者会被"手抄一份真路径"的写法满足。
+    """
+    here = tmp_path / "clone"
+    shutil.copytree(PROJECT / "deploy", here / "deploy")
+    shutil.copy2(PROJECT / "config.py", here / "config.py")
+    out_env = tmp_path / "cli.env"
+    out = subprocess.run(["bash", str(here / "deploy/asip-cli-conf.sh")], text=True,
+                         capture_output=True, timeout=60,
+                         env={**os.environ, "ASIP_CLI_ENV": str(out_env),
+                              "PYTHON": sys.executable})
+    assert out.returncode == 0, out.stderr[-400:]
+    text = out_env.read_text(encoding="utf-8")
+    assert str(here) in text, "设置未随 clone 目录变化"
+    assert str(PROJECT) not in text, "设置里混入了源仓库路径（说明是写死的）"
+    members = config.CFG["warp"]["members"]
+    assert text.count("usque-warp") >= len(members), "隧道清单未写全"
+    for key in ("ASIP_LOG", "ASIP_SECRET_FILE", "ASIP_CLASH_API", "ASIP_WARP_SELECTOR",
+                "ASIP_UNIT_DIR", "ASIP_IP_USED_FILE", "ASIP_CYCLES_FILE", "ASIP_PY",
+                "ASIP_SOCKS_HOST"):
+        assert f"{key}=" in text, f"设置缺少 {key}"
+
+    # CLI 侧：源文件里不得再有写死的绝对路径或隧道端口
+    cli = (PROJECT / "deploy/asip-cli.sh").read_text(encoding="utf-8")
+    assert "/home/" not in cli, "asip-cli.sh 出现写死的家目录"
+    assert "usque-warp.service" not in cli, "asip-cli.sh 自带隧道清单（应从设置读取）"
+    assert "127.0.0.1:" not in cli, "asip-cli.sh 写死了探测主机（应从 ASIP_SOCKS_HOST 读取）"
+    assert 'ASIP_CLI_ENV' in cli and '. "$ASIP_CLI_ENV"' in cli, "CLI 未加载设置文件"
+
+
+def _fake_bin(tmp_path, name, script):
+    """在 tmp_path/bin 里放一个记录 argv 的桩，返回 (bin_dir, log_path)。"""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    log = tmp_path / f"{name}.argv"
+    stub = bindir / name
+    stub.write_text("#!/bin/bash\nprintf '%s\\n' \"$*\" >> " + str(log) + "\n" + script + "\n",
+                    encoding="utf-8")
+    stub.chmod(0o755)
+    return bindir, log
+
+
+def _cli_env(tmp_path, **overrides):
+    """按真实设置生成一份隔离 cli.env；不读生产文件，避免用例受本机部署影响。"""
+    conf = tmp_path / "cli.env"
+    out = subprocess.run(["bash", str(PROJECT / "deploy/asip-cli-conf.sh")], text=True,
+                         capture_output=True, timeout=60,
+                         env={**os.environ, "ASIP_CLI_ENV": str(conf),
+                              "PYTHON": sys.executable,
+                              "ASIP_HOME_DIR": str(tmp_path / "home")})
+    assert out.returncode == 0, out.stderr[-400:]
+    text = conf.read_text(encoding="utf-8")
+    for k, v in overrides.items():
+        text = re.sub(rf"^{k}=.*$", f"{k}={v}", text, count=1, flags=re.M)
+    conf.write_text(text, encoding="utf-8")
+    return conf
+
+
+def test_asip_cli_uses_configured_socks_host_and_every_member(tmp_path):
+    """探测主机与成员清单必须来自设置：用桩 curl 记录 argv，断言真实用上。
+
+    字符串断言（"源码里没有 127.0.0.1:"）挡不住 `localhost:{}`、`SOCKS_HOST=127.0.0.1`
+    这类等价硬编码，也挡不住「PORTS 写死前 10 条」这个真实事故。行为断言两种都能抓。
+    """
+    members = config.CFG["warp"]["members"]
+    ports = [str(m["port"]) for m in members]
+    env = _cli_env(tmp_path, ASIP_SOCKS_HOST="10.9.8.7",
+                   ASIP_CLASH_API="http://127.0.0.1:1")
+    bindir, log = _fake_bin(tmp_path, "curl", "exit 0")
+
+    subprocess.run(["bash", str(PROJECT / "deploy/asip-cli.sh"), "warp", "status"],
+                   capture_output=True, text=True, timeout=120,
+                   env={**os.environ, "ASIP_CLI_ENV": str(env),
+                        "PATH": f"{bindir}:{os.environ['PATH']}"})
+    argv = log.read_text(encoding="utf-8") if log.exists() else ""
+    assert argv, "桩 curl 一次都没被调用（探测路径没跑）"
+    assert "10.9.8.7" in argv, f"探测没走设置的 ASIP_SOCKS_HOST：{argv[:300]}"
+    assert "127.0.0.1:1" in argv or "10.9.8.7" in argv
+    probed = [p for p in ports if f"10.9.8.7:{p}" in argv]
+    assert len(probed) == len(ports), \
+        f"探测了 {len(probed)}/{len(ports)} 条隧道（历史 bug：写死前 10 条）：{probed}"
+
+
+def test_asip_cli_systemctl_scope_follows_settings(tmp_path):
+    """CLI 的 systemctl 作用域必须跟设置走，不能恒用 --user。
+
+    用户级单元迁到系统级后，`systemctl --user stop <unit>` 返回 0 而什么也不做 ——
+    `asip warp stop` 报成功、隧道照跑。之前只有 conf 侧探测被测试覆盖，CLI 侧
+    「恒用 --user」的回归全绿逃逸。
+    """
+    env = _cli_env(tmp_path, ASIP_CLASH_API="http://127.0.0.1:1")
+    bindir, log = _fake_bin(tmp_path, "systemctl", "echo inactive")
+    # system 作用域下 CLI 走 `sudo -n systemctl`（非 root 时），必须桩住 sudo，
+    # 否则真实 sudo 会真的打系统总线。桩只剥掉 -n 再转发，argv 照样进 systemctl 日志。
+    sudo = bindir / "sudo"
+    sudo.write_text(f'#!/bin/bash\n[ "$1" = "-n" ] && shift\nexec "$@"\n', encoding="utf-8")
+    sudo.chmod(0o755)
+
+    def scope_args(scope):
+        text = env.read_text(encoding="utf-8")
+        env.write_text(re.sub(r"^ASIP_SYSTEMD_SCOPE=.*$", f"ASIP_SYSTEMD_SCOPE={scope}",
+                              text, count=1, flags=re.M), encoding="utf-8")
+        if log.exists():
+            log.unlink()
+        subprocess.run(["bash", str(PROJECT / "deploy/asip-cli.sh"), "warp", "status"],
+                       capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "ASIP_CLI_ENV": str(env),
+                            "PATH": f"{bindir}:{os.environ['PATH']}"})
+        return log.read_text(encoding="utf-8") if log.exists() else ""
+
+    user_args = scope_args("user")
+    assert "--user" in user_args, f"user 作用域下未加 --user：{user_args[:200]}"
+    system_args = scope_args("system")
+    assert system_args, "system 作用域下没调用 systemctl"
+    assert "--user" not in system_args, \
+        f"system 作用域下仍用 --user（会静默操作不存在的单元）：{system_args[:200]}"

@@ -22,15 +22,20 @@
 
 - `parse_subscription.py` — 拉 okz 订阅 + 解析 vless/vmess/hysteria2/anytls/trojan/shadowsocks + 生成 sing-box config
 - `daemon.py` — 监控 9router + 主动轮换 sing-box 节点
+- `asip/` — 无副作用的可复用工具（原子 JSON 写、密钥脱敏、Clash API 客户端、出口探测、带超时的子进程/HTTP 封装）；daemon 通过同名门面委托，便于单测与复用
+- `warp_line_worker.py` — 每条 WARP 隧道一个常驻 worker（判断与执行同循环）；由 `warp.line_worker.enabled` 开启，默认关闭，开启前可先用 `dry_run` 观察
+- `.env` — 订阅 token 与路径覆盖（**不入库**，chmod 600）
 - `singbox-config.json` — 生成的 sing-box 配置（**不入库**，含 Clash API secret 与节点凭据；启动时按需生成）
-- `sing-box` — Linux x64 二进制（1.13.0）
+- `sing-box` — 仓库内是 Linux amd64 二进制（1.13.0）；arm64 由 `deploy/fetch-binaries.sh` 自动获取
+- `deploy/` — `install.sh`（单元生成/启用 + asip 设置与入口）、`asip-cli-conf.sh`（从 `config.py` 推导 CLI 设置）、`asip-cli.sh`（`asip` 运维命令源文件）、`preflight.sh`（新主机预检）、`fetch-binaries.sh`（校验下载）、`wsl-boot.conf.example`（WSL 引导模板）
 - `daemon.log` — daemon 运行日志
 
 ## 安装
 
 ### 0. 前置条件
 
-- Linux x86_64（WSL2 可用），systemd 用户实例（`systemctl --user`），Python ≥ 3.10
+- Linux amd64 / arm64（WSL2 可用），systemd 用户实例（`systemctl --user`），Python ≥ 3.10
+- `curl`、`tar`；模型层探测需要 **Bun**（`curl -fsSL https://bun.sh/install | bash`，非标准路径用 `PROBE_BUN_BIN=`）
 - 二进制由 `./deploy/fetch-binaries.sh` 自动获取并校验（详见 §0.1），无需手工下载
 - Python 依赖：`python3 -m pip install -r requirements.txt`
 - 9router 已在本机运行（`~/.9router/db/data.sqlite` 存在），或用 `NINE_ROUTER_DB_PATH` 指过去
@@ -38,6 +43,9 @@
   否则 Windows 的 127.0.0.1 到不了 WSL 内的 7890
 
 订阅地址、路径都可覆盖：`cp .env.example .env` 后改，脚本与 systemd 单元都会读。
+订阅源**没有内置默认值**：`.env` 至少要有一个 `*_SUB_URL`，否则订阅刷新会明确
+失败，而不是静默使用仓库里的 token。历史提交中出现过真实 token，即使已在工作树
+移除，也应在服务商侧轮换一次。
 
 ### 0.1 二进制获取
 
@@ -70,6 +78,13 @@ ELF 架构不符时会自动调用它——所以从 arm64 机器 clone（仓库
 ./deploy/install.sh --units-only   # 只重生成单元，不重启
 ```
 
+部署同时产出运维命令 `asip`（软链到 `deploy/asip-cli.sh`，设置写进
+`~/.config/asip/cli.env`）。设置全部从 `config.py` 推导，所以换目录或改 `members`
+后它自动跟上；只想刷新设置可单独跑 `./deploy/asip-cli-conf.sh`。
+常用子命令：`asip st`（状态）、`asip warp status|stop|start`（隧道）、
+`asip warp jlog`（隧道日志）、`asip inbox`（Sister Bus 里本项目的消息）。
+完整清单见 `asip -h`。
+
 纯手动启动（不走 systemd）可用 `./start-auto-switch-ip.sh`。
 
 ### 2. 把 9router 出口指到 7890
@@ -97,10 +112,49 @@ curl -x http://127.0.0.1:7890 https://api.ipify.org  # 应返回非本地 IP
 ```bash
 python3 -m pytest test_portability.py -q          # 路径/单元可移植性
 python3 -m pytest test_daemon_unit.py test_subscription_parse.py test_warp_refresh.py -q
-systemctl --user status auto-switch-ip.service
+sudo systemctl status auto-switch-ip.service
 curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
      http://127.0.0.1:9090/proxies/opencode-out | head -c 200
 ```
+
+## 移植到新机器（WSL2 / 通用 Linux）
+
+同一份代码不绑目录、不绑用户：`config.py` 以仓库目录 + 当前用户家目录为基准，
+外部路径都可用 `.env` 覆盖。完整步骤：
+
+1. 克隆仓库（保留可执行位即可）：`git clone <repo> ~/dkk-projects/auto-switch-ip`
+2. 装依赖：`sudo apt install -y python3 python3-pip curl tar`，然后
+   `python3 -m pip install -r requirements.txt`；Bun 见 §0 前置条件。
+3. 预检：`./deploy/preflight.sh`。硬项（Python/依赖/systemd/curl）失败即退出；
+   软项（linger、订阅、9router DB、Bun、WSL mirrored、端口）只警告。
+4. 配置：`cp .env.example .env && chmod 600 .env`，至少填一个 `*_SUB_URL`。
+5. 部署：`./deploy/install.sh`（自动取二进制、注册 WARP 隧道单元；主 daemon 现用系统级 unit，见下方「服务托管」）。
+   已有单元指向旧目录时会拒绝覆盖；确认迁移用 `./deploy/install.sh --adopt`。
+6. 开机自启（无桌面登录）：`sudo loginctl enable-linger $USER`。
+7. WSL 额外：
+   - Windows `%USERPROFILE%\.wslconfig` 设 `[wsl2] networkingMode=mirrored`，`wsl --shutdown` 重进；
+   - `/etc/wsl.conf` 设 `[boot] systemd=true`（模板 `deploy/wsl-boot.conf.example`）。
+8. 9router 必须在本机（daemon 读它的 SQLite + Clash API）。若 9router 不在本机，
+   只能盲轮换：`.env` 设 `ASIP_OBSERVE_9ROUTER=false`；或将 9router DB 只读挂载后
+   用 `NINE_ROUTER_DB_PATH` 指过去（Clash API 仍需本机 sing-box）。
+9. 验证：`sudo systemctl status auto-switch-ip.service`；
+   `python3 -m pytest test_portability.py -q`。
+
+无 systemd 的沙箱/CI 可用 `SKIP_PREFLIGHT=1 SYSTEMD_DIR=/tmp/x ./deploy/install.sh --units-only`
+只渲染单元，不碰真实服务。
+
+### 服务托管（系统级）
+
+主 daemon 与 9Router 都由**系统级** unit 托管，用户级单元已删除，禁止再用 `systemctl --user`：
+
+```bash
+sudo systemctl status auto-switch-ip     # 代理轮换 daemon（KillMode=process）
+sudo systemctl restart auto-switch-ip
+sudo systemctl status 9router            # 9Router，:20127
+sudo systemctl restart 9router
+```
+
+重装时若安装器仍写用户级 `auto-switch-ip.service`，装完必须删除该副本，避免两个 daemon 抢同一把锁。
 
 ## 配置
 
@@ -127,11 +181,13 @@ curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
 **安全特性**：
 - 出口 IP 记录落盘 `.warp_ip_used.json`，24h 内用过的地址不复用
 - 403/429 标脏的 IP 按 6h/24h 恢复期挡在候选池外
-- 所有 WARP 不可用时兜底落 proxy 池（3h 冷却防来回弹）
+- 所有 WARP 不可用时原地重连当前 WARP 线；**落 proxy 池已禁用**（2026-10-26，
+  `warp.proxy_fallback_enabled=false`，池内节点全挂）
 
 ## 网络要求
 
-- WSL2 mirrored 模式（`/mnt/c/Users/Administrator/.wslconfig` 里 `networkingMode=mirrored`）— Windows 127.0.0.1 能直通 WSL2 内的服务
+- WSL2 mirrored 模式（Windows `%USERPROFILE%\.wslconfig` 里 `[wsl2] networkingMode=mirrored`）— Windows 127.0.0.1 能直通 WSL2 内的服务
+- 通用 Linux 无此要求；用户服务要开机自启需 `sudo loginctl enable-linger $USER`
 - hysteria2 在 WSL2 下有 utls 不兼容问题（sing-box 报错 "unsupported usage for uTLS"），本项目默认排除 h2 节点（用 `--include-h2` 开启）
 
 ## 恢复
@@ -140,8 +196,9 @@ curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
 ```bash
 # 9router 改回 6696 (okz)
 python3 -c "
-import sqlite3, json
-con = sqlite3.connect('/home/administrator/.9router/db/data.sqlite')
+import sqlite3, json, os
+db = os.environ.get('NINE_ROUTER_DB_PATH') or os.path.expanduser('~/.9router/db/data.sqlite')
+con = sqlite3.connect(db)
 cur = con.cursor()
 cur.execute('SELECT data FROM settings WHERE id=1')
 s = json.loads(cur.fetchone()[0])

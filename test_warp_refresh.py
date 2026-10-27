@@ -42,6 +42,9 @@ def _isolate_warp_state(monkeypatch, tmp_path):
     # 探测台账是进程级全局：不隔离则前一个用例探过的 IP 在本用例被当成
     # 「TTL 内已探过」而跳过真实探测，台账相关断言全落空。
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    # 整批探测结论也是进程级全局：不隔离会让上一个用例的 tag→verdict 参与
+    # 本用例的失明判定（尤其「缓存跳过也要记结论」分支）。
+    monkeypatch.setattr(daemon, "_PROBE_LAST_VERDICT", {})
     # 标脏墓碑同样是进程级全局：残留条目会拒收后续用例带 started_at 的写入。
     monkeypatch.setattr(daemon, "_PROBE_BLOCKED_AT", {})
     # 模型探测通过会记 last_ok_ts 并落盘，不隔离就写进生产 .warp_ip_used.json。
@@ -180,15 +183,26 @@ def test_quota_verdict_turns_line_into_refresh_candidate(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     ip = "2a09:bac5:1ef9:281e::1"
     assert daemon._warp_ip_needs_refresh(ip, 1000.0) is False  # 无结论：全新地址不算低质
+    daemon._mark_warp_ip_used(ip, 1000.0, blocked=True, kind="rate429",
+                              ban_after=3600)
     daemon._probe_cache_put("W1", ip, "quota", now=1000.0)
     assert daemon._probe_cache_verdict("W1", ip, 1001.0) == "quota"
     assert daemon._warp_ip_needs_refresh(ip, 1001.0, "W1") is True, \
         "本线实测 quota 必须判为低质"
     assert "quota" in daemon._warp_ip_refresh_reason(ip, 1001.0, "W1")
 
-    # 长 TTL 过后结论作废：同一地址重新可探，也不再凭旧结论判低质
-    assert daemon._probe_cache_verdict("W1", ip, 1000.0 + 21601) is None
-    assert daemon._warp_ip_needs_refresh(ip, 1000.0 + 21601, "W1") is False
+    # 缓存自身的 TTL 已收到 600s：过期即作废，同一地址重新可探
+    assert daemon._probe_cache_verdict("W1", ip, 1000.0 + 599) == "quota"
+    assert daemon._probe_cache_verdict("W1", ip, 1000.0 + 601) is None
+
+    # 精确解禁（Retry-After 1h）到期后旧 quota 不得再驱动重启，否则
+    # 「精确解禁」只在探测路径生效、预热路径仍白烧隧道。
+    # 重放一条新结论模拟 TTL 内又探了一次：缓存仍是 quota 而惩罚期已过，
+    # 判据必须落在惩罚期上，不是落在缓存结论上。
+    daemon._probe_cache_put("W1", ip, "quota", now=4600.0)
+    assert daemon._probe_cache_verdict("W1", ip, 4602.0) == "quota"
+    assert daemon._warp_ip_needs_refresh(ip, 4602.0, "W1") is False
+    assert "quota" not in daemon._warp_ip_refresh_reason(ip, 4602.0, "W1")
 
 
 def test_probe_cache_never_bleeds_across_ips_in_same_segment(monkeypatch):
@@ -603,16 +617,21 @@ def test_reconnect_now_does_not_read_error_counts():
 
     用 AST 查真实调用而非文本匹配 —— docstring 里也提到了该函数名，
     文本匹配会把说明文字误判成调用。
+
+    改查 `co_names` 而不是解析源码：源码解析要读磁盘上的 daemon.py，多个
+    session 共用一个工作区时读到半写入的文件会抛 IndentationError，把「代码里
+    有没有这个调用」的断言变成与审查对象无关的偶发失败。`co_names` 是编译产物，
+    只含真实引用的名字，docstring 文本不在其中。
     """
-    import ast
-    import inspect
-    tree = ast.parse(inspect.getsource(daemon._reconnect_warp_now))
-    names = {n.func.id for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    names |= {n.func.attr for n in ast.walk(tree)
-              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    code = daemon._reconnect_warp_now.__code__
+    names: set[str] = set()
+    stack = [code]
+    while stack:
+        c = stack.pop()
+        names |= set(c.co_names)
+        stack.extend(k for k in c.co_consts if hasattr(k, "co_names"))
     assert "count_warp_blocked_since" not in names, \
-        f"绕阈值入口不应查错误计数，实际调用: {sorted(names)}"
+        f"绕阈值入口不应查错误计数，实际引用: {sorted(names)}"
 
 
 def test_refresh_rejects_line_when_model_probe_fails(monkeypatch):
@@ -642,7 +661,7 @@ def test_refresh_model_check_disabled_keeps_old_mode(monkeypatch):
     import probe_warp
     called = []
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: (called.append(port), ("OK", 0.1, ""))[1])
+                        lambda port, timeout: (called.append(port), ("OK", 0.1, "", None))[1])
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", False)
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-a") is True
     assert called == [], "原模式下不得发探测请求"
@@ -656,7 +675,7 @@ def test_model_probe_maps_quota_to_unusable(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     verdict = {"v": "quota"}
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: (verdict["v"], 0.1, ""))
+                        lambda port, timeout: (verdict["v"], 0.1, "", None))
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip") is False
     verdict["v"] = "OK"
     assert daemon._warp_model_usable({"tag": "W2", "port": 1081}, "ip2") is True
@@ -669,7 +688,7 @@ def test_probe_runs_at_most_once_per_address_within_ttl(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "probe_persistent_ttl_sec", 21600)
     calls = []
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: (calls.append(port), ("quota", 0.1, ""))[1])
+                        lambda port, timeout: (calls.append(port), ("quota", 0.1, "", None))[1])
     m = {"tag": "W1", "port": 1080}
     assert daemon._warp_model_usable(m, "2a09:bac5:1ef9:281e::1") is False
     assert daemon._warp_model_usable(m, "2a09:bac5:1ef9:281e::1") is False
@@ -712,7 +731,7 @@ def test_model_quota_verdict_marks_ip_blocked(monkeypatch):
                         lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: ("quota", 0.1, ""))
+                        lambda port, timeout: ("quota", 0.1, "", None))
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-q") is False
     entry = daemon._WARP_IP_USED.get("ip-q") or {}
     assert entry.get("blocked") is True, "quota 必须写进 blocked 台账"
@@ -733,7 +752,7 @@ def test_model_flagged_verdict_maps_to_abuse403(monkeypatch):
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: ("flagged", 0.1, ""))
+                        lambda port, timeout: ("flagged", 0.1, "", None))
     assert daemon._warp_model_usable({"tag": "W2", "port": 1081}, "ip-f") is False
     entry = daemon._WARP_IP_USED["ip-f"]
     assert "abuse403" in daemon._warp_block_stamps(entry)
@@ -748,11 +767,33 @@ def test_model_ok_verdict_does_not_mark_blocked(monkeypatch):
     monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: ("OK", 0.1, ""))
+                        lambda port, timeout: ("OK", 0.1, "", None))
     assert daemon._warp_model_usable({"tag": "W3", "port": 1082}, "ip-ok") is True
     entry = daemon._WARP_IP_USED["ip-ok"]
     assert entry.get("blocked") is False
     assert daemon._ip_disqualified("ip-ok", time.time(), 86400) is False
+
+
+def test_all_probe_exceptions_mark_channel_blind(monkeypatch):
+    """整批探测抛异常与整批 unreachable 同义：都是探测器自己没跑通。
+
+    旧实现异常分支不写 `_PROBE_LAST_VERDICT`，批判据看到的是空串/旧 OK，
+    失明机制不触发 —— 每条线都被判「地址坏了」白重启、白烧配额。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    monkeypatch.setattr(daemon, "_PROBE_LAST_VERDICT", {})
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    import probe_warp
+
+    def _boom(port, timeout):
+        raise RuntimeError("bun gone")
+
+    monkeypatch.setattr(probe_warp, "probe", _boom)
+    pairs = [({"tag": f"W{i}", "port": 1080 + i}, f"ip-{i}") for i in range(3)]
+    out = daemon._warp_model_test_many(pairs)
+    assert out == {"W0": False, "W1": False, "W2": False}
+    assert daemon._warp_probe_blind() is True, "整批异常须判定通道失明"
 
 
 def test_blind_channel_falls_back_to_ip_history(monkeypatch):
@@ -773,7 +814,7 @@ def test_blind_channel_falls_back_to_ip_history(monkeypatch):
     import probe_warp
     called = []
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: (called.append(port), ("OK", 0.1, ""))[1])
+                        lambda port, timeout: (called.append(port), ("OK", 0.1, "", None))[1])
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-a") is True
     assert called == [], "通道失明期间不该再探测"
 
@@ -785,6 +826,23 @@ def test_partial_unreachable_is_not_blindness(monkeypatch):
     daemon._note_probe_batch(["unreachable", "OK", "quota"])
     assert daemon._warp_probe_blind() is False
     assert daemon._ip_history_is_truth() is False, "未失明时仍以实测为准"
+
+
+def test_single_unreachable_batch_is_not_blindness(monkeypatch):
+    """只测 1 条且 unreachable 不得判失明 —— `all()` 对单元素恒真，会误锁 120s。
+
+    回归 2026-10-26：`probe_candidates_per_switch`=2 时错误换线每轮只测 1~2 条，
+    日志实测出现「本批 1 条模型层探测全 unreachable → 判定通道失明」，随后 47 次
+    候选跳过实测被放行。放行的正是 quota 地址：切上去首条请求就 429。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
+    monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
+    daemon._note_probe_batch(["unreachable"])
+    assert daemon._warp_probe_blind() is False, "单条 unreachable 不足以判通道失明"
+    daemon._note_probe_batch(["unreachable", "unreachable"])
+    assert daemon._warp_probe_blind() is False, "2 条样本同样不足以判定"
+    daemon._note_probe_batch(["unreachable"] * 3)
+    assert daemon._warp_probe_blind() is True, "达到最小样本数才判定失明"
 
 
 def test_blind_channel_does_not_restart_line_on_stale_unreachable(monkeypatch):
@@ -904,7 +962,7 @@ def test_model_probe_ok_records_probe_ok_not_served(monkeypatch):
     """
     import probe_warp
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
-    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: ("OK", 0.1, ""))
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: ("OK", 0.1, "", None))
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {"ip-a": {"ts": 1000.0}})
     monkeypatch.setattr(time, "time", lambda: 2000.0)
 
@@ -943,7 +1001,7 @@ def test_model_mode_selection_trusts_probe_not_history(monkeypatch):
 
     monkeypatch.setattr(daemon, "_warp_model_test_many", fake_test_many)
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a: None)
     monkeypatch.setattr(daemon, "_set_warp_line_ip", lambda *a: None)
@@ -978,7 +1036,7 @@ def _reconnect_fixture(monkeypatch, test_many, refresh_result=None):
     monkeypatch.setattr(daemon, "_schedule_idle_refresh",
                         lambda m: scheduled.append(m["tag"]))
     switched = []
-    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: switched.append(tag) or True)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: switched.append(tag) or True)
     monkeypatch.setattr(daemon, "_warp_line_selected", lambda *a: None)
     monkeypatch.setattr(daemon, "_set_warp_line_ip", lambda *a: None)
     monkeypatch.setattr(daemon, "_warp_prefix_rest", lambda ip, now: None)
@@ -1100,7 +1158,8 @@ def test_real_error_after_new_exit_is_still_marked(monkeypatch):
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-new")
     monkeypatch.setattr(daemon, "_warp_member", lambda tag: {"tag": tag})
     monkeypatch.setattr(daemon, "_mark_warp_ip_used",
-                        lambda ip, now, blocked=False, kind=None: marked.append((ip, blocked)))
+                        lambda ip, now, blocked=False, kind=None, **k:
+                        marked.append((ip, blocked)))
     monkeypatch.setattr(daemon, "_record_warp_cycle", lambda *a, **k: None)
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda **k: pytest.fail("生效 2s 内硬闸必须拦住换线"))

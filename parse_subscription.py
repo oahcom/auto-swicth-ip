@@ -6,8 +6,11 @@ import base64
 import json
 import urllib.parse
 import sys
-import os
 from pathlib import Path
+
+from asip.atomic_io import write_json
+from asip.http import request_json
+from asip.redact import redact_secrets
 
 import config
 from config import CFG, get_lan_auth, get_singbox_secret
@@ -20,13 +23,28 @@ def fetch_and_decode_sub(url: str) -> list[str]:
     """拉订阅，base64 解码，返回原始 URL 列表
     支持：标准 base64 订阅、明文 URL 列表、Clash YAML 配置（提取 proxy 节点）
     """
-    import requests
     import yaml
     # 仅对 dasho 等需要 UA 的源添加 headers
     headers = {"User-Agent": "clash-verge/1.0"} if "dasho" in url else {}
-    r = requests.get(url, timeout=30, headers=headers)
-    r.raise_for_status()
-    raw = r.text
+    # text_limit=None：非 JSON 订阅是整段 base64/明文，截断到 2000 字符
+    # 会静默丢掉后面的节点（多源合并后按截断内容生成配置）。
+    result = request_json("GET", url, timeout=30, headers=headers,
+                          text_limit=None)
+    if not result.ok:
+        # 与 raise_for_status 等价：传输失败单独说明，非 2xx 带上状态码。
+        if result.status is None:
+            detail = redact_secrets(result.error or "transport error")
+        else:
+            detail = f"HTTP {result.status}"
+        raise RuntimeError(f"订阅拉取失败: {detail}")
+    # JSON 响应走 data；非 JSON（base64/Clash YAML/明文列表）走全文 text
+    # （request_json 显式传 text_limit=None，不能截断）。
+    # 结构化 data 重新序列化，后面的 base64/YAML/splitlines 解析都针对字符串。
+    if result.data is not None:
+        raw = (result.data if isinstance(result.data, str)
+               else json.dumps(result.data, ensure_ascii=False))
+    else:
+        raw = result.text or ""
 
     all_lines = []
 
@@ -644,6 +662,8 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--urls", nargs="+", help="subscription URLs (can specify multiple)")
+    ap.add_argument("--urls-file",
+                    help="file containing one subscription URL per line (avoids argv leak)")
     ap.add_argument("--url", help="single subscription URL (legacy)")
     ap.add_argument("--out", default=CFG["singbox"]["config_file"])
     ap.add_argument("--port", type=int, default=CFG["singbox"]["mixed_port"])
@@ -656,10 +676,18 @@ if __name__ == "__main__":
 
     # 无参数时回退到 CFG 里的全部订阅源（与 daemon 的每小时刷新同一份清单，
     # 每项都可用环境变量覆盖）。README 的首装命令依赖此路径。
-    sub_urls = args.urls or ([args.url] if args.url else []) or [
-        u for u in (CFG.get(k, {}).get("sub_url", "")
-                    for k in ("okz", "hd23n", "dasho", "dasho_alt")) if u
-    ]
+    file_urls = []
+    if args.urls_file:
+        try:
+            with open(args.urls_file, encoding="utf-8") as f:
+                file_urls = [ln.strip() for ln in f
+                             if ln.strip() and not ln.lstrip().startswith("#")]
+        except OSError as e:
+            print(f"ERROR: 读取 --urls-file 失败: {e}", file=sys.stderr)
+            sys.exit(1)
+    sub_urls = (args.urls or file_urls
+                or ([args.url] if args.url else [])
+                or config.subscription_urls())
     if not sub_urls:
         print("ERROR: no subscription URLs provided (use --urls or --url)", file=sys.stderr)
         sys.exit(1)
@@ -671,7 +699,9 @@ if __name__ == "__main__":
         try:
             urls = fetch_and_decode_sub(url)
         except Exception as e:
-            print(f"  ✗ 源失败，跳过: {type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
+            # 异常串可能带完整 URL（含 token），stderr 会进 daemon.log。
+            print(f"  ✗ 源失败，跳过: {type(e).__name__}: "
+                  f"{redact_secrets(str(e))[:120]}", file=sys.stderr)
             continue
         print(f"  got {len(urls)} raw URLs")
         all_urls.extend(urls)
@@ -695,11 +725,11 @@ if __name__ == "__main__":
         sys.exit(1)
 
     cfg = make_config(nodes, args.port, args.clash_port, args.secret or get_singbox_secret(), include_h2=args.include_h2)
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    out_path = Path(args.out)
-    fd = os.open(str(out_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    # 调用方（daemon）传进来的 args.out 本身已是 <config>.tmp：它要在 promote
+    # 前做节点数/sing-box check 校验。write_json 先写同目录唯一临时文件再
+    # os.replace 到 args.out，既不截断写（崩溃不会留下半份 JSON），也不改变
+    # 调用方看到的路径契约。
+    write_json(args.out, cfg, mode=0o600, indent=2)
     print(f"wrote config to {args.out}")
     print(f"first 3 nodes:")
     for n in nodes[:3]:

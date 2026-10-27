@@ -53,7 +53,9 @@
 
 1. **两种 403 被混为一谈**。另一条文案 `only be used from within OpenCode` 才是客户端指纹（裸 curl 必现，换 IP 无效）；`abusive traffic from this IP` 是**IP 信誉**拦截，换干净出口可解。之前按"指纹"结论处理，方向错了。
 2. **83 个代理节点全部撞名单**。轮换只在同一批脏 IP 里打转，所以切得再快也没有收益。
-3. WireGuard 版 WARP 在本机不通：UDP 2408/4500/500/1701 握手全部超时（同网段 UDP 19302/3478 正常，属端口/协议过滤）。
+3. WireGuard 版 WARP 直连不通：UDP 2408/4500/500/1701 握手全部超时（同网段 UDP 19302/3478 正常）。
+   **2026-10-28 更正**：UDP 出站本身可用，被拦的是到 Cloudflare 2408 的路径（traceroute 末端
+   收到 ICMP type 3 code 13）。把同一条 UDP 经代理节点转发后握手成功，见 `warp_wg.py`。
 
 ### 修复
 
@@ -470,3 +472,221 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
 - `timeout` 缺失时 `awk`/`journalctl` 可静默返回空，看似"无事件"实为查询本身
   失败。关键窗口的"日志空白"要先确认日志系统本身是否健康（本次 user journal
   最早条目仅到 19:29:55，之前的已丢失）。
+
+## INC-007 — 落池兜底把流量交给全挂的付费池（2026-10-26）
+
+**日期**: 2026-10-26
+**等级**: P1（WARP 全不可用时落池，池内节点全部 connection reset → 断流）
+**现象**: 02:57:13 daemon 日志 `出口=PROXY:pq.aws67.yydjc.top:443-vl`，
+`.egress_log.jsonl` 最后一条 ts=1792954624 停在该节点；05:32 部署重启后 selector
+回到 WARP，但 `proxy` 仍在 `opencode-out` 成员里，随时可能再落池。
+
+### 根因
+
+1. 付费 anytls 节点（`*.juhazf.cn` / `pq.aws67.yydjc.top`）全部 connection reset，
+   落池后没有可用出口。
+2. `_fallback_to_proxy` 的设计前提是「池比原地重连可靠」（2026-10-19 INC-006 的
+   反向教训），池整体失效后该前提不成立。
+3. 代码没有关闭开关，`deploy/install.sh` 每次部署 `enable --now`，看起来像
+   「自动切换被切断」，实际一直在跑。
+
+### 修复
+
+- `config.py` 新增 `warp.proxy_fallback_enabled: False`。
+- `_fallback_to_proxy` 入口守卫：禁用时只 `_restart_warp_inplace` 当前线；
+  `restart_singbox` 恢复路径也不再切回 proxy。
+- 保留 WARP 轮换（当前 9router 200 靠它换到未烧出口）。
+- 验证：`pytest -q` 351 passed；daemon 06:02:39 重启（PID 844647），
+  selector WARP-CF-C，`/v1/chat/completions` 200。
+
+### 教训
+
+- 兜底路径也要有「兜底资源是否还活着」的开关；共享池全挂时，原地重连优于落池。
+- 「服务被停用」要看 journal 的 `Stopped/Started` 和 `is-enabled`，不要从日志
+  空窗推断。
+
+## INC-008 — 禁令：429 不得再解释为"账号级配额"（2026-10-26）
+
+**日期**: 2026-10-26
+**等级**: P0（认知红线，反复违反）
+**现象**: 主人已无数次强调，模型仍在分析/方案中把 opencode 429
+（`FreeUsageLimitError` / `Rate limit exceeded`）解释为账号级/账户级/key 级
+配额上限，并据此提出"全池冷却""暂停轮换""等配额重置""短封禁等待退出"等
+错误方案。
+
+### 红线条文
+
+1. **禁止**把 opencode 429 判定为账号级/账户级/key 级配额。
+2. **禁止**提出依赖该前提的衍生策略：全池冷却、暂停轮换、等待配额重置、
+   短封禁等待退出。
+3. 429 的唯一判定框架：**按出口 IP（egress）判定**。治理手段只有两个：
+   出口级换线 + IP 池治理（池规模、-6 隧道扩容、出口质量）。
+4. 依据：INC-005 实测——同一 key、仅切换出口，成功率 3.5% → 9.3%；
+   若为账号级配额，换 IP 不可能提升成功率。主人 2026-10-26 原话：
+   "账号级配额是错误的，不允许再次提前（出现）。"
+   对短封禁等待退出的否决："提示非常小，大不了下次刷到再用。"
+
+### 教训
+
+- 错误文案分析要先"看证据"（响应体类型、status、出口台账），再谈配额语义。
+- 涉及 429 的任何方案，先过本条红线的 4 条禁令，再动笔。
+
+## INC-009 — 60 秒"挂起错误"实为传输层合成 503（sidecar 文案误导，2026-10-26）
+
+**日期**: 2026-10-26
+**等级**: P2（可观测性/文案误导；触发窗口内 300 条 error 一次性灌入）
+**现象**: 21:07–21:08 一批 opencode 请求记录 `status=error`、`ttft=0`、
+`total≈60004`、`tokens=0`，早期分类器把这类行标成 "other"，
+被误读成"60 秒超时"。实际响应体为：
+`503 {"type":"error","error":{"type":"UpstreamTransportError",
+"message":"OpenCode free lane requires the Bun transport; sidecar unavailable."}}`
+
+### 根因链（代码 + journal 证据）
+
+1. 21:04:30–32 全部 20 条 usque-warp 隧道被一次性重启（本轮 -6 改单的批量
+   重启窗口），所有出口同时断线重连。
+2. 窗口内 Bun sidecar 的 forward 请求上游零字节返回（`ttft=0`）。
+3. transport 自身无请求超时：`readyTimeoutMs`=8s、`failureBackoffMs`=5min、
+   `STREAM_STALL_TIMEOUT_MS`=360s，均非此 60s（open-sse/config/runtimeConfig.js:71-81）。
+4. 约 60s 无首字节，发起方中止 → `forward()` AbortError →
+   `fetchViaTransport` 返回 null（open-sse/utils/opencodeTransport.js:179-186）。
+5. executor 将 null 统一合成为上述 503（open-sse/executors/opencode.js:660-682，
+   带 `retry-after: 1`）。**"sidecar unavailable" 同时覆盖了"forward 卡死"，
+   文案误导。**
+6. 并发请求同一窗口卡住、同时到 60s 被掐、同时记错 → 短时 error 爆发。
+
+### 定性（与 429 红线的关系）
+
+- 非 429/403，非账号级配额，亦非出口封禁：上游零字节，纯传输悬挂。
+- ASIP 未换线是正确行为：503 不落 egress 标记；换 IP 救不了本地传输卡死
+  （opencode.js:654-658 `computeRetryDelay` 明确禁止进程内重试）。
+
+### 处置与待办
+
+- 批量隧道重启必须滚动/错峰，禁止把 20 条线同时停掉。
+- `[OpenCodeTransport]` 的 warn 只写 9router stdout（fd 为 socket，不落盘）
+  → 需要落盘日志/告警，否则同类故障不可观测。
+- 报错文案建议拆分 "forward hang" 与 "sidecar unavailable"（改动需 Codex 复审）。
+
+
+## INC-010 — 传输 503 真因：换线后僵尸 CONNECT + 9router 生产构建未重建（2026-10-26）
+
+**日期**: 2026-10-26
+**等级**: P1（21:51–22:12 期间 opencode free 100% 失败，每条挂满 60s）
+**现象**: 21:51 起 `transport503` 连续出现，`ttft=0`、`total≈60-65s`、
+`tokens=0`；重启 9router 后立刻恢复 37/39。
+
+### 真因链（证据）
+
+1. 9router sidecar（bun pid 215307）自 21:07 起持有 3 条到 `opencode.ai` 的
+   HTTP CONNECT 长连接（CF-C 出口，累计 up 54.8/38.6/29.4MB）。
+2. 21:46:13 ASIP 把出口 WARP-CF-C 换到 WARP-CF-16；这些连接每个请求仍走
+   `chains[0]=WARP-CF-C` 的僵尸隧道——本地 socket 仍 ESTAB，但黑洞无 RST。
+3. 同一时刻经 7890 的新连接 1.0–6.3s 就拿到 429 FreeUsageLimitError，
+   证明**出口是好的**，坏的是被复用的旧连接。
+4. 旧构建无请求超时（readyTimeout=8s / stall=360s 都不是 60s），故每条复用
+   请求挂满调用方 60s 上限 → 合成 503。
+5. 另发现: `npm run start` 跑的是 `.next` 生产构建（06:08），而 21:28/22:28
+   的 JS 改动从未 build；`.next` 内搜不到 `OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS`。
+   即「20s 超时 + alternate 换线」此前只在源码/测试里，线上未生效。
+
+### 处置
+
+- ASIP：换线成功后异步清理旧链 `age>=120s` 的 opencode 连接；传输 503 且出口
+  探测正常时，清理当前链 `age>=300s` 的连接（10 分钟节流）。实测 23:31:15
+  换线后输出「✓ 清理 6 条旧链连接（WARP-CF，≥120s）」。
+- 9router：`headerTimeoutMs=20s`（`OPENCODE_TRANSPORT_HEADER_TIMEOUT_MS`）、
+  503+UpstreamTransportError 换 alternate 重试一次；`oc/deepseek-v4.1-flash-free`
+  上限 330k。**必须 `npm run build` 后重启才生效**。
+- 构建离线化：`next/font/google` 改为 `next/font/local`（自托管 Inter latin），
+  否则本机出口到 fonts.googleapis.com 不可达，`next build` 直接失败。
+
+### 教训
+
+- 重启「止血」不等于修复上线：先确认运行产物（`.next` BUILD_ID/mtime）是否
+  包含改动，再看源码。
+- 换线只切换 selector 出口，不会迁移已建立的长连接；长连接池必须按链清理。
+- 清理必须带 age 过滤，禁止 kill-all（在途流仍可能是好请求）。
+
+## INC-011 — 出口被上游静默悬挂 + 守护进程权限/托管缺失（2026-10-27）
+
+**日期**: 2026-10-27
+**等级**: P0（00:0x 起 opencode free 大面积失败；9router 01:49 被杀后停机 ~10h）
+**现象**: `transport503` 每 2 分钟 159 条、`ttft=0`、`total≈20s`；`/v1/models`
+每次 10s；面板/会话大量超时。ASIP 健康行长期 `503=0`，从不换线。
+
+### 真因链（证据）
+
+1. **出口被上游静默悬挂，而非出口不通**：故障链上 `warp_egress_ip` 1.2s 通、
+   `GET https://opencode.ai/` 0.6s 200，但不带指纹的 chat 探测 0.26s 返回 429，
+   带 `Bearer public` + `x-opencode-*` 指纹的同一请求挂满 30s 无响应头。
+   换到 WARP-CF-D 后同请求 0.25s 429、真实会话 5/5 成功 —— 结论：该 WARP 出口
+   被上游针对，CF 可达 ≠ 上游肯服务。
+2. **检测失明**：`get_9router_error_rate` 的 transport 计数只看最近
+   `RECENT_WINDOW=5` 条（高流量下 ~2s 就滚出窗口），10s tick 到来时恒为 0；
+   清理又被 `transport_stale_gap_sec` 节流，故障期间从未触发。
+3. **9router 无托管**：`9router.service` 处于 disabled，进程靠手工 `npm start`；
+   01:49 被 SIGKILL 后无人拉起，停机约 10 小时（`logs/server.log` 停在 23:31，
+   journal 末条 01:49:35）。
+4. **sidecar 重启风暴泄漏**：`stop()` 只杀 `active.child`，spawn 等待期间再次
+   `stop()` 会把旧 promise 的 child 复活成孤儿；实测 `bun` 进程 52→65 个、
+   合计 1.3GB RSS。
+5. **ASIP systemd 单元以 root 运行**：`/root/.singbox_secret` 缺失、
+   `NODE_INFO_DB` 打不开（`unable to open database file`），单元每 10s
+   `auto-restart` 空转；真实实例一直是手工跑的 administrator 进程。
+
+### 修复
+
+- `daemon.py`：transport 计数改为 **180s 时间回看**（`TRANSPORT_LOOKBACK_SEC`），
+  不再受 5 行窗口限制；新增 `_opencode_lane_alive()`（curl + socks5h 打一条
+  最小 free-lane 请求，任何 HTTP 状态含 429 都算活），出口可达但链路悬挂时
+  **换线**而不是清连接；主循环在 transport>0 时直接驱动探针。
+- `config.py`：新增 `TRANSPORT_LOOKBACK_SEC=180`。
+- 9router：`opencodeTransport.js` 增加 `startGen` 代号守卫（作废的 start 不得
+  写回 `active`）+ 传输超时重启 sidecar 的 30s 冷却。
+- 运维：`systemctl enable --now 9router.service`（Restart=on-failure）；
+  ASIP 单元加 drop-in `User=administrator` + `HOME=/home/administrator`。
+- 验证：全量 `test_daemon_unit.py` 230 passed；重建后 rebuild 后 5/5 会话
+  0.8–1.4s，3 分钟内 36 success / 0 error。
+
+### 教训
+
+- 「出口探通」不等于「上游可用」：健康探针必须打真实业务端点，并带上线上
+  同款指纹头；只探 CF trace 会把「IP 被针对」误判成「连接池僵死」。
+- 计数窗口必须按时间而不是条数：高流量下条数窗口只覆盖数秒。
+- 任何常驻服务都必须有 supervisor；`Restart=always` + 正确的 User/HOME 是
+  最低要求，缺一条就会静默停机或空转重启。
+
+## INC-012 — 新 WG 线「已启用但没人用」+ 模型层 quota 被当出口故障（2026-10-28）
+
+**等级**: P3（无用户可见故障，但换线算力被白白消耗）
+**现象**: 16 条 `warp-wg-*.service` 全部 active、主 sing-box 的 Clash API 里
+16 个 `WARP-WG-*` 出站可见，openCode 也验证过可切；但 `daemon.log` 里
+`WARP-WG` 出现 0 次，轮换全部落在 `WARP-CF-*`（usque）。
+
+### 根因
+
+1. **daemon 的成员表是 config.py 导入时按环境变量展开的**。systemd 单元里只有
+   `SINGBOX_SECRET` / `NINE_ROUTER_PASSWORD` / `OKZ_SUB_URL`，没有
+   `WARP_WG_FAMILIES` / `WARP_WG_NODES` → `CFG["warp"]["members"]` 里没有 WG
+   成员。sing-box 有出站 ≠ daemon 会用它。
+2. **模型层 quota 被归为出口级错误**。日志里 `[OpenCode Free] 5/5 出口级错误 |
+   403占比=0%` 配合 `模型层: quota（Retry-After 3.9h）`，说明上游是额度耗尽，
+   与 IP 无关；daemon 仍按 IP 故障处理，重启同一条线 33–35 次，且「暂无 120s
+   内 OK 的备线」导致换线判断连续空转。
+
+### 结论
+
+- 部署新线必须同时改 **部署脚本** 与 **systemd 单元的 daemon 环境**，两处
+  不一致就会出现「线在跑、没人选」。
+- 403=0% 且带 `Retry-After` 的失败不能算 IP 问题，换线无效；这类错误应直接
+  上报冷却，不重启隧道。
+
+### 处理
+
+- systemd 单元补 `WARP_WG_FAMILIES=v4,v6,v6,v6` + `WARP_WG_NODES=4`，重启后
+  daemon 状态表从 20 条变 36 条（16 条 WG 全部纳入探测/换线）。
+- 新增全局额度闸 `_QUOTA_HOLD`：Retry-After ≥ 30 分钟的 quota 开闸，闸内不重启
+  「quota/惩罚期/429」类线，短 Retry-After 与隧道半死照常处理。
+- 效果：改动前 30 分钟重启 253 次，改动后同口径 2 次。
+

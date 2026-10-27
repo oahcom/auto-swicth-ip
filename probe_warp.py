@@ -19,6 +19,7 @@ per-tunnel 是 SOCKS5（1080-1099），Bun fetch 只认 HTTP 代理，故每次�
 本地起一个 CONNECT→SOCKS5 的桥（probe_fetch.mjs 负责 Bun 侧）。会话按「端口」
 稳定复用（9router 的 stable session 语义，TTL 2h），遇到 quota 才换一代重试一次
 （对应 opencode.js 的 rotateSession + 一次重试）。会话表落 `.probe_sessions.json`。
+429 响应会解析 `Retry-After`（头或体），输出该出口的确切封禁剩余秒数。
 """
 import argparse
 import glob
@@ -26,17 +27,22 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import secrets
 import shutil
 import socket
 import socketserver
 import struct
-import subprocess
 import sys
 import tempfile
 import threading
 import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 
+from asip.atomic_io import write_json
+from asip.egress import probe_egress
+from asip.proc import run as run_proc
 from config import CFG
 
 # 只复刻 open-sse/executors/opencode.js 的 UA 与指纹工具定义（后者见下方
@@ -46,7 +52,6 @@ from config import CFG
 UA = "opencode/latest/2.0.26/cli"
 FREEMODEL = "deepseek-v4.1-flash-free"
 URL = "https://opencode.ai/inference/v1/chat/completions"
-TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 ENV_MARKER = ("<env>\n"
               "  Working directory: /workspace\n"
               "  Workspace root folder: /workspace\n"
@@ -56,6 +61,12 @@ SESSION_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   ".probe_sessions.json")
 SESSION_TTL_SEC = 2 * 60 * 60
 ROTATE_DELAY_SEC = 1.5
+# 429 封禁时长：头优先于体，对齐 9router parseRetryAfterMs 的取数顺序。
+RETRY_HEADERS = ("retry-after", "x-ratelimit-reset-after", "reset-after",
+                 "x-retry-after", "x-ratelimit-reset")
+RETRY_BODY_KEYS = ("retry_after", "retryAfter", "retry_after_ms", "retryAfterMs",
+                   "reset_after", "resetAfter", "reset_after_ms", "resetAfterMs")
+MAX_RETRY_SEC = 86400   # 与 9router 的 maxCooldownMs 一致，防上游给出荒谬值
 _B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _MASK48 = (1 << 48) - 1
 
@@ -141,19 +152,9 @@ def _load_sessions() -> dict:
 
 
 def _save_sessions(data: dict) -> None:
-    directory = os.path.dirname(SESSION_STATE_FILE) or "."
-    tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(prefix=".probe_sessions_", dir=directory)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, SESSION_STATE_FILE)
+        write_json(SESSION_STATE_FILE, data)
     except OSError as e:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
         print(f"⚠ 会话表写入失败: {e}", file=sys.stderr)
 
 
@@ -240,26 +241,17 @@ def _body() -> dict:
     return _apply_env_marker(body)
 
 
-# egress_ip 仍用 curl：Cloudflare trace 不校 TLS 指纹。模型层请求不能走 curl：
-# 同一出口、同一分钟、同一份 body，Bun 200 / curl 429（9router bfd5ad66）。
-# daemon 跑在 systemd 的 /usr/bin/python3，没有 PySocks，requests 遇 socks5h://
-# 会立刻 InvalidSchema；curl --socks5-hostname 只留给出口 IP 探测。
-
-def _socks(port: int) -> list[str]:
-    return ["--socks5-hostname", f"127.0.0.1:{port}"]
-
+# egress_ip 仍走 curl（经 asip.egress）：Cloudflare trace 不校 TLS 指纹。模型层
+# 请求不能走 curl：同一出口、同一分钟、同一份 body，Bun 200 / curl 429
+# （9router bfd5ad66）。daemon 跑在 systemd 的 /usr/bin/python3，没有 PySocks，
+# requests 遇 socks5h:// 会立刻 InvalidSchema；curl --proxy 只留给出口 IP 探测。
 
 def egress_ip(port: int, timeout: float = 10.0) -> str:
     try:
-        r = subprocess.run(
-            ["curl", "-s", "--max-time", str(timeout), *_socks(port), TRACE_URL],
-            capture_output=True, text=True, timeout=timeout + 5)
+        result = probe_egress(socks_port=port, timeout=timeout)
     except Exception:
         return "?"
-    for line in r.stdout.splitlines():
-        if line.startswith("ip="):
-            return line[3:].strip()
-    return "?"
+    return result.ip or "?"
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -391,7 +383,10 @@ class _LocalBridge:
 
 
 def _bun_bin() -> str | None:
-    """Bun binary: env override → PATH → ~/.bun → nvm (systemd PATH has no nvm)."""
+    """Bun binary: env override → PATH → ~/.bun → ~/.local/bin → nvm.
+
+    systemd 的 PATH 没有 nvm/~/.local/bin，所以这里按家目录兜底找。
+    """
     for name in ("PROBE_BUN_BIN", "OPENCODE_BUN_BIN"):
         value = os.environ.get(name)
         if value and os.path.exists(value):
@@ -401,15 +396,100 @@ def _bun_bin() -> str | None:
         return found
     homes = {os.path.expanduser("~"), pwd.getpwuid(os.getuid()).pw_dir}
     for home in homes:
-        for pattern in (".bun/bin/bun", ".nvm/versions/node/*/bin/bun"):
+        for pattern in (".bun/bin/bun", ".local/bin/bun",
+                        ".nvm/versions/node/*/bin/bun"):
             hits = sorted(glob.glob(os.path.join(home, pattern)))
             if hits:
                 return hits[-1]
     return None
 
 
+def _retry_seconds(raw, now: float | None = None) -> float | None:
+    """Retry-After 值 → 秒。支持数字（秒/ms/epoch）、HTTP 日期、'4h' 短单位。"""
+    if raw is None:
+        return None
+    now = time.time() if now is None else now
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+        if value <= 0:
+            return None
+        if value > 1e12:
+            # epoch 毫秒：已过去的值表示「现在就能重试」，不是 1 秒封禁。
+            diff = value / 1000.0 - now
+            return diff if diff > 0 else None
+        if value > 1e9:
+            diff = value - now
+            return diff if diff > 0 else None
+        return value
+    text = str(raw).strip()
+    if not text:
+        return None
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
+        return _retry_seconds(float(text), now)
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        diff = parsed.timestamp() - now
+        return diff if diff > 0 else None
+    units = {"ms": 0.001, "s": 1, "sec": 1, "second": 1, "m": 60, "min": 60,
+             "h": 3600, "hour": 3600, "d": 86400, "day": 86400}
+    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(ms|s|sec|second|m|min|h|hour|d|day)s?",
+                     text, re.I)
+    if not m:
+        return None
+    return float(m.group(1)) * units[m.group(2).lower()]
+
+
+def parse_retry_after(retry: dict | None, head: str = "",
+                      now: float | None = None) -> int | None:
+    """从 429 响应头/体解析封禁剩余秒数；拿不到返回 None（调用方退回默认惩罚期）。
+
+    上游 opencode 的 429 body 只有 FreeUsageLimitError 文案，不带时长；实际
+    窗口在响应头 `retry-after`（实测 16671s ≈ 4.6h）。解析顺序对齐
+    9router 的 parseRetryAfterMs：retry-after → x-ratelimit-* → 体内字段 → 文本。
+    """
+    if now is None:
+        now = time.time()
+    lower = {str(k).lower(): v for k, v in (retry or {}).items()}
+    for name in RETRY_HEADERS:
+        secs = _retry_seconds(lower.get(name), now)
+        if secs is not None:
+            return int(min(max(secs, 1.0), MAX_RETRY_SEC))
+    if head:
+        for key in RETRY_BODY_KEYS:
+            m = re.search(rf'"{key}"\s*:\s*([0-9]+(?:\.[0-9]+)?)', head)
+            if not m:
+                continue
+            secs = float(m.group(1)) * (0.001 if key.endswith(("_ms", "Ms")) else 1.0)
+            if secs > 0:
+                return int(min(max(secs, 1.0), MAX_RETRY_SEC))
+        m = re.search(
+            r"(?:retry|reset|try\s+again)\s*(?:after|in)\s*([0-9]+(?:\.[0-9]+)?)"
+            r"\s*(ms|milliseconds?|s|seconds?|secs?|m|minutes?|mins?|h|hours?|hrs?|d|days?)?",
+            head, re.I)
+        if m:
+            secs = _retry_seconds(f"{m.group(1)}{m.group(2) or 's'}", now)
+            if secs is not None and secs > 0:
+                return int(min(max(secs, 1.0), MAX_RETRY_SEC))
+    return None
+
+
+def _fmt_retry(sec: int | None) -> str:
+    if not sec:
+        return ""
+    if sec >= 3600:
+        return f"{sec / 3600:.1f}h"
+    if sec >= 60:
+        return f"{sec / 60:.0f}m"
+    return f"{sec}s"
+
+
 def _bun_probe(bun: str, proxy_url: str, sid: str,
-               timeout: float) -> tuple[int | None, str, str | None]:
+               timeout: float) -> tuple[int | None, str, dict, str | None]:
     payload = {
         "url": URL,
         "method": "POST",
@@ -422,20 +502,24 @@ def _bun_probe(bun: str, proxy_url: str, sid: str,
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
-        r = subprocess.run([bun, BUN_SCRIPT, path], capture_output=True, text=True,
-                           timeout=timeout + 5)
-        if r.returncode != 0:
+        r = run_proc([bun, BUN_SCRIPT, path], timeout=timeout + 5)
+        if r.error:
+            return None, "", {}, r.error[:120]
+        if r.timed_out:
+            return None, "", {}, "bun timed out"
+        if r.code != 0:
             detail = (r.stderr or r.stdout or "").strip().splitlines()
-            return None, "", (detail[-1] if detail else f"bun rc={r.returncode}")[:120]
+            return None, "", {}, (detail[-1] if detail else f"bun rc={r.code}")[:120]
         lines = [line for line in r.stdout.splitlines() if line.strip()]
         if not lines:
-            return None, "", "bun produced no output"
+            return None, "", {}, "bun produced no output"
         data = json.loads(lines[-1])
         if data.get("error"):
-            return None, "", str(data["error"])[:120]
-        return int(data["status"]), str(data.get("head") or ""), None
+            return None, "", {}, str(data["error"])[:120]
+        return (int(data["status"]), str(data.get("head") or ""),
+                data.get("retry") or {}, None)
     except Exception as e:
-        return None, "", f"{type(e).__name__}: {e}"[:120]
+        return None, "", {}, f"{type(e).__name__}: {e}"[:120]
     finally:
         try:
             os.remove(path)
@@ -454,33 +538,37 @@ def classify(status: int | None, head: str) -> str:
     return "err"
 
 
-def probe(port: int, timeout: float) -> tuple[str, float, str]:
+def probe(port: int, timeout: float) -> tuple[str, float, str, int | None]:
     t0 = time.time()
     bun = _bun_bin()
     if not bun:
-        # 返回独立结论而不是 unreachable：没装 bun 是**探测器缺失**，不是这条线
+        # 返回独立结论而不是 unreachable：没装 bun 是探测器缺失，不是这条线
         # 不能出流量。混进 unreachable 会让整批隧道被判死、被反复重启（实测
         # 每 5 分钟一轮 20 条全部 unreachable，白烧重启与配额）。
-        return "noprobe", 0.0, "bun not found (set PROBE_BUN_BIN)"
+        return "noprobe", 0.0, "bun not found (set PROBE_BUN_BIN)", None
     try:
         with _LocalBridge(port) as proxy_url:
             session = _session_for(port)
-            status, head, err = _bun_probe(bun, proxy_url, session, timeout)
+            status, head, retry, err = _bun_probe(bun, proxy_url, session, timeout)
             if err is not None:
-                return "unreachable", round(time.time() - t0, 1), f"bun: {err}"[:100]
+                return "unreachable", round(time.time() - t0, 1), f"bun: {err}"[:100], None
             verdict = classify(status, head)
             if verdict != "quota":
-                return verdict, round(time.time() - t0, 1), head.strip()[:100]
+                return (verdict, round(time.time() - t0, 1), head.strip()[:100],
+                        parse_retry_after(retry, head))
             # quota 可能是会话级（9router 实测轮换 epoch 能恢复），换一代再试一次；
             # 仍是 quota 才算出口级。对齐 opencode.js 的 rotateSession + 一次重试。
             session = _session_for(port, rotate=True)
             time.sleep(ROTATE_DELAY_SEC)
-            status, head, err = _bun_probe(bun, proxy_url, session, timeout)
+            status, head, retry, err = _bun_probe(bun, proxy_url, session, timeout)
             if err is not None:
-                return "unreachable", round(time.time() - t0, 1), f"bun(retry): {err}"[:100]
-            return classify(status, head), round(time.time() - t0, 1), head.strip()[:100]
+                return ("unreachable", round(time.time() - t0, 1),
+                        f"bun(retry): {err}"[:100], None)
+            return (classify(status, head), round(time.time() - t0, 1),
+                    head.strip()[:100], parse_retry_after(retry, head))
     except Exception as e:
-        return "unreachable", round(time.time() - t0, 1), f"{type(e).__name__}: {e}"[:100]
+        return ("unreachable", round(time.time() - t0, 1),
+                f"{type(e).__name__}: {e}"[:100], None)
 
 
 def check_fingerprint() -> int:
@@ -549,9 +637,10 @@ def main() -> int:
         ip = egress_ip(m["port"])
         verdicts = []
         for i in range(args.repeat):
-            verdict, sec, _ = probe(m["port"], args.timeout)
+            verdict, sec, _, retry_after = probe(m["port"], args.timeout)
             verdicts.append(verdict)
-            print(f"{m['tag']:<12}{ip:<28}{verdict:<13}{sec}s")
+            label = f"{verdict}（{_fmt_retry(retry_after)}）" if retry_after else verdict
+            print(f"{m['tag']:<12}{ip:<28}{label:<13}{sec}s")
             if verdict != "OK" and i < args.repeat - 1:
                 time.sleep(1)
         if any(v != "OK" for v in verdicts):

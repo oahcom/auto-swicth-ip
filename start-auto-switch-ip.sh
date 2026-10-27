@@ -8,6 +8,9 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SINGBOX="$DIR/sing-box"
 CONFIG="${SINGBOX_CONFIG:-$DIR/singbox-config.json}"
 DAEMON="$DIR/daemon.py"
+# 手动启动也钉解释器：conda/venv 的 python3 与 systemd 单元可能不是同一个。
+PYBIN="${PYTHON:-/usr/bin/python3}"
+[ -x "$PYBIN" ] || { echo "ERROR: 解释器不存在: $PYBIN（用 PYTHON=... 指定）" >&2; exit 1; }
 
 # 订阅地址走环境变量（token 不入库）。批量启动时由调用方 export，
 # 或放在 $DIR/.env（gitignored）里。
@@ -24,11 +27,11 @@ done
 # 先生成（配置不入库，全新 clone / 误删即此状态）
 if [ ! -f "$CONFIG" ]; then
     echo "config missing, generating from subscription..."
-    python3 "$DIR/parse_subscription.py" --out "$CONFIG" \
+    "$PYBIN" "$DIR/parse_subscription.py" --out "$CONFIG" \
         || echo "WARN: config generation failed; daemon will retry on startup" >&2
 fi
 
-if ! pgrep -f "sing-box run" >/dev/null; then
+if ! pgrep -f "$SINGBOX run" >/dev/null; then
     if [ ! -f "$CONFIG" ]; then
         echo "ERROR: $CONFIG absent and could not be generated; skipping sing-box" >&2
     else
@@ -43,7 +46,7 @@ if ! pgrep -f "sing-box run" >/dev/null; then
 fi
 
 # Start daemon if not running
-if ! pgrep -f "daemon.py" >/dev/null; then
-    nohup python3 "$DAEMON" > "$DIR/daemon.out" 2>&1 &
+if ! pgrep -f "$DAEMON" >/dev/null; then
+    nohup "$PYBIN" "$DAEMON" > "$DIR/daemon.out" 2>&1 &
     echo "started daemon PID $!"
 fi

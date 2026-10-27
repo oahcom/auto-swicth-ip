@@ -10,12 +10,24 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UNIT_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+# 与 config.py 一致：从 passwd 取本用户家目录，不信 $HOME。sudo -u 下
+# HOME 可能仍是 /root，会把密钥写到错误用户的家目录。
+if [ -z ${ASIP_HOME_DIR:-} ] && [ -n ${SYSTEMD_DIR:-} ]; then
+    case $SYSTEMD_DIR in
+        /etc/systemd/*) ;;
+        *) ASIP_HOME_DIR=$(dirname $SYSTEMD_DIR)/home ;;
+    esac
+fi
+HOME_DIR=${ASIP_HOME_DIR:-$(getent passwd $(id -u) 2>/dev/null | cut -d: -f6 || true)}
+[ -n $HOME_DIR ] || HOME_DIR=$HOME
+mkdir -p $HOME_DIR
+# 本机是系统级部署：默认写 /etc/systemd/system，而不是用户级目录。
+UNIT_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 # 写进 $UNIT_DIR 的单元会把 ExecStart 钉成**本次运行的这个 DIR**。所以拿一份副本
 # 试跑（如 /tmp 下的 clone）时若忘了设 SYSTEMD_DIR，就会把现网单元悄悄改指到副本，
 # 而副本随时可被清理 —— 服务下次重启即崩。真实事故：`--units-only` 在 /tmp 副本
 # 里跑过一次，23 个单元全被改指 /tmp/xxx，直到有人发现。
-# 全新机器上单元文件还不存在；pipefail 下 sed 的 exit 2 会让 set -e 直接中断部署。
+# 首次部署时单元文件尚不存在：pipefail 下 sed 的非零退出会让 set -e 直接中止。
 cur="$(sed -n 's/^WorkingDirectory=//p' "$UNIT_DIR/auto-switch-ip.service" 2>/dev/null | head -1 || true)"
 if [ -z "${SYSTEMD_DIR:-}" ] && [ -n "$cur" ] && [ "$cur" != "$DIR" ] && [ -f "$cur/daemon.py" ]; then
     echo "✗ 现网单元当前指向 $cur，而本次运行的是 $DIR —— 拒绝覆盖生产单元" >&2
@@ -36,6 +48,16 @@ for arg in "$@"; do
         --adopt)      ADOPT=1 ;;
     esac
 done
+
+# ---- 新主机前置检查：硬项失败即退出，软项只警告 ----
+# 试跑/无 systemd 的沙箱可 SKIP_PREFLIGHT=1 跳过。
+if [ "${SKIP_PREFLIGHT:-0}" != 1 ]; then
+    if [ "$UNITS_ONLY" = 1 ]; then
+        PYTHON="$PYBIN" bash "$DIR/deploy/preflight.sh" --units-only || exit 1
+    else
+        PYTHON="$PYBIN" bash "$DIR/deploy/preflight.sh" || exit 1
+    fi
+fi
 
 # ---- 二进制：架构不符或缺失就由 fetch 脚本按官方 sha256 补 ----
 # 仓库里提交的 sing-box 是 amd64 构建。arm64 机器 clone 下来能 `-x` 通过，但一跑
@@ -138,7 +160,7 @@ MEMBERS="$("$PYBIN" "$DIR/deploy/members.py" 2>/dev/null | awk 'NF==5')"
          && echo "已生成 .warp/warp-outbound.json"; }
 
 # ---- 密钥：缺失时生成，绝不覆盖已有的（改它会让正在跑的 sing-box 掉线）----
-SECRET_FILE="${SINGBOX_SECRET_FILE_PATH:-$HOME/.singbox_secret}"
+SECRET_FILE="${SINGBOX_SECRET_FILE_PATH:-$HOME_DIR/.singbox_secret}"
 if [ ! -f "$SECRET_FILE" ]; then
     (umask 077; "$PYBIN" -c "import base64,os;print(base64.b64encode(os.urandom(32)).decode())" > "$SECRET_FILE")
     echo "已生成 $SECRET_FILE"
@@ -223,6 +245,7 @@ User=$RUN_USER
 Group=$RUN_USER
 ExecStart=$PYBIN $DIR/self_evolve_checkpoint.py
 WorkingDirectory=$DIR
+EnvironmentFile=-$DIR/.env
 StandardOutput=journal
 StandardError=journal
 
@@ -269,7 +292,12 @@ WantedBy=multi-user.target
 EOF
 done <<< "$MEMBERS"
 
-need_root systemctl daemon-reload
+# 单元写到哪就 reload 哪：本机生产单元在 /etc（系统级），对空着的用户级目录
+# daemon-reload 打空；无 user bus 的容器/CI 里它还会直接失败（No such file or directory）。
+case "$UNIT_DIR" in
+    /etc/systemd/system|/usr/lib/systemd/system) : ;;   # 系统级：本次不 reload，避免影响在跑的服务
+    *) systemctl --user daemon-reload 2>/dev/null || true ;;
+esac
 if [ "$UNITS_ONLY" = 0 ]; then
     need_root systemctl enable --now auto-switch-ip.service asi-selfcheck.timer $SERVICES
     echo "已启用 auto-switch-ip + asi-selfcheck.timer +$(echo $SERVICES | wc -w)条隧道单元"
@@ -278,3 +306,14 @@ if [ "$UNITS_ONLY" = 0 ]; then
 else
     echo "已重生成单元（未启用/未重启）：$UNIT_DIR"
 fi
+
+# ---- asip 运维 CLI：设置由 config.py 推导，入口落到 PATH ----
+# 必须先于任何手工排障：CLI 读的是设置文件里的路径/端口，写死一份到脚本里的
+# 下场是换目录或改 members 后它静默指向旧位置（症状像服务故障，不像配置错误）。
+# SYSTEMD_DIR 由调用方传给本脚本，conf 脚本继承同一份环境变量，据此把设置指向
+# 演练目录而非 /etc —— 否则演练完跑一次 `asip warp stop` 就动了生产单元。
+bash "$DIR/deploy/asip-cli-conf.sh" || { echo "✗ 生成 asip 设置失败" >&2; exit 1; }
+BIN_DIR="${ASIP_BIN_DIR:-$HOME_DIR/.local/bin}"
+mkdir -p "$BIN_DIR"
+ln -sfn "$DIR/deploy/asip-cli.sh" "$BIN_DIR/asip"
+echo "asip CLI: $BIN_DIR/asip → $DIR/deploy/asip-cli.sh"

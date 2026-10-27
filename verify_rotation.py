@@ -13,17 +13,16 @@
 """
 import argparse
 import collections
-import concurrent.futures
 import json
 import re
-import subprocess
 import sys
 import time
 from datetime import datetime
 from urllib.parse import urlparse
 
-import requests
-
+from asip.clash_client import ClashClient
+from asip.egress import probe_egress
+from asip.proc import run as proc_run, run_curl
 from config import CFG, get_singbox_secret
 
 # 端点全部取自 config：改端口/selector 时不必再改本脚本。
@@ -53,21 +52,20 @@ def check(name: str, ok: bool, detail: str = ""):
     return ok
 
 
-def hdr():
-    return {"Authorization": f"Bearer {get_singbox_secret()}"}
-
-
 class ClashUnreachable(RuntimeError):
     """Clash API 不可达 —— 比裸 traceback 更能说明问题。"""
 
 
+_clash = ClashClient(CLASH_API, get_singbox_secret, timeout=10)
+
+
 def _selector() -> dict:
-    try:
-        r = requests.get(f"{CLASH_API}/proxies/{SELECTOR}", headers=hdr(), timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        raise ClashUnreachable(f"Clash API {CLASH_API} 不可达: {type(e).__name__}: {e}") from e
+    status, data = _clash.get_json(f"proxies/{SELECTOR}", timeout=10)
+    if status is None:
+        raise ClashUnreachable(f"Clash API {CLASH_API} 不可达")
+    if status != 200 or not isinstance(data, dict):
+        raise ClashUnreachable(f"Clash API {CLASH_API} 返回 HTTP {status}")
+    return data
 
 
 def nodes() -> list[str]:
@@ -79,59 +77,52 @@ def current() -> str:
 
 
 def switch(node: str) -> bool:
-    r = requests.put(f"{CLASH_API}/proxies/{SELECTOR}", json={"name": node},
-                     headers=hdr(), timeout=10)
-    return r.status_code == 204
-
-
-def curl(args: list[str], timeout: int = 15) -> str:
-    try:
-        r = subprocess.run(["curl", "-s", "-m", str(timeout)] + args,
-                           capture_output=True, text=True, timeout=timeout + 5)
-        return r.stdout.strip()
-    except Exception:
-        return ""
+    return _clash.select(SELECTOR, node, timeout=10)
 
 
 def egress_ip() -> str:
-    out = curl(["-x", PROXY, IP_URL], timeout=12)
-    return out if out and "." in out and "<" not in out else "FAIL"
+    result = probe_egress(http_proxy=PROXY, urls=(IP_URL,), timeout=12)
+    return result.ip if result.ip else "FAIL"
 
 
 def _healthy_nodes(candidates: list[str]) -> list[str]:
     """用 Clash API 的延迟测试筛出当前可用的节点（并发，最多 15s）。"""
-    def one(n):
-        try:
-            r = requests.get(f"{CLASH_API}/proxies/{requests.utils.quote(n, safe='')}/delay",
-                             params={"url": PROBE_URL, "timeout": 5000},
-                             headers=hdr(), timeout=8)
-            return n if "delay" in r.json() else None
-        except Exception:
-            return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
-        return [n for n in ex.map(one, candidates) if n]
+    delays = _clash.delays(candidates, workers=16, timeout_ms=5000, hard_timeout=8)
+    return [n for n in candidates if delays.get(n) is not None]
 
 
-def journal(since: str, pattern: str) -> list[str]:
-    try:
-        r = subprocess.run(
-            ["journalctl", "--user", "-u", "auto-switch-ip.service",
-             "--since", since, "--no-pager"],
-            capture_output=True, text=True, timeout=30)
-        return [l for l in r.stdout.splitlines() if re.search(pattern, l)]
-    except Exception:
-        return []
+class JournalLines(list):
+    """journalctl 结果。error 非空表示**没有读到日志**，不等于「没有匹配」。
+
+    旧实现把失败折叠成空列表，`daemon 主循环无异常` 于是恒过 —— 观测缺失
+    被当成健康证据。
+    """
+
+    error: str | None = None
+
+
+def journal(since: str, pattern: str) -> JournalLines:
+    r = proc_run(
+        ["journalctl", "--user", "-u", "auto-switch-ip.service",
+         "--since", since, "--no-pager"],
+        timeout=10)
+    out = JournalLines()
+    if not r.ok:
+        out.error = ("journalctl 超时" if r.timed_out
+                     else (r.error or f"journalctl rc={r.code}"))
+        return out
+    out.extend(l for l in r.stdout.splitlines() if re.search(pattern, l))
+    return out
 
 
 # ============= 1. 混合端口正常性 =============
 def verify_port():
     print(f"\n[1] {MIXED_PORT} 端口正常性")
-    r = subprocess.run(["ss", "-ltn"], capture_output=True, text=True)
+    r = proc_run(["ss", "-ltn"], timeout=5)
     check(f"{MIXED_PORT} 监听中", f":{MIXED_PORT}" in r.stdout)
     check(f"{CLASH_PORT} Clash API 监听中", f":{CLASH_PORT}" in r.stdout)
 
-    proc = subprocess.run(["pgrep", "-x", "sing-box"], capture_output=True, text=True)
+    proc = proc_run(["pgrep", "-x", "sing-box"], timeout=5)
     check("sing-box 进程存活", bool(proc.stdout.strip()))
 
     for label, args in [
@@ -141,24 +132,48 @@ def verify_port():
         ("CONNECT 隧道", ["-x", PROXY, "-o", "/dev/null", "-w", "%{http_code}",
                           "https://api.github.com"]),
     ]:
-        code = curl(args, timeout=15)
+        code = run_curl(args, timeout=15).stdout.strip()
         check(f"{label} 经 {MIXED_PORT} 可用", code in ("200", "204"), f"HTTP {code}")
 
-    dn = curl(["-x", PROXY, "https://1.1.1.1/dns-query?name=example.com&type=A",
-               "-H", "accept: application/dns-json"], timeout=12)
+    dn = run_curl(["-x", PROXY, "https://1.1.1.1/dns-query?name=example.com&type=A",
+                   "-H", "accept: application/dns-json"], timeout=12).stdout.strip()
     check(f"DNS over {MIXED_PORT} 解析正常", dn.startswith("{") and '"Status":0' in dn, dn[:60])
 
-    size = curl(["-x", PROXY, "-o", "/dev/null", "-w", "%{http_code} %{size_download}",
-                 "https://speed.cloudflare.com/__down?bytes=100000"], timeout=25)
+    size = run_curl(["-x", PROXY, "-o", "/dev/null", "-w", "%{http_code} %{size_download}",
+                     "https://speed.cloudflare.com/__down?bytes=100000"], timeout=25).stdout.strip()
     check(f"大文件传输经 {MIXED_PORT} 正常", size.startswith("200"), size)
 
-    code = curl(["-o", "/dev/null", "-w", "%{http_code}",
-                 f"{NINE_ROUTER_BASE}/v1/models"], timeout=8)
+    code = run_curl(["-o", "/dev/null", "-w", "%{http_code}",
+                     f"{NINE_ROUTER_BASE}/v1/models"], timeout=8).stdout.strip()
     check("9router 网关可达", code == "200", f"HTTP {code}")
 
 
 # ============= 2. IP 切换正常性 =============
 def verify_switch(samples: int, quick: bool) -> list[str]:
+    """切到若干节点验证出口，返回节点池；结束时恢复原选择。
+
+    WHY 必须 finally：本脚本是运维手动跑的诊断工具，中途异常/超时会把线上
+    opencode 留在被测试的节点上，后续请求继续打到那个出口 —— 测完不还原
+    等于让诊断改变被测系统。
+    """
+    try:
+        original = current()
+    except ClashUnreachable:
+        original = ""
+    try:
+        return _verify_switch_body(samples, quick)
+    finally:
+        if original:
+            try:
+                if current() != original:
+                    ok = switch(original)
+                    print(("  恢复原选择: " if ok else "  ⚠ 恢复原选择失败: ")
+                          + original)
+            except ClashUnreachable:
+                print("  ⚠ Clash API 不可达，未能恢复原选择")
+
+
+def _verify_switch_body(samples: int, quick: bool) -> list[str]:
     print("\n[2] IP 切换正常性")
     all_nodes = nodes()
     check("节点池非空", len(all_nodes) > 10, f"实际={len(all_nodes)}")
@@ -292,10 +307,13 @@ def verify_reasonableness(all_nodes: list[str], quick: bool):
     # 3.5 daemon 无异常
     if not quick:
         bad = journal("5 minutes ago", "Traceback|UnboundLocalError|主循环异常")
-        check("daemon 主循环无异常", not bad, f"{len(bad)} 条")
-        check("daemon 服务 active", subprocess.run(
+        if bad.error:
+            check("daemon 主循环无异常", False, f"无法读取日志：{bad.error}")
+        else:
+            check("daemon 主循环无异常", not bad, f"{len(bad)} 条")
+        check("daemon 服务 active", proc_run(
             ["systemctl", "--user", "is-active", "auto-switch-ip.service"],
-            capture_output=True, text=True).stdout.strip() == "active")
+            timeout=20).stdout.strip() == "active")
 
     # 3.6 地理多样性（订阅绕限速的核心价值）
     if not quick:
@@ -304,7 +322,7 @@ def verify_reasonableness(all_nodes: list[str], quick: bool):
         for n in sample:
             if switch(n):
                 time.sleep(0.5)
-                out = curl(["-x", PROXY, GEO_URL], timeout=12)
+                out = run_curl(["-x", PROXY, GEO_URL], timeout=12).stdout.strip()
                 try:
                     geo[json.loads(out).get("country", "?")] += 1
                 except Exception:
