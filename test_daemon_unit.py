@@ -4583,14 +4583,21 @@ def test_verify_transport_failure_rotates_only_when_egress_dead(monkeypatch):
     daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
     assert rotations and "transport" in rotations[0], rotations
 
-    # 出口可达但 free lane 静默悬挂（IP 被针对）→ 必须换线，清连接没用
+    # 出口可达但 free lane 静默悬挂（IP 被针对）→ 连续两次才换线，单次只留观
     monkeypatch.setattr(daemon, "warp_egress_ip",
                         lambda port, timeout_sec=8.0: "2a09:bac5::1")
     monkeypatch.setattr(daemon, "_opencode_lane_alive",
                         lambda port, timeout_sec=6.0: False)
     monkeypatch.setattr(daemon, "_LAST_TRANSPORT_PROBE_SIG", (0.0, 0))
+    monkeypatch.setattr(daemon, "_LANE_FAIL_STREAK", 0)
+    monkeypatch.setattr(daemon, "_LANE_FAIL_TS", 0.0)
+    before = len(rotations)
     daemon._verify_transport_failure("WARP-CF-X", 1080, 4)
+    assert len(rotations) == before, "首次悬挂不得立即换线（可能是上游抖动）"
+    assert daemon._LANE_FAIL_STREAK == 1, daemon._LANE_FAIL_STREAK
+    daemon._verify_transport_failure("WARP-CF-X", 1080, 5)
     assert "悬挂" in rotations[-1], rotations
+    assert daemon._LANE_FAIL_STREAK == 0, "换线后确认计数应归零"
 
 
 def test_opencode_lane_alive_treats_any_http_status_as_alive(monkeypatch):
@@ -4834,3 +4841,53 @@ def test_connection_cleanup_flag_released_on_error(monkeypatch):
     monkeypatch.setattr(daemon, "_close_opencode_connections", boom)
     daemon._cleanup_connection_worker("WARP-CF-X", 120.0, "旧链")
     assert daemon._CLEANUP_RUNNING is False
+
+
+def test_cleanup_disabled_by_default(monkeypatch):
+    """默认不清理连接：DELETE 会掐断在途流式请求（实测 upstream connection lost）。"""
+    logs = []
+    monkeypatch.setattr(daemon, "log", logs.append)
+    monkeypatch.setitem(daemon.CFG["warp"], "cleanup_enabled", False)
+    monkeypatch.setattr(daemon, "_LAST_CLEANUP_SKIP_LOG", 0.0)
+
+    class _Thread:
+        def __init__(self, *a, **k):
+            raise AssertionError("禁用状态下不得起清理线程")
+
+    monkeypatch.setattr(daemon.threading, "Thread", _Thread)
+    daemon._schedule_connection_cleanup("WARP-CF-X", 120.0, "旧链")
+    assert any("连接清理已禁用" in m for m in logs), logs
+
+
+def test_cleanup_runs_when_enabled(monkeypatch):
+    started = []
+
+    class _Thread:
+        def __init__(self, *a, **k):
+            started.append(k.get("name"))
+
+        def start(self):
+            started.append("started")
+
+    monkeypatch.setattr(daemon.threading, "Thread", _Thread)
+    monkeypatch.setitem(daemon.CFG["warp"], "cleanup_enabled", True)
+    monkeypatch.setattr(daemon, "_CLEANUP_RUNNING", False)
+    daemon._schedule_connection_cleanup("WARP-CF-X", 120.0, "旧链")
+    assert "started" in started, started
+
+
+def test_lane_probe_uses_mixed_port(monkeypatch):
+    """探活必须走 9router 实际用的 mixed_port，而不是隧道成员端口。"""
+    seen = {}
+
+    class _R:
+        stdout = "429"
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return _R()
+
+    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+    assert daemon._opencode_lane_alive(daemon.MIXED_PORT) is True
+    cmd = seen["cmd"]
+    assert f"socks5h://" in " ".join(cmd) and str(daemon.MIXED_PORT) in cmd[cmd.index("--proxy") + 1]

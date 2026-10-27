@@ -1709,6 +1709,7 @@ def _close_opencode_connections(chain_tag: str | None, min_age_sec: float,
 
 _CLEANUP_LOCK = threading.Lock()
 _CLEANUP_RUNNING = False
+_LAST_CLEANUP_SKIP_LOG = 0.0
 
 
 def _cleanup_connection_worker(chain_tag: str | None, min_age_sec: float,
@@ -1733,7 +1734,17 @@ def _schedule_connection_cleanup(chain_tag: str | None, min_age_sec: float,
     与 DELETE 叠加；同一时刻只保留一个清理任务，后来的直接跳过（下一轮
     换线/探针会再触发）。
     """
-    global _CLEANUP_RUNNING
+    global _CLEANUP_RUNNING, _LAST_CLEANUP_SKIP_LOG
+    if not _warp().get("cleanup_enabled", False):
+        # 关掉的 WHY：DELETE 不区分「僵死的池化 socket」和「正在跑的在途请求」，
+        # 实测会掐断正常流式响应（客户端报 upstream connection lost），而 sidecar
+        # 收到 socket hang up 又产生新 503，反过来再触发清理。
+        now = time.time()
+        if now - _LAST_CLEANUP_SKIP_LOG >= 3600:
+            _LAST_CLEANUP_SKIP_LOG = now
+            log(f"· 连接清理已禁用（cleanup_enabled=false），跳过：{reason or '未注明'}"
+                f" tag={chain_tag}")
+        return
     with _CLEANUP_LOCK:
         if _CLEANUP_RUNNING:
             return
@@ -5057,6 +5068,12 @@ _LAST_TRANSPORT_PROBE_TS = 0.0
 _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
 # 出口正常时的僵死连接清理节流：清理本身便宜，但 503 风暴期每秒都会触发。
 _LAST_STALE_SWEEP_TS = 0.0
+# L7 探针的连续失败计数：单次悬挂可能只是上游抖动/慢排队，连续两次才换线，
+# 避免把一条正常但偶发超时的出口切走（K8s/CF LB 的 consecutive_down 同思路）。
+_LANE_FAIL_STREAK = 0
+_LANE_FAIL_TS = 0.0
+LANE_FAIL_CONFIRM = 2
+LANE_FAIL_WINDOW_SEC = 120.0
 
 
 def _maybe_verify_transport_failures(count: int, now: float) -> None:
@@ -5089,7 +5106,12 @@ OPENCODE_LANE_URL = "https://opencode.ai/inference/v1/chat/completions"
 
 
 def _opencode_lane_alive(port: int, timeout_sec: float = 6.0) -> bool:
-    """经当前隧道打一条最小 free-lane 请求，判断上游是否在静默悬挂这一出口。
+    """经指定本地代理打一条最小 free-lane 请求，判断上游是否在静默悬挂。
+
+    `port` 应当是**9router 实际走的那个本地代理端口**（mixed_port），不是隧道
+    成员端口：2026-10-27 12:20 实测，从成员 socks 直连探活返回 429（隧道通），
+    而 sidecar 经 sing-box 的池化连接却 socket hang up —— 探错路径就会在真正
+    挂死时判定「出口正常」，asip 于是永远不换线。
 
     WHY 不能只看 CF trace：2026-10-27 00:0x 的故障里出口探测 1.2s 通、
     GET https://opencode.ai/ 也 0.6s 通，但带 x-opencode-* 指纹的 chat 请求
@@ -5144,6 +5166,7 @@ def _verify_transport_failure(tag: str, port: int, count: int) -> None:
     这条僵死连接会被一直复用，503 持续到它自然断开。
     """
     global _LAST_STALE_SWEEP_TS, _LAST_TRANSPORT_PROBE_SIG
+    global _LANE_FAIL_STREAK, _LANE_FAIL_TS
     ip = warp_egress_ip(port, timeout_sec=8.0)
     if not ip:
         log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
@@ -5154,13 +5177,27 @@ def _verify_transport_failure(tag: str, port: int, count: int) -> None:
         _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
         log("  · 传输层换线被冷却/闸门拒绝，已解除签名等待重试")
         return
-    if not _opencode_lane_alive(port):
-        log(f"⚠ 传输层 503 ×{count}，{tag} 出口可达（{ip}）但 opencode 链路悬挂 → 换线")
-        if _reconnect_warp_now(f"transport ×{count}（opencode 链路悬挂）", _now_ts()):
+    if not _opencode_lane_alive(MIXED_PORT):
+        probe_now = time.time()
+        if probe_now - _LANE_FAIL_TS > LANE_FAIL_WINDOW_SEC:
+            _LANE_FAIL_STREAK = 0
+        _LANE_FAIL_STREAK += 1
+        _LANE_FAIL_TS = probe_now
+        if _LANE_FAIL_STREAK < LANE_FAIL_CONFIRM:
+            # 留观一次：把签名清掉，下一批 503 到达时立刻再探，而不是等 15s 节流。
+            log(f"⚠ 传输层 503 ×{count}，{tag} 出口可达（{ip}）"
+                f"但 opencode 链路悬挂（{_LANE_FAIL_STREAK}/{LANE_FAIL_CONFIRM}），留观")
+            _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
+            return
+        log(f"⚠ 传输层 503 ×{count}，{tag} 出口可达（{ip}）"
+            f"但 opencode 链路连续 {_LANE_FAIL_STREAK} 次悬挂 → 换线")
+        if _reconnect_warp_now(f"transport ×{count}（opencode 链路连续悬挂）", _now_ts()):
+            _LANE_FAIL_STREAK = 0
             return
         _LAST_TRANSPORT_PROBE_SIG = (0.0, 0)
         log("  · 传输层换线被冷却/闸门拒绝，已解除签名等待重试")
         return
+    _LANE_FAIL_STREAK = 0
     now = time.time()
     gap = float(_warp().get("transport_stale_gap_sec", 600))
     if now - _LAST_STALE_SWEEP_TS < gap:

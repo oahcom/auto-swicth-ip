@@ -240,6 +240,10 @@ CFG = {
         # 若其隧道已静默死亡，每次复用都要白等满超时。换线成功即异步清理
         # age >= 120s 的旧链连接：正常请求 p50 6.5s，120s 以上的不可能是
         # 在途请求，但 45 分钟的僵尸连接会被这里清掉。
+        # 2026-10-27 12:19 实测：DELETE /connections 会把 sidecar 正在复用的连接
+        # 一起删掉，客户端看到 "upstream connection lost"，sidecar 侧 socket hang
+        # up → 503 → 再次触发清理，形成正反馈。默认关闭，只保留代码与配置开关。
+        "cleanup_enabled": False,
         "cleanup_old_chain_age_sec": 120,
         # 出口探测正常但仍报传输层 503 → 判为连接池僵死，清理当前链上
         # age >= 300s 的连接（30 秒节流，避免 503 风暴里反复全表扫描）。
