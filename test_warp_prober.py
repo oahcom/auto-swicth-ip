@@ -153,6 +153,88 @@ def test_restart_clears_warming_when_busy_check_raises(monkeypatch):
     monkeypatch.setattr(daemon, "warp_line_busy",
                         lambda *a, **k: (_ for _ in ()).throw(
                             RuntimeError("clash down")))
+def _stub_probe(monkeypatch, verdict="quota"):
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "1.1.1.1")
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: False)
+    monkeypatch.setattr(daemon, "_warp_probe_blind", lambda now=None: False)
+    monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda member, ip: False)
+    monkeypatch.setitem(daemon._PROBE_LAST_VERDICT, "W2", verdict)
+
+
+def test_long_quota_hold_blocks_quota_restart(monkeypatch):
+    """长 Retry-After 的 quota 是账号级时间窗，换 IP 改不了结论。
+
+    实测（2026-10-28）：1711 条 quota 结论反推的解禁时刻全部落在 08:00:03
+    ±3 分钟内；换址后首探 1495/1519（98.4%）仍判 quota。此时重启隧道只是
+    换一个同样耗尽的地址，换来 190 次/分的重启风暴。
+    """
+    _stub_probe(monkeypatch)
+    monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r: restarted.append(m["tag"]) or True)
+    daemon._probe_one_line(_member())
+    assert restarted == [], \
+        "额度闸开着仍重启 quota 线 —— 换 IP 不能让账号级配额提前恢复"
+
+
+def test_quota_hold_also_blocks_penalty_restart(monkeypatch):
+    """quota 把新地址写进台账后，别的线会走「惩罚期」路径继续重启同一轮风暴。
+
+    实测两条路径在 190 次/分里各占一半（模型层 quota 2383 / 出口处于惩罚期
+    1316 次重启后首探仍 quota），故闸必须同时覆盖两者。
+    """
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "1.1.1.1")
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: True)
+    monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r: restarted.append(m["tag"]) or True)
+    daemon._probe_one_line(_member())
+    assert restarted == [], \
+        "额度闸只拦了 quota 路径，惩罚期路径仍在重启 —— 同一轮风暴从另一半漏过去"
+
+
+def test_quota_hold_does_not_block_tunnel_death_restart(monkeypatch):
+    """额度闸只拦「换地址」这一类，隧道半死照常重启。"""
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            fail_streak=daemon._UNKNOWN_RESTART_STREAK)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: False)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r: restarted.append(m["tag"]) or True)
+    daemon._probe_one_line(_member())
+    assert restarted == ["W2"], \
+        "额度闸把隧道半死的自愈路径也挡了 —— 那是地址没了，不是配额没了"
+
+
+def test_model_probe_opens_hold_only_for_long_quota(monkeypatch):
+    """只有长 Retry-After 的 quota 开闸；短冷却与 403 不开。"""
+    monkeypatch.setattr(daemon, "_probe_cache_get", lambda tag, ip: "")
+    monkeypatch.setattr(daemon, "_probe_cache_put", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_warp_probe_blind", lambda now=None: False)
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: False)
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    monkeypatch.setitem(daemon.CFG["warp"], "quota_hold_min_sec", 1800)
+    import probe_warp
+
+    for verdict, retry, expect in [("quota", 7200, True), ("quota", 20, False),
+                                   ("flagged", 7200, False)]:
+        monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", 0.0)
+        monkeypatch.setattr(probe_warp, "probe",
+                            lambda *a, _v=verdict, _r=retry, **k: (_v, 0, "", _r))
+        daemon._warp_model_usable(_member(), "1.1.1.1")
+        held = daemon._QUOTA_HOLD_UNTIL > time.time()
+        assert held is expect, f"{verdict}/{retry}s 开闸结果 {held}，应为 {expect}"
+
+
     assert daemon._warp_line_restart(m, "test") is False
     assert daemon._warp_line_state("W2")["warming"] is False
 
