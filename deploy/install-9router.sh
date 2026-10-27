@@ -126,6 +126,11 @@ WorkingDirectory=$SRC
 Environment=PATH=$HOME/.bun/bin:$(dirname "$NODE_BIN"):/usr/local/bin:/usr/bin:/bin
 Environment=NODE_ENV=production
 Environment=NEXT_TELEMETRY_DISABLED=1
+# 显式声明密码而不是留着「出厂默认」：login route 的判据是
+# !storedHash && !INITIAL_PASSWORD && !isLocalRequest —— 不设它，局域网登录必被
+# 403 拒（默认密码人人知道，放行就有人能 PATCH /api/settings 关鉴权）。
+# 改密码：export NINE_ROUTER_INITIAL_PASSWORD=... 后重跑本脚本。
+Environment=INITIAL_PASSWORD=${NINE_ROUTER_INITIAL_PASSWORD:-123456}
 # 冷却按 proxy URL 记账（egress.js 的 hashEgress("proxy", proxyUrl)），而 asip
 # 换的是同一个 URL 后面的 WARP 出口。默认上限 24h 会把 asip 的换线整段罩死：
 # 请求根本不出门，9router 本地合成 429，asip 读到 429 再换线 —— 死循环。
