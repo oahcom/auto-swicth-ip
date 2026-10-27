@@ -142,12 +142,18 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   记录落盘 `.warp_ip_used.json`，跨重启保留。
 - 动作（2026-10-26 起）：`warp-prober` 是唯一探测器，持续把每条线的
   `last_ok_ts/last_ok_ip` 写进 per-line 状态表；`reconnect_warp` **只读表**。
-  120s 内 OK 的线直接 `PUT /proxies/opencode-out` 切过去；没有新鲜 OK 就在条件变量
-  上等 `switch_wait_sec`(20s)，超时本次放弃，不现场探测、不盲切、不原地重连、
-  不落 proxy。换线路径不再重启目标线；重启只由探测器在**确定失败**时触发。
+  120s 内 OK 的线直接 `PUT /proxies/opencode-out` 切过去；没有新鲜 OK 就先 `notify_all()`
+  催醒探测器、再在条件变量上等 `switch_wait_sec`(3s)，超时本次放弃，不现场探测、不盲切、
+  不原地重连、不落 proxy。旧实现只等不催（20s）：实测 74 次换线里 73 次等满 20s 照样
+  放弃，空转 24.7 分钟 —— 等待期间没有任何人能让「新鲜度」变好，所以必须催。
+  换线路径不再重启目标线；重启只由探测器在**确定失败**时触发。
 - 确定失败才重启：`quota/flagged/unreachable/err` 且非整批 `unreachable`（整批视为
   探测通道失明）才走 `_warp_line_restart`。active 线永不重启，只换线。重启入口有
-  per-line 锁、5s 冷却、`2/5/10/20/60s` 指数退避（上限 120s）、每小时 20 次上限。
+  per-line 锁、5s 冷却、`2/5/10/20/60s` 指数退避（上限 120s）、每小时 20 次上限
+  （`restart_hist` 滑动窗口，**计数落在 `systemctl` 调用之前**：失败的重启同样掐断过
+  在途连接、同样烧掉一格，只统计成功会让「重启后未就绪」这条路径绕过上限）。
+  达上限只停重启、不停探测 —— 压的是有副作用的决策，不是观测。
+  实测无上限时单线 76 次/h。
   重启成功只把 IP 写回表，等 5s 后的模型层探测给出 OK 才算新鲜。
 - 状态表落盘 `.warp_line_state.json`（`WARP_LINE_STATE_FILE_PATH` 可覆盖），启动加载
   并丢弃过期 OK。`prober_enabled=false` 才回滚到旧 `_start_line_workers` /
@@ -395,9 +401,11 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   IP），已烧段里的**全新** /128 OK=0/2469（0.0%），未烧段里的全新 /128
   OK=3/152（2.0%）—— 段不是充分条件，判死的是地址自己；段级聚合两头都错。
   **TTL 按结论的「持久性」分档，不是按好坏**：
-    - 持久（`quota` / `flagged`）：`probe_persistent_ttl_sec`=21600。地址自身的配额/信誉
-      结论，重探同 /128 有 99.2% 仍 quota，30h 内仅 1 次恢复（间隔 56min），与生产 403
-      惩罚期同量级。
+    - 持久（`quota` / `flagged`）：`probe_persistent_ttl_sec`=**600**。地址自身的配额/信誉
+      结论，重探同 /128 有 99.2% 仍 quota，30h 内仅 1 次恢复（间隔 56min）。
+      **不要调回 21600**：那会让「结论一落缓存，这条地址 6 小时不再被观测」——
+      而它正是最该持续看的对象。重复探测的代价已被入口的惩罚期短路挡住
+      （判脏地址根本不探），不需要第二道停探闸。
     - 瞬时（`OK` / `unreachable` / `err`）：`probe_transient_ttl_sec`=120。OK 复现率
       <10s 97.9% → ≥1h 43.2%（N=10113）；`err`/`unreachable` 是探测侧故障而非地址状态
       （日志实测同一地址 err 后 66s 即 OK）。
@@ -456,6 +464,10 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   该结论消失。
 - sing-box 重启会把 selector 重置为 default（主线），`restart_singbox()` 会记住并恢复重启前的线路。
 
+**服务托管（系统级）**：`auto-switch-ip` 与 `9router` 都由 `/etc/systemd/system/` 下的系统级 unit 托管；
+用户级同名单元已删除并屏蔽。所有状态/重启命令一律用 `sudo systemctl ...`，禁止 `systemctl --user`，
+否则会拉起第二个实例抢 `.daemon.lock` / 20127 端口。
+
 **部署约束（勿改）**：sing-box 由 daemon 用 `Popen(start_new_session=True)` 拉起，进程仍属于
 `auto-switch-ip.service` 的 cgroup。该 unit 必须保持 `KillMode=process` —— 默认的
 `control-group` 会让每次 `systemctl restart auto-switch-ip.service` 连带杀掉 sing-box，
@@ -487,7 +499,14 @@ WHY 不按「WARP 探测又通了」回切：探测会抖动，实测 00:02:45 �
 所以它只作**最后兜底**，不作主力。
 
 - 原理：opencode 免费层的 403 有两种文案，9router 命中的是 "abusive traffic from this IP" —— IP 信誉拦截，换干净出口可解；另一种 "only be used from within OpenCode" 是客户端指纹，换 IP 无效。
-- WireGuard 版 WARP 在本机不通（UDP 2408/4500/500/1701 握手全超时），只能用 MASQUE(TCP/443)。
+- WireGuard 版 WARP **直连**不通：到 162.159.192.1:2408 的 UDP 被运营商 ACL 拦（实测在
+  27.50.59.99 收到 ICMP type 3 code 13），握手全部超时。但把同一条 UDP 经代理节点中转
+  （sing-box endpoint 的 `detour`）后可正常握手并拿到 WARP 出口（实测 104.28.222.43 / SG）。
+  原生实现见 `warp_wg.py` 与 `docs/warp-wg-over-proxy.md`，默认关闭
+  （`WARP_WG_FAMILIES` 为空）。拓扑是「落地节点 × 渠道」：`WARP_WG_FAMILIES=v4,v6,v6,v6`
+  + `WARP_WG_NODES=N` = N 个 colo × 每节点 1 条 v4 + 3 条 v6（端口 1110+）。
+  v6 出口重启必换；v4 出口只在 colo 地址池内翻牌，换网段必须 `rebind`，
+  daemon 只在 v4 线重试 ≥2 次时才走这条路径。
 - 配置来源：`.warp/warp-outbound.json`（600，gitignored），单个对象或数组皆可，`make_config()` 自动并入；文件不存在则整条链路不生成，行为回到旧版。
 - 设备凭据：`.warp/usque{,2..10}/config.json`，各自独立注册的 usque 设备（600，gitignored）。
 - 10 条 WARP 成员都不在 `proxy` 轮换池里，daemon 的节点轮换不影响 opencode 出口。
@@ -640,24 +659,25 @@ warp.proxy_fallback_cooldown_sec: 10800        # 落池冷却（3h）
 warp.proxy_fallback_enabled: false             # 落池开关（2026-10-26 关闭，池节点全挂）
 warp.probe_cache_ttl_sec: 12                   # 旧路径探测缓存 TTL（出口 IP 新鲜度）
 warp.probe_transient_ttl_sec: 120                 # 探测结论 TTL：OK/unreachable/err（瞬时档）
-warp.probe_persistent_ttl_sec: 21600              # 探测结论 TTL：quota/flagged（与 403 惩罚期同量级）
+warp.probe_persistent_ttl_sec: 600             # 探测结论 TTL：quota/flagged（与探测节奏同量级）
 warp.fallback_idle_wait_sec: 3                 # 旧路径错误换线等备线空闲上限
 # 单实例探测器（2026-10-26，prober_enabled=false 时才走旧路径）
 warp.prober_enabled: true                      # 唯一后台探测器 + 状态表驱动换线
 warp.line_fresh_sec: 120                       # per-line OK 新鲜窗口
 warp.probe_unknown_retry_sec: 5                # IP 未知 / 重启成功后重探间隔
-warp.probe_transient_retry_sec: 120            # 瞬时失败重探间隔
-warp.probe_transient_retry_max_sec: 600        # 瞬时失败退避上限
-warp.probe_persistent_retry_sec: 21600         # quota/flagged 重探间隔（6h）
+# 探测节奏：同一线两次观测之间的最小间隔，**只由 last_probe_ts 推出**。
+# 结论决定「探完拿它做什么」，不决定「下次还探不探」 —— 旧实现让 quota 结论
+# 把下次探测推到次日 08:00（=上游 ban_until），20 条线全冻结 56.6 分钟。
+warp.line_probe_cadence_sec: 60
 warp.probe_concurrency: 4                      # 每轮并发探测线数
 warp.model_probe_concurrency: 2                # 模型层并发探测数（每格配额都是钱）
 warp.probe_max_per_min: 30                     # 全局探测速率上限
 warp.prober_idle_wait_sec: 30                  # 探测器空闲等待
-warp.switch_wait_sec: 20                       # 无新鲜 OK 时换线等待上限
+warp.switch_wait_sec: 3                        # 无新鲜 OK 时换线等待上限（等前先催探测器）
 warp.restart_cooldown_sec: 5                   # 同一线重启冷却
 warp.restart_backoff_sec: [2, 5, 10, 20, 60]   # 重启失败指数退避
 warp.restart_backoff_max_sec: 120              # 退避上限
-warp.restart_max_per_hour_per_line: 20         # 每线每小时重启上限
+warp.restart_max_per_hour_per_line: 20         # 每线每小时重启上限（滑动 1h 窗口，计在 systemctl 之前）
 warp.restart_concurrency: 4                    # 全局并发重启上限
 warp.ip_observe_sec: 120                       # 换线后出口观察窗
 # 连错门控不是配置项，是代码常量：consec_err < 3 → 不换线（daemon.py maybe_reconnect_warp）
@@ -741,9 +761,11 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `test_subscription_parse.py` | 561 | 订阅解析回归单测（无网络，40 个用例：vless/trojan transport/单源失败/rc 检查/URL 文件传参/局域网入站与来源守卫）|
 | `test_warp_refresh.py` | 1243 | WARP 刷新/换线门控单测（22 个用例）|
 | `verify_rotation.py` | 360 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），结束时恢复原选择，`--quick` 约 20s |
-| `deploy/install.sh` | — | 部署脚本：生成密钥 + 注册 20 条隧道 + 由 config.py 推导并写入 23 个 systemd 单元 + enable |
+| `deploy/install.sh` | — | 部署脚本：生成密钥 + 注册 20 条隧道 + 由 config.py 推导并写入 23 个 systemd 单元 + enable + 生成 asip 设置与入口 |
 | `deploy/members.py` | — | 把 `CFG["warp"]["members"]` 渲染成 `tag port service dir family`，供 install.sh 用 |
-| `test_portability.py` | — | 可移植性回归（4 例）：路径不越出仓库、运行期文件无硬编码家目录、成员可部署、单元渲染全覆盖 |
+| `deploy/asip-cli-conf.sh` | — | 从 `config.py` 推导 asip CLI 设置，写 `~/.config/asip/cli.env`（16 项 + 隧道清单）；`--print` 只打印 |
+| `deploy/asip-cli.sh` | — | asip 运维 CLI 源文件（本项目为唯一副本，`~/.local/bin/asip` 是指向它的软链）；自身不含任何站点设置 |
+| `test_portability.py` | — | 可移植性回归（20 例）：路径不越出仓库、运行期文件无硬编码家目录、成员可部署、单元渲染全覆盖、CLI 设置随 config 变化 |
 | `test_asip_tools.py` | 73 | asip 工具单测（5 例）：Clash 选择码/密钥轮换、脱敏、原子写权限 |
 | `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写、`append_line`、`update_json`）、`redact`、`clash_client`（`request_json`/`selector_state`/`delay`/`delays`/`connections`）、`egress`（`probe_egress` 保留失败原因）、`proc`（强制超时、无 shell）、`http`（`status=None` 区分传输失败）；daemon 同名门面委托 |
 | `test_asip_*.py` | — | 共享层离线单测：`test_asip_{proc,http,egress,atomic,clash}.py` + `test_asip_integration.py`（daemon 边界）；无 `test_asip_unit.py` 文件 |
@@ -771,6 +793,24 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 `warp.members` 生成 20 条隧道单元 + `auto-switch-ip.service` + `asi-selfcheck.{service,timer}`。
 单元名必须与 `members[].service` 一致，否则 daemon 的 `systemctl restart` 打空。
 改 `members` 后跑 `./deploy/install.sh --units-only` 重生成（不重启）。
+
+**asip 运维 CLI 的设置同样由代码推导**：`deploy/asip-cli.sh` 里没有一处路径、端口或
+单元名，启动时 source `deploy/asip-cli-conf.sh` 生成的 `~/.config/asip/cli.env`。
+该文件在 install.sh 末尾自动生成，并把 `~/.local/bin/asip` 软链到项目内的脚本 ——
+所以改 `warp.members`、换 clone 目录、换用户，CLI 都自动跟上。
+设置缺失时 CLI 直接报错并提示部署命令，不会静默用空清单（那会让 `warp status`
+什么都不显示，看起来像「隧道全没了」）。
+
+WHY 不再手抄：旧版把 10 条隧道的端口/单元名写死在脚本里，而 `members` 实际是 20 条，
+`_warp_members()` 的 sed 又按双引号格式解析（config 用单引号）于是永远回落到写死那份。
+症状是 `warp stop` 只停了 10 条、另 10 条照跑，看起来像屏蔽失效。
+
+**systemd 作用域由探测决定，不写死 `--user`**：单元已从 `~/.config/systemd/user/`
+迁到 `/etc/systemd/system/`（带 `User=` drop-in）。对系统级单元跑 `systemctl --user`
+会返回 0 而什么也不做 —— `asip warp stop` 报成功、隧道照跑，比报错更难查。
+`asip-cli-conf.sh` 在生成时探测 `/etc/systemd/system/auto-switch-ip.service` 是否存在，
+据此写 `ASIP_SYSTEMD_SCOPE`；CLI 再据此选 `systemctl` / `sudo -n systemctl`。
+两种部署并存，CLI 跟着实际落点走。`ASIP_SYSTEM_UNIT_DIR` 可覆盖探测目标（测试用）。
 
 **`members[].ipv6`**：`True` → 期望走 `usque socks -6`（MASQUE over IPv6，出口 SJC），
 其余走 v4（出口 LAX）。这不是装饰 —— 换协议版本即换出口地理位置，实测 5 条 `-6` 线

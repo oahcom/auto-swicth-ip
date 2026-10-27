@@ -27,7 +27,7 @@
 - `.env` — 订阅 token 与路径覆盖（**不入库**，chmod 600）
 - `singbox-config.json` — 生成的 sing-box 配置（**不入库**，含 Clash API secret 与节点凭据；启动时按需生成）
 - `sing-box` — 仓库内是 Linux amd64 二进制（1.13.0）；arm64 由 `deploy/fetch-binaries.sh` 自动获取
-- `deploy/` — `install.sh`（单元生成/启用）、`preflight.sh`（新主机预检）、`fetch-binaries.sh`（校验下载）、`wsl-boot.conf.example`（WSL 引导模板）
+- `deploy/` — `install.sh`（单元生成/启用 + asip 设置与入口）、`asip-cli-conf.sh`（从 `config.py` 推导 CLI 设置）、`asip-cli.sh`（`asip` 运维命令源文件）、`preflight.sh`（新主机预检）、`fetch-binaries.sh`（校验下载）、`wsl-boot.conf.example`（WSL 引导模板）
 - `daemon.log` — daemon 运行日志
 
 ## 安装
@@ -78,6 +78,13 @@ ELF 架构不符时会自动调用它——所以从 arm64 机器 clone（仓库
 ./deploy/install.sh --units-only   # 只重生成单元，不重启
 ```
 
+部署同时产出运维命令 `asip`（软链到 `deploy/asip-cli.sh`，设置写进
+`~/.config/asip/cli.env`）。设置全部从 `config.py` 推导，所以换目录或改 `members`
+后它自动跟上；只想刷新设置可单独跑 `./deploy/asip-cli-conf.sh`。
+常用子命令：`asip st`（状态）、`asip warp status|stop|start`（隧道）、
+`asip warp jlog`（隧道日志）、`asip inbox`（Sister Bus 里本项目的消息）。
+完整清单见 `asip -h`。
+
 纯手动启动（不走 systemd）可用 `./start-auto-switch-ip.sh`。
 
 ### 2. 把 9router 出口指到 7890
@@ -105,7 +112,7 @@ curl -x http://127.0.0.1:7890 https://api.ipify.org  # 应返回非本地 IP
 ```bash
 python3 -m pytest test_portability.py -q          # 路径/单元可移植性
 python3 -m pytest test_daemon_unit.py test_subscription_parse.py test_warp_refresh.py -q
-systemctl --user status auto-switch-ip.service
+sudo systemctl status auto-switch-ip.service
 curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
      http://127.0.0.1:9090/proxies/opencode-out | head -c 200
 ```
@@ -121,7 +128,7 @@ curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
 3. 预检：`./deploy/preflight.sh`。硬项（Python/依赖/systemd/curl）失败即退出；
    软项（linger、订阅、9router DB、Bun、WSL mirrored、端口）只警告。
 4. 配置：`cp .env.example .env && chmod 600 .env`，至少填一个 `*_SUB_URL`。
-5. 部署：`./deploy/install.sh`（自动取二进制、注册 WARP、写 23 个用户单元并启用）。
+5. 部署：`./deploy/install.sh`（自动取二进制、注册 WARP 隧道单元；主 daemon 现用系统级 unit，见下方「服务托管」）。
    已有单元指向旧目录时会拒绝覆盖；确认迁移用 `./deploy/install.sh --adopt`。
 6. 开机自启（无桌面登录）：`sudo loginctl enable-linger $USER`。
 7. WSL 额外：
@@ -130,11 +137,24 @@ curl -s -H "Authorization: Bearer $(cat ~/.singbox_secret)" \
 8. 9router 必须在本机（daemon 读它的 SQLite + Clash API）。若 9router 不在本机，
    只能盲轮换：`.env` 设 `ASIP_OBSERVE_9ROUTER=false`；或将 9router DB 只读挂载后
    用 `NINE_ROUTER_DB_PATH` 指过去（Clash API 仍需本机 sing-box）。
-9. 验证：`systemctl --user status auto-switch-ip.service`；
+9. 验证：`sudo systemctl status auto-switch-ip.service`；
    `python3 -m pytest test_portability.py -q`。
 
 无 systemd 的沙箱/CI 可用 `SKIP_PREFLIGHT=1 SYSTEMD_DIR=/tmp/x ./deploy/install.sh --units-only`
 只渲染单元，不碰真实服务。
+
+### 服务托管（系统级）
+
+主 daemon 与 9Router 都由**系统级** unit 托管，用户级单元已删除，禁止再用 `systemctl --user`：
+
+```bash
+sudo systemctl status auto-switch-ip     # 代理轮换 daemon（KillMode=process）
+sudo systemctl restart auto-switch-ip
+sudo systemctl status 9router            # 9Router，:20127
+sudo systemctl restart 9router
+```
+
+重装时若安装器仍写用户级 `auto-switch-ip.service`，装完必须删除该副本，避免两个 daemon 抢同一把锁。
 
 ## 配置
 

@@ -1828,13 +1828,13 @@ New-NetFirewallRule -DisplayName 'auto-switch-ip LAN proxy (TCP 7891)' -Directio
 | T-127 | P1 | 换线冷却防风暴 | 连续两次 `maybe_reconnect_warp` | 冷却窗口内第二次不产生新换线日志 |
 | T-128 | P2 | sing-box 重启保留线路 | 在备线上 `restart_singbox()` | 日志 `↺ WARP 线路恢复为 WARP-CF-B`，`active_warp_tag()` 不变 |
 | T-129 | P0 | 换线不受节点切换时间戳门控 | `test_warp_failover_not_gated_by_node_switch` | 一次 abuse 403 即触发换线；主动轮换刷新时间戳不影响 |
-| T-130 | P0 | daemon 重启不连带杀 sing-box | `systemctl --user restart auto-switch-ip.service` 后比对 sing-box PID | PID 不变；`KillMode=process` |
+| T-130 | P0 | daemon 重启不连带杀 sing-box | `sudo systemctl restart auto-switch-ip.service` 后比对 sing-box PID | PID 不变；`KillMode=process` |
 
 | T-135 | P0 | IP 新鲜度守卫：窗口内用过的出口先刷新再切 | `test_warp_ip_reuse_window_and_cleanup` | 300s 内用过的 IP 触发刷新；窗口外的直接用 |
 | T-136 | P0 | 换线前刷新目标线出口 | `test_warp_failover_refreshes_target_ip_before_switch` | 日志 `↻ <tag> 会话已刷新: <IP>` 后再 `✓ 换线成功` |
 | T-137 | P1 | 目标线 IP 已新鲜则跳过刷新 | `test_warp_failover_skips_refresh_for_fresh_ip` | 不产生刷新日志，直接换线 |
 | T-138 | P1 | 刷新后仍是旧 IP 则换下一条备线 | `test_warp_failover_skips_target_when_refresh_keeps_stale_ip` | 跳过该线；全不新鲜则切轮换池 `proxy` |
-| T-139 | P0 | 有在途连接不强刷（防 upstream connection lost） | `systemctl --user stop auto-switch-ip` 后 `grep '备线均在服务在途连接' daemon.log` | 日志出现该行时**不**出现 `强刷`；连接归零后才刷新 |
+| T-139 | P0 | 有在途连接不强刷（防 upstream connection lost） | `sudo systemctl stop auto-switch-ip` 后 `grep '备线均在服务在途连接' daemon.log` | 日志出现该行时**不**出现 `强刷`；连接归零后才刷新 |
 | T-140 | P0 | user manager 未重启（排「全线崩」） | `systemctl --user show user@1000.service -p ActiveEnterTimestamp --value` + `journalctl -u user@1000.service \| grep -E 'Exit the Session\|Deactivated'` | manager Active 起始时间早于当前故障窗口；出现 `Exit the Session` 则按 INC-006 处置（非代理问题） |
 | T-141 | P0 | 判「线忙闲」用字节增量而非连接数 | `pytest test_warp_refresh.py -k line_busy` | 字节增长=忙、不变/回落=闲、查询失败=None；活跃线恒有 7~10 连接故连接数判据必然超时 |
 | T-141b | P0 | 判闲观察窗按路径分三档，错误换线不得吃后台的 12s | `pytest test_daemon_unit.py -k error_path_uses_short_busy_window` | 错误换线路径 `reconnect_warp` 的兜底分支必须显式传 `_ERROR_PATH_BUSY_WINDOW_SEC`(2s)，`_wait_warp_idle` 的轮询窗同样传 2s；后台补刷/脏线守护用 `busy_window_sec`(12s)；被切下的主渠道排空用 `_DRAIN_BUSY_WINDOW_SEC`(30s)。WHY：12s 覆盖 SSE token 静默 p90=9.1s，但按候选逐条睡 12s 时最坏 ~120s 才把坏出口切走，期间它一直在服务失败请求（codex review P1）；30s 覆盖静默分布 max=16.1s 并留一倍余量，候选线的重启则完全不需要窗口（不在服务流量，等端口就绪即可） |
@@ -1935,6 +1935,10 @@ New-NetFirewallRule -DisplayName 'auto-switch-ip LAN proxy (TCP 7891)' -Directio
 | T-224 | P1 | 刷新日志必须区分「离渠总时长」与「上次成功」 | 人工：观察 `刷新成功` / `模型层:` 行 | 格式为 `（离渠后第 N 次刷，X min，上次成功 Y min 前）`。`X min` 含静置期不是单次耗时：实测 WARP-CF-C `65.4min/第 29 次刷` 中 45.6min 是 OK 着不动，只有 34 秒在真刷新；757 次刷新 0% 超 60s。地址由 usque 自行更换 —— 同 tag 间隔 10~30s 时 99.4% 换了地址，所以「刚 OK 又判 quota」是地址被换掉，不是结论被无视 |
 | T-225 | P0 | OK 探测结论单独一档 TTL（600s），不与 err/unreachable 同档 | `pytest test_warp_refresh.py -k ttl_by_persistence` | 三档：quota/flagged 21600s > OK 600s > err/unreachable 120s。判据是同一 `(tag, /128)` 的重探间隔中位 212s —— 120s 档位命中不到自己，实测 1980 次「前一次 OK」里 1831 次（92.5%）结论不变；按 600s 可省 33.8% 探测量，判错 8.0%，1200s 只再省 0.1 个百分点。安全网是标脏即作废：47 例 OK→quota 里 45 例期间有生产侧 429/403 换线走 `_probe_cache_forget`，变异验证把该调用换成 `pass` 后回归用例立即转红 |
 | T-226 | P1 | `/64` 段状态不得升级为选线准入或跨档判据 | 时间序回放台账（段状态取探前 `blocked_ts`） | 只用于同档内静置排序。回放结果：T0 已烧段 OK 56/1024（5.47%）vs 干净段 1/108（0.93%），T1 已烧段 95.44% vs 干净段 98.59% —— 干净段里的全新地址并不更好。反例记录：按「24/24 quota 地址落在已烧段内」曾推断段级过滤可省 1762 格，那是用被判死的探测反推段状态的自证偏差 |
+| T-227 | P0 | asip CLI 不得自带站点设置 | `pytest test_portability.py -k reads_everything_from_generated_settings` | 把 `deploy/` + `config.py` 复制到 tmp 后生成设置：产物里出现 **clone 路径**、不出现源仓库路径（后者能被「手抄一份真路径」满足）；`ASIP_WARP_MEMBERS` 覆盖全部成员；8 个关键键齐备。CLI 源文件里 `/home/` 与 `usque-warp.service` 均出现 0 次，且必须 `. "$ASIP_CLI_ENV"`。背景：旧版写死 10 条隧道而 `members` 是 20 条，`_warp_members()` 的 sed 按双引号格式解析（config 用单引号）永远回落到写死那份 → `warp stop` 只停 10 条、另 10 条照跑 |
+| T-228 | P0 | CLI 的 systemctl 作用域必须跟单元落点 | `pytest test_portability.py -k follows_actual_unit_scope` | `ASIP_SYSTEM_UNIT_DIR` 指向不存在目录 → `ASIP_SYSTEMD_SCOPE=user`；在其中放入 `auto-switch-ip.service` 后 → `=system`。背景：单元已迁到 `/etc/systemd/system/`，`systemctl --user` 对系统级单元**返回 0 而什么也不做** —— `asip warp stop` 报成功、隧道照跑，比报错更难查 |
+| T-229 | P0 | 部署必须顺带产出 asip 设置与入口 | `pytest test_portability.py -k renders_units_on_fresh_host` | 跑完 `--units-only` 后 `~/.config/asip/cli.env` 存在、`~/.local/bin/asip` 是软链。CLI 不含任何站点设置，缺了它日志/换线/隧道整条运维链不可用，而这些正是部署后第一个要用的东西 |
+| T-230 | P0 | 演练生成的设置必须指向演练目录，不得指向 /etc 真实单元 | `pytest test_portability.py -k rehearsal` | `SYSTEMD_DIR=/tmp/x install.sh --units-only` 后设置里 `ASIP_UNIT_DIR=/tmp/x`、`ASIP_SYSTEMD_SCOPE=user`。不这么做的话：演练把单元写进 /tmp，设置却探测到 /etc 的真实单元仍存在 → 演练完随手跑一次 `asip warp stop` 就去屏蔽生产单元，演练反而动了生产。变异验证：把 conf 里的 `SYSTEMD_DIR` 优先级改成忽略 → 该用例转红（`ASIP_UNIT_DIR=/etc/systemd/system`） |
 
 补充（自对抗审查记录）：并发会话改 `daemon.py` 期间，`test_warp_refresh.py` 有 2 例瞬时失败 —— 失败跑在 20:44，而 `daemon.py` 的 mtime 是 20:46，即跑的是半截改动；修复落盘后两次复跑均 **284 passed**。教训：混跑结果异常时先看被测文件 mtime 是否晚于测试启动时刻。
 
@@ -2069,3 +2073,4 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.52 | 2026-10-26 | 纳入并行 WIP 并修正：传输层 503（`UpstreamTransportError`）单独计数，不进 `errors`/`consec_err`/`full_err`、不记脏台账；`count_warp_blocked_since` 增 `transport` 键；达阈值先经当前隧道探出口（`warp_egress_ip`，15s 节流），探通判 9router 侧故障不换线、探不通才换线；健康摘要增 `503=N`；`ErrorWindow` 尾字段带默认值，main 循环 6 元解包；修 WIP 遗留的 5 元解包（`maybe_reconnect_warp` 会 ValueError）。564 passed | 并行 WIP + 修正 |
 | v1.53 | 2026-10-26 | 传输层探针去重：签名 `(换线窗口起点, transport 计数)`，同窗口同计数不再重复探出口（实测每 10~20s 刷一条「出口探测正常」且每次查 CF trace）；换线后窗口起点变化自动重新武装。补 2 例（同证据不重探 / 换线后重探）。566 passed | 实测刷屏修复 |
 | v1.54 | 2026-10-26 | 审查修复：① 探测起手后该线已重启换址 → 旧地址结论丢弃（否则 `st["ip"]` 退回旧值并按旧地址 quota 惩罚期停探 16h）；② 传输层换线被冷却/闸门拒绝时撤掉探针签名并如实记日志（原日志恒称「→ 换线」，且同证据永久锁死不再重试）；③ 回切分支兜底 dict 补 `transport` 键。补 2 例。568 passed | 第三方/自查 |
+| v1.55 | 2026-10-27 | asip CLI 设置外置 (T-227~T-229)：`~/.local/bin/asip` 里的路径/密钥/Clash API/selector/10 条隧道清单全部搬进项目，新增 `deploy/asip-cli-conf.sh` 从 `config.py` 推导 16 项设置写入 `~/.config/asip/cli.env`，`deploy/asip-cli.sh` 启动时 source；`install.sh` 末尾自动生成设置并软链 `~/.local/bin/asip`。修旧版三处真实缺陷：① `_warp_members()` 的 sed 按双引号解析而 config 用单引号 → 永远回落到写死的 10 条，而 `members` 是 20 条（`warp stop` 只停一半）；② 单元迁到 `/etc/systemd/system/` 后 `systemctl --user` 返回 0 却不做事 → 作用域改为部署期探测；③ `cat --line-buffered` 不是 GNU 选项 → `jlog all` 输出被吞。另修 `jlog` 的系统级前缀（`Tue … 主机名 unit[pid]:`）剥除，压缩规则移到 sed 链末（sed 按规则顺序单遍执行）。`test_portability.py` 补 3 例（含 `ASIP_HOME_DIR` 隔离，避免测试把设置装进真人目录），25 passed | 主人需求 |

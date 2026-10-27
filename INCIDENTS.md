@@ -53,7 +53,9 @@
 
 1. **两种 403 被混为一谈**。另一条文案 `only be used from within OpenCode` 才是客户端指纹（裸 curl 必现，换 IP 无效）；`abusive traffic from this IP` 是**IP 信誉**拦截，换干净出口可解。之前按"指纹"结论处理，方向错了。
 2. **83 个代理节点全部撞名单**。轮换只在同一批脏 IP 里打转，所以切得再快也没有收益。
-3. WireGuard 版 WARP 在本机不通：UDP 2408/4500/500/1701 握手全部超时（同网段 UDP 19302/3478 正常，属端口/协议过滤）。
+3. WireGuard 版 WARP 直连不通：UDP 2408/4500/500/1701 握手全部超时（同网段 UDP 19302/3478 正常）。
+   **2026-10-28 更正**：UDP 出站本身可用，被拦的是到 Cloudflare 2408 的路径（traceroute 末端
+   收到 ICMP type 3 code 13）。把同一条 UDP 经代理节点转发后握手成功，见 `warp_wg.py`。
 
 ### 修复
 
@@ -654,3 +656,37 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
 - 计数窗口必须按时间而不是条数：高流量下条数窗口只覆盖数秒。
 - 任何常驻服务都必须有 supervisor；`Restart=always` + 正确的 User/HOME 是
   最低要求，缺一条就会静默停机或空转重启。
+
+## INC-012 — 新 WG 线「已启用但没人用」+ 模型层 quota 被当出口故障（2026-10-28）
+
+**等级**: P3（无用户可见故障，但换线算力被白白消耗）
+**现象**: 16 条 `warp-wg-*.service` 全部 active、主 sing-box 的 Clash API 里
+16 个 `WARP-WG-*` 出站可见，openCode 也验证过可切；但 `daemon.log` 里
+`WARP-WG` 出现 0 次，轮换全部落在 `WARP-CF-*`（usque）。
+
+### 根因
+
+1. **daemon 的成员表是 config.py 导入时按环境变量展开的**。systemd 单元里只有
+   `SINGBOX_SECRET` / `NINE_ROUTER_PASSWORD` / `OKZ_SUB_URL`，没有
+   `WARP_WG_FAMILIES` / `WARP_WG_NODES` → `CFG["warp"]["members"]` 里没有 WG
+   成员。sing-box 有出站 ≠ daemon 会用它。
+2. **模型层 quota 被归为出口级错误**。日志里 `[OpenCode Free] 5/5 出口级错误 |
+   403占比=0%` 配合 `模型层: quota（Retry-After 3.9h）`，说明上游是额度耗尽，
+   与 IP 无关；daemon 仍按 IP 故障处理，重启同一条线 33–35 次，且「暂无 120s
+   内 OK 的备线」导致换线判断连续空转。
+
+### 结论
+
+- 部署新线必须同时改 **部署脚本** 与 **systemd 单元的 daemon 环境**，两处
+  不一致就会出现「线在跑、没人选」。
+- 403=0% 且带 `Retry-After` 的失败不能算 IP 问题，换线无效；这类错误应直接
+  上报冷却，不重启隧道。
+
+### 处理
+
+- systemd 单元补 `WARP_WG_FAMILIES=v4,v6,v6,v6` + `WARP_WG_NODES=4`，重启后
+  daemon 状态表从 20 条变 36 条（16 条 WG 全部纳入探测/换线）。
+- 新增全局额度闸 `_QUOTA_HOLD`：Retry-After ≥ 30 分钟的 quota 开闸，闸内不重启
+  「quota/惩罚期/429」类线，短 Retry-After 与隧道半死照常处理。
+- 效果：改动前 30 分钟重启 253 次，改动后同口径 2 次。
+
