@@ -121,7 +121,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$SRC
-Environment=PATH=$(dirname "$NODE_BIN"):/usr/local/bin:/usr/bin:/bin
+# bun 必须在 PATH 里：[OpenCodeTransport] 用 subprocess 直接 spawn bun，
+# ENOENT 时它退回直连 —— 流量绕过 sing-box，出口是真实 IP，必定 429。
+Environment=PATH=$HOME/.bun/bin:$(dirname "$NODE_BIN"):/usr/local/bin:/usr/bin:/bin
 Environment=NODE_ENV=production
 Environment=NEXT_TELEMETRY_DISABLED=1
 # 冷却按 proxy URL 记账（egress.js 的 hashEgress("proxy", proxyUrl)），而 asip
