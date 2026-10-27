@@ -35,7 +35,11 @@ if __name__ == "__main__":
         write_warp_outbound(out)
         print(out)
     else:
+        # 只渲染 usque 成员：install.sh 用这行输出注册设备、建目录、生成单元，
+        # 而 WG 线的单元由 deploy/wg-lines-install.sh 单独生成。
         for m in CFG["warp"]["members"]:
+            if m.get("kind") == "wg":
+                continue
             n = m["port"] - 1079
             print(m["tag"], m["port"], m["service"],
                   "usque" if n == 1 else f"usque{n}", "-6" if m.get("ipv6") else "-")

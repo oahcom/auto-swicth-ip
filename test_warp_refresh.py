@@ -191,14 +191,18 @@ def test_quota_verdict_turns_line_into_refresh_candidate(monkeypatch):
         "本线实测 quota 必须判为低质"
     assert "quota" in daemon._warp_ip_refresh_reason(ip, 1001.0, "W1")
 
-    # 精确解禁（Retry-After 1h）到期、缓存 TTL（6h）未到：旧 quota 不得再
-    # 驱动重启，否则「精确解禁」只在探测路径生效、预热路径仍白烧隧道。
+    # 缓存自身的 TTL 已收到 600s：过期即作废，同一地址重新可探
+    assert daemon._probe_cache_verdict("W1", ip, 1000.0 + 599) == "quota"
+    assert daemon._probe_cache_verdict("W1", ip, 1000.0 + 601) is None
+
+    # 精确解禁（Retry-After 1h）到期后旧 quota 不得再驱动重启，否则
+    # 「精确解禁」只在探测路径生效、预热路径仍白烧隧道。
+    # 重放一条新结论模拟 TTL 内又探了一次：缓存仍是 quota 而惩罚期已过，
+    # 判据必须落在惩罚期上，不是落在缓存结论上。
+    daemon._probe_cache_put("W1", ip, "quota", now=4600.0)
     assert daemon._probe_cache_verdict("W1", ip, 4602.0) == "quota"
     assert daemon._warp_ip_needs_refresh(ip, 4602.0, "W1") is False
     assert "quota" not in daemon._warp_ip_refresh_reason(ip, 4602.0, "W1")
-
-    # 长 TTL 过后结论作废：同一地址重新可探，不再凭缓存作答
-    assert daemon._probe_cache_verdict("W1", ip, 1000.0 + 21601) is None
 
 
 def test_probe_cache_never_bleeds_across_ips_in_same_segment(monkeypatch):

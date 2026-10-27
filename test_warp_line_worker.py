@@ -67,6 +67,9 @@ class Fake:
         self.calls.append(("restart", tag))
         return True
 
+    def _restart_warp_line(self, member, rebind=False):
+        return self._restart_service(member["service"], member.get("tag"))
+
     def _wait_port_ready(self, port, timeout_sec):
         return True
 

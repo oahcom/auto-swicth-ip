@@ -12,8 +12,19 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # 与 config.py 一致：从 passwd 取本用户家目录，不信 $HOME。`sudo -u` 下
 # HOME 可能仍是 /root，会把单元/密钥写到错误用户的家目录。
-HOME_DIR="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+# ASIP_HOME_DIR 供试跑/测试隔离，避免一次演练把设置与入口装进真人目录。
+# SYSTEMD_DIR 指到 /etc/systemd 之外即视为演练：此时家目录不跟过去的话，演练
+# 会顺手改写生产的 cli.env 与 ~/.local/bin/asip（实测真的发生过，md5 变了）。
+# 这三样（设置/入口/密钥）全由 HOME_DIR 推导，隔离住它一处就够。
+if [ -z "${ASIP_HOME_DIR:-}" ] && [ -n "${SYSTEMD_DIR:-}" ]; then
+    case "$SYSTEMD_DIR" in
+        /etc/systemd/*) ;;
+        *) ASIP_HOME_DIR="$(dirname "$SYSTEMD_DIR")/home" ;;
+    esac
+fi
+HOME_DIR="${ASIP_HOME_DIR:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)}"
 [ -n "$HOME_DIR" ] || HOME_DIR="$HOME"
+mkdir -p "$HOME_DIR"
 UNIT_DIR="${SYSTEMD_DIR:-$HOME_DIR/.config/systemd/user}"
 # 写进 $UNIT_DIR 的单元会把 ExecStart 钉成**本次运行的这个 DIR**。所以拿一份副本
 # 试跑（如 /tmp 下的 clone）时若忘了设 SYSTEMD_DIR，就会把现网单元悄悄改指到副本，
@@ -198,7 +209,12 @@ WantedBy=default.target
 EOF
 done <<< "$MEMBERS"
 
-systemctl --user daemon-reload
+# 单元写到哪就 reload 哪：本机生产单元在 /etc（系统级），对空着的用户级目录
+# daemon-reload 打空；无 user bus 的容器/CI 里它还会直接失败（No such file or directory）。
+case "$UNIT_DIR" in
+    /etc/systemd/system|/usr/lib/systemd/system) : ;;   # 系统级：本次不 reload，避免影响在跑的服务
+    *) systemctl --user daemon-reload 2>/dev/null || true ;;
+esac
 if [ "$UNITS_ONLY" = 0 ]; then
     systemctl --user enable --now auto-switch-ip.service asi-selfcheck.timer $SERVICES
     echo "已启用 auto-switch-ip + asi-selfcheck.timer +$(echo $SERVICES | wc -w)条隧道单元"
@@ -207,3 +223,14 @@ if [ "$UNITS_ONLY" = 0 ]; then
 else
     echo "已重生成单元（未启用/未重启）：$UNIT_DIR"
 fi
+
+# ---- asip 运维 CLI：设置由 config.py 推导，入口落到 PATH ----
+# 必须先于任何手工排障：CLI 读的是设置文件里的路径/端口，写死一份到脚本里的
+# 下场是换目录或改 members 后它静默指向旧位置（症状像服务故障，不像配置错误）。
+# SYSTEMD_DIR 由调用方传给本脚本，conf 脚本继承同一份环境变量，据此把设置指向
+# 演练目录而非 /etc —— 否则演练完跑一次 `asip warp stop` 就动了生产单元。
+bash "$DIR/deploy/asip-cli-conf.sh" || { echo "✗ 生成 asip 设置失败" >&2; exit 1; }
+BIN_DIR="${ASIP_BIN_DIR:-$HOME_DIR/.local/bin}"
+mkdir -p "$BIN_DIR"
+ln -sfn "$DIR/deploy/asip-cli.sh" "$BIN_DIR/asip"
+echo "asip CLI: $BIN_DIR/asip → $DIR/deploy/asip-cli.sh"

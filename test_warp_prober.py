@@ -121,7 +121,13 @@ def _stub_restart(monkeypatch, new_ip):
     monkeypatch.setattr(daemon, "_probe_refresh_egress", lambda port: new_ip)
 
 
-def test_restart_same_ip_keeps_quota_park(monkeypatch):
+def test_restart_same_ip_reprobes_on_cadence(monkeypatch):
+    """重启后拿回同一地址：不再沿用旧结论的停探，按节奏重探。
+
+    WHY 改：旧实现把上次 quota 结论的停探时刻原样搬过来（16h），于是
+    「重启换地址」这条唯一自愈路径在同址时完全失效 —— 而重启后本来就要
+    重新确认这个地址此刻还行不行。结论只决定探完做什么，不决定还探不探。
+    """
     _stub_restart(monkeypatch, "1.1.1.1")
     park = time.time() + 16 * 3600
     with daemon._WARP_LINE_CV:
@@ -129,8 +135,9 @@ def test_restart_same_ip_keeps_quota_park(monkeypatch):
             ip="1.1.1.1", last_verdict="quota", next_probe_ts=park)
     assert daemon._warp_line_restart(_member(), "模型层 quota") is True
     st = daemon._warp_line_state("W2")
-    assert st["next_probe_ts"] == pytest.approx(park)
-    assert st["last_verdict"] == "quota"
+    assert st["next_probe_ts"] - time.time() < 10, \
+        "重启后仍沿用 16h 停探 —— 这条线的下一次观测被推到明天"
+    assert st["last_verdict"] == "unknown"
 
 
 def test_restart_new_ip_clears_park_for_untested_ip(monkeypatch):
@@ -146,13 +153,6 @@ def test_restart_new_ip_clears_park_for_untested_ip(monkeypatch):
     assert st["next_probe_ts"] - time.time() < 10
 
 
-def test_restart_clears_warming_when_busy_check_raises(monkeypatch):
-    """判忙异常不得把 warming 留在 True：那会让这条线被永久跳过。"""
-    m = _member()
-    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_line_busy",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            RuntimeError("clash down")))
 def _stub_probe(monkeypatch, verdict="quota"):
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "1.1.1.1")
@@ -196,6 +196,23 @@ def test_quota_hold_also_blocks_penalty_restart(monkeypatch):
     daemon._probe_one_line(_member())
     assert restarted == [], \
         "额度闸只拦了 quota 路径，惩罚期路径仍在重启 —— 同一轮风暴从另一半漏过去"
+
+
+def test_quota_hold_does_not_block_tunnel_death_restart(monkeypatch):
+    """额度闸只拦「换地址」这一类，隧道半死照常重启。"""
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            fail_streak=daemon._UNKNOWN_RESTART_STREAK)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: False)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r: restarted.append(m["tag"]) or True)
+    daemon._probe_one_line(_member())
+    assert restarted == ["W2"], \
+        "额度闸把隧道半死的自愈路径也挡了 —— 那是地址没了，不是配额没了"
 
 
 def test_model_probe_opens_hold_only_for_long_quota(monkeypatch):
@@ -342,3 +359,4 @@ def test_stale_verdict_after_line_restart_is_dropped():
     st = daemon._warp_line_state("W2")
     assert st["ip"] == "2.2.2.2", st
     assert st["last_verdict"] == "unknown", st
+

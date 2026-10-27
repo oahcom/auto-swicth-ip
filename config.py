@@ -89,6 +89,34 @@ def get_singbox_secret() -> str:
 if not get_singbox_secret():
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WARNING: sing-box secret 未设置 — 在 {SECRET_FILE} (chmod 600) 中写入 base64 secret", file=sys.stderr)
 
+# WARP-over-proxy 线路拓扑。0 条 = 不启用（默认）。
+#
+#   WARP_WG_FAMILIES=v4,v6,v6,v6   每个落地节点上的渠道模式（长度 = 每节点渠道数）
+#   WARP_WG_NODES=4                落地节点数 → 总线路数 = 4 × 4 = 16
+#
+# 地址族决定消耗哪个配额池，不是装饰：v6 每次重连换一个 /64（近乎无限），
+# v4 由 WARP 落地 colo 决定，同 colo 必拿到同一地址（实测 aws49 与 unamecf
+# 均为 104.28.243.105）。所以 v4 渠道数不应超过可用 colo 数。
+# 旧变量 WARP_WG_COUNT=N 仍可用，等价于 N 条全 v6、单落地节点。
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+def _wg_families() -> list[str]:
+    raw = (os.environ.get("WARP_WG_FAMILIES") or "").strip()
+    if raw:
+        fams = [x.strip().lower() for x in raw.split(",") if x.strip()]
+        return [f for f in fams if f in ("v4", "v6")]
+    return ["v6"] * _env_int("WARP_WG_COUNT", 0)
+
+
+_WG_FAMILIES: list[str] = _wg_families()
+_WG_HOME_NODES = max(1, _env_int("WARP_WG_NODES", 1)) if _WG_FAMILIES else 0
+_wg_count = len(_WG_FAMILIES) * _WG_HOME_NODES
+
 CFG = {
     "9router": {
         "db_path": _env_path("NINE_ROUTER_DB_PATH", os.path.join(HOME_DIR, ".9router/db/data.sqlite")),
@@ -194,33 +222,16 @@ CFG = {
         # ipv6=True → 隧道用 `usque socks -6`（MASQUE over IPv6，出口落在 SJC）；
         # 其余走 v4（出口 LAX）。这不是装饰：换协议版本即换出口地理位置，
         # 部署脚本据此生成 systemd ExecStart，别删。
+        #
+        # 2026-10-28 主人定：CF/usque 线从 20 条缩到 3 条 —— 1 条 v4 + 2 条 v6。
+        # 旧的 20 条是为了扛排空并发（换线间隔 p50 8s、排空 p50 68s），当时
+        # 池里只有 usque；现在 16 条 WARP-WG 线并入同一个 members 表分担轮换，
+        # 容量不再需要靠 usque 数量堆，多留的 17 条只是多 17 份注册身份和
+        # 17 个待探测端口。
         "members": [
             {"tag": "WARP-CF", "port": 1080, "service": "usque-warp.service", "ipv6": True},
             {"tag": "WARP-CF-B", "port": 1081, "service": "usque-warp-b.service", "ipv6": True},
-            {"tag": "WARP-CF-C", "port": 1082, "service": "usque-warp-c.service", "ipv6": True},
             {"tag": "WARP-CF-D", "port": 1083, "service": "usque-warp-d.service"},
-            {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
-            {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service", "ipv6": True},
-            {"tag": "WARP-CF-G", "port": 1086, "service": "usque-warp-g.service", "ipv6": True},
-            {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service", "ipv6": True},
-            {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service", "ipv6": True},
-            {"tag": "WARP-CF-J", "port": 1089, "service": "usque-warp-j.service", "ipv6": True},
-            # 2026-10-22 扩到 20 条。WHY：扩容前的实测是在排空并发上打满的 ——
-            # 换线间隔 p50 8s（高频时 1.8 次/分钟），被切下的线排空 p50 68s /
-            # p90 335s，任一时刻平均 4.9 条在排空（≥3 条占 84% 的时间），
-            # 而池里只有 10 条、真正服务流量的只有 3 条。近 1 小时 23% 的
-            # 换线时刻只剩 1 条候选。排空等的是真实在途流式响应（28 条连接
-            # 180s 采样零增长占比 0.0%，不是僵尸连接），只能靠加容量吸收。
-            {"tag": "WARP-CF-11", "port": 1090, "service": "usque-warp-11.service", "ipv6": True},
-            {"tag": "WARP-CF-12", "port": 1091, "service": "usque-warp-12.service", "ipv6": True},
-            {"tag": "WARP-CF-13", "port": 1092, "service": "usque-warp-13.service", "ipv6": True},
-            {"tag": "WARP-CF-14", "port": 1093, "service": "usque-warp-14.service", "ipv6": True},
-            {"tag": "WARP-CF-15", "port": 1094, "service": "usque-warp-15.service", "ipv6": True},
-            {"tag": "WARP-CF-16", "port": 1095, "service": "usque-warp-16.service", "ipv6": True},
-            {"tag": "WARP-CF-17", "port": 1096, "service": "usque-warp-17.service", "ipv6": True},
-            {"tag": "WARP-CF-18", "port": 1097, "service": "usque-warp-18.service", "ipv6": True},
-            {"tag": "WARP-CF-19", "port": 1098, "service": "usque-warp-19.service", "ipv6": True},
-            {"tag": "WARP-CF-20", "port": 1099, "service": "usque-warp-20.service", "ipv6": True},
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
@@ -259,6 +270,7 @@ CFG = {
         # 时钟走，任何固定周期都只能在「切早了浪费地址」和「切晚了吃 429」
         # 之间瞎猜；按已用配额切才和配额扣减同源，流量大小自动适应。
         # 当前生效：requests（按成功 dsv4 调用数换线）。切回 fixed 只需改这一行。
+        # 2026-10-28 主人要求切回 requests（阈值 150 格）。
         "proactive_mode": "requests",
         "proactive_fixed_sec": 60,
         # requests 模式数哪个模型的配额。配额按模型扣，别的模型成功不占这格。
@@ -336,7 +348,7 @@ CFG = {
         # 原模式：只验「这个地址没被烧过」，不验它此刻能不能出流量 ——
         # 新地址几分钟内 429 的情况真实存在，原模式会让候选池大但不保证能用。
         # 开启后每条候选多耗一格出口配额、多 1~3s（实测 B 线曾 16.8s）。
-        "refresh_model_check": True,
+        "refresh_model_check": _env_bool("ASIP_REFRESH_MODEL_CHECK", True),
         "refresh_model_timeout_sec": 15,
         # 换线后短暂静默让在途请求落定。固定值，不随连续失败放大 ——
         # 只要目标线能拿到窗口外的新鲜 IP，换线就值得做；拉长冷却只会让
@@ -424,25 +436,62 @@ CFG = {
         #     作废 OK，不靠这个 TTL 兜底。
         "probe_transient_ttl_sec": 120,
         "probe_ok_ttl_sec": 600,
-        "probe_persistent_ttl_sec": 21600,
+        # 与探测节奏同量级。旧值 21600 是第二道停探闸：结论一落缓存，
+        # 这条地址 6 小时内不再被观测 —— 而那正是最该持续看的对象。
+        # 重复探测的代价已被入口的惩罚期短路挡住（判脏地址根本不探）。
+        "probe_persistent_ttl_sec": 600,
         # 单实例探测器：所有线路的出口/模型探测都由唯一后台线程写入状态表，
         # 换线只读表 + 条件变量等待，不再在 reconnect_warp 里同步探测。
         # prober_enabled=False 只用于回滚到旧路径（测试默认不会启动探测器）。
         "prober_enabled": True,
+        # 备线「新鲜」的定义：last_ok_ts 距今 ≤ 这个秒数才算可用备线。
+        # 换线只接受新鲜备线 —— 旧 OK 说明的是「那时能用」，不是「现在能用」。
         "line_fresh_sec": 120,
+        # 探测节奏：无论上次结论是什么，同一线两次观测之间至少隔这么久。
+        # 结论只决定「探完拿它做什么」，不决定「下次还探不探」。
+        # 0 = 探完立刻重新排队。曾经是 60s：36 条线 × 60s 把吞吐锁死在
+        # 36 条/分钟，而单次探测只要 1.9~5.7s —— 加渠道本来是为了提速，
+        # 却按「渠道数 × 60s」算轮次，等于白加。
+        "line_probe_cadence_sec": 0,
+        # 探不到结论（unknown）时这条线的重试间隔。它不是「轮次」：
+        # 只作用于没拿到结论的那一条线，不拖慢其它线的节奏。
         "probe_unknown_retry_sec": 5,
-        "probe_transient_retry_sec": 120,
-        "probe_transient_retry_max_sec": 600,
-        "probe_persistent_retry_sec": 21600,
+        # 同时在飞的行级探测线程上限。探测本身不限速，并发是唯一的物理上限：
+        # 36 条线 × 1.9~5.7s，需要 32 个槽才能把一轮压到单次探测耗时量级。
         "probe_concurrency": 32,
+        # 模型层探测（真打上游 chat/completions）的并发闸。与上面分开是因为
+        # 它撞的是上游限流而不是本地 CPU。取值同上：单条实测 WG v4 1.9s / CF 5.7s。
         "model_probe_concurrency": 32,
-        "probe_max_per_min": 600,
+        # 每分钟探测次数上限。0 = 不限。旧值 30/600 是纯自我设限：
+        # 烂地址在入口就被惩罚期短路（判脏根本不探），再压频次只会让
+        # 「新地址刚刚变可用」这件事没人发现。
+        "probe_max_per_min": 0,
+        # 无 due 线时探测器的最长休眠。有 due 时条件变量会立刻唤醒，不影响时延；
+        # 它只决定「全都闲着时别空转」。
         "prober_idle_wait_sec": 30,
-        "switch_wait_sec": 20,
+        # 无新鲜备线时的等待上限。旧值 20s：实测 74 次换线里 73 次等满 20s
+        # 后照样放弃（一共空转 24.7 分钟），因为等待期间没有任何人让「新鲜度」
+        # 变好。现在等待前先催探测器，所以等的是「探测写入」，3s 够一个来回。
+        "switch_wait_sec": 3,
+        # 重启被「不是失败」的原因挡下时（在途连接没排空、拿不到重启槽、
+        # 这条线正在被别处处理）的重排间隔：不是惩罚，只是别原地空转，
+        # 所以固定 5s，不随 fail_streak 涨。
         "restart_cooldown_sec": 5,
-        "restart_backoff_sec": [2, 5, 10, 20, 60],
-        "restart_backoff_max_sec": 120,
-        "restart_concurrency": 4,
+        # 2026-10-28 删除 restart_backoff_sec / restart_backoff_max_sec：
+        # 这条曲线从未真正生效 —— 重启成功会把 next_restart_ts 清零，紧接着
+        # 探到 quota 又立刻重启，退避表根本没被查过（实测 168 次重启/分钟、
+        # fail_streak 涨到 6586 而间隔仍是最低档）。现在重启只受
+        # restart_cooldown_sec 这个固定冷却约束。
+        # 每线每小时重启上限。0 = 不设上限（2026-10-28 按主人要求去掉）。
+        # 它挡的从来不是观测，而是「把一个确定不能用的地址换掉」这个动作本身：
+        # 撞上限后线路就原地带着烂地址继续跑，比多重启几次更糟。
+        # 现在唯一的间隔来源是 restart_cooldown_sec 这个固定冷却。
+        "restart_max_per_hour_per_line": 0,
+        # 同时在飞的重启数。每条 quota/blocked 线都要「重启换地址 → 等就绪 →
+        # 重探」，这个闸才是现在的真正吞吐瓶颈：4 槽 × 一次 3~5s ≈ 20~40 条/分钟。
+        # 12 是折中：16 条同时注册会撞 Cloudflare 的 ~9 台/窗口限流，吃 429 后
+        # 退避 30/90/240s，反而比排队更慢。
+        "restart_concurrency": 12,
         "ip_observe_sec": 120,
         # fixed 模式的提前量：换线从发起到达生效 p50=2s / p90=7s，等满
         # proactive_fixed_sec 再发起就赶不上节律，必须提前这个时长。
@@ -461,10 +510,64 @@ CFG = {
             "dry_run": True,
             "interval_sec": 30,
         },
+        # 原生 WireGuard 版 WARP（sing-box endpoints），UDP 经代理节点中转。
+        # opt-in：enabled=False 时完全不改变现网行为，也不往 members 里加线。
+        # WHY 经代理：本机到 162.159.192.1:2408 的 UDP 被运营商 ACL 拦
+        # （ICMP type 3 code 13），直连握手只会超时。
+        "wg": {
+            # 单一开关：WARP_WG_FAMILIES 为空即关闭。不再另设 enabled —— 两个
+            # 开关会漂移成「文件里有线、daemon 看不见」的半开状态。
+            "enabled": _wg_count > 0,
+            "count": _wg_count,
+            "families": _WG_FAMILIES,
+            "per_node": len(_WG_FAMILIES) or 1,
+            "home_nodes": _WG_HOME_NODES,
+            # 每条线可切的后备节点数（含当前节点）。v6 线基本用不到（重启就换
+            # 地址），v4 线和节点故障时才走它。
+            "rotation_size": _env_int("WARP_WG_ROTATION", 8) or 8,
+            "udp_cache_ttl_sec": 6 * 3600,
+            "base_port": 1110,
+            "tag_prefix": "WARP-WG-",
+            "service_prefix": "warp-wg-",
+            "wgcf_bin": _env_path("WGCF_BIN", os.path.join(PROJECT_DIR, ".warp", "wgcf")),
+            # 本地入站只监听环回：线路端口由主 sing-box 的 socks outbound 消费，
+            # 不需要对外暴露。
+            "listen_host": "127.0.0.1",
+            # peer 用 IP 而非域名：线路进程不走本机解析器。
+            "peer_v4": "162.159.192.1:2408",
+            "peer_v6": "[2606:4700:103::2]:2408",
+            "mtu": 1280,
+            "keepalive": 25,
+        },
     },
     "log_file": _env_path("ASIP_LOG_FILE", os.path.join(PROJECT_DIR, "daemon.log")),
     "log_format": "%Y-%m-%d %H:%M:%S",
 }
+
+def _append_wg_members(cfg: dict) -> None:
+    """WARP-over-proxy 线路并入 members（仅 enabled 时）。
+
+    对 daemon 来说它就是一条「有 service、有 socks 端口」的出口，探测/预热/
+    换线路径无需分叉。安装单元由 deploy/wg-lines-install.sh 负责，这里只声明。
+    """
+    wg = cfg["warp"]["wg"]
+    if not wg["enabled"] or wg["count"] <= 0 or not wg["families"]:
+        return
+    per = len(wg["families"])
+    for i in range(1, wg["count"] + 1):
+        cfg["warp"]["members"].append({
+            "tag": f"{wg['tag_prefix']}{i}",
+            "port": wg["base_port"] + i - 1,
+            "service": f"{wg['service_prefix']}{i}.service",
+            "kind": "wg",
+            "index": i,
+            # 第 i 条线属于第几组落地节点，以及该组内的渠道位置。
+            "home_group": (i - 1) // per,
+            "family": wg["families"][(i - 1) % per],
+        })
+
+
+_append_wg_members(CFG)
 
 # ============= 便捷常量 =============
 # ponytail: SINGBOX_SECRET 不在此导出为模块级常量——CFG["singbox"]["secret"] 是 import 时冻结的
