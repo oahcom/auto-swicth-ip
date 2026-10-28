@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "relays": {
+    "b140d8d946f3": {
+      "url": "https://relay-a.vercel.app",
+      "name": "https://relay-a.vercel.app",
+      "pool_id": "",
+      "ip": null,
+      "last_ok_ts": 0.0,
+      "last_probe_ts": 0.0,
+      "latency_ms": null,
+      "fail_streak": 0,
+      "error": null,
+      "burned_until": 0.0,
+      "burn_kind": null,
+      "created_at": 1793192380.3398404
+    },
+    "4f905f6eabf0": {
+      "url": "https://relay-b.vercel.app",
+      "name": "https://relay-b.vercel.app",
+      "pool_id": "",
+      "ip": null,
+      "last_ok_ts": 0.0,
+      "last_probe_ts": 0.0,
+      "latency_ms": null,
+      "fail_streak": 0,
+      "error": null,
+      "burned_until": 0.0,
+      "burn_kind": null,
+      "created_at": 1793192380.3398533
+    }
+  },
+  "ip_used": {},
+  "updated_at": 1793192401.3526824
+}

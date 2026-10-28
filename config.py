@@ -525,6 +525,10 @@ CFG = {
         "restart_max_per_minute": 12,
         # 撞到长 Retry-After 的线隔离多久（秒，下限）。低于这个值算瞬时限流，照常换。
         "line_quota_quarantine_min_sec": 1800,
+        # 单次隔离上限（秒）。24h 的 Retry-After 会把线锁到后天，夹到 2h。
+        "line_quota_quarantine_max_sec": 7200,
+        # 同时被隔离的线占比上限。到顶不再新增隔离，保证池子里始终有活线。
+        "line_quota_quarantine_max_ratio": 0.8,
         # 同时在飞的重启数。每条 quota/blocked 线都要「重启换地址 → 等就绪 →
         # 重探」，这个闸才是现在的真正吞吐瓶颈：4 槽 × 一次 3~5s ≈ 20~40 条/分钟。
         # 12 是折中：16 条同时注册会撞 Cloudflare 的 ~9 台/窗口限流，吃 429 后
@@ -581,6 +585,43 @@ CFG = {
             "peer_v6": "[2606:4700:103::2]:2408",
             "mtu": 1280,
             "keepalive": 25,
+        },
+    },
+    # Vercel 中继线路 —— 第三条地址空间（见 asip/vercel_relay.py 的模块注释）。
+    #
+    # 为什么放在 warp 之后单独一块：它不是一条隧道，也不是一个 sing-box 节点。
+    # 它改的是 9router 自己的出口选择（providerStrategies + proxyPools），
+    # 走的是 9router 的 relay 协议，sing-box 完全不参与。把它硬塞进 warp.members
+    # 会得到一个「有 service、有端口」的假成员，所有探测路径都会去连一个不存在的
+    # socks 口。
+    #
+    # 默认 enabled=False / takeover=False：打开之前不改变现网任何一个字节。
+    # takeover=True 才让 daemon 在 403/429 之后改用中继轮换而不是 WARP 换线 ——
+    # 两者同时动会互相抵消（一个换隧道、一个换池），日志里看不出是谁在动。
+    "vercel": {
+        "enabled": _env_bool("ASIP_VERCEL_ENABLED", False),
+        "takeover": _env_bool("ASIP_VERCEL_TAKEOVER", False),
+        # 只接管这一个 provider。opencode 是 9router 里的 noAuth free provider，
+        # 它的出口就是 providerStrategies.opencode（auth.js 里写死的判据）。
+        "provider": os.environ.get("ASIP_VERCEL_PROVIDER") or "opencode",
+        # round-robin：9router 每请求现算（pickProxyPoolId），写库即生效，不用重启。
+        # 单条 relay 的出口 IP 本来就常变，轮换的意义是分散到多个部署/区域。
+        "strategy": os.environ.get("ASIP_VERCEL_STRATEGY") or "round-robin",
+        "ledger_path": _env_path(
+            "ASIP_VERCEL_LEDGER", os.path.join(PROJECT_DIR, ".vercel_relay.json")),
+        "probe_target": os.environ.get("ASIP_VERCEL_PROBE_TARGET") or "https://api.ipify.org",
+        "probe_timeout_sec": 10.0,
+        # 同一个出口地址在这个窗口内不再选（与 warp.ip_reuse_guard_sec 同量级）。
+        "guard_sec": _env_int("ASIP_VERCEL_GUARD_SEC", 86400),
+        # 至少要留几个 active 池。低于它就别 off —— 一个空池等于直连真实 IP。
+        "min_active_pools": _env_int("ASIP_VERCEL_MIN_ACTIVE", 2),
+        # daemon 侧两次中继轮换的最小间隔，防 429 风暴里连环写库。
+        "rotate_cooldown_sec": _env_int("ASIP_VERCEL_ROTATE_COOLDOWN", 5),
+        # 部署（asip vercel deploy）：Vercel token 只从环境变量/.env 读，不落台账。
+        "deploy": {
+            "count": _env_int("ASIP_VERCEL_DEPLOY_COUNT", 3),
+            "region": os.environ.get("ASIP_VERCEL_REGION") or "",
+            "project_prefix": os.environ.get("ASIP_VERCEL_PROJECT_PREFIX") or "asip-relay",
         },
     },
     "log_file": _env_path("ASIP_LOG_FILE", os.path.join(PROJECT_DIR, "daemon.log")),

@@ -105,6 +105,8 @@ WARP 控制
   asip warp log        跟随 daemon 日志中与 WARP 换线相关的行
   asip warp jlog       跟随 usque 隧道 journal（默认滤噪）
   asip warp jlog all   同上，不过滤
+  asip vercel status   Vercel 中继：台账 + 9router 池/策略 + 开关
+  asip vercel probe    经每条中继探出口 IP（-h 看全部子命令）
 
 收件箱（Sister Bus，各角色报给本项目的消息）
   asip inbox           本项目相关的未读消息（关键词过滤，约 4%）
@@ -525,6 +527,9 @@ case "${1:-}" in
   -h|--help|help) _usage ;;
   warp) shift; cmd_warp "$@" ;;
   inbox|inb) shift; cmd_inbox "$@" ;;
+  # Vercel 中继：子命令全在 python 里（argparse 管，别在 bash 里再抄一份参数表）。
+  # 用 exec 而不是调用后返回：退出码要原样透出去（2 = 有 relay 不可用）。
+  vercel) shift; exec "$ASIP_PY" "$ASIP_DIR/vercel_relay_cli.py" "$@" ;;
   st|status)
     out=$(_singbox GET /proxies/$ASIP_WARP_SELECTOR | grep -oP '"now"\s*:\s*"\K[^"]+')
     # 「当前」必须跟着模式走：WARP 模式下 opencode 走 opencode-out 指向的隧道，

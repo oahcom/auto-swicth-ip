@@ -142,8 +142,8 @@ tag 换指新节点时不继承旧 `strikes`；`save_state` 补目录 `fsync`。
 
 - 撤 `90-administrator-nopasswd`（我建议撤，改成只放行 `asip-unit`）。
 - `.warp/wglines/line13~16/` 里还留着 4 条已停用线路的 WARP 私钥。
-- 运行时状态（`.dormant_state.json` / `.pool_history.json` / `.dormant_probe.lock`）、`dormant_probe.py` 已加进 `.gitignore`（`.sub_stats.json` 已删除，不再存在）；
-  **但 `dormant_probe.py` 与本文档本身仍是未跟踪文件、也不在 `.gitignore` 里** —— `git clean -fd` 会真的删掉它们（22KB 的探测脚本 + 这份台账），别当它们是安全的。
+- 运行时状态（`.dormant_state.json` / `.pool_history.json` / `.dormant_probe.lock`）已加进 `.gitignore`（`.sub_stats.json` 已删除，不再存在）；
+  **`dormant_probe.py` 与本文档曾经是未跟踪文件**（`git clean -fd` 会真的删掉：22KB 探测脚本 + 这份台账）；20:48:43 有一次提交 `2e1b596` 把整棵树收了进去，**那次提交不是我做的** —— 从那时起两者都已入库、`git clean -fd` 不会再删它们。但这也意味着**这个仓库有第二个写者**（同一时段还留下了 `daemon.py.pre-ha-audit`），动文件前先 `git status` 看一眼。
 - `/tmp` 里还有今天摸出来的临时脚本和几份含凭据的 JSON 快照（`pq_*.json`）。
 - 21 个已停用单元的 `[Install]` 段还在，`systemctl preset-all` 会把它们全部拉回来。
 
@@ -203,12 +203,12 @@ tag 换指新节点时不继承旧 `strikes`；`save_state` 补目录 `fsync`。
 | # | 我干的事 | 症状 | 修法 |
 |---|---|---|---|
 | 1 | 给 daemon 单元加 `CapabilityBoundingSet=` | sudo-rs panic（`could not restore to saved user id`），12 条 WARP 线全拉不起来 | 撤掉，单元里写明为什么不能加 |
-| 2 | 补丁把 `def _discard(path: str):` 写了两遍 | **daemon 语法错误，systemd 重启 12 次**；轮换从 19:28:12（SIGTERM）停到 19:30:05（横幅），**约 113 秒**，其中崩溃循环段 19:29:24–19:30:05 约 40 秒。sing-box 没停（`KillMode=process`），代理本身依旧可用 | 去重；此后每个补丁跑完先 `ast.parse` 再重启 |
+| 2 | 补丁把 `def _discard(path: str):` 写了两遍 | **daemon 语法错误，journal 记到 10 次 `exited`**；轮换从 19:28:12（SIGTERM）停到 19:30:05（横幅），**约 113 秒**，其中崩溃循环段 19:29:24–19:30:05 约 40 秒。sing-box 没停（`KillMode=process`），代理本身依旧可用 | 去重；此后每个补丁跑完先 `py_compile` 再重启（`ast.parse` 不看 `global` 这类规则） |
 | 3 | `ExecStopPost` 里写了 `printf "%s"` | systemd 把 `%s` 当"用户 shell"说明符，日志里变成 `/bin/bash` | 所有 `%` 写成 `%%` |
 | 4 | 正则改 `make_config` 签名 | 生成 `stats_out=None): -> dict:` → `parse_subscription.py` 直接起不来（daemon 报"✗ 订阅解析失败 (rc=1)"；19:31:02 那句"无可用订阅源"来自一个**旁路进程**，不是常驻 daemon —— 同一进程 33 秒后又成功刷新过） | 手改回 `stats_out=None) -> dict:` |
 | 5 | 替换区间跨过了变量声明 | `alive/errors/transitions` 被连带删除，探测 `NameError` | 补回 |
 | 6 | 用 root 跑过一次探测 | 锁文件变 root:root 0600，administrator 的定时器打不开 | chown + 代码里加容错分支 |
-| 7 | 给 `log()` 加"每 5 分钟重试建文件 handler"时，把 `global _logger` 写在使用之后 | **SyntaxError，daemon 20:09–20:23 崩了 94 次、约 14 分钟不可用**（代理没断，轮换停了） | 删掉重复的 `global`（第一次声明就够） |
+| 7 | 给 `log()` 加"每 5 分钟重试建文件 handler"时，把 `global _logger` 写在使用之后 | **SyntaxError，daemon 20:09–20:23 不可用约 14 分钟**（journal：`Started` 81 次、`exited` 80 次）（代理没断，轮换停了） | 删掉重复的 `global`（第一次声明就够） |
 | 8 | 审查脚本 import 了 daemon 并调 `log()` | 假事件写进生产 `daemon.log`，`grep` 会得出"拦了 3 次"的错结论 | 副作用闸：只有 systemd 进程（`INVOCATION_ID`）才写文件日志 |
 
 **教训一句话**：这一夜里"改坏"的次数比"改好"的次数少不了多少，每一次都是同一个原因 ——
@@ -218,9 +218,9 @@ tag 换指新节点时不继承旧 `strikes`；`save_state` 补目录 `fsync`。
 **而且 `ast.parse()` 不是语法检查。** 第 7 条那个 `global` 声明顺序的问题，
 `ast.parse()` 照单全收（它只管括号和缩进），只有 `compile()` 才报
 `name '_logger' is used prior to global declaration`。我用 ast 做了三次"语法 ok"的
-确认，daemon 崩了 94 次。**以后一律 `python3 -m py_compile`。**
+确认，daemon 崩了 80 多次。**以后一律 `python3 -m py_compile`。**
 
-**顺带**：无限重启比"停住"更糟 —— 94 次重启把真问题埋进了滚动日志，还让人以为
+**顺带**：无限重启比"停住"更糟 —— 80 多次重启把真问题埋进了滚动日志，还让人以为
 服务还在跑。所以 `auto-switch-ip.service` 加了 `StartLimitIntervalSec=300` +
 `StartLimitBurst=5`：5 次起不来就停住等人看。
 
@@ -232,7 +232,9 @@ tag 换指新节点时不继承旧 `strikes`；`save_state` 补目录 `fsync`。
 
 它有两个用处：① `md5sum -c md5sum.txt` 一眼看出"现在跑的还是不是这一版"；② 真要回到过去，用下面表里的 `.bak-*` / `.pre-*`。
 
-**留底**：`backups/` 与所有 `.bak-*` 都在 `.gitignore` 里、且只在这一块盘上 —— `git clean -fdx` 或盘坏就一起没了。稳妥做法是把 `backups/` + `*.bak-*` + `*.pre-*` 打成一个 tar 放到仓库外（例：`tar czf ~/asip-backup-$(date +%F).tgz backups/ *.bak-* *.pre-*`）。想要"改之前"的样子用同目录下的 `.bak-*`：
+**核对会 FAILED，多数时候是正常的。** 快照拍的是 19:50 那一刻，之后每改一次它就会"过期"一格：现在 `daemon.py` 对不上（快照 `f536ee37…` → 现役 `49d50dfa…`）、`.gitignore` 也对不上，都是 19:50 之后正常修的东西。**要判断"跑的是不是最新那版，用这一轮的冻结 md5"**：`daemon.py 49d50dfa…` / `dormant_probe.py 73f4b47f…` / `parse_subscription.py 68cf5f9e…` / `warp_wg.py 50378cad…`（第六轮之后 `daemon.py`、`dormant_probe.py` 又变过，见文末口径）。快照唯一不可替代的用处是"回到 19:50 那个状态"，以及 `sudoers.d.txt` 这种事后查不到的东西。
+
+**留底**：`backups/` 与所有 `.bak-*` / `.pre-*` 现在都在 `.gitignore` 里 —— 所以 `git clean -fd` **不会**碰它们（这一点第六轮刚查出来原来说错了：`backups/` 之前根本没被忽略，`clean -fd` 会连 `md5sum.txt` 一起删）。但 `git clean -fdx` 会，盘坏也会，因为它们只在这一块盘上。稳妥做法是把 `backups/` + `*.bak-*` + `*.pre-*` 打成一个 tar 放到仓库外（例：`bash -c 'shopt -s nullglob; tar czf ~/asip-backup-$(date +%F).tgz backups/ *.bak-* *.pre-*'` —— **必须带 `nullglob`**：哪天一份前像都不剩了，`*.bak-*` 会原样传给 tar，tar 报 `Cannot stat` 并以 rc=2 退出，你以为备份好了其实只打了一半）。想要"改之前"的样子用同目录下的 `.bak-*`：
 
 | 要回到 | 文件 | 说明 |
 |---|---|---|
@@ -246,10 +248,46 @@ tag 换指新节点时不继承旧 `strikes`；`save_state` 补目录 `fsync`。
 所以真要整文件回退，先 `git diff > /tmp/parse.diff` 留底，再手工摘。
 
 **顺序**：
-1. 覆盖 .py → `python3 -c "import ast; ast.parse(open(f).read())"` 过语法
+1. 覆盖 .py → `python3 -m py_compile daemon.py dormant_probe.py parse_subscription.py warp_wg.py`
+   （**不要用 `ast.parse`**：它放过了今晚那次 `global` 声明顺序的崩溃）
 2. `sudo systemctl daemon-reload`（**改过 unit 就必须做这一步**，否则重启的还是旧参数）
 3. `sudo systemctl restart dormant-probe.timer`；daemon 用 `kill <MainPID>` 让 systemd 拉起。改过 unit 之后顺手核一眼 `systemctl show dormant-probe.timer -p NextElapseUSecRealtime` —— `OnCalendar` + `Persistent=true` 会按新时间重算，别以为"重启了就等于按原计划"
-4. 状态文件**不必删**（格式没变）。只有回滚到"锁在 /tmp"那一版时，项目目录里的
+4. 如果 unit 起不来了，先看 `systemctl status` 是不是 `start request repeated too quickly` —— `StartLimitBurst=5` 生效之后，50 秒内连崩 5 次就会被锁住，必须 `sudo systemctl reset-failed auto-switch-ip.service` 才能再起。**注意 `KillMode=process`：unit 停住时 sing-box 可能还在跑，7890 还能用，别以为"daemon 在跑"。**
+5. 状态文件**不必删**（格式没变）。只有回滚到"锁在 /tmp"那一版时，项目目录里的
    `.dormant_probe.lock` 会变成孤儿，删掉即可
-5. 回滚会丢掉：统计通道、24h 滚动窗口护栏（旧的是棘轮，会永久拒收）、临时实例失败
+6. 回滚会丢掉：统计通道、24h 滚动窗口护栏（旧的是棘轮，会永久拒收）、临时实例失败
    尾部日志与换端口重试、真锁、`ExecStopPost` 时间戳、日志兜底与副作用闸
+
+
+---
+
+## 第六轮之后补的口径（2026-10-28 21:00）
+
+- **新池子日志格式还没在线上出现过。** `池子成员 N（订阅节点 X + 仅休眠源 Y = 在池 N + 判死摘出 Z）`
+  是 20 点后改的，要等下一次小时刷新才会第一次写进 `daemon.log`。在那之前
+  `grep '池子成员 39（'` 得 0 是正常的，不代表没改。
+- **判死数会动。** 文里举的"判死摘出 78"是某一刻的快照；探测那边 20:05 写的是 77 条。
+  差 1 不代表谁错 —— 判死的口径是 `strikes >= 2`，一条节点刚好卡在中间就会左右晃。
+  要比就比同一时刻的 `.dormant_state.json`。
+- **`本会话重启 N 次` 指的是"当前这个 daemon 进程生命周期内"**，不是今天累计。
+  20:39–20:43 那段 16 秒里 30 多行 `↻ 重启 WARP-WG-N（出口处于惩罚期）`，是 WARP 出口
+  全被 quota 惩罚时的正常反应（每次换线都会试一轮），**没有做日志限流**。真要在里面
+  挑坏线，看 `退出=探测失败` 和 `模型层` 两种行，别数 `↻ 重启`。
+- **`dormant-probe` 退出码表**（`ExecStopPost` 会把码翻成中文写进 `daemon.log`）：
+
+  | 码 | 含义 | 先查什么 |
+  |---|---|---|
+  | 0 | 正常 | — |
+  | 1 | 未捕获的内部异常 | `journalctl -u dormant-probe` 的 traceback |
+  | 2 | 读不到现役配置 | `singbox-config.json` 在不在、daemon 是否正在换配置 |
+  | 3 | 探测链路故障过多（含"全垮"） | 临时 sing-box 能不能起、DNS、上游代理 |
+  | 4 | `sing-box` 起不来 | 二进制、执行权限、`RestrictAddressFamilies` |
+  | 5 | 端口反复撞号 | 本机端口占用（重启后还撞才需要管） |
+  | 124 | 超时被 `TimeoutStartSec=1800` 杀掉 | 卡住的那个节点 |
+
+- **`StartLimitIntervalSec` 只在 unit 文件里叫这名**；`systemctl show` 的属性名是
+  `StartLimitIntervalUSec`，拿前者去 show 会打印空，别误判成"没设置"。
+- **`log()` 的重建挪进锁里了。** 第六轮实测：重建在锁外时 720 条丢 120 条（17%）；
+  挪进 `_log_lock` 之后，用同样的"每条都强制重建"最坏场景压 8 线程 × 30 条，
+  240 条全落盘、0 丢 0 重复。顺带补了两种自愈：文件 handler 丢了、以及**文件被删了**
+  （后者 `_logger_has_file()` 看不出来，日志会静默写进已删除的 inode）。
