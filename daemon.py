@@ -3091,7 +3091,7 @@ def _quarantine_line(tag: str, ip: str | None, seconds: float, now: float) -> No
     """
     cap = float(_warp().get("line_quota_quarantine_max_sec", 7200))
     until = now + (min(float(seconds), cap) if cap > 0 else float(seconds))
-    ratio = float(_warp().get("line_quota_quarantine_max_ratio", 0.6))
+    ratio = float(_warp().get("line_quota_quarantine_max_ratio", 0.8))
     # 分母用「状态表里的线」而不是 members：members 只登记了 15 条（12 WG + 3
     # usque），状态表有 20 条，按 members 算 80% 会变成 12/15 —— 提前把闸关死。
     members = _warp().get("members") or []
@@ -3115,7 +3115,8 @@ def _trim_quarantine_locked() -> None:
 
     隔离是强相关的：一次账号级配额窗口会让十几条线在同一分钟写入同一个
     quota_until（2026-10-28 实测 14/20，其中 10 条值完全相同）。超过上限就
-    提前解禁解禁最晚的那几条，否则池子里只剩 6 条活线，很快被烧到 0。
+    提前解禁的是「最早到期」的那几条（它们本来就快解禁，放出来代价最小），
+    否则池子里只剩 6 条活线，很快被烧到 0。
     """
     ratio = float(_warp().get("line_quota_quarantine_max_ratio", 0.6))
     members = _warp().get("members") or []
