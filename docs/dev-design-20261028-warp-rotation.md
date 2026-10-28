@@ -168,11 +168,12 @@
 
 ### 2.7 CF（usque）线 20 → 3（1 条 v4 + 2 条 v6）
 
-**背景**：20 条 usque 线是 2026-10-22 为扛排空并发扩的（当时池里只有 usque）。现在 16 条
+**背景**：20 条 usque 线是 2026-10-22 为扛排空并发扩的（当时池里只有 usque）。现在 12 条
 WARP-WG 线与 usque 同在 `warp.members` 一张表里参与轮换，容量不再需要靠 usque 数量堆；
-多留的 17 条只是多 17 份注册身份、17 个待探测端口、17 个常驻进程。
+多留的 17 条原本只是多 17 份注册身份、17 个待探测端口、17 个常驻进程
+（2026-10-28 已全部 `stop` + `disable`，常驻进程现为 0）。
 
-**改动**（`config.py:233`）：
+**改动**（`config.py:257`）：
 
 ```python
 "members": [
@@ -183,17 +184,22 @@ WARP-WG 线与 usque 同在 `warp.members` 一张表里参与轮换，容量不�
 ```
 
 - `.warp/warp-outbound.json` 重新生成（**必须带 `WARP_WG_FAMILIES` / `WARP_WG_NODES`**，
-  否则 `_append_wg_members` 不生效，会连带把 16 条 WG 冲掉 —— 本次已踩过一次并修正）
-- `singbox-config.json` 用 `parse_subscription.make_config(nodes)` 从现有 27 个节点重建
-  （订阅源不可用，只能走"提取现有节点 + 合并 WARP 出口"路径），`sing-box check` 通过
-- 17 个 usque 单元 `stop`，单元文件移到 `/root/usque-units-removed/`（`mask` 对真实单元文件无效，
-  必须移走），`daemon-reload`
+  否则 `_append_wg_members` 不生效，会连带把 12 条 WG 冲掉 —— 本次已踩过一次并修正）
+- `singbox-config.json` 用 `parse_subscription.make_config(nodes)` 重建（订阅源不可用时
+  只能走"提取现有节点 + 合并 WARP 出口"这条路）；重建时是 27 个节点，2026-10-28 收工时
+  池子是 36 个。`sing-box check` 通过
+- 17 个 usque 单元 `stop` + `disable`，**单元文件留在 `/etc/systemd/system/` 没移走**
+  （2026-10-28 复核：文档原先写的是「移到 `/root/usque-units-removed/`」，实际没做；
+  文件留着反而好回滚 —— 想恢复就 `systemctl enable --now`，不用重装单元），`daemon-reload`
 
 **原因**：v4/v6 各留一条是为了保住两个出口地理位置（v6 → SJC，v4 → LAX）；缩到 3 条后
-CF 只作为兜底，主力轮换交给 16 条 WG。
+CF 只作为兜底，主力轮换交给 12 条 WG（2026-10-28 由 16 条收缩，见 §7.2）。
 
-**验证**：`/etc/systemd/system` 只剩 `usque-warp{,-b,-d}.service`；端口只剩 1080/1081/1083；
-Clash API `proxies=50`（27 节点 + 3 CF + 16 WG + selector 等），`CF 3 / WG 16`。
+**验证**（2026-10-28 实测）：**只有 `usque-warp{,-b,-d}.service` 是 active+enabled**，
+另外 17 个单元文件仍在 `/etc/systemd/system/` 但为 `inactive`+`disabled`；端口只剩
+1080/1081/1083；配置出站合计 135 条，`proxy` 组 39 个节点成员（10.28 晚实测；数字随沉睡池浮动）（selector 里再加上
+末尾的 `direct` 一共 37 项 —— 数 `len(outbounds)` 会看到 37，那不是错），
+`opencode-out` 组 16 个成员（3 条 CF + 12 条 WG + proxy），`CF 3 / WG 12`。
 
 ---
 
@@ -201,8 +207,8 @@ Clash API `proxies=50`（27 节点 + 3 CF + 16 WG + selector 等），`CF 3 / WG
 
 **背景**：此前因 503 风暴把 `proactive_mode` 临时改成 `fixed`（60s 到点切走）。
 
-**改动**：`config.py:274` `proactive_mode: "fixed" → "requests"`；
-`proactive_after_dsv4_ok` 保持 **150**（`config.py:293`）。
+**改动**：`config.py:300` `proactive_mode: "fixed" → "requests"`；
+`proactive_after_dsv4_ok` 保持 **150**（`config.py:319`）。
 
 **原因**：时间判据与配额扣减不同源 —— 实测主动段 dsv4 成功中位 113.5 / p90 175，60s 上限本身
 就在扔掉没用完的配额；而 429 段存活中位仅 6s。requests 模式数的是配额格数，与扣减同源，
@@ -361,7 +367,10 @@ sudo pkill -f "sing-box run -c /home/administrator/dkk-projects/auto-switch-ip/s
 
 - 台账映射（`wg_colo_map.json` / `wg_colo_v6.json`）与实测采样均无跨 colo 重复 IP；
   每 colo 的 v4 `/24` 互不相同，v6 `/48` 无跨 colo 复用。
-- 组↔colo 由 detour 决定且固定：**WG-1~4=NRT、5~8=PHX、9~12=SIN、13~16=SJC**。
+- 组↔colo 由 detour 决定且固定。**2026-10-28 拓扑改成 12 条**（每 colo 3 条 =
+  1 条 v4 + 2 条 v6）：**WG-1~3=NRT、WG-4~6=SIN、WG-7~9=PHX、WG-10~12=SJC**。
+  （原文写的是 16 条时代的分组 `WG-1~4=NRT、5~8=PHX、9~12=SIN、13~16=SJC`；
+  改理由见 §6 的 usque 收缩条目，改动后 `warp-wg-13~16.service` 不再是拓扑的一部分。）
   → 某组地址被烧 = 整组被烧，重启换不出别的 colo。这是 WG-1/2/3 看起来"死"的根因。
 
 ### 7.3 现有 27 节点清单的实测 colo
@@ -477,8 +486,9 @@ SIN 5 个地址里最偏的一个节点 8 次全抽到 `.222.43`，另一个节�
 
 ### 8.5 线路映射
 
-每个 colo 一条 v4（`WARP_WG_FAMILIES=v4,v6,v6,v6`）→ v4 线只有 WG-1/5/9/13，其余 12 条走 v6。
-于是 4 条 v4 线共享上面那 14 个地址，12 条 v6 线地址近似无限。
+每个 colo 一条 v4。**2026-10-28 起族序是 `v4,v6,v6`、每组 3 条**（原文写的是
+`v4,v6,v6,v6`/每组 4 条的 16 条时代）→ v4 线是 WG-1/4/7/10，其余 8 条走 v6。
+于是 4 条 v4 线共享上面那 14 个地址，8 条 v6 线地址近似无限。
 
 ### 8.6 结论
 

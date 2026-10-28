@@ -251,9 +251,9 @@ CFG = {
         #
         # 2026-10-28 主人定：CF/usque 线从 20 条缩到 3 条 —— 1 条 v4 + 2 条 v6。
         # 旧的 20 条是为了扛排空并发（换线间隔 p50 8s、排空 p50 68s），当时
-        # 池里只有 usque；现在 16 条 WARP-WG 线并入同一个 members 表分担轮换，
+        # 池里只有 usque；现在 12 条 WARP-WG 线并入同一个 members 表分担轮换，
         # 容量不再需要靠 usque 数量堆，多留的 17 条只是多 17 份注册身份和
-        # 17 个待探测端口。
+        # 17 个待探测端口（2026-10-28 已全部 stop + disable，单元文件留着好回滚）。
         "members": [
             {"tag": "WARP-CF", "port": 1080, "service": "usque-warp.service", "ipv6": True},
             {"tag": "WARP-CF-B", "port": 1081, "service": "usque-warp-b.service", "ipv6": True},
@@ -519,7 +519,12 @@ CFG = {
         # 它挡的从来不是观测，而是「把一个确定不能用的地址换掉」这个动作本身：
         # 撞上限后线路就原地带着烂地址继续跑，比多重启几次更糟。
         # 现在唯一的间隔来源是 restart_cooldown_sec 这个固定冷却。
-        "restart_max_per_hour_per_line": 0,
+        "restart_max_per_hour_per_line": 20,
+        # 全局重启节流（条/分钟，0=关）。单线上限管不住 19 条线叠加：
+        # 2026-10-28 19:36~20:08 实测 10028 次重启 / 125 分钟。
+        "restart_max_per_minute": 12,
+        # 撞到长 Retry-After 的线隔离多久（秒，下限）。低于这个值算瞬时限流，照常换。
+        "line_quota_quarantine_min_sec": 1800,
         # 同时在飞的重启数。每条 quota/blocked 线都要「重启换地址 → 等就绪 →
         # 重探」，这个闸才是现在的真正吞吐瓶颈：4 槽 × 一次 3~5s ≈ 20~40 条/分钟。
         # 12 是折中：16 条同时注册会撞 Cloudflare 的 ~9 台/窗口限流，吃 429 后

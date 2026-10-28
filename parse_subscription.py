@@ -3,6 +3,7 @@
 解析 okz 订阅，生成 sing-box 配置
 """
 import base64
+import os
 import json
 import urllib.parse
 import sys
@@ -504,6 +505,183 @@ def _load_warp_outbounds() -> list[dict]:
 
 
 
+def _load_dormant_outbounds() -> list[dict]:
+    """休眠节点：订阅源暂时不可用、但节点随时可能复活的。
+
+    现状（2026-10-28 实测）：okz 的订阅**是活的**（HTTP 200、64 条 URL），但里面的
+    节点全死。所以它们被抽出来放在这份外挂文件里：出站保留，池子成员按实测动态剔除。
+
+    与 WARP 出站共用「主配置外挂一份 JSON」的做法，区别是这些节点要进
+    主池 selector —— daemon 的轮换与降级判断看的是主池成员。放在订阅节点
+    之后；selector 的 default 由 `_pick_default` 依证据挑（**不是** nodes[0]），
+    所以不会被死节点顶掉。
+    """
+    p = Path(__file__).resolve().parent / "dormant-outbounds.json"
+    try:
+        with open(p) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        print(f"  休眠节点文件读取失败，跳过: {e}", file=sys.stderr)
+        return []
+    items = data if isinstance(data, list) else [data]
+    out = [o for o in items
+           if isinstance(o, dict) and o.get("tag") and o.get("type")
+           and o.get("server") and o.get("server_port")]
+    if len(out) != len(items):
+        print(f"  dropped {len(items) - len(out)} invalid dormant entries",
+              file=sys.stderr)
+    return out
+
+
+def _node_fp(node: dict) -> str:
+    """节点指纹。tag 是订阅到达顺序分配的（`~N` 后缀），源一换序，同一个 tag
+    可能换指另一个物理节点；状态证据按指纹核对，对不上就整条忽略。"""
+    tr = node.get("transport") or {}
+    tls = node.get("tls") or {}
+    ws = ""
+    if isinstance(tr, dict):
+        ws = f"{tr.get('type', '')}|{tr.get('path', '')}|{tr.get('host', '')}"
+    sni = tls.get("server_name") if isinstance(tls, dict) else ""
+    return f"{node.get('server')}|{node.get('server_port')}|{node.get('type')}|{ws}|{sni}"
+
+
+def _load_dormant_state(current: list[dict] | None = None) -> set[str]:
+    """沉睡池状态：`alive: false` 的 tag（由 dormant_probe.py 实测写入）。
+
+    读不到或格式不对就当空集 —— 探测脚本没跑过时行为与原来一致（全进池子）。
+    不能因为一个状态文件读失败，把整池子节点挡在门外。
+
+    三条过滤（2026-10-28 三方审查补的）：
+      - 字符串 "false" 也认，免得手写过一次就让整套机制静默失效；
+      - 证据有保质期（7 天）：一周前判死的不能当今天的事实；
+      - 记录带 `fp` 且与当前同 tag 节点的指纹不符 → 整条忽略（tag 被别的节点占了）。
+    """
+    p = Path(__file__).resolve().parent / ".dormant_state.json"
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        # 静默返回空集 = 判死的节点整批回池，且日志上跟"今天没判死任何节点"无法区分。
+        print(f"  ⚠ 沉睡池状态读不到（{e}），本轮全部节点进池子", file=sys.stderr)
+        return set()
+    entries = d.get("nodes") if isinstance(d, dict) else None
+    if not isinstance(entries, dict):
+        return set()
+    import time
+    now = time.time()
+    fps = {n["tag"]: _node_fp(n) for n in (current or [])}
+    out: set[str] = set()
+    for t, v in entries.items():
+        if not isinstance(v, dict):
+            continue
+        alive = v.get("alive")
+        is_dead = alive is False or (
+            isinstance(alive, str) and alive.strip().lower() in ("false", "0", "no"))
+        if not is_dead:
+            continue
+        try:
+            checked = float(v.get("checked") or 0)
+        except (TypeError, ValueError):
+            checked = 0.0
+        if checked and (now - checked) > 7 * 24 * 3600:
+            continue
+        fp = v.get("fp")
+        if fp and t in fps and fp != fps[t]:
+            continue          # tag 被别的节点占了，旧证据作废
+        out.add(t)
+    return out
+
+
+def write_sub_stats(out_path, sub_nodes: int, dormant_source_nodes: int,
+                    pool_nodes: int, dead_nodes: int, fallback: bool) -> None:
+    """把"这一次生成了什么"写在**配置文件旁边**（`<out>.stats.json`）。
+
+    WHY 不写仓库根的一个固定文件（2026-10-28 三轮审查，两条都是实测出来的）：
+      - 任何手工跑、pytest、`--out /tmp/...` 试跑都会调 make_config，写固定路径会
+        把线上基线污染成试跑的数值（实测：`.sub_stats.json` 的 mtime 是 18:58 的
+        一次试跑，而线上配置是 18:15 生成的）。
+      - 峰值不能在这里算：`ts` 每次刷新都被重写，"距上次写 >24h 才重置"永远不成立
+        → 基线变成"自上次中断以来的历史最大"，只会涨不会落，一次合法的池子腰斩
+        就把订阅刷新永久钉死（实测：pool 128 → 60 之后每一轮都被拒）。
+    滚动窗口交给 daemon：它按真实时间戳保存样本序列，自己 prune。
+    """
+    import time as _t
+    if not out_path:
+        # 不传路径就什么都不写。以前会写出 "None.stats.json" —— pytest 里 15 处
+        # make_config(...) 不带 stats_out，在仓库根跑一遍就掉一个未跟踪文件。
+        return
+    try:
+        tmp = str(out_path) + ".stats.json.tmp"
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"sub_nodes": sub_nodes,
+                       "dormant_source_nodes": dormant_source_nodes,
+                       "pool_nodes": pool_nodes,
+                       "dead_nodes": dead_nodes,
+                       "fallback": bool(fallback),
+                       "ts": _t.time()}, f)
+        os.replace(tmp, str(out_path) + ".stats.json")
+    except OSError as e:
+        print(f"  ⚠ 订阅统计写入失败（本轮不做骤降判定）: {e}", file=sys.stderr)
+
+
+def _pick_default(nodes: list[dict]) -> str:
+    """取一个「有存活证据」的节点当 selector 默认值。
+
+    两份证据都在磁盘上、都由别人持续写：
+      - `.bad_nodes.json`        daemon 的临时封禁（tag → {expire, reason}），过期不算
+      - `.warp/wg_colo_map.json` 实测 colo 台账，`ok: false` = 探不通
+
+    优先级：实测 ok:true → 证据不明的 → （全死时）nodes[0]。
+    为什么不在这里现测：生成配置是热路径，128 条逐个连一遍要几分钟；而「默认值」
+    只要不是死节点就够，剩下的交给 daemon 轮换 —— 别在这儿替它做决策。
+    """
+    import time
+    if not nodes:
+        return "direct"
+    base = Path(__file__).resolve().parent
+    now = time.time()
+    dead: set[str] = set()
+    alive: set[str] = set()
+    try:
+        with open(base / ".bad_nodes.json") as f:
+            for t, v in json.load(f).items():
+                if isinstance(v, dict) and (v.get("expire") or 0) > now:
+                    dead.add(t)
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(base / ".warp/wg_colo_map.json") as f:
+            raw = json.load(f)
+        raw = raw if isinstance(raw, dict) else {}
+        cm = raw.get("nodes") or {}
+        # 台账里有 updated。太旧的 ok:true 不能当「实测通」用：一次探测的结论
+        # 最多管一天，之后节点可能早换了落地。
+        try:
+            upd = float(raw.get("updated") or 0)
+        except (TypeError, ValueError):
+            upd = 0.0
+        if upd and (now - upd) > 24 * 3600:
+            print(f"  colo 台账已过期 {(now - upd) / 3600:.0f} 小时，"
+                  f"选默认值时不予采信", file=sys.stderr)
+            cm = {}
+        for t, v in cm.items():
+            if not isinstance(v, dict):
+                continue
+            if v.get("ok") is False:
+                dead.add(t)
+            elif v.get("ok") is True:
+                alive.add(t)
+    except (OSError, ValueError):
+        pass
+    pick = [n["tag"] for n in nodes if n["tag"] in alive and n["tag"] not in dead]
+    if not pick:
+        pick = [n["tag"] for n in nodes if n["tag"] not in dead]
+    return pick[0] if pick else nodes[0]["tag"]
+
+
 def _build_inbounds(listen_port: int) -> list[dict]:
     """环回入站（必有）+ 局域网入站（配了端口且有认证时才建）。
 
@@ -560,7 +738,7 @@ def _build_lan_guard(inbounds: list[dict]) -> list[dict]:
 
 def make_config(nodes: list[dict], listen_port: int = 0,
                 clash_port: int = 0, clash_secret: str = "",
-                include_h2: bool = False) -> dict:
+                include_h2: bool = False, stats_out=None) -> dict:
     """生成 sing-box 配置：mixed port + selector + clash API
 
     include_h2: 是否包含 hysteria2 节点（WSL2 下 utls 不兼容，默认排除）
@@ -579,11 +757,50 @@ def make_config(nodes: list[dict], listen_port: int = 0,
         print(f"  dropped {before - len(nodes)} invalid nodes (missing server/port or loopback)", file=sys.stderr)
     if not include_h2:
         nodes = [n for n in nodes if n.get("type") != "hysteria2"]
-    # 与订阅节点同 tag 时丢弃 WARP 条目（订阅里同名节点优先）
+    # 休眠节点排在订阅节点之后：default 由 _pick_default 挑，不会被死节点顶掉。
+    # 订阅复活后同名 tag 由 node_tags 挡掉，不会重复。
     node_tags = {n["tag"] for n in nodes}
-    warps = [w for w in _load_warp_outbounds() if w["tag"] not in node_tags]
-    outbounds = nodes[:] + warps
+    dormant = [d for d in _load_dormant_outbounds()
+               if d["tag"] not in node_tags]
+    if not include_h2:
+        # hysteria2 在 WSL2 下 utls 不兼容（默认排除）。休眠文件是外挂的，不跟着
+        # 这个开关走就会从后门把 h2 放进池子。
+        dormant = [d for d in dormant if d.get("type") != "hysteria2"]
+    dormant_tags = {d["tag"] for d in dormant}
+    # 与订阅节点/休眠节点同 tag 时丢弃 WARP 条目：命名空间撞上就是重复 outbound，
+    # sing-box check 直接 FATAL，刷新会永远失败。
+    warps = [w for w in _load_warp_outbounds()
+             if w["tag"] not in node_tags and w["tag"] not in dormant_tags]
+    if dormant:
+        print(f"  + {len(dormant)} 个休眠节点（订阅源暂时不可用，等它复活）",
+              file=sys.stderr)
+    outbounds = nodes[:] + dormant + warps
     outbounds.append({"type": "direct", "tag": "direct"})
+
+    # 沉睡池：出站全留着（参数、tag、订阅里的原样都在），但**池子成员按实测进出**。
+    # `.dormant_state.json` 由 dormant_probe.py 写：alive:false = 刚探过、确实不通。
+    # 动机：okz 那 65 个死节点留在池里时，daemon 每轮都在「撞死节点 → 标死 30 秒
+    # → 再撞」之间空转（实测 dead=81），把换线机会浪费在注定失败的节点上。
+    sleeping = _load_dormant_state(nodes + dormant)
+    total = len(nodes) + len(dormant)
+    pool_objs = [x for x in nodes + dormant if x["tag"] not in sleeping]
+    dropped = total - len(pool_objs)
+    fallback = False
+    if len(pool_objs) < 3:
+        # 全被判死时宁可空转也不能让池子空着：selector 没成员就直接不可用。
+        # 但这必须喊出来 —— 退回全部等于「把判死的节点又放回来」，静默做就是骗人，
+        # 而且计数会变成 0，日志上跟「完全没过滤」无法区分。
+        print(f"  ⚠ 只剩 {len(pool_objs)} 条没被判死（共 {total} 条），退回全部节点；"
+              f"池子里重新混入 {dropped} 条已判死的", file=sys.stderr)
+        pool_objs = nodes + dormant
+        fallback = True
+    if sleeping and not fallback:
+        print(f"  - {dropped} 个节点暂离池子（实测不通，出站仍保留）",
+              file=sys.stderr)
+    # dead_nodes 是"因实测判死被摘出池子"的条数 —— 这是事后回答"为什么它不在池子里"
+    # 唯一可靠的数字（原来只有 stderr 那一行，成功刷新时会被 daemon 丢掉）。
+    write_sub_stats(stats_out, len(nodes), len(dormant), len(pool_objs),
+                    len(sleeping), fallback)
     inbounds = _build_inbounds(listen_port)
     # selector tag 与 daemon / CLI 共用 config 里的名字：改一处即可整体改名，
     # 不必再同步 grep 本文件里的字符串字面量。
@@ -597,8 +814,8 @@ def make_config(nodes: list[dict], listen_port: int = 0,
             {
                 "type": "selector",
                 "tag": pool_selector,
-                "outbounds": [n["tag"] for n in nodes] + ["direct"],
-                "default": nodes[0]["tag"] if nodes else "direct",
+                "outbounds": [x["tag"] for x in pool_objs] + ["direct"],
+                "default": _pick_default(pool_objs),
                 "interrupt_exist_connections": False,
             },
             # opencode 流量固定走 WARP：403 实为 IP 信誉拦截，轮换池全在脏 IP 上。
@@ -709,22 +926,41 @@ if __name__ == "__main__":
     print(f"total raw URLs from all sources: {len(all_urls)}")
 
     nodes = []
+    seen_urls: set[str] = set()
     seen_tags: set[str] = set()
     filter_sub = args.filter.lower() if args.filter else None
     for u in all_urls:
+        # 身份 = 去掉 #名字 的整条 URL：同一台机器上靠 ws path / sni 区分的
+        # 多条节点身份不同，必须都留下；只有名字不同的重复项才该合并。
+        ident = u.split("#", 1)[0]
+        if ident in seen_urls:
+            continue
         n = parse_url(u)
-        if n and n["tag"] not in seen_tags:
-            if filter_sub and filter_sub not in n["tag"].lower():
-                continue
-            seen_tags.add(n["tag"])
-            nodes.append(n)
+        if not n:
+            continue
+        if filter_sub and filter_sub not in n["tag"].lower():
+            continue
+        # tag 撞名不能整条丢：dasho 的 9 条日本节点全在
+        # unamecf*.xn--ghqu5fm27b67w.com:443，只靠 path=/pq/jp1..jp5 区分，
+        # 而 tag 只有 host:port-协议 —— 旧逻辑把 5 条压成 1 条（71 条 URL
+        # 只剩 41 个 tag，24 个真节点白丢），节点数连骤降护栏都过不了。
+        if n["tag"] in seen_tags:
+            scheme = n["tag"].rsplit("-", 1)[-1]
+            stem = f"{n['server']}:{n['server_port']}"
+            i = 2
+            while f"{stem}~{i}-{scheme}" in seen_tags:
+                i += 1
+            n["tag"] = f"{stem}~{i}-{scheme}"
+        seen_urls.add(ident)
+        seen_tags.add(n["tag"])
+        nodes.append(n)
 
     print(f"parsed {len(nodes)} usable nodes (deduplicated)")
     if not nodes:
         print("ERROR: no nodes parsed, aborting")
         sys.exit(1)
 
-    cfg = make_config(nodes, args.port, args.clash_port, args.secret or get_singbox_secret(), include_h2=args.include_h2)
+    cfg = make_config(nodes, args.port, args.clash_port, args.secret or get_singbox_secret(), include_h2=args.include_h2, stats_out=args.out)
     # 调用方（daemon）传进来的 args.out 本身已是 <config>.tmp：它要在 promote
     # 前做节点数/sing-box check 校验。write_json 先写同目录唯一临时文件再
     # os.replace 到 args.out，既不截断写（崩溃不会留下半份 JSON），也不改变

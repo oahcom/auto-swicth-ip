@@ -200,17 +200,23 @@ def region_key(node: dict) -> str:
 
 
 def assign_nodes(nodes: list[dict], count: int, start: int = 0,
-                 key=None) -> list[dict]:
+                 key=None, rank=None) -> list[dict]:
     """按分组轮转挑节点，尽量让每条线落在不同主机。
 
     这不是 colo 保证（落地位置由节点出口决定，只能实测），但能避免 N 条线
     全部指向同一台机器的不同端口。
+
+    ``rank`` 给分组键排先后。WHY 需要它：分组键里混着实测 colo（NRT/SIN/
+    PHX/SJC/LAX）和未实测时的主机名兜底（203.10 / downloadcfpro…）。按
+    字符串排序会把 "203.10" 排到 "NRT" 前面，于是一个没实测 colo 的节点
+    抢走一个落地名额，真有 colo 的反被挤掉 —— 那就不是按 colo 分配了。
     """
     key = key or node_group
     groups: dict[str, list[dict]] = {}
     for n in nodes:
         groups.setdefault(key(n), []).append(n)
-    buckets = [groups[k] for k in sorted(groups)]
+    order = sorted(groups, key=(lambda k: (rank(k), k)) if rank else None)
+    buckets = [groups[k] for k in order]
     picked: list[dict] = []
     idx = start
     while len(picked) < count and any(buckets):
@@ -600,24 +606,44 @@ def apply(count: int | None = None, nodes: list[str] | None = None,
 
     pool = udp_capable(load_nodes(), probe=probe)
     by_tag = {n["tag"]: n for n in pool}
+    # 实测判定不可用的节点不参与落地选择：拿死节点当 home，这条线就永远
+    # 连不上（16 个 unamecf 系节点此前一直占着 WARP-WG-1~4 的 home）。
+    colo = load_colo_map()
+    usable = [n for n in pool
+              if (colo.get(n["tag"]) or {}).get("ok") is not False]
+    if not usable:
+        # 原来写成 `... or pool`：一个能用的都没有时静默退回全部。那等于让 WARP
+        # 拿死节点当 home、线永远连不上，而日志上一片正常。兜底可以，但要喊。
+        print("  ⚠ 台账里所有节点都被标死，退回全部节点当落地点候选"
+              "（这些线大概率连不上）", file=sys.stderr)
+        usable = pool
     if nodes:
         missing = [t for t in nodes if t not in by_tag]
         if missing:
             raise SystemExit(f"节点不在当前订阅里或 UDP 不可用: {missing}")
+        # 显式 --nodes 原本绕过 ok 过滤：指定一个实测死的节点会被照单收下，
+        # home 直接写进线配置、那条线从此连不上。照用但要说一声。
+        dead = [t for t in nodes if (colo.get(t) or {}).get("ok") is False]
+        if dead:
+            print(f"  ⚠ 显式指定的节点里有台账判死的 {dead}；照用，线可能连不上",
+                  file=sys.stderr)
         home_nodes = [by_tag[t] for t in nodes][:homes]
         if len(home_nodes) < homes:
             raise SystemExit(f"落地节点不足：需要 {homes} 个，给了 {len(home_nodes)} 个")
     else:
         # 按实测 colo 分组：v4 出口只由 colo 决定，同 colo 多挂 v4 线只会
         # 抢同一个地址池（实测同节点重启即在 .211/.243 间跳，与节点无关）。
-        home_nodes = assign_nodes(pool, homes, start, key=region_key)
+        known = {str(v.get("colo")) for v in colo.values() if v.get("colo")}
+        home_nodes = assign_nodes(
+            usable, homes, start, key=region_key,
+            rank=lambda k: 0 if k in known else 1)
 
     rot_size = max(1, int(wg.get("rotation_size") or 8))
     state = {"lines": {}, "updated": int(time.time())}
     for i in range(1, total + 1):
         group = (i - 1) // per
         home = home_nodes[group]
-        rotation = _rotation_for(home, pool, rot_size)
+        rotation = _rotation_for(home, usable, rot_size)
         # 同组的兄弟线错开后备顺序，避免三条线同时跳去同一个节点。
         off = (i - 1) % per
         head, tail = rotation[0], rotation[1:]

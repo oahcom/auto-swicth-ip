@@ -1055,23 +1055,74 @@ _log_lock = threading.RLock()
 _LOG_MAX_BYTES = 5 * 1024 * 1024  # 5MB 轮转
 _LOG_BACKUP_COUNT = 5              # 保留 5 个备份
 
+def _side_effects_off() -> bool:
+    """本进程是不是"不该留下痕迹"的那种。
+
+    2026-10-28 四轮审查（严重）：只要有人 import 这个模块调一下 log()，假事件
+    （"✗ 刷新节点数骤降 (39 → 17)"）就会写进生产 daemon.log。事后 grep 会得出
+    "线上拦了 3 次"的结论，而真相是一次都没拦过 —— 日志是运维唯一的账本。
+    所以：**只有 systemd 拉起的那个进程才写文件**（systemd 会设 INVOCATION_ID），
+    其它情况（pytest、审查脚本、手工跑）一律只写 stdout。
+    """
+    # 顺序有讲究：先认"这是测试/演练"，再认后门。反过来的话，只要有人把
+    # ASIP_ALLOW_FILE_LOG=1 写进 .env（unit 直接吃这个文件），pytest 就会重新
+    # 往生产 daemon.log 写假事件 —— 四轮定的那条"严重"一行环境变量就重开了。
+    if "pytest" in sys.modules or os.environ.get("ASIP_NO_SIDE_EFFECTS") == "1":
+        return True
+    if os.environ.get("ASIP_ALLOW_FILE_LOG") == "1":
+        return False
+    return not os.environ.get("INVOCATION_ID")
+
+
+_logger_retry_ts = 0.0             # 上次尝试建文件 handler 的时间
+
+
+def _logger_has_file() -> bool:
+    try:
+        import logging.handlers as _lh
+        return any(isinstance(h, _lh.RotatingFileHandler) for h in _logger.handlers)
+    except Exception:
+        return False
+
+
 def _init_logger():
-    global _logger
+    global _logger, _logger_retry_ts
+    _logger_retry_ts = time.time()
     if _logger is not None:
         return
     _logger = logging.getLogger("auto-switch-ip")
     _logger.setLevel(logging.DEBUG)
-    # 文件 handler（轮转）
-    fh = RotatingFileHandler(CFG["log_file"], maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUP_COUNT)
+    # 文件 handler（轮转）。
+    # 2026-10-28 四轮审查（严重）：这里以前没有兜底。daemon.log 一旦变成
+    # root:root 0600（有人用 root 手工跑过一次就够），open("a") 抛 PermissionError
+    # → 进程启动即崩 → systemd Restart=always 无限重启，且没有任何自愈路径。
+    # 日志写不出来不该让整条代理链停摆：打不开就只留 stdout handler（进 journal）。
+    fh = None
+    if not _side_effects_off():
+        try:
+            fh = RotatingFileHandler(CFG["log_file"], maxBytes=_LOG_MAX_BYTES,
+                                     backupCount=_LOG_BACKUP_COUNT)
+        except Exception as e:
+            print(f"⚠ 日志文件打不开（{e}），本次只写 stdout/journal；"
+                  f"修法：sudo chown administrator {CFG['log_file']}", file=sys.stderr)
+            fh = None
     # 日志会带订阅源/探测细节，默认 0644 等于对同机其他用户公开；台账与
-    # .env 都是 0600，日志不能例外。
-    try:
-        os.chmod(CFG["log_file"], 0o600)
-    except OSError:
-        pass
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt=LOG_FORMAT))
-    _logger.addHandler(fh)
+    # .env 都是 0600，日志不能例外。**只在真拿到了文件 handler 时才 chmod** ——
+    # 否则 pytest / 手工 import 也会去改生产日志的权限，"只读不碰"就是句空话。
+    if fh is not None:
+        try:
+            os.chmod(CFG["log_file"], 0o600)
+        except OSError:
+            pass
+    if fh is None and _side_effects_off():
+        # 手工起的那份守护进程没有文件日志 —— 这件事本身要有痕迹，否则排查时
+        # 会误以为"代码没跑"。
+        print("（本进程不是 systemd 拉起的：只写 stdout，不写 daemon.log、"
+              "不记护栏样本）", file=sys.stderr)
+    if fh is not None:
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt=LOG_FORMAT))
+        _logger.addHandler(fh)
     # stdout handler
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(logging.DEBUG)
@@ -1103,12 +1154,39 @@ def _sanitize_log_message(msg: str) -> str:
 
 
 def log(msg: str):
-    """写日志到文件（轮转）+ stdout，线程安全"""
+    """写日志到文件（轮转）+ stdout，线程安全。
+
+    2026-10-28 五轮审查（中）：`_init_logger()` 一旦跑过就不再重建，所以"文件
+    handler 建失败"是**一次性判定** —— root 把 daemon.log 变成 root:root 之后，
+    就算人把属主修好，这个进程到死也不会再写文件。现在每隔 5 分钟重试一次。
+    """
     global _logger
+    # 重建必须和 emit 在同一把锁里。第六轮实测：重建在锁外时，另一线程正好
+    # emit，会撞上 handlers 已被清空的瞬间 —— 720 条里丢 120 条（17%），而且
+    # 丢的那些连 stdout 都没有（record 根本没被任何 handler 拿到）。重建本来是
+    # 为了把账本修回来，结果每修一次就撕一页。
     with _log_lock:
+        try:
+            stale = (_logger is not None and not _side_effects_off()
+                     and time.time() - _logger_retry_ts > 300
+                     and (not _logger_has_file()
+                          # 文件 handler 还在、但文件被人删了：fd 还指着已删除的
+                          # inode，日志静默写进虚空，直到进程重启。这种情况
+                          # _logger_has_file() 看不出来，得看路径还在不在。
+                          or not os.path.exists(CFG["log_file"])))
+            if stale:
+                for h in list(_logger.handlers):
+                    try:
+                        h.close()
+                    except Exception:
+                        pass
+                _logger.handlers.clear()
+                _logger = None
+        except Exception:
+            pass
         if _logger is None:
             _init_logger()
-    _logger.info(_sanitize_log_message(msg))
+        _logger.info(_sanitize_log_message(msg))
 
 def log_health(msg: str):
     """健康状态日志，每 10s 最多一条"""
@@ -2652,6 +2730,7 @@ _LINE_DEFAULTS = {
     "restart_hist": [],
     "restart_ts": 0.0,
     "next_restart_ts": 0.0,
+    "quota_until": 0.0,
     "warming": False,
     "port_ok": False,
     "sel": 0.0,
@@ -2973,6 +3052,30 @@ def _warp_line_selected(tag: str, ip: str, ts: float) -> None:
     _save_warp_line_state()
 
 
+_GLOBAL_RESTART_HIST: list[float] = []
+_GLOBAL_RESTART_LOCK = threading.Lock()
+_GLOBAL_RESTART_LOG_TS = [0.0]
+
+
+def _restart_rate_allow(now: float) -> bool:
+    """全局重启节流：任何原因的重启都记一次。
+
+    restart_max_per_hour_per_line 只管单条线，19 条线叠起来仍能到每分钟上百次
+    （实测 2h05m 内 10028 次）。每重启一次就掐断该线在途连接，9router 侧表现为
+    fetch failed / 502，所以全局限速是最后一道闸，与单线配额互不替代。
+    """
+    cap = int(_warp().get("restart_max_per_minute", 12))
+    if cap <= 0:
+        return True
+    with _GLOBAL_RESTART_LOCK:
+        hist = [t for t in _GLOBAL_RESTART_HIST if now - t < 60.0]
+        _GLOBAL_RESTART_HIST[:] = hist
+        if len(hist) >= cap:
+            return False
+        hist.append(now)
+        return True
+
+
 def _warp_line_restart_allowed(st: dict, now: float) -> bool:
     """滑动一小时窗口内的重启配额。只拦重启，不拦探测。
 
@@ -3001,8 +3104,20 @@ def _warp_line_restart(member: dict, reason: str) -> bool:
         st = _warp_line_state_locked(tag)
         if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
             return False
+        quota_until = float(st.get("quota_until") or 0.0)
+        if quota_until > now:
+            if now - _GLOBAL_RESTART_LOG_TS[0] > 30.0:
+                _GLOBAL_RESTART_LOG_TS[0] = now
+                log(f"  · {tag} 额度隔离中（剩 {int((quota_until - now) / 60)}min），"
+                    f"跳过重启（{reason}）")
+            return False
         if not _warp_line_restart_allowed(st, now):
             log(f"  · {tag} 本小时重启已达上限，跳过重启（{reason}）")
+            return False
+        if not _restart_rate_allow(now):
+            if now - _GLOBAL_RESTART_LOG_TS[0] > 30.0:
+                _GLOBAL_RESTART_LOG_TS[0] = now
+                log(f"  · {tag} 全局重启节流（每分钟上限），跳过重启（{reason}）")
             return False
         st["warming"] = True
     got_slot = False
@@ -3148,6 +3263,9 @@ def _probe_one_line(member: dict) -> None:
     st = _warp_line_state(tag)
     if st.get("warming"):
         return
+    if float(st.get("quota_until") or 0.0) > now:
+        # 隔离期内不探：结论已知（quota 到点才解），再探只是重复买同一个结论。
+        return
     active = active_warp_tag()
     if (tag == active and st.get("ip")
             and now - float(st.get("ip_ts") or 0.0)
@@ -3173,6 +3291,13 @@ def _probe_one_line(member: dict) -> None:
         return
     if _warp_ip_is_blocked(ip, now):
         _warp_line_record_observation(tag, ip, "blocked", time.time(), started_at)
+        # 这条地址已判脏，惩罚期结束前换地址没有信息量：同一烧毁段里的新 /128
+        # 照样是 quota，重启只是白掐一次在途连接。隔离到确切解禁时刻。
+        left = _line_block_remaining(ip, now)
+        if left and left >= int(_warp().get("line_quota_quarantine_min_sec", 1800)):
+            st_now = _warp_line_state(tag)
+            _warp_line_update(tag, quota_until=max(
+                float(st_now.get("quota_until") or 0.0), now + left))
         if tag == active:
             _reconnect_warp_now("探测发现当前出口处于惩罚期", time.time())
         elif not _quota_hold_skips(tag, "出口处于惩罚期"):
@@ -4243,6 +4368,10 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     if (retry_after and _warp().get("quota_hold_enabled", True)
             and retry_after >= int(_warp().get("quota_hold_min_sec", 1800))):
         _QUOTA_HOLD_UNTIL = max(_QUOTA_HOLD_UNTIL, time.time() + retry_after)
+    # 逐线隔离：全局额度闸一开会把所有线一起冻住（主人否过这条）；改成只隔离
+    # 「自己撞了长 Retry-After」的那条线，其余线照常轮换。
+    if retry_after and retry_after >= int(_warp().get("line_quota_quarantine_min_sec", 1800)):
+        _warp_line_update(tag, quota_until=time.time() + retry_after)
     hint = (f"（Retry-After {retry_after / 3600:.1f}h）"
             if retry_after and retry_after > 0 else "")
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}{hint}"
@@ -4265,6 +4394,7 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
             # 撑过流量的地址同权 —— 实测台账 2945 条里 738 条属于这种「验过没用过」。
             entry["probe_ok_ts"] = max(float(entry.get("probe_ok_ts") or 0), now)
             _save_warp_ip_used()
+        _warp_line_update(tag, quota_until=0.0)
     elif verdict in _MODEL_VERDICT_BLOCK_KIND:
         # 模型层判 quota/flagged 与生产侧 429/403 是同一件事（前者是
         # FreeUsageLimitError，后者是 abusive traffic），都该落进 blocked 台账：
@@ -6519,17 +6649,196 @@ def restart_singbox() -> bool:
 
 
 # ============= 订阅刷新 =============
+def _dormant_tags() -> set[str]:
+    """休眠源里的 tag（`.dormant-outbounds.json`）。读不到就当空集。"""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "dormant-outbounds.json")
+        with open(p) as f:
+            d = json.load(f)
+        items = d.get("outbounds") if isinstance(d, dict) else d
+        return {x["tag"] for x in items if isinstance(x, dict) and x.get("tag")}
+    except Exception:
+        return set()
+
+
 def _count_outbounds(path: str) -> int:
-    """数配置文件里的代理节点数（不存在/损坏返回 0）"""
+    """数「活订阅还能供出多少条节点」（不存在/损坏/无 selector 返回 0）。
+
+    WHY 不数出站条数（2026-10-28 审查发现）：配置里常驻 65 条休眠出站 + 15 条
+    WARP socks，全是常量。按出站条数算，下面那段骤降护栏（new_n < old_n*0.5）
+    的闸门被抬到 66，而常量就有 80 条 —— 订阅只剩 1 条节点时 new_n 仍有 81，
+    一路绿灯。改成数主 selector 的成员：那才是「能被切过去的东西」的个数。
+    """
     try:
         with open(path) as f:
             cfg = json.load(f)
-        return len([o for o in cfg.get("outbounds", [])
-                    if o.get("type") not in ("direct", "selector")])
+        sel = CFG["singbox"]["selector"]
+        dormant = _dormant_tags()
+        for o in cfg.get("outbounds", []):
+            if o.get("type") == "selector" and o.get("tag") == sel:
+                # 只数「来自活订阅」的成员。休眠源（okz 那 65 条）也算成员，
+                # 但订阅整个挂掉时它们照样把数撑到 65，护栏就不会触发 ——
+                # 那正是这个护栏最该拦住的情形。
+                return len([m for m in o.get("outbounds", [])
+                            if m != "direct" and m not in dormant])
+        return 0
     except Exception:
         return 0
 
+def _pool_members(path: str) -> set[str]:
+    """某个配置文件里主池 selector 的节点成员（不含 direct）。"""
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        sel = CFG["singbox"]["selector"]
+        for o in cfg.get("outbounds", []):
+            if o.get("type") == "selector" and o.get("tag") == sel:
+                return {m for m in o.get("outbounds", []) if m != "direct"}
+    except Exception:
+        pass
+    return set()
+
+
+def _log_pool_diff(old_path: str, new_path: str) -> None:
+    """刷新前后池子成员的进出，写进 daemon.log。
+
+    WHY：沉睡池让成员可以动态进出，但原来日志里只有一个总数（old_n → new_n），
+    事后问「这条什么时候出的池、为什么」答不出来。这里把 tag 和证据一起落。
+    """
+    before, after = _pool_members(old_path), _pool_members(new_path)
+    added, removed = sorted(after - before), sorted(before - after)
+    if not added and not removed:
+        return
+    evid: dict = {}
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ".dormant_state.json")) as f:
+            evid = json.load(f).get("nodes") or {}
+    except Exception:
+        pass
+
+    def why(tag: str) -> str:
+        v = evid.get(tag)
+        if not isinstance(v, dict):
+            return "无实测记录"
+        return "实测通" if v.get("alive") else "实测不通"
+
+    log(f"  池子成员 +{len(added)} / -{len(removed)}")
+    if added:
+        log("    入池: " + ", ".join(f"{t}({why(t)})" for t in added[:8]))
+    if removed:
+        log("    出池: " + ", ".join(f"{t}({why(t)})" for t in removed[:8]))
+
+
+_pool_reject_streak = 0          # 连续被骤降护栏拦住的次数（只用于喊话）
+
+
+def _read_sub_stats(cfg_path: str) -> dict:
+    """读生成侧写在配置文件旁边的 `<cfg>.stats.json`。
+
+    只认"这一次真的生成出来的那份"，所以手工试跑 / pytest 都不会污染线上基线。
+    读不到返回空 dict，调用方退回"数池子成员"的旧口径。
+    """
+    try:
+        with open(str(cfg_path) + ".stats.json") as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except Exception:
+        return {}
+
+
+POOL_WINDOW_SEC = 24 * 3600      # 基线窗口：只认这个时间窗内的样本
+POOL_HISTORY = ".pool_history.json"
+
+
+def _pool_history_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), POOL_HISTORY)
+
+
+_pool_history_bad = False        # 读失败过一次就置位，护栏会喊话
+_stats_missing_streak = 0        # 连续多少轮拿不到统计（护栏等于被拆）
+
+
+def _read_pool_history() -> list:
+    """读样本序列，只保留真实时间窗内的（按每条的 ts 判断）。
+
+    2026-10-28 三轮审查的核心教训：原先写成"峰值 + 每次写刷新 ts"，判断恒真，基线
+    变成"自上次中断以来的历史最大"，只涨不落 —— 一次合法的池子腰斩（上游永久少一半
+    节点、删掉一个订阅源）就会让好配置被**无限期**拒收，且没有自愈路径。
+    """
+    try:
+        with open(_pool_history_path()) as f:
+            d = json.load(f)
+        samples = d.get("samples") if isinstance(d, dict) else None
+        if not isinstance(samples, list):
+            return []
+        now = time.time()
+        out = []
+        for s in samples:
+            try:
+                ts, pool = float(s["ts"]), int(s["pool"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= now - ts <= POOL_WINDOW_SEC:
+                out.append({"ts": ts, "pool": pool})
+        return out
+    except FileNotFoundError:
+        return []                       # 还没跑过刷新，正常
+    except Exception as e:
+        # 读失败 = 拿不到基线 = 骤降判定恒不成立（静默空转）。必须喊。
+        global _pool_history_bad
+        if not _pool_history_bad:
+            _pool_history_bad = True
+            log(f"⚠ 护栏基线读不出来（{e}），骤降判定本轮不生效；"
+                f"修法：检查 {POOL_HISTORY} 的属主/权限，或删掉它重建")
+        return []
+
+
+def _pool_baseline():
+    """窗口内的最大池子成员数；窗口内没有样本时返回 None（护栏不介入）。"""
+    return max((s["pool"] for s in _read_pool_history()), default=None)
+
+
+def _record_pool_sample(pool: int) -> None:
+    """记一条样本。只在**真的 promote 之后**调用，退回全部节点那种轮次不记。"""
+    samples = _read_pool_history()
+    samples.append({"ts": time.time(), "pool": int(pool)})
+    if _side_effects_off():
+        return                      # 测试/审查/手工跑不往线上基线里塞样本
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_pool_history_path()),
+                                   prefix=".pool_history.", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"samples": samples[-2000:]}, f)
+            os.replace(tmp, _pool_history_path())
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        log(f"⚠ 护栏样本写不进去（{e}），基线会一直用旧窗口")
+
+
+def _drop_stats(path: str) -> None:
+    """删掉生成侧写在配置旁边的那份统计（`<cfg>.stats.json`）。
+
+    刷新用的是 `<config>.tmp`，统计落在 `<config>.tmp.stats.json`；配置被 rename
+    走之后这份就没人读了，不清会每次刷新留一个文件。
+    """
+    for p in (str(path) + ".stats.json", str(path) + ".stats.json.tmp"):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
 def _discard(path: str):
+    _drop_stats(path)
     try:
         os.unlink(path)
     except OSError:
@@ -6610,6 +6919,7 @@ def refresh_subscription() -> bool:
         _REFRESH_LOCK.release()
 
 def _refresh_subscription_locked() -> bool:
+    global _stats_missing_streak
     log("🔄 刷新订阅...")
     try:
         parse_script = os.path.join(os.path.dirname(__file__), "parse_subscription.py")
@@ -6641,22 +6951,81 @@ def _refresh_subscription_locked() -> bool:
             log(f"✗ 订阅解析失败 (rc={r.returncode}): {_stderr_reason(r.stderr)}")
             _discard(tmp_file)
             return False
-        new_n = _count_outbounds(tmp_file)
-        old_n = _count_outbounds(config_file)
+        # 生成侧的告警都走 stderr，而成功路径以前整个丢掉 —— 于是"多少条因判死被
+        # 摘出池子""是不是退回了全部节点"这两件事在 daemon.log 里一次都看不到。
+        for ln in (r.stderr or "").splitlines():
+            ln = ln.strip()
+            if ln.startswith("⚠") or "暂离池子" in ln:
+                log(f"  {ln}")
+        # 护栏口径（2026-10-28 三轮审查后定版）：
+        #   比「池子实际成员数」的 **24 小时滚动窗口最大值**。
+        #   - 比订阅条数会误伤：okz 那 62 条全是死节点，它挂掉时池子一个不少；
+        #   - 比"上一次成员数"会随判死一路下移，护栏越守越松；
+        #   - 比"峰值 + 每次刷新重写 ts"是单向棘轮：只涨不落，好配置被永久拒收。
+        # 样本只在 promote 成功后追加，且按每条自己的 ts 判断是否过期。
+        new_stat = _read_sub_stats(tmp_file)
+        new_pool = new_stat.get("pool_nodes")
+        fallback = bool(new_stat.get("fallback"))
+        if isinstance(new_pool, int):
+            # 统计读到了就算"这一轮有统计"，不管后面会不会被拒收 ——
+            # 否则"连续 N 轮缺统计"会把其实有统计的轮次也算进去，喊话数字偏大。
+            _stats_missing_streak = 0
+            new_n = new_pool
+            base = _pool_baseline()
+            old_n = base if base is not None else new_pool
+            # 数字关系（实测对得上）：订阅节点 + 仅休眠源 = 在池 + 判死摘出。
+            # 19:59 那版写成"订阅节点 = 在池 + 判死 + 仅休眠源"，39+78+3=120≠114，
+            # 多算了那 3 条 —— 它们本来就在订阅节点里，只是池子判死表里没有。
+            sub_n = new_stat.get('sub_nodes', '?')
+            dorm_n = new_stat.get('dormant_source_nodes', '?')
+            dead_n = new_stat.get('dead_nodes', '?')
+            log(f"  池子成员 {new_n}（订阅节点 {sub_n} + 仅休眠源 {dorm_n}"
+                f" = 在池 {new_n} + 判死摘出 {dead_n}"
+                f"{'，⚠ 本轮退回全部节点' if fallback else ''}）")
+            unjudgeable = False
+        else:
+            # 统计文件缺失（生成侧没写成功 / 部署了旧版 parse / 被人手工删了）。
+            # 这时只能数"出站条数"（135 里 80 条是常量出站），这个口径会被严重
+            # 稀释；更危险的是 fallback 轮在这一口径下会被当成正常，把 117 记进
+            # 基线 —— 第三轮辛苦修掉的毒化就从这条缝里原样复活。
+            # 所以：**这一轮不判定、不记样本**，只喊一句。
+            _stats_missing_streak += 1
+            extra = ""
+            if _stats_missing_streak >= 3:
+                # 不记样本 → 24h 后窗口清空 → 基线变 None → 骤降判定恒不成立。
+                # 也就是说这道理序会自己把自己拆掉，必须喊到人看见。
+                extra = (f"；已连续 {_stats_missing_streak} 轮，"
+                         f"**骤降护栏处于失效状态**，再这样下去 24h 后连基线都没了")
+            log(f"  ⚠ 统计文件缺失，本轮不做骤降判定，也不记基线样本"
+                f"（生成侧没写成功？）{extra}")
+            new_n = _count_outbounds(tmp_file)
+            old_n = _count_outbounds(config_file)
+            fallback = False
+            unjudgeable = True
         if new_n == 0:
             log("✗ 刷新产出 0 节点，保留现有配置")
             _discard(tmp_file)
             return False
         # 节点数骤降：old_n 为 0（配置缺失/损坏/编码异常）时护栏不可用，
         # 此时若旧配置本来存在，宁可拒绝也不要冒风险覆盖
-        if old_n == 0 and os.path.exists(config_file):
+        if not fallback and not unjudgeable and old_n == 0 and os.path.exists(config_file):
             log("✗ 现有配置不可读（0 节点），无法判断刷新是否合理，保留现有配置")
             _discard(tmp_file)
             return False
-        if old_n and new_n < old_n * 0.5:
-            log(f"✗ 刷新节点数骤降 ({old_n} → {new_n})，疑似订阅源故障，保留现有配置")
+        if not fallback and not unjudgeable and old_n and new_n < old_n * 0.5:
+            global _pool_reject_streak
+            _pool_reject_streak += 1
+            log(f"✗ 刷新节点数骤降 ({old_n} → {new_n}，基线是 24h 滚动窗口最大值)，"
+                f"疑似订阅源故障或大批节点下线，保留现有配置")
+            if _pool_reject_streak >= 4:
+                # 基线可能过时（上游真的永久缩水）。不自动放宽 —— 放宽就等于没有
+                # 护栏；但必须喊出来，人看一眼就知道要不要清掉旧样本。
+                log(f"⚠ 已连续 {_pool_reject_streak} 次被骤降护栏拦住，基线 "
+                    f"{old_n} 可能已过时。确认订阅确实缩水了，就删掉 "
+                    f"{POOL_HISTORY} 里旧的样本，让它按新水位重建。")
             _discard(tmp_file)
             return False
+        _pool_reject_streak = 0
         # 最后一道防线：promote 前用 sing-box 自身校验。单个坏节点
         # （非法 pbk/sid、缺 password 等）会让整个配置 FATAL，而一旦覆盖，
         # 好节点池就没了 —— 只能等下一小时刷新重装同一份毒配置。
@@ -6665,9 +7034,15 @@ def _refresh_subscription_locked() -> bool:
             log(f"✗ 新配置未通过 sing-box check，保留现有配置: {err}")
             _discard(tmp_file)
             return False
+        _log_pool_diff(config_file, tmp_file)
         os.replace(tmp_file, config_file)
+        _drop_stats(tmp_file)
+        if not fallback and not unjudgeable:
+            # 只记"真的上线了"的样本：试跑、被拒的、口径不明的都不进窗口。
+            _record_pool_sample(new_n)
         _rebind_wg_lines_after_refresh()
-        log(f"✓ 订阅刷新完毕 ({old_n} → {new_n} 节点)，重启 sing-box 加载新配置...")
+        log(f"✓ 订阅刷新完毕（池子成员 {old_n} → {new_n}），"
+            f"重启 sing-box 加载新配置...")
         return restart_singbox()
     except Exception as e:
         log(f"✗ 订阅刷新失败: {e}")

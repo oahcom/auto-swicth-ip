@@ -316,10 +316,12 @@ step "6/7 并入主配置（无订阅期的必要步骤）"
 restart_main_singbox() {
     # 只杀主进程：WG 线各跑一份 run -c .../lineN/singbox.json，宽匹配会把 16 条
     # 一起杀掉，每条线换一次 WARP 会话就换一个出口 IP，台账绑定当场作废。
-    need_root pkill -f "run -c $CONFIG" 2>/dev/null || true
+    # 锚定 + 转义：原句 `pkill -f "run -c $CONFIG"` 会连带命中包装进程
+    # （`bash -c "… run -c …"`）和编辑器，与 daemon.py:6411 保持同一写法。
+    pkill -f "^$(printf '%s' "$SINGBOX" | sed 's/[][\.*^$]/\\&/g') run -c $(printf '%s' "$CONFIG" | sed 's/[][\.*^$]/\\&/g')" 2>/dev/null || true
     for _ in $(seq 1 24); do
         sleep 5
-        if pgrep -f "run -c $CONFIG" >/dev/null 2>&1; then
+        if pgrep -f "^$(printf '%s' "$SINGBOX" | sed 's/[][\.*^$]/\\&/g') run -c $(printf '%s' "$CONFIG" | sed 's/[][\.*^$]/\\&/g')" >/dev/null 2>&1; then
             ok "主 sing-box 已由 daemon 拉起"
             return 0
         fi

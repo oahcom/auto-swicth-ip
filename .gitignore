@@ -35,3 +35,18 @@ singbox-config.json.tmp
 
 # /rotate 的 API token 与 socket（0600/0700，不入库）
 run/
+# 运行时状态 / 补丁前像（2026-10-28 四轮审查后补）
+.dormant_state.json
+.dormant_probe.lock
+.pool_history.json
+/*.stats.json
+*.stats.json.tmp
+.pool_history.*.tmp
+*.bak-*
+/daemon.py.pre-*
+/dormant_probe.py.pre-*
+/parse_subscription.py.pre-*
+
+# 本地快照（可再生成，不入库）
+backups/
+*.pre-ha-audit
