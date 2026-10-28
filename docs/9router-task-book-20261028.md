@@ -306,7 +306,7 @@ node -e '…'   # 或 /tmp/b9check.mjs 与 /tmp/envcheck.mjs 两个探针
 |---|---|
 | `9router1` 对端卡住的原因 | 只有本机侧证据；对端日志不在管辖内，未查 |
 | B9 的长期影响 | 六条池里四条同 url、两条非活跃。用户可继续按自己的意愿加池，只是它们不构成备选 |
-| 条件变化后的有效性 | 「108 次失败 / 0 次成功」是修复前 30 分钟窗口的实测，来自 `0c4a2c09` 的提交说明。`requestDetails` 按 `DEFAULT_MAX_RECORDS`（2000 行）滚动裁剪（`src/lib/db/repos/requestDetailsRepo.js:128`），这批行已被挤出，无法复核（§4 F5） |
+| 条件变化后的有效性 | 「108 次失败 / 0 次成功」是修复前 30 分钟窗口的实测，来自 `0c4a2c09` 的提交说明。`requestDetails` 按 `settings.observabilityMaxRecords`（当前 2000 行，代码默认 200）滚动裁剪（`src/lib/db/repos/requestDetailsRepo.js:128`），这批行已被挤出，无法复核（§4 F5） |
 | 235s 预算的算术缺口 | 4×60s + 3×3s = 249s，实测均值 235.5s，差 13.5s，未能闭合；相关行已被挤出，无法再验（§4 F5） |
 | 构建与源码一致性 | 08:40 的构建含 `55f31496`（构建产物 chunk 里能 grep 到 `suppressed`）。mtime 判据会出现倒挂，见 §4 F8 |
 
