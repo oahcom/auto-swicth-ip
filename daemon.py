@@ -2828,6 +2828,11 @@ def _load_warp_line_state() -> None:
                 st["last_ok_ts"] = 0.0
                 st["last_ok_ip"] = None
             st["warming"] = False
+        if not _warp().get("line_quota_quarantine_enabled", False):
+            for _tag, _st in _WARP_LINE_STATE.items():
+                if isinstance(_st, dict) and float(_st.get("quota_until") or 0.0):
+                    _st["quota_until"] = 0.0
+                    _st["quota_ip"] = None
         _trim_quarantine_locked()
         _WARP_LINE_CV.notify_all()
     log(f"✓ 已恢复 {len(lines)} 条 WARP 线路状态")
@@ -2892,7 +2897,7 @@ def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
         # 隔离期内的线不参与探测排期：否则 prober 每轮都判它 due、spawn 完就
         # continue，把 CPU 烧成一个核（2026-10-28 实测 warp-prober 单线程 46%）。
         quota_until = float(st.get("quota_until") or 0.0)
-        if quota_until > now:
+        if _warp_line_quarantined(st, now):
             return False, quota_until
         last_ok = float(st.get("last_ok_ts") or 0.0)
         if (st.get("last_ok_ip") == ip
@@ -3076,6 +3081,8 @@ def _warp_line_quarantined(st: dict, now: float) -> bool:
     隔离绑地址：换到新地址后旧结论作废，否则一次 16h 的 Retry-After 会把线
     锁到明天（复审 P1-2）。quota_ip 缺省时视为绑当前地址。
     """
+    if not _warp().get("line_quota_quarantine_enabled", False):
+        return False
     if float(st.get("quota_until") or 0.0) <= now:
         return False
     qip = st.get("quota_ip")
@@ -3089,6 +3096,11 @@ def _quarantine_line(tag: str, ip: str | None, seconds: float, now: float) -> No
     13/20 条线一起隔离」—— 剩下的 7 条会被更快烧掉，最后 0 条可用
     （复审 P0-1：20:46 实测 13 条隔离，其中 10 条同一时刻写入）。
     """
+    if not _warp().get("line_quota_quarantine_enabled", False):
+        # 默认关：隔离是「重启买不到配额」这个判断的产物，而这个判断本身没有
+        # 得到主人认可（2026-10-28 23:10 明确质疑：重启多没有坏影响，反而降低
+        # 刷新效率）。留着开关，一行就能开回来。
+        return
     cap = float(_warp().get("line_quota_quarantine_max_sec", 7200))
     until = now + (min(float(seconds), cap) if cap > 0 else float(seconds))
     ratio = float(_warp().get("line_quota_quarantine_max_ratio", 0.8))

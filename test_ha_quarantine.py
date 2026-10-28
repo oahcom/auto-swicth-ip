@@ -30,6 +30,7 @@ import daemon
 
 
 def _reset():
+    config.CFG["warp"]["line_quota_quarantine_enabled"] = True
     daemon._GLOBAL_RESTART_HIST[:] = []
     daemon._GLOBAL_RESTART_LOG_TS[0] = 0.0
     daemon._QUARANTINE_REFUSE_TS = 0.0
@@ -146,6 +147,18 @@ def test_ratio_zero_disables_gate_and_no_clamp():
     daemon._quarantine_line(tag, "5.5.5.5", 120, now)
     until = float(daemon._warp_line_state(tag).get("quota_until") or 0)
     assert abs(until - (now + 120)) < 2, until
+
+
+def test_switch_off_disables_quarantine():
+    """总开关关了，残留的 quota_until 一律不算数（2026-10-28 23:10 主人的要求：
+    重启换地址是要的刷新行为，不能因为隔离把好节点探不到）。"""
+    _reset()
+    config.CFG["warp"]["line_quota_quarantine_enabled"] = False
+    tag = "WARP-WG-T8"
+    daemon._warp_line_update(tag, quota_until=time.time() + 600, warming=False)
+    st = daemon._warp_line_state(tag)
+    assert daemon._warp_line_quarantined(st, time.time()) is False
+    config.CFG["warp"]["line_quota_quarantine_enabled"] = True
 
 
 def main():
