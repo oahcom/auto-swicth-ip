@@ -522,7 +522,7 @@ CFG = {
         "restart_max_per_hour_per_line": 20,
         # 全局重启节流（条/分钟，0=关）。单线上限管不住 19 条线叠加：
         # 2026-10-28 19:36~20:08 实测 10028 次重启 / 125 分钟。
-        "restart_max_per_minute": 12,
+        "restart_max_per_minute": 6,
         # 撞到长 Retry-After 的线隔离多久（秒，下限）。低于这个值算瞬时限流，照常换。
         "line_quota_quarantine_min_sec": 1800,
         # 单次隔离上限（秒）。24h 的 Retry-After 会把线锁到后天，夹到 2h。

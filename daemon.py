@@ -3092,17 +3092,20 @@ def _quarantine_line(tag: str, ip: str | None, seconds: float, now: float) -> No
     cap = float(_warp().get("line_quota_quarantine_max_sec", 7200))
     until = now + (min(float(seconds), cap) if cap > 0 else float(seconds))
     ratio = float(_warp().get("line_quota_quarantine_max_ratio", 0.6))
+    # 分母用「状态表里的线」而不是 members：members 只登记了 15 条（12 WG + 3
+    # usque），状态表有 20 条，按 members 算 80% 会变成 12/15 —— 提前把闸关死。
     members = _warp().get("members") or []
-    if ratio > 0 and members:
+    total = max(len(members), len(_WARP_LINE_STATE))
+    if ratio > 0 and total:
         q = 0
         for m in members:
             if m.get("tag") == tag:
                 continue
             if _warp_line_quarantined(_warp_line_state(m.get("tag")), now):
                 q += 1
-        if q + 1 > int(len(members) * ratio):
+        if q + 1 > int(total * ratio):
             log(f"  · {tag} 撞上长 Retry-After，但隔离中的线已占 "
-                f"{q}/{len(members)}（上限 {int(ratio * 100)}%），本次不隔离")
+                f"{q}/{total}（上限 {int(ratio * 100)}%），本次不隔离")
             return
     _warp_line_update(tag, quota_until=until, quota_ip=ip)
 
@@ -3127,7 +3130,7 @@ def _trim_quarantine_locked() -> None:
         if until > now:
             qs.append((until, tag))
     qs.sort()
-    limit = int(len(members) * ratio)
+    limit = int(max(len(members), len(_WARP_LINE_STATE)) * ratio)
     # 放的是「最早解禁」的那几条：它们本来就快到期，放出来代价最小；
     # 放最晚的等于把刚判死的线重新推回火里（实测会立刻再撞 penalty）。
     excess = len(qs) - limit
@@ -3253,7 +3256,7 @@ def _warp_line_restart(member: dict, reason: str) -> bool:
                     _warp().get("restart_cooldown_sec", 5))
                 st["next_probe_ts"] = st["next_restart_ts"]
             return False
-    log(f"↻ 重启 {tag}（{reason}）")
+    log(f"↻ 尝试重启 {tag}（{reason}）")
     # 计数落在真正调用 systemctl 之前：重启失败同样掐断过在途连接，
     # 只统计成功会让「重启后未就绪」这条路径绕过上限。
     with _WARP_LINE_CV:
@@ -3378,8 +3381,12 @@ def _probe_one_line(member: dict) -> None:
         # 这条地址已判脏，惩罚期结束前换地址没有信息量：同一烧毁段里的新 /128
         # 照样是 quota，重启只是白掐一次在途连接。隔离到确切解禁时刻。
         left = _line_block_remaining(ip, now)
-        if left and left >= int(_warp().get("line_quota_quarantine_min_sec", 1800)):
-            _quarantine_line(tag, ip, left, now)
+        # 惩罚期内换地址买不到配额（实测重启后中位 9s 又撞同一结论、21.5% 拿回
+        # 同一个 IP），所以一律隔离到 max(确切解禁, 下限)，而不是「短惩罚就照常
+        # 每 5s 重启一次」。比例闸仍然兜住「全部线一起隔离」那种情况。
+        _quarantine_line(tag, ip, max(float(left or 0.0),
+                                      float(_warp().get("line_quota_quarantine_min_sec", 1800))),
+                         now)
         if tag == active:
             _reconnect_warp_now("探测发现当前出口处于惩罚期", time.time())
         elif not _quota_hold_skips(tag, "出口处于惩罚期"):
