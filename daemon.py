@@ -650,11 +650,20 @@ _WARP_PROBE_PERSISTENT = frozenset({"quota", "flagged"})
 # `_probe_cache_forget` 立即作废 OK，不依赖本 TTL 兜底。取 600s：命中率已饱和
 # （1200s 只多 0.1 个点），再长只是把「凭旧 OK 选线」的窗口拉宽。
 _WARP_PROBE_OK = frozenset({"OK"})
+# 跨线可复用的结论：判的是地址（配额 / 信誉），不是某条隧道当时通不通。
+_WARP_PROBE_ADDRESS_SCOPED = _WARP_PROBE_OK | _WARP_PROBE_PERSISTENT
+# 正在探测中的 (tag -> ip)：用来量「同一地址是否被多条线同时探」。
+_PROBING_IP: dict[str, str] = {}
 
 # 模型探测结论 → 生产侧惩罚类型。quota 是 FreeUsageLimitError（配额耗尽，24h），
 # flagged 是 abusive traffic（信誉标记，6h）—— 与 `_classify_warp_error` 归出的
 # rate429 / abuse403 完全同义，只是观测来源从生产流量换成了主动探测。
 _MODEL_VERDICT_BLOCK_KIND = {"quota": "rate429", "flagged": "abuse403"}
+
+
+# 探测缓存命中统计，暴露在 /debug/state，用来回答「同一地址被探了几次」。
+_PROBE_STATS = {"hit": 0, "miss": 0, "cross_tag_reuse": 0, "expired": 0,
+                "inflight_dup": 0}
 
 
 def _probe_ttl(verdict: str) -> float:
@@ -666,19 +675,47 @@ def _probe_ttl(verdict: str) -> float:
     return float(w.get("probe_transient_ttl_sec", 120))
 
 
-def _probe_cache_get(tag: str, ip: str, now: float | None = None) -> str | None:
-    """这条线在 TTL 内探过这个地址就复用结论，None 表示该探。"""
+def _probe_cache_lookup(tag: str, ip: str,
+                        now: float | None = None) -> tuple[str, float] | None:
+    """命中返回 (结论, 落账时刻)；None 表示该探。
+
+    落账时刻要单独给出来：调用方判「能不能靠这条 OK 跳过实测」看的是**年龄**，
+    而缓存的 TTL（600s）只说明结论还作数，不说明它还新鲜。"""
     if now is None:
         now = time.time()
     with _WARP_REFRESH_LOCK:
         hit = _WARP_PROBE_SEEN.get((tag, ip))
-        if hit is None:
-            return None
-        verdict, ts = hit
-        if now - ts > _probe_ttl(verdict):
+        if hit is not None:
+            verdict, ts = hit
+            if now - ts <= _probe_ttl(verdict):
+                _PROBE_STATS["hit"] += 1
+                return verdict, ts
             del _WARP_PROBE_SEEN[(tag, ip)]
-            return None
-        return verdict
+            _PROBE_STATS["expired"] += 1
+        best: tuple[float, str] | None = None
+        for (t2, ip2), (v2, ts2) in _WARP_PROBE_SEEN.items():
+            if ip2 != ip or t2 == tag:
+                continue
+            # 只复用「关于地址」的结论。unreachable / err / unknown 说的是
+            # **这条隧道**当时没跑通，换条线同样的地址完全可能探通 —— 复用
+            # 它等于拿 A 线的故障去否决 B 线的地址，白丢一次供给。
+            if v2 not in _WARP_PROBE_ADDRESS_SCOPED:
+                continue
+            if now - ts2 > _probe_ttl(v2):
+                continue
+            if best is None or ts2 > best[0]:
+                best = (ts2, v2)
+        if best is not None:
+            _PROBE_STATS["cross_tag_reuse"] += 1
+            return best[1], best[0]
+        _PROBE_STATS["miss"] += 1
+        return None
+
+
+def _probe_cache_get(tag: str, ip: str, now: float | None = None) -> str | None:
+    """这条线在 TTL 内探过这个地址就复用结论，None 表示该探。"""
+    hit = _probe_cache_lookup(tag, ip, now)
+    return hit[0] if hit else None
 
 
 def _probe_cache_verdict(tag: str | None, ip: str | None,
@@ -4126,11 +4163,24 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         log(f"  · {tag} 出口 {ip} 台账已判脏，跳过实测"
             f"{_warp_refresh_count_note(tag)}")
         return False
-    cached = _probe_cache_get(tag, ip)
-    # 只复用「地址已被上游拒绝」且封禁仍在生效的结论；OK 绝不能跳过实测。
-    # OK 的 TTL 是 600s，而地址被生产流量烧掉只需几秒 —— 命中旧 OK 等于把
-    # 已知会 429 的地址直接切上去，实测每轮换线后的 429 爆发都落在这种线上。
-    # 负结论也要看 ban_until：上游给过 Retry-After 时，它可能比缓存 TTL 先到期；
+    hit = _probe_cache_lookup(tag, ip)
+    cached = hit[0] if hit else None
+    # TTL 内的 OK 直接复用、不再实测（省配额）。
+    #
+    # 这里原来是**禁止**复用的：地址被生产流量烧掉只要几秒，踩着 600s 的旧 OK
+    # 切上去，实测每轮换线后的 429 爆发都落在这种线上。主人 2026-10-28 明确说
+    # 「600 秒的 OK 会让已被烧掉的地址被切上去，这个是可以接受的」—— 权衡是
+    # 省配额优先，代价是复用被烧地址的概率。要收回来就删掉这一段。
+    if cached == "OK":
+        _PROBE_LAST_VERDICT[tag] = cached
+        # 结论可能来自另一条线（同址跨线复用），日志必须说清来源，
+        # 否则排障时会把「别的线验过」当成「这条线验过」。
+        log(f"  · {tag} 出口 {ip} TTL 内已有 OK"
+            f"（{int(time.time() - hit[1])}s 前落账，跳过实测）"
+            f"{_warp_refresh_count_note(tag)}")
+        return True
+    # 负结论：地址已被上游拒绝且封禁仍在生效。
+    # 也要看 ban_until：上游给过 Retry-After 时，它可能比缓存 TTL 先到期；
     # 此时必须重探，否则「精确解禁」在模型模式下会被缓存多锁住最多 1.4h。
     if cached in _WARP_PROBE_PERSISTENT and _warp_ip_is_blocked(ip):
         # 记录本条目的结论，供 `_note_probe_batch` 判定整批失明；否则被缓存
@@ -4148,10 +4198,25 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     # 探测要 1.4~8.7s，期间该地址可能已被 403/429 标脏并作废台账。带上起手
     # 时刻，让 `_probe_cache_put` 拒收这种「证据比事实旧」的结论（见其 docstring）。
     started_at = time.time()
+    # 并发重复：同一地址挂在两条线上时，两条线会各自起探（缓存里还没有结论）。
+    # 实测 104.28.222.43 同时挂在 WG-1 与 WG-9。这里先只计数，量出来再决定跳过 ——
+    # 跳过会改变「这条线本轮有没有结论」的语义，不能顺手改。
+    with _WARP_LINE_CV:
+        for _t2, _ip2 in list(_PROBING_IP.items()):
+            if _ip2 == ip and _t2 != tag:
+                _PROBE_STATS["inflight_dup"] += 1
+                break
+        _PROBING_IP[tag] = ip
     try:
         import probe_warp
-        verdict, _sec, _detail, retry_after = probe_warp.probe(
-            member["port"], w.get("refresh_model_timeout_sec", 15))
+        try:
+            verdict, _sec, _detail, retry_after = probe_warp.probe(
+                member["port"], w.get("refresh_model_timeout_sec", 15))
+        finally:
+            # 必须 finally：探测抛异常时也要把登记清掉，否则这条 tag 的
+            # `_PROBING_IP` 永远留着旧地址，之后同址的别的线会被误记成并发重复。
+            with _WARP_LINE_CV:
+                _PROBING_IP.pop(tag, None)
     except Exception as e:
         # 探测抛异常与 unreachable 同源（探测器自己没跑通）。必须记进本批
         # 结论，否则整批异常时 `_note_probe_batch` 看到的是旧 OK/空串，
@@ -6334,6 +6399,18 @@ def _set_outbound_proxy(url: str = "", enabled: bool = False,
             time.sleep(0.2 * (attempt + 1))
     return False
 
+def _singbox_pkill_argv() -> list[str]:
+    """只杀主 sing-box 的 pkill 参数。纯函数，回归测试直接验它。
+
+    WHY 不能用宽匹配 `^{bin} run`：WARP-WG 线各自跑一份 `sing-box run -c
+    .../lineN/singbox.json`，宽匹配会把 17 个进程一起杀掉 —— 每条线重启就换一个
+    WARP 会话、换一个出口 IP，台账里的 line→ip 绑定当场作废。
+    """
+    binary = CFG["singbox"]["binary"]
+    cfg = CFG["singbox"]["config_file"]
+    return ["pkill", "-f", f"^{_re.escape(binary)} run -c {_re.escape(cfg)}"]
+
+
 def restart_singbox() -> bool:
     """重启 sing-box，互斥锁防止并发调用。停服前绕过代理，启动后恢复。"""
     global _RESTART_COUNT, _ACTIVE_WARP_IP
@@ -6359,10 +6436,7 @@ def restart_singbox() -> bool:
         # 宽匹配 `^{bin} run` 会把它们一起杀掉（实测 17 个进程全中）：每条线重启
         # 就换一个 WARP 会话、换一个出口 IP，台账里的 line→ip 绑定当场作废，
         # 而且订阅每小时刷新一次就等于每小时churn 一遍全部线路。
-        subprocess.run(
-            ["pkill", "-f",
-             f"^{_re.escape(singbox_bin)} run -c {_re.escape(config_file)}"],
-            capture_output=True, timeout=10)
+        subprocess.run(_singbox_pkill_argv(), capture_output=True, timeout=10)
         time.sleep(2)
 
         subprocess.run(
@@ -7057,6 +7131,7 @@ def _api_debug_state() -> dict:
         "active_tag": active,
         "fresh_candidates": cands,
         "blocked_ips": blocked,
+        "probe_stats": dict(_PROBE_STATS),
         "active_ip": _ACTIVE_WARP_IP,
         "line_ip": {m["tag"]: _warp_line_ip(m["tag"])
                     for m in _warp()["members"]},
