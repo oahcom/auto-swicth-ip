@@ -296,7 +296,20 @@ def write_line(i: int, node: dict, peer: str | None = None,
     cfg = build_line_config(profile, _wg()["base_port"] + i - 1, node,
                             peer or _wg()["peer_v4"],
                             family or line_family(i))
-    write_json(str(d / "singbox.json"), cfg, mode=0o600, indent=2)
+    path = d / "singbox.json"
+    write_json(str(path), cfg, mode=0o600, indent=2)
+    # 以 root 跑（sudo / 安装 / 排障）时，0600 + root 属主会让以 User=administrator
+    # 启动的单元报 `FATAL read config: permission denied` —— 而且报的是「读不了配置」，
+    # 极易误判成文件损坏或 sing-box 版本问题（实测踩过一次）。属主一律对齐目录属主：
+    # 目录是安装时以运行用户建的，所以它就是该跑这条线的身份。
+    try:
+        if os.getuid() == 0:
+            owner = d.stat()
+            cur = path.stat()
+            if (cur.st_uid, cur.st_gid) != (owner.st_uid, owner.st_gid):
+                os.chown(path, owner.st_uid, owner.st_gid)
+    except Exception:
+        pass
     return cfg
 
 

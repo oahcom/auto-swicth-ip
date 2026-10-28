@@ -4173,7 +4173,10 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     ok = verdict == "OK"
     # 只有 quota(429) 的 Retry-After 会写进惩罚期；403 带限流头不算。
     retry_after = retry_after if verdict == "quota" else None
-    if retry_after and retry_after >= int(_warp().get("quota_hold_min_sec", 1800)):
+    # quota_hold_enabled=false 时永不写 _QUOTA_HOLD_UNTIL：账号级配额不恢复也照样
+    # 换地址。（2026-10-28 按主人要求默认关闭；要恢复保护把配置改回 true 即可。）
+    if (retry_after and _warp().get("quota_hold_enabled", True)
+            and retry_after >= int(_warp().get("quota_hold_min_sec", 1800))):
         _QUOTA_HOLD_UNTIL = max(_QUOTA_HOLD_UNTIL, time.time() + retry_after)
     hint = (f"（Retry-After {retry_after / 3600:.1f}h）"
             if retry_after and retry_after > 0 else "")
@@ -6950,6 +6953,25 @@ def _normalize_rotate_reason(raw) -> str:
     return "rate429"
 
 
+def _rotate_gap() -> float:
+    """两次换线之间的最小间隔（秒）。
+
+    WHY 不能是固定值：429 的惩罚期是 rate429_guard_sec（60s），N 条活线意味着
+    可持续换线速率就是「60/N 秒一次」——超出这个速率，换出去的地址会先被烧光，
+    然后 no_warm_standby。固定 8s 在 16 条线的规模上正好卡在反方向：实测 24 次
+    /rotate 里 20 次被这个闸拒掉，客户端只能拿着已经被拦的 IP 继续重试。
+
+    config 的 min_gap_verified_sec 只当**下限**用（默认 1.5s）：线少的时候
+    （比如只剩 3 条 usque）自动退回 20s，不会把三条线来回烧。
+    """
+    floor = float(CFG.get("api", {}).get("min_gap_verified_sec") or 1.5)
+    try:
+        sustain = float(_warp()["rate429_guard_sec"]) / max(1, len(_warp()["members"]))
+    except Exception:
+        return floor
+    return max(floor, sustain)
+
+
 def _rotate_once(reason: str) -> dict:
     """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
 
@@ -6971,8 +6993,20 @@ def _rotate_once(reason: str) -> dict:
             return {"ok": True, "switched": False, "reason": "coalesced",
                     "switched_at": _last_rotate_ts,
                     "ms": int((time.time() - t0) * 1000)}
-        gap = float(cfg["min_gap_verified_sec"])
-        if _last_rotate_ts and t0 - _last_rotate_ts < gap:
+        old_ip = _warp_line_ip(active_warp_tag()) or _ACTIVE_WARP_IP
+        # 调用方带来的就是证据：它刚在我们当前出口上吃到 429/403。所以先记账再判
+        # 限速 —— 判完拒掉也不能当这条 IP 是干净的，否则同一波风暴里被拒的那些
+        # 请求会在 60s 后重新选中它。
+        was_blocked = False
+        try:
+            was_blocked = bool(old_ip) and _warp_ip_is_blocked(old_ip, t0)
+        except Exception:
+            was_blocked = False
+        if reason != "proactive" and old_ip:
+            _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason)
+        gap = _rotate_gap()
+        if (_last_rotate_ts and t0 - _last_rotate_ts < gap
+                and not was_blocked):
             _api_stats["too_frequent"] += 1
             return {"ok": False, "reason": "too_frequent",
                     "switched_at": _last_rotate_ts,
@@ -6980,7 +7014,6 @@ def _rotate_once(reason: str) -> dict:
         # 换下来的出口必须记账：429/403 是出口 IP 级拦截，不标记就只是
         # 「用过」，60s 冷却一过又能被选中 —— 实测会在两条撑过生产流量的
         # 线上反复来回，另外十几条新鲜线永远轮不到。
-        old_ip = _warp_line_ip(active_warp_tag()) or _ACTIVE_WARP_IP
         out: dict = {}
         ok = _reconnect_warp_by_table(reason, interrupt=False, out=out)
         if not ok:
@@ -6989,9 +7022,6 @@ def _rotate_once(reason: str) -> dict:
                     "switched_at": _last_rotate_ts,
                     "ms": int((time.time() - t0) * 1000)}
         _last_rotate_ts = float(out.get("switched_at") or t0)
-        if reason != "proactive":
-            _mark_warp_ip_used(old_ip, _last_rotate_ts, blocked=True,
-                               kind=reason)
         _api_stats["switched"] += 1
         return {"ok": True, "switched": True,
                 "tag": out.get("tag"), "egress": out.get("ip"),
@@ -7001,10 +7031,32 @@ def _rotate_once(reason: str) -> dict:
 
 
 def _api_debug_state() -> dict:
-    """测试与排障用的状态快照。"""
+    """测试与排障用的状态快照。
+
+    fresh_candidates 是 /rotate 当下能选到的备线集合 —— 它是 no_warm_standby 的
+    唯一直接解释。不给出来，供给不足就只能靠猜（第一次排查时就踩过：状态表里
+    看着有 9 条新鲜线，候选列表其实是空的）。blocked_ips 给出惩罚期的 IP 数，
+    用来区分「线不够」和「IP 全在罚期」。
+    """
+    now = time.time()
+    active = active_warp_tag()
+    try:
+        cands = [m["tag"] for m, _ip in
+                 _warp_line_fresh_candidates(active, now)]
+    except Exception:
+        cands = []
+    blocked = 0
+    try:
+        with _WARP_IP_LOCK:
+            ips = list(_WARP_IP_USED)
+        blocked = sum(1 for ip in ips if _warp_ip_is_blocked(ip, now))
+    except Exception:
+        blocked = -1
     return {
         "ok": True,
-        "active_tag": active_warp_tag(),
+        "active_tag": active,
+        "fresh_candidates": cands,
+        "blocked_ips": blocked,
         "active_ip": _ACTIVE_WARP_IP,
         "line_ip": {m["tag"]: _warp_line_ip(m["tag"])
                     for m in _warp()["members"]},

@@ -25,7 +25,7 @@ print('T6 PASS  800ms 内合并')
 d._last_rotate_ts = time.time() - 2.0
 r = d._rotate_once('rate429')
 assert r['reason'] == 'too_frequent' and r['ok'] is False, r
-print('T7 PASS  8s 内拒绝')
+print('T7 PASS  间隔内拒绝')
 
 # ---- T7b: 无备线 ----
 d._last_rotate_ts = 0
