@@ -283,6 +283,21 @@ else
         fi
         install_lines || die "降级铺开仍失败，见上方错误"
     fi
+    # daemon 靠 /usr/local/bin/asip-unit 重启系统级单元（sudoers 白名单）。白名单
+    # 一旦漏了 warp-wg-*，每次重启都被拒（实测 3 小时 528 次），死掉的线谁也拉不起来。
+    # 这个包装器原本只由 install.sh 安装 —— 只跑 bootstrap 的机器会拿到旧版本。
+    WRAPPER=/usr/local/bin/asip-unit
+    if [ -f "$DIR/deploy/asip-unit" ]; then
+        if ! cmp -s "$DIR/deploy/asip-unit" "$WRAPPER" 2>/dev/null \
+           || ! grep -q 'warp-wg-\*' "$WRAPPER" 2>/dev/null; then
+            need_root install -m 0755 "$DIR/deploy/asip-unit" "$WRAPPER"
+            ok "已更新单元提权包装器（白名单含 warp-wg-*）"
+        else
+            ok "单元提权包装器已是最新"
+        fi
+    fi
+    [ -f /etc/sudoers.d/auto-switch-ip ] \
+        || warn "缺少 /etc/sudoers.d/auto-switch-ip：daemon 重启线路会被拒（跑一次 deploy/install.sh 生成）"
     # 必须先把属主交还给运行用户，再重启：顺序反了就是 permission denied 崩溃循环。
     # 以 root 跑时 apply 生成的凭据属 root，而单元以 $OWNER 运行 —— 必须交还属主。
     chown -R "$OWNER:$OWNER_GROUP" "$DIR/.warp/wglines" "$STATE" \
