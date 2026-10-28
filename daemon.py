@@ -3104,10 +3104,18 @@ def _quarantine_line(tag: str, ip: str | None, seconds: float, now: float) -> No
             if _warp_line_quarantined(_warp_line_state(m.get("tag")), now):
                 q += 1
         if q + 1 > int(total * ratio):
-            log(f"  · {tag} 撞上长 Retry-After，但隔离中的线已占 "
-                f"{q}/{total}（上限 {int(ratio * 100)}%），本次不隔离")
+            # 池子被烧穿时这条会每条线每次探测都命中（实测 222 次），必须节流，
+            # 否则日志自己变成噪音，把真正的信号淹掉。
+            global _QUARANTINE_REFUSE_TS
+            if now - _QUARANTINE_REFUSE_TS > 60.0:
+                _QUARANTINE_REFUSE_TS = now
+                log(f"  · {tag} 撞上长 Retry-After，但隔离中的线已占 "
+                    f"{q}/{total}（上限 {int(ratio * 100)}%），本次不隔离")
             return
     _warp_line_update(tag, quota_until=until, quota_ip=ip)
+
+
+_QUARANTINE_REFUSE_TS = 0.0
 
 
 def _trim_quarantine_locked() -> None:
