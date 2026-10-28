@@ -199,14 +199,18 @@ def test_quota_hold_also_blocks_penalty_restart(monkeypatch):
 
 
 def test_quota_hold_does_not_block_tunnel_death_restart(monkeypatch):
-    """额度闸只拦「换地址」这一类，隧道半死照常重启。"""
+    """额度闸只拦「换地址」这一类，隧道半死照常重启。
+
+    半死 = 进程还在（端口开着）、上游取不到地址。
+    端口关着的那种是进程死了，交给 systemd 的 Restart=always。
+    """
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
     monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
     with daemon._WARP_LINE_CV:
         daemon._warp_line_state_locked("W2").update(
             fail_streak=daemon._UNKNOWN_RESTART_STREAK)
-    monkeypatch.setattr(daemon, "_port_open", lambda port: False)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
                         lambda m, r: restarted.append(m["tag"]) or True)
@@ -360,3 +364,22 @@ def test_stale_verdict_after_line_restart_is_dropped():
     assert st["ip"] == "2.2.2.2", st
     assert st["last_verdict"] == "unknown", st
 
+
+
+def test_tunnel_death_port_closed_defers_to_systemd(monkeypatch):
+    """端口已关着时不重启：进程死了是 systemd Restart=always 的活。
+
+    反过来写的代价实测过：:1080 端口开着但会话僵死，
+    fail_streak 堆到 374、restart_count 还是 0，只能人工手拉。
+    """
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            fail_streak=daemon._UNKNOWN_RESTART_STREAK * 3)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: False)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r: restarted.append(m["tag"]) or True)
+    daemon._probe_one_line(_member())
+    assert restarted == [], "端口已关还重启，等于抢 systemd 的活"

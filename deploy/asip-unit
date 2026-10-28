@@ -17,8 +17,11 @@ set -euo pipefail
 cmd=${1:?用法: asip-unit <restart|start|stop|is-active> <单元名>}
 unit=${2:?缺少单元名}
 
+# warp-wg-*.service 不能漏：config.py 把 WARP-WG-* 写成独立单元（service_prefix =
+# "warp-wg-"），它们才是承载流量的大头。漏了就是 daemon 每轮都发启动、
+# 每轮都被拒（实测一次启动内 107 次），罚期线永远换不出新地址。
 case $unit in
-    usque-warp*.service|nine-router-src.service) ;;
+    usque-warp*.service|warp-wg-*.service|nine-router-src.service) ;;
     *) echo "✗ 拒绝：$unit 不在白名单" >&2; exit 2 ;;
 esac
 

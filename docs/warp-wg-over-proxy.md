@@ -308,6 +308,13 @@ python3 warp_wg.py apply --dry-run # 只打印分配，不写文件
 python3 -m pytest test_warp_wg.py -q
 ```
 
+回归用例（与主路径同改同测，不同步的测试比没有测试更贵）：
+
+~~~bash
+python3 tests/test_rotate.py         # 合并窗口 / 限速 / 无备线 / 换走的出口要拉黑
+python3 tests/test_restart_scope.py  # 重启主 sing-box 不许误杀 WARP-WG 线
+~~~
+
 覆盖：profile 解析、IPv6 peer 拆分、detour/final/DNS 路由、`dns.strategy`
 随渠道族切换、生成配置的 `sing-box check`、按 colo 分组的节点分配、
 rotate 的「先写配置后重启」顺序、`WARP_WG_FAMILIES × WARP_WG_NODES`
@@ -391,3 +398,93 @@ sing-box。**订阅一旦配回来，这一步会被 `parse_subscription.py` 自
 单轮 10 次轮换统计：`switched=10`、distinct egress=7、`too_frequent=22`
 （测试节奏 9s < 8s 限速边界的边界抖动）、`no_warm_standby=1`（探测器补货中）。
 比修复前「2 条线乒乓」实质改善了供给面。
+
+---
+
+## 10. 一条命令初始化（远端部署）
+
+### 10.1 入口
+
+~~~bash
+# 新主机：基础安装 + 线路一起
+./deploy/install.sh --with-wg
+
+# 已有基础安装，只补/补线路
+./deploy/wg-bootstrap.sh
+
+# 其它形态
+./deploy/wg-bootstrap.sh --dry-run        # 只打印计划，不动系统（也不会触发换线）
+./deploy/wg-bootstrap.sh --verify-only    # 只验收（只读）
+./deploy/wg-bootstrap.sh --resurvey       # 强制重测落地 colo（10-20 分钟）
+./deploy/wg-bootstrap.sh --count=8        # 只铺 8 条
+WARP_WG_FAMILIES=v4,v6,v6,v6 WARP_WG_NODES=4 ./deploy/wg-bootstrap.sh
+~~~
+
+七段：预检 → wgcf → .env → survey → 注册+铺线+单元 → 并入主配置 → 验收。
+
+**幂等**（远端反复执行不会自伤），实测连续两次跑完全一致、16 个出口 IP 一字未变：
+
+| 动作 | 幂等策略 |
+|------|----------|
+| 注册 WARP 设备 | 已有 profile.conf 就跳过（重注册会换掉在用密钥，隧道当场掉线） |
+| .env | 只补/改本脚本管的键，其余原样保留 |
+| 线路配置 | 按内容哈希判定，变了才重启该线 |
+| 单元 | 重写文件，enable --now 对已 active 的单元不重启 |
+| 主配置 | 未变化就不重启 sing-box（重启是断流操作） |
+| daemon | 成员表条数与实际一致就不重启 |
+
+验收不过返回非零 —— 无人值守部署必须失败得响。验收里对「进程活着但隧道死了」的线
+会**重启该线一次再测**（WARP 会话会静默失效，sing-box 仍在监听，只有真发请求才看得出来）。
+
+### 10.2 落地过程中踩到并修掉的四个坑
+
+**坑 1：以 root 部署 → 线路全部崩溃循环。**
+本机唯一提权路径是 wsl -u root，于是 warp_wg.py apply 以 root 写出 singbox.json
+（0600，属 root），而单元以 User=administrator 运行：
+
+~~~
+FATAL read config at .../line5/singbox.json: permission denied
+~~~
+
+16 条线全在 Restart=always 里循环。修法是从源头给对属主：以 root 且 ASIP_RUN_USER
+非 root 时，apply 走 runuser -u <owner>。bootstrap 里的 chown -R 只作兜底，
+且**必须在重启之前**执行（顺序反了就是同一个崩溃窗口）。
+
+**坑 2：pkill -f '^{bin} run' 会连 16 条线一起杀掉。**
+每条线各跑一份 sing-box run -c .../lineN/singbox.json，宽匹配实测命中 **17 个进程**。
+后果不只是瞬时断流：每条线重启就是一次新 WARP 会话、一个新出口 IP，台账里的
+line→ip 绑定当场作废；订阅每小时刷新一次就等于每小时 churn 一遍全部线路。
+已改为锚定主配置路径（run -c <config>），并加了回归测试 tests/test_restart_scope.py。
+
+**坑 3：配置变了但进程还跑旧的。**
+apply 重写线路配置后不重启单元，就会出现「配置里是 v4、线上还在 v6」的静默不一致
+—— 验收全绿却跟配置不符。bootstrap 现在按内容哈希对比，只重启真正变了的线。
+
+**坑 4：降级会静默丢掉 v4 通道。**
+注册被限流时如果直接退回 WARP_WG_COUNT=<就绪数>，拓扑会变成「全部 v6」，
+v4 渠道（4 个 colo 各一条，是 v4 多样性的上限）就没了。现在优先**减落地节点**
+（NODES = 就绪数 / 每节点渠道数），渠道配比不变；只有除不尽时才退回单渠道，
+并且明确告警说 v4 已丢。
+
+### 10.3 验收输出（本机 2026-10-28 08:50）
+
+~~~
+== 7/7 验收 ==
+✓ 单元 active 16/16
+  line1  :1110  NRT      104.28.243.105
+  line2  :1111  NRT      2a09:bac5:4301:dc::16:171
+  ...
+  line16 :1125  SJC      2a09:bac5:6213:1250::1d3:bf
+✓ 出口去重 16/16（同 colo 共享地址池，去重数 = v4 渠道多样性上限）
+✓ /rotate 探活通过：{ok: true, switched: true, tag: WARP-WG-5, ...}
+✓ 验收通过：16 条线全部 warp=on，出口 16 个
+~~~
+
+### 10.4 远端部署仍需人工确认的三件事
+
+1. **install.sh 要以仓库属主跑**（不是 root）：单元里的 User= 取自运行身份，
+   以 root 跑会把 usque 单元写成 User=root，而 daemon 以属主身份读 .warp 会失败。
+2. **wireguard 内核模块**：WSL 需 wsl --update；通用 Linux 可能要
+   linux-modules-extra-$(uname -r)。bootstrap 会 modprobe 一次并在缺失时告警。
+3. **GitHub 可达性**：wgcf 下载先直连，失败自动退回 $https_proxy 或本机 7890。
+   两者都不通时需手动放二进制到 .warp/wgcf（或用 WGCF_BIN=/path 覆盖）。

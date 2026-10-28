@@ -3122,10 +3122,13 @@ def _probe_one_line(member: dict) -> None:
     if not ip:
         _warp_line_record_observation(tag, None, "unknown", time.time(), started_at)
         # 连续拿不到地址 = 隧道半死（进程在、上游不通）。单次 unknown 是瞬态，
-        # 不重启；连续多次且端口仍开着才是确定失败。
+        # 不重启；连续多次且端口仍开着才是确定失败 —— 端口开着说明进程还活着、
+        # 只是 MASQUE 会话僵死（实测 :1080 僵了 3 小时，TCP 能 accept 但握不完手，
+        # 靠 systemd 的 Restart=always 永远等不到，只能这里重启）。
+        # 端口关着则相反：进程已经没了，那是 systemd 的活，再从这儿重启等于抢它的活。
         streak = int(_warp_line_state(tag).get("fail_streak") or 0)
         if (tag != active and streak >= _UNKNOWN_RESTART_STREAK
-                and not _port_open(member["port"])):
+                and _port_open(member["port"])):
             _warp_line_restart(member, f"连续 {streak} 次取不到出口地址")
         return
     cur = _warp_line_state(tag)
@@ -6348,8 +6351,14 @@ def restart_singbox() -> bool:
         # 停服前绕过代理，避免重启窗口请求报错
         _set_outbound_proxy(enabled=False)
         singbox_bin = CFG["singbox"]["binary"]
+        config_file = CFG["singbox"]["config_file"]
+        # 只杀主进程。WARP-WG 线各自跑一份 `sing-box run -c .../lineN/singbox.json`，
+        # 宽匹配 `^{bin} run` 会把它们一起杀掉（实测 17 个进程全中）：每条线重启
+        # 就换一个 WARP 会话、换一个出口 IP，台账里的 line→ip 绑定当场作废，
+        # 而且订阅每小时刷新一次就等于每小时churn 一遍全部线路。
         subprocess.run(
-            ["pkill", "-f", f"^{_re.escape(singbox_bin)} run"],
+            ["pkill", "-f",
+             f"^{_re.escape(singbox_bin)} run -c {_re.escape(config_file)}"],
             capture_output=True, timeout=10)
         time.sleep(2)
 

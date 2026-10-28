@@ -30,7 +30,15 @@ HOME_DIR="${ASIP_HOME_DIR:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 
 # 用户级单元在它那里会撞 polkit 交互认证（`Interactive authentication
 # required`），换线时只能看着「重启后未就绪」。
 UNIT_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+RUN_USER="${ASIP_RUN_USER:-$(id -un)}"
+RUN_GROUP="${ASIP_RUN_GROUP:-$(id -gn "$RUN_USER" 2>/dev/null || id -gn)}"
 mkdir -p "$UNIT_DIR"
+
+# 单元以哪个用户跑。默认本用户；以 root 部署时必须显式给 ASIP_RUN_USER ——
+# 否则单元会写成 User=root，而 .warp 下的线路凭据仍属普通用户，或反过来：
+# root 生成的 singbox.json 属 root，单元以 administrator 跑就读不到（Permission
+# denied），现象是 16 条线全部 start-limit 循环重启。本机唯一提权路径是
+# `wsl -u root`，所以这条不是假想。
 
 # 单元把 ExecStart 钉死在本次 DIR。拿副本试跑却没设 SYSTEMD_DIR 会把生产单元
 # 改指到副本（install.sh 里真实发生过），这里同样拦一道。
@@ -63,7 +71,14 @@ fi
 # 首次部署建议开着确认节点可用性。
 APPLY_ARGS=(apply)
 [ "${WARP_WG_PROBE:-0}" = "1" ] && APPLY_ARGS+=(--probe)
-PYTHONPATH="$DIR" "$PYBIN" "$DIR/warp_wg.py" "${APPLY_ARGS[@]}"
+# apply 会写 .warp/wglines/lineN/{account.toml,profile.conf,singbox.json}（0600）。
+# 以 root 部署时若以 root 跑，文件属 root，而单元以 $RUN_USER 运行 —— 读不到配置，
+# 16 条线全在 permission denied 里崩溃循环（实测过一次）。从源头给对属主。
+if [ "$(id -u)" = 0 ] && [ "$RUN_USER" != root ]; then
+    runuser -u "$RUN_USER" -- env PYTHONPATH="$DIR" "$PYBIN" "$DIR/warp_wg.py" "${APPLY_ARGS[@]}"
+else
+    PYTHONPATH="$DIR" "$PYBIN" "$DIR/warp_wg.py" "${APPLY_ARGS[@]}"
+fi
 
 # ---- 2. 单元：每条线一个进程，重启只影响这条线 ----
 # 名字必须与 config.py 里生成的 member.service 一致，否则 daemon 的
@@ -82,8 +97,8 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-User=$(id -un)
-Group=$(id -gn)
+User=$RUN_USER
+Group=$RUN_GROUP
 Environment=HOME=$HOME_DIR
 Type=simple
 # 上一实例异常退出可能仍占着端口，先清持有者再 bind。

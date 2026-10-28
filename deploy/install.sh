@@ -41,11 +41,15 @@ fi
 RUN_USER="${ASIP_RUN_USER:-$(id -un)}"
 PYBIN="${PYTHON:-/usr/bin/python3}"
 [ -x "$PYBIN" ] || { echo "✗ 解释器不存在：$PYBIN（用 PYTHON=... 指定）" >&2; exit 1; }
-UNITS_ONLY=0; ADOPT=0
+UNITS_ONLY=0; ADOPT=0; WITH_WG=0; WG_COUNT=""
 for arg in "$@"; do
     case "$arg" in
         --units-only) UNITS_ONLY=1 ;;
         --adopt)      ADOPT=1 ;;
+        # 顺带铺 WARP-over-proxy 线路（deploy/wg-bootstrap.sh）。默认关：
+        # 注册会撞 Cloudflare 限流，不该让基础安装因此失败。
+        --with-wg)    WITH_WG=1 ;;
+        --wg-count=*) WITH_WG=1; WG_COUNT="${arg#*=}" ;;
     esac
 done
 
@@ -317,3 +321,19 @@ BIN_DIR="${ASIP_BIN_DIR:-$HOME_DIR/.local/bin}"
 mkdir -p "$BIN_DIR"
 ln -sfn "$DIR/deploy/asip-cli.sh" "$BIN_DIR/asip"
 echo "asip CLI: $BIN_DIR/asip → $DIR/deploy/asip-cli.sh"
+
+# ---- 可选：WARP-over-proxy 线路 ----
+# 单列一步而不是揉进上面：它要提权写 /etc、要逐个注册 WARP 设备（有速率限制），
+# 失败只该让这一步红，不该把已经装好的 daemon 拖成失败。
+if [ "$WITH_WG" = 1 ] && [ "$UNITS_ONLY" = 0 ]; then
+    echo
+    echo "→ 初始化 WARP-over-proxy 线路（deploy/wg-bootstrap.sh）"
+    WG_ARGS=()
+    [ -n "$WG_COUNT" ] && WG_ARGS+=("--count=$WG_COUNT")
+    if bash "$DIR/deploy/wg-bootstrap.sh" "${WG_ARGS[@]+"${WG_ARGS[@]}"}"; then
+        echo "✓ WARP 线路就绪"
+    else
+        echo "⚠ WARP 线路初始化未完全成功（多半是注册限流）：窗口过后重跑" >&2
+        echo "  bash $DIR/deploy/wg-bootstrap.sh" >&2
+    fi
+fi
