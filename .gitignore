@@ -32,3 +32,6 @@ singbox-config.json.tmp
 # 池节点 IP 使用台账（运行时状态）
 .node_ip_used.json
 .warp_segment.json
+
+# /rotate 的 API token 与 socket（0600/0700，不入库）
+run/

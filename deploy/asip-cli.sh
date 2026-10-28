@@ -61,7 +61,14 @@ else
   SCTL=(systemctl --user)
   JCTL=(journalctl --user)
 fi
-_sctl() { "${SCTL[@]}" "$@"; }
+# 查询类动词不需要 root：systemctl is-active 普通用户就能问，而本机 sudoers 只放行了
+# asip-unit，走 sudo -n 会直接报"需要交互认证"，把状态打成空白。
+_sctl() {
+  case "${1:-}" in
+    is-active|is-enabled|status|show) systemctl "$@" ;;
+    *) "${SCTL[@]}" "$@" ;;
+  esac
+}
 _jctl() { "${JCTL[@]}" "$@"; }
 # 系统级单元目录在 /etc 下：屏蔽/还原要写文件，非 root 必须借 sudo。
 # 失败必须冒泡：没有 set -e，静默失败的 sudo 会让 stop 报成功而单元原样还在。

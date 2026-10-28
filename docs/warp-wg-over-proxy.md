@@ -336,3 +336,58 @@ AnonPages 7.8G   Cached 5.3G
 同期全机 RSS 合计 12.2 GB / PSS 合计 8.6 GB，占用大头不在代理：
 PyCharm remote 2.9 GB、9router 12 进程 1.9 GB、opencode TUI 1.4 GB。
 
+
+---
+
+## 9. 上线结果与两处选线回归（2026-10-28 08:00–08:30）
+
+### 9.1 部署
+
+```bash
+WARP_WG_FAMILIES=v4,v6,v6,v6 WARP_WG_NODES=4 WARP_WG_PROBE=1 \
+  ./deploy/wg-lines-install.sh
+```
+
+- 16 个系统级单元（`warp-wg-1..16`）全部 active，端口 1110–1125。
+- 16 个独立 WARP 设备（wgcf `register`），第 9 台起撞 CF 限流，30/90/240s
+  退避后全部拿到 profile。
+- 实测出口：4 条 v4（NRT/PHX/SIN/SJC 各一）+ 12 条 v6，**16 个互不相同的地址**。
+- `.env` 加 `WARP_WG_FAMILIES`/`WARP_WG_NODES`，daemon 重启后成员表
+  19 条（3 usque + 16 WG）。
+
+### 9.2 回归一：订阅源为空时新出口进不了主配置
+
+`OKZ_SUB_URL` 等四个订阅变量当前都没配，`refresh_subscription` 直接
+「无可用订阅源」返回，`singbox-config.json` 不会重生成 —— `warp-outbound.json`
+里新增的 16 条 socks 出口进不了 `opencode-out` selector，切换全部
+`status=400`。
+
+处置：`patch_wg_outbounds.py` 就地并入（幂等），`sing-box check` 通过后重启主
+sing-box。**订阅一旦配回来，这一步会被 `parse_subscription.py` 自动接管**，
+补丁脚本只在无订阅期用。
+
+### 9.3 回归二：`/rotate` 换走的出口没有拉黑（真 bug）
+
+`_rotate_once` 重构为复用 `_reconnect_warp_by_table` 后，只保留了
+`_mark_warp_ip_used(old_ip, now)`（= 记「用过」），**丢了 `blocked=True, kind=...`**。
+
+后果：被 429 打下来的出口 60s 后重新成为候选，而它在台账里有 `last_ok_ts`
+（档位 1，高于只有 probe_ok 的档位 2），于是轮换在**两条撑过生产流量的线之间
+来回**，另外十几条新鲜线永远轮不到。实测 10 次连续 `/rotate` 只在
+`WARP-CF-B` 与 `WARP-WG-1` 之间乒乓。
+
+修复：`_rotate_once` 换线前取 `old_ip`，成功后按 reason 拉黑
+（`proactive` 除外）。修复后同样 10 次轮换落到 WG-5/6/7/9、CF-D、WG-4/15
+共 7 条不同线。
+
+同时发现 `tests/test_rotate.py` 仍在 monkeypatch 已删除的 `_rotate_pick` /
+`_finalize_warp_switch` / `_close_line_conns_now`，**这条路径早就没有回归覆盖**
+—— 这才是缺陷能溜进主干的直接原因。已按当前实现重写（合并窗口、限速、
+无备线、拉黑 429/403、主动轮换不拉黑），`tests/test_finalize.py` 与
+`tests/test_rotate_add.py` 测的是已废弃接口，一并删除。
+
+### 9.4 容量
+
+单轮 10 次轮换统计：`switched=10`、distinct egress=7、`too_frequent=22`
+（测试节奏 9s < 8s 限速边界的边界抖动）、`no_warm_standby=1`（探测器补货中）。
+比修复前「2 条线乒乓」实质改善了供给面。

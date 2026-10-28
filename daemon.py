@@ -6968,6 +6968,10 @@ def _rotate_once(reason: str) -> dict:
             return {"ok": False, "reason": "too_frequent",
                     "switched_at": _last_rotate_ts,
                     "ms": int((time.time() - t0) * 1000)}
+        # 换下来的出口必须记账：429/403 是出口 IP 级拦截，不标记就只是
+        # 「用过」，60s 冷却一过又能被选中 —— 实测会在两条撑过生产流量的
+        # 线上反复来回，另外十几条新鲜线永远轮不到。
+        old_ip = _warp_line_ip(active_warp_tag()) or _ACTIVE_WARP_IP
         out: dict = {}
         ok = _reconnect_warp_by_table(reason, interrupt=False, out=out)
         if not ok:
@@ -6976,6 +6980,9 @@ def _rotate_once(reason: str) -> dict:
                     "switched_at": _last_rotate_ts,
                     "ms": int((time.time() - t0) * 1000)}
         _last_rotate_ts = float(out.get("switched_at") or t0)
+        if reason != "proactive":
+            _mark_warp_ip_used(old_ip, _last_rotate_ts, blocked=True,
+                               kind=reason)
         _api_stats["switched"] += 1
         return {"ok": True, "switched": True,
                 "tag": out.get("tag"), "egress": out.get("ip"),
