@@ -20,8 +20,10 @@
 | 全量单测 | `29 failed / 3640 passed`，与改动前基线 `29 failed / 3622 passed` 失败集合一致 | `npx vitest run tests/unit --exclude "**/*.live.test.js"` |
 
 **部署判据订正**：本表原来用「进程启动时刻晚于 BUILD_ID mtime」判定部署生效。08:40 这次实测
-出现 3 秒倒挂（进程 08:40:45 起，BUILD_ID 08:40:48 落盘）而运行中的确实是新代码 —— 判据不可靠，
-详见 §4 F8。可靠做法是从构建产物里 grep 本次改动独有的字符串。
+三个时间戳互相矛盾（同一 pid 的启动时刻两次读到 `08:40:45` / `08:39:31`，日志文件 birth
+`08:41:13`，BUILD_ID mtime `08:40:48`），无法据此判定先后，而运行中的确实是新代码。原因未查明
+（不排除 WSL2 时间戳读数不可靠），所以不把时间顺序当判据，改用内容判据：
+`grep -l suppressed .next/standalone/.next/server/chunks/*.js` + 运行时行为探针（见 §4 F8）。
 
 本轮已落地提交（按时间顺序）：
 
@@ -354,7 +356,7 @@ ps -o lstart= -p $(ss -ltnp | grep ':20127' | grep -oP 'pid=\K[0-9]+')
 | F5 | 「235.5s = 4×60s 预算」 | 4×60s + 3×3s 退避 = 249s，差 13.5s 未闭合；137 条原始行已被 `requestDetails` 保留窗口（约 2000 行 / 35 分钟）挤出，无法复核 | §3 标注为历史证据 + 未闭合缺口 |
 | F6 | B-9R1「对端 chat 恒挂，建议摘掉」 | 直连对端 `model=remote` → 200/1.746s；经本机 `9router1/remote` → 200/1.755s；最近 10 条 2.26–14.01s，7 成功 3 失败 | 状态改「已恢复」，摘除建议撤回 |
 | F7 | 「空候选要说话」（新增告警） | 无节流：39 分钟 585 行，同一秒最多 4 条重复 | `55f31496` 起同一出口每分钟至多一行，实测 `(+14 suppressed)` |
-| F8 | 「进程启动晚于 BUILD_ID mtime」判部署 | 本次 08:40:45 启动 vs BUILD_ID 08:40:48，倒挂 3 秒，而运行中的确是新代码 | 判据改为 grep 构建产物中的新增字符串 |
+| F8 | 「进程启动晚于 BUILD_ID mtime」判部署 | 时间戳互不相容：同一 pid 两次读到 08:40:45 / 08:39:31，日志文件 birth 08:41:13，BUILD_ID mtime 08:40:48；而运行中的确是新代码（行为探针 delta=0 + `(+N suppressed)`） | 时间判据弃用，改为内容判据；原因未查明，不编机制 |
 | F9 | `opencode.js:646-650`、`opencode.js:689`、`egress.js:51` | 实际 681、721、50；`auth.js` 实际路径 `src/sse/services/auth.js` | 已订正 |
 | F10 | B10「所有出口共用同一份 socket 池」 | 进程单例成立（`opencodeTransport.js:14`），但 sidecar 内 `sessions` 按 proxy 分键（`scripts/opencode-transport.mjs:43`） | 结论保留，理由改写 |
 | F11 | `daemon.py` 有 `_classify_transport_error` / `_verify_transport_failure` 兜底 | 实测存在：`daemon.py:1108`、`:1124` | 断言成立，无需改 |
