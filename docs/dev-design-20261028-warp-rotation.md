@@ -255,6 +255,7 @@ RestartSec=2                   # 原 3s
 | `probe_ok_ttl_sec` | 600 | IP 未变且已验 OK 的结论缓存 |
 | `prober_idle_wait_sec` | 30 | 全部线闲着时的最长休眠 |
 | `line_fresh_sec` | 120 | 备线"新鲜"（`last_ok_ts` 窗口） |
+| `min_gap_verified_sec` | 1.5 | 换线间隔的**地板**；实际间隔见第 9 节 |
 | `restart_concurrency` | 12 | 同时在飞的重启槽位 |
 | `restart_cooldown_sec` | 5 | 重启被非失败原因挡下时的固定冷却 |
 | `restart_max_per_hour_per_line` | 0 | 每线每小时重启上限，0 = 不限 |
@@ -293,7 +294,7 @@ sudo pkill -f "sing-box run -c /home/administrator/dkk-projects/auto-switch-ip/s
 
 ## 5. 遗留问题与风险
 
-1. **WG-1 / WG-9 仍在 503 循环**（未修，待决策）
+1. **503 不是本地问题：detour 节点失效**（2026-10-28 09:20 已定论，见第 9.4 节）
    `connect to server: unexpected HTTP response status: 503` → sing-box 干净退出 → 单元被拉起。
    驱动者是 daemon 的 `↻ 重启 …（出口处于惩罚期）`，1~2 秒一轮：v4 地址从 colo 池随机抽，
    重启很容易抽回台账里已知在惩罚期的地址。两条候选方案：
@@ -488,3 +489,82 @@ SIN 5 个地址里最偏的一个节点 8 次全抽到 `.222.43`，另一个节�
    或等窗口过去；地址维度唯一还有效的杠杆是换入口端点（见 8.2），但它不改变结论。
 4. `probe_warp.py` 用 `Bearer public` 时对每条线都返回 `quota`，包括历史上 OK 的线 ——
    在接真实凭据之前，它不能用来区分 colo 级与地址级的失败。
+
+---
+
+## 9. 调用方同步换线 + 间隔自适应（2026-10-28 09:00–09:25）
+
+### 9.1 结论先说
+
+| 问题 | 答案 | 证据 |
+|------|------|------|
+| S6/S7 做了吗 | **早就做了，而且一直在生产里跑** | 40 分钟内 9router 日志 `asip rotated` 191 次 |
+| 换线超时取多少 | **2000ms** | 10 次实测 min 774 / p50 1090 / p90 1314 / max 1374 |
+| 供给为什么不足 | **不是候选不够，是固定 8s 闸** | 候选常年 8–13 条，`no_standby` 恒为 0；191 次调用里 82 次被闸拒 |
+
+### 9.2 S6/S7 的真实状态
+
+`open-sse/utils/asipRotate.js`（UDS + token 客户端）和 `open-sse/executors/opencode.js`
+里的 429 分支本来就已经写好，但**两处关键事实没人核对过**：
+
+1. 它是不是真的在跑 —— 9router 的 server 是 node22，sidecar 才是 bun。`node:http`
+   的 `socketPath` 在 bun 里能不能用，之前没验证。实测 bun 1.4.4 下 `readAsipState()`
+   / `rotateEgress()` 都正常返回，这条路是通的。
+2. 它是不是进了构建 —— 源码改了不等于跑着的进程里有。`.next/server/chunks/5330.js`
+   里能搜到 `abusive traffic` 与 `ASIP_TIMEOUT_MS`，说明当前构建包含这段。
+
+本次补的是**403**：原来只有 429 会触发换线。照搬 daemon 的 `_classify_egress_error`，
+403 必须先看正文 —— 只有 `abusive traffic` 是出口信誉问题，`FreeTierError` 是请求指纹/
+请求形状被拒，换 IP 无效，还会把另一条线拖进惩罚期。
+
+### 9.3 换线超时：2000ms
+
+实测 10 次（16 条 WG + 3 条 usque，探测器同时在跑，198s 间隔 3.4s 连续触发）：
+
+```
+min 774 / p50 1090 / p90 1314 / max 1374  (ms)
+```
+
+- **800ms 不可行**：会砍掉一半正常换线。
+- **1500ms 太薄**：对 max 1374 只剩 9% 余量，尾巴一抖就超。
+- 超时还有隐性代价：客户端销毁请求，但 asip 那边的换线**不会停**。于是 9router 在旧
+  隧道上重试、出口却已经变了 —— 比多等 0.5s 糟得多。
+
+### 9.4 供给：不是候选不够，是闸太慢
+
+连续 12 次 `rate429` 压测（间隔 1.2s）的原始输出：
+
+```
+成功=3  限速=20  无备线=0   cands 8~13 / 19
+```
+
+候选从来没缺过，`no_warm_standby` 一次没出现。真正的限制是固定 `min_gap_verified_sec=8.0`：
+429 惩罚 60s、19 条线，可持续换线速率本来就是 3.16s 一次，8s 等于主动丢掉一半机会，
+客户端只能拿着已经被拦的 IP 继续重试（生产日志里 60 次 `too_frequent` 就是它）。
+
+改成随规模自适应：
+
+```python
+gap = max(1.5, rate429_guard_sec / len(members))   # 19 条 -> 3.16s；3 条 -> 20s
+```
+
+同一波压测变成 **成功=7 / 限速=5 / 无备线=0**。另外两处：
+
+- 当前出口**已被拉黑**时立刻放行（那时换出去只会更好，没必要等间隔）。
+- 记账挪到判限速**之前**：被拒的那次调用带来的也是真证据，拒了也不能当那条 IP 是干净的。
+
+### 9.5 503 的真身：detour 节点死了，重启无效
+
+`connect to server: unexpected HTTP response status: 503` 意味着这条线的**中转节点**
+失效，本地怎么重启都拿不回新节点。对策是 `warp_wg.py rebind <i> --probe` 换节点重写
+该线配置。2026-10-28 实测 line1 / line12 / line13 就是这样救回来的。
+
+`deploy/wg-bootstrap.sh --verify-only` 的自愈因此改成两段：重启 → 重测 → 仍不通则
+rebind → 重启 → 重测。
+
+### 9.6 顺手修掉的老坑：rebind 写配置的属主
+
+`rebind` 以 root 跑时写出的 `singbox.json` 是 0600 + root，而单元是 `User=administrator`，
+sing-box 报 `FATAL read config: permission denied` —— 报错读起来像文件损坏，实测把两条线
+误判成「节点 503」。现在 `write_line()` 写完就把属主对齐目录属主（目录是安装时以运行用户
+建的），从根上不再依赖调用者是谁。

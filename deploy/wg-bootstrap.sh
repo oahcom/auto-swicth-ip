@@ -418,6 +418,18 @@ for i in $(seq 1 "${N:-0}"); do
         need_root systemctl restart "warp-wg-$i.service" 2>/dev/null || true
         sleep 10
         probe_line "$PORT"
+        # 重启还是死线，通常不是本地问题：日志里是
+        #   connect to server: unexpected HTTP response status: 503
+        # 即这条线的 detour 中转节点失效。同一份配置再重启一百次也拿不到新节点，
+        # 必须 rebind（换节点、重写该线配置）后再重启 —— 2026-10-28 实测 line1/12/13
+        # 就是这样救回来的，光重启只会一直 503。
+        if [ -z "$IP" ] || [ "$WR" != on ]; then
+            warn "line$i 重启无效（疑似 detour 503），换中转节点后重测"
+            py warp_wg.py rebind "$i" --probe >/dev/null 2>&1 || true
+            need_root systemctl restart "warp-wg-$i.service" 2>/dev/null || true
+            sleep 10
+            probe_line "$PORT"
+        fi
         [ -n "$IP" ] && [ "$WR" = on ] && REPAIRED=$((REPAIRED + 1))
     fi
     if [ -z "$IP" ]; then
