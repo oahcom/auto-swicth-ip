@@ -7625,17 +7625,49 @@ def _api_debug_state() -> dict:
     }
 
 
+_CLIENT_GONE = {"count": 0, "last_log": 0.0, "last_switched": 0}
+
+
+def _note_client_gone(result: dict) -> None:
+    """换线已完成、但回传时客户端已经走了。
+
+    这不是 /rotate 的故障，而是一次「换了但没等」：客户端 ASIP_TIMEOUT_MS
+    （默认 2000ms）先到点、销毁了连接，锁内的换线照旧跑完并生效，只是没人
+    接这个响应。所以这里只计数 + 限流打一行，绝不吞成异常再补写 500 ——
+    补写那一次同样会炸，栈打穿之后日志里就只剩下 Broken pipe 这一种声音，
+    真正的故障反而被淹掉。
+    """
+    _CLIENT_GONE["count"] += 1
+    _CLIENT_GONE["last_switched"] = 1 if result.get("switched") else 0
+    _api_stats["client_gone"] = _CLIENT_GONE["count"]
+    now = time.time()
+    if now - _CLIENT_GONE["last_log"] >= 60:
+        _CLIENT_GONE["last_log"] = now
+        log(f"· /rotate 回传超时累计 {_CLIENT_GONE['count']} 次；"
+            f"本次已换线 switched={bool(result.get('switched'))} "
+            f"reason={result.get('reason')} ms={result.get('ms')}"
+            f"（换线生效，只是没人收响应）")
+
+
 class _RotateHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "asip/1"
 
-    def _send(self, code: int, payload: dict) -> None:
+    def _send(self, code: int, payload: dict) -> bool:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        except (BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError, OSError):
+            # 对端已关闭（超时销毁 / 客户端重启）。写不出去就是写不出去，
+            # 交给调用方决定记账方式，这里不再重试、不再补写。
+            self.close_connection = True
+            return False
 
     def _authed(self) -> bool:
         return self.headers.get("X-Asip-Token") == _API_TOKEN
@@ -7663,11 +7695,15 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             req = {}
         try:
-            self._send(200, _rotate_once(
-                _normalize_rotate_reason(req.get("reason"))))
+            result = _rotate_once(_normalize_rotate_reason(req.get("reason")))
         except Exception as e:
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})
+            return
+        # 换线与回传分成两步：换线成功但客户端已超时断开时，记账为「回传超时」
+        # 而不是异常。否则 except 里再补写一次 500 必然二次 Broken pipe。
+        if not self._send(200, result):
+            _note_client_gone(result)
 
     def log_message(self, fmt, *a):
         pass

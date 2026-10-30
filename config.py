@@ -258,6 +258,12 @@ CFG = {
             {"tag": "WARP-CF", "port": 1080, "service": "usque-warp.service", "ipv6": True},
             {"tag": "WARP-CF-B", "port": 1081, "service": "usque-warp-b.service", "ipv6": True},
             {"tag": "WARP-CF-D", "port": 1083, "service": "usque-warp-d.service"},
+            # 2026-10-30 扩容（主人定）：CF-D 同配置 ×2，v4 传输 → LAX 落地，
+            # 各自独立注册（.warp/usque5 / usque6），不是复制同一份私钥。
+            {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
+            {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service"},
+            # WG-5 同配置 ×1：落地节点同为 pq.aws63（SIN），独立注册（line13）。
+            {"tag": "WARP-WG-13", "port": 1122, "service": "warp-wg-13.service"},
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
