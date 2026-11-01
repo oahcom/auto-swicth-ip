@@ -678,6 +678,10 @@ warp.restart_cooldown_sec: 5                   # 同一线重启冷却
 warp.restart_backoff_sec: [2, 5, 10, 20, 60]   # 重启失败指数退避
 warp.restart_backoff_max_sec: 120              # 退避上限
 warp.restart_max_per_hour_per_line: 20         # 每线每小时重启上限（滑动 1h 窗口，计在 systemctl 之前）
+# 渠道模型（warp_blocks.py）。enabled=false 时不接管拓扑：apply 仍走 assign_nodes。
+warp.blocks.enabled: false                     # ASIP_WARP_BLOCKS（默认关，开了才按块开渠道）
+warp.blocks.channels_per_block: 2              # 每块每类几条渠道（同 colo 一主一备）
+warp.blocks.table: [9 个 colo]                 # 只放静态属性（机房/承载/段封禁率），节点清单在 .warp/block-map.json
 warp.restart_concurrency: 4                    # 全局并发重启上限
 warp.ip_observe_sec: 120                       # 换线后出口观察窗
 # 连错门控不是配置项，是代码常量：consec_err < 3 → 不换线（daemon.py maybe_reconnect_warp）
@@ -750,7 +754,7 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 
 | 文件 | 行数（2026-10-21 实测 wc -l） | 说明 |
 |------|------|------|
-| `daemon.py` | 4224 | 节点管理 + 错误检测 + 轮换 + WARP 主备换线 |
+| `daemon.py` | 8290 | 节点管理 + 错误检测 + 轮换 + WARP 主备换线（夜锁策略已拆到 `warp_night.py`）|
 | `config.py` | 262 | 共享配置常量（CFG dict） |
 | `singbox-config.json` | 1732 | sing-box 代理节点配置（83 池节点 + 10 WARP + opencode-out） |
 | `.bad_nodes.json` | 动态 | 坏节点文件（daemon 只读；self_evolve 用 flock + 原子写更新） |
@@ -770,6 +774,10 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写、`append_line`、`update_json`）、`redact`、`clash_client`（`request_json`/`selector_state`/`delay`/`delays`/`connections`）、`egress`（`probe_egress` 保留失败原因）、`proc`（强制超时、无 shell）、`http`（`status=None` 区分传输失败）；daemon 同名门面委托 |
 | `test_asip_*.py` | — | 共享层离线单测：`test_asip_{proc,http,egress,atomic,clash}.py` + `test_asip_integration.py`（daemon 边界）；无 `test_asip_unit.py` 文件 |
 | `warp_line_worker.py` | — | 每条 WARP 隧道常驻 worker：`_plan` 决策与执行分离，`dry_run` 只读；由 `warp.line_worker` 开关接管三个旧守护 |
+| `warp_blocks.py` | 340 | **渠道模型**：块 = colo，渠道 = (类型, 块, 序号)。纯函数（不测量/不写盘，CLI 除外）：`channels()` / `plan_lines()` / `night_line_tags()` / `build_map()`。设计见 `docs/warp-channel-allocation.md` |
+| `warp_night.py` | 80 | **夜锁策略**：`window` / `active` / `restart_allowed` / `label`。纯函数，不读配置不打日志；daemon 保留同名门面处理 IO |
+| `warp_diag.py` | 230 | **单节点 WARP 承载诊断**：配置只从 `warp_wg.build_line_config` 生成（不复刻），失败分 config/port/handshake/ok 四类。`--job` 输入 `{tag,node,egress_ip}` |
+| `test_warp_blocks.py` | — | 上面两个纯模块的单测（22 例）：块的切法、稳定性判定、夜间取舍、探针故障不计入节点履历 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
 
 ## 部署与可移植性（2026-10-22）

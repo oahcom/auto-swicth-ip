@@ -2012,6 +2012,43 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
    daemon，观察 `daemon.log` 只有 `[dry-run] 应…`，20 条线的 `systemctl` 重启次数不增；
    确认无异常后再关 `dry_run`。
 
+## 14. WARP 渠道模型与夜锁分层（T-268~T-280）
+
+**范围**：`warp_blocks.py`（块 = colo 的渠道模型）、`warp_night.py`（夜锁策略）、
+`warp_diag.py`（单节点承载诊断）、`config.warp.blocks`。全部用例离线：
+实测表用 `tmp_path` 造假数据，配置用最小 dict 直接构造，不碰 `.warp/` 真文件。
+
+```bash
+python3 -m pytest test_warp_blocks.py -q          # 22 例，<0.1s
+python3 -m pytest test_night_window.py test_warp_prober_gates.py -q   # daemon 侧门面
+```
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-268 | P0 | 默认不接管现网拓扑 | `pytest test_warp_blocks.py -k disabled` | `warp.blocks.enabled=False` 时 `channels()` 返回 `[]`；`warp_wg.apply` 仍走 `assign_nodes` |
+| T-269 | P0 | 块按 colo 切，不按落地 /64 | `pytest test_warp_blocks.py -k block_cap` | 同一节点连测 5 轮落 5 个不同 /64 时块表不变（段不参与分组） |
+| T-270 | P1 | 每块每类渠道数有上限 | `pytest test_warp_blocks.py -k block_cap` | `channels_per_block=2` 时 NRT 常规恰好 2 条；池里只有 1 个非常规节点时只出 1 条（不拿同一节点凑两条） |
+| T-271 | P1 | v4 只有一个合并块 | `pytest test_warp_blocks.py -k v4` | v4 渠道 2 条且 colo 均为 `ALL`，tag 为 `WARP-BLK-ALL-V4-{0,1}` |
+| T-272 | P1 | 延迟只读缓存，未知排尾 | `pytest test_warp_blocks.py -k order` | 有延迟的按升序在前，无延迟的按 tag 定序在尾部；同输入两次结果一致 |
+| T-273 | P0 | 稳定性三分类 | `pytest test_warp_blocks.py -k category` | `ok==n` → regular；`0<ok<n` → irregular；`ok==0` → 不入块 |
+| T-274 | P1 | 渠道不足必须报错 | `pytest test_warp_blocks.py -k insufficient` | `plan_lines(chs, 99)` 抛 `SystemExit`，不静默补空节点 |
+| T-275 | P1 | 后备顺序先同块 | `pytest test_warp_blocks.py -k rotation` | 首条线的 `rotation[1]` 是同 colo 的另一个节点；`rotation_size` 生效 |
+| T-276 | P0 | 100% 封禁的块夜间不刷 | `pytest test_warp_blocks.py -k fully_banned` | `ban_rate=1.0` 的块不出现在 `night_channel_tags()` |
+| T-277 | P1 | 封禁率未知的块必须保留 | `pytest test_warp_blocks.py -k unknown` | `ban_rate=None` 的块（今日首现的 TPE/HKG/ORD/PIT）保留；节点不在实测表里也保留 |
+| T-278 | P1 | 实测表按出口 IP 聚合 | `pytest test_warp_blocks.py -k aggregates` | 同一 IP 上的两个节点得到同一 `{colo, category, ok, n}`；0 成功不入表 |
+| T-279 | P0 | 探针自身故障不得记成节点故障 | `pytest test_warp_blocks.py -k prefers_diag` | `stage=config/port` 的轮次不计入 attempts；有 `diag44.jsonl` 时不再叠加旧 `udp_probe` 的 `warp_rounds` |
+| T-280 | P0 | 夜锁策略跨零点且当前出口豁免 | `pytest test_warp_blocks.py -k night` | 20→8 窗口在 21 点与 3 点为真、12 点为假；非白名单线被拦、当前出口与白名单放行；`label` 三种形态正确 |
+
+**手工验收（开 `warp.blocks.enabled` 之前）**：
+
+1. `python3 warp_blocks.py build-map <probe_dir>` —— 落 `.warp/block-map.json`，打印块分布；
+   `regular + irregular` 应等于实测「能建隧道」的节点数。
+2. `ASIP_WARP_BLOCKS=1 python3 warp_blocks.py plan` —— 只读，打印渠道清单与条数。
+3. `python3 warp_wg.py apply --dry-run`（`enabled=True` 时）—— 打印每条线落到哪个块/节点，
+   **不写配置、不重启**；与 `plan` 的输出对得上。
+4. `python3 warp_diag.py --job <job.json> --out <jsonl> --rounds 2` —— 先用 3 个已知可用
+   节点做对照组：`stage=ok` 且 `colo` 与台账一致，否则停手查探针，不要拿它的结论判节点。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
@@ -2074,3 +2111,7 @@ python3 -m pytest test_asip_proc.py test_asip_http.py test_asip_egress.py \
 | v1.53 | 2026-10-26 | 传输层探针去重：签名 `(换线窗口起点, transport 计数)`，同窗口同计数不再重复探出口（实测每 10~20s 刷一条「出口探测正常」且每次查 CF trace）；换线后窗口起点变化自动重新武装。补 2 例（同证据不重探 / 换线后重探）。566 passed | 实测刷屏修复 |
 | v1.54 | 2026-10-26 | 审查修复：① 探测起手后该线已重启换址 → 旧地址结论丢弃（否则 `st["ip"]` 退回旧值并按旧地址 quota 惩罚期停探 16h）；② 传输层换线被冷却/闸门拒绝时撤掉探针签名并如实记日志（原日志恒称「→ 换线」，且同证据永久锁死不再重试）；③ 回切分支兜底 dict 补 `transport` 键。补 2 例。568 passed | 第三方/自查 |
 | v1.55 | 2026-10-27 | asip CLI 设置外置 (T-227~T-229)：`~/.local/bin/asip` 里的路径/密钥/Clash API/selector/10 条隧道清单全部搬进项目，新增 `deploy/asip-cli-conf.sh` 从 `config.py` 推导 16 项设置写入 `~/.config/asip/cli.env`，`deploy/asip-cli.sh` 启动时 source；`install.sh` 末尾自动生成设置并软链 `~/.local/bin/asip`。修旧版三处真实缺陷：① `_warp_members()` 的 sed 按双引号解析而 config 用单引号 → 永远回落到写死的 10 条，而 `members` 是 20 条（`warp stop` 只停一半）；② 单元迁到 `/etc/systemd/system/` 后 `systemctl --user` 返回 0 却不做事 → 作用域改为部署期探测；③ `cat --line-buffered` 不是 GNU 选项 → `jlog all` 输出被吞。另修 `jlog` 的系统级前缀（`Tue … 主机名 unit[pid]:`）剥除，压缩规则移到 sed 链末（sed 按规则顺序单遍执行）。`test_portability.py` 补 3 例（含 `ASIP_HOME_DIR` 隔离，避免测试把设置装进真人目录），25 passed | 主人需求 |
+| v1.56 | 2026-11-01 | 夜间刷新锁（主人需求「20:00→08:00 把全部渠道的刷新锁定到存活渠道」）：`warp.night_window{enabled,start_hour 20,end_hour 8,allow[8 条 10-31 夜间存活线]}` + §启动校验（起止须 0~24、不得相同＝全天锁死、allow 非空）。闸装在**四条重启路径的唯一汇合点**：`_restart_warp_line`（`_refresh_idle_warp`/`_restart_warp_inplace`/脏线守护旧路径共用）、`_warp_line_restart`（探测器路径）、`_rebind_wg_lines_after_refresh`（订阅刷新换绑定，原为直调 `_restart_service` 的旁路）。**只锁重启不锁探测**（夜里探到 quota 照常记账，08:00 开闸即知该刷谁，沿用「压的是重启，不是观测」契约）；当前出口永远豁免（`_restart_warp_inplace` 是全备线不新鲜时的最后兜底，锁住＝整夜断流）；白名单 ∩ live members 为空时退回不锁（失败落在无限制一侧）。窗口按 `time.localtime()` 算，跨零点两段式。依据：10-31 20:00→11-01 08:00 实测 **17036 次重启 / 0 次刷新成功**（上游免费层配额次日 08:00 才重置，夜里重启只换到另一个同样 quota 的 /128）。`test_night_window.py` 10 例（跨零点边界、白名单交集与空集回退、四条路径受锁、白天不查 selector、当前出口豁免、探测不停、生产配置形态）。既有 3 套件无回归：改前改后同为 98 passed / 4 failed（4 例为既有红：状态恢复、quota 长隔离、同段跨址探针缓存、主动轮换门控） | 主人需求 |
+| v1.57 | 2026-11-01 | okz 复活修复（主人实测「用代理或隧道连啊」）：机场订阅的 Clash 版本明写 `dns.proxy-server-nameserver: [https://custom.juhazf.cn/inst, enter.aiokz.com/inst, custom.hk.juhazf.cn/inst]`，但生产走的是 base64 版本（不带 DNS 段），`parse_subscription.py` 也不翻译它 → 所有机场域名走系统 DNS。修在 `parse_subscription.py`：① 新增 `AIRPORT_DNS_SUFFIXES=(okzdns.com, juhazf.cn, hi2026.net, acczzz.com, bing.com)` 与 `dns-airport` DoH server（`path: /inst`，`domain_resolver: dns-default` 避免 circular）；② DNS 规则 `domain_suffix→dns-airport, strategy ipv4_only` 排在 opencode 规则之前；③ **每个机场节点写 `domain_resolver: dns-airport`** —— 这一条才是决定性的：节点上省略它时 sing-box 退回 `route.default_domain_resolver`（系统 DNS），`cn.bing.com` 被解到真 Bing 202.89.233.x，握手报 `certificate is valid for *.bing.com ... not tw-mik-55.okzdns.com`。对照实验（同一节点、只差这一个字段）：有 `domain_resolver` 通（出口 114.42.196.71），去掉即 FAIL，错误与生产日志一字不差。**效果**：okz 系节点 0/54 通 → 50/54（两轮稳定性 50、51，中位 886/974ms；`cn.bing.com:443-any` 实测 1520ms）。顺带否掉两个假说：alpn 缺失（A/B 两组都通）、机场 DoH 不可达（HTTPS `/dns-query` 404 是路径错，真实路径是 `/inst`，三个端点全 200）。`singbox-config.json` 已就地补齐 119 个节点的 `domain_resolver`（备份 `singbox-config.json.bak-dns-*`），sing-box 已重启生效 | 主人实测 |
+| v1.58 | 2026-11-01 | 独立审查（codex 缺 `@openai/codex-linux-x64` 二进制，改用对抗性审查代理）对 v1.56 的 4 项修复 + 1 项新增覆盖。**P0 测试时段相关**：`conftest.py` 未关 night_window，既有套件全用真实时钟 + 非白名单 tag → 20:00–08:00 跑 pytest 会有 9+ 例变红、`performed<=20`/`quota_until<=now` 两例假绿。修：autouse `_disable_night_window`；验证方式为 `TZ=Etc/GMT-14`（本地 23:51）复跑，改前改后同为 98 passed/4 failed，与白天逐例一致。**P1 校验洞**：① `_v` 允许 24 → `0→24` 恒真＝全天锁，且 `isinstance(True,int)` 让布尔值混进小时；改 `0<=v<=23` + 显式挡 bool。② `allow` 不校验元素类型，非字符串会被 `_night_allow_tags` 的 isinstance 静默滤空 → 夜里全锁；改导入期断言。③ 时区靠主机 localtime，unit 无 `TZ=`，主机改 UTC 就整体偏 8h；`deploy/install.sh` 与现网 unit 均加 `Environment=TZ=Asia/Shanghai`（备份 `auto-switch-ip.service.bak-tz-*`，已 daemon-reload）。④ `_refresh_idle_warp` 被锁后仍按通用失败重试 3 次（2+5s 退避）并写「端口未就绪」，把锁误报成故障；改为进循环前短路返回 None。**P2**：`_NIGHT_LOG_TS` 由单时间戳改 `dict[tag,ts]`（全局单值时 20 条线 30s 内只打一条，读日志会误判成只有一条被拦）；订阅刷新换绑定的 `now` 从循环外移进循环（跨 08:00 会多锁/少锁一夜）；补 `_warp_line_restart` 夜间用例（该闸删掉仍会被下层 `_restart_warp_line` 兜住，但那时已 `warming=True`、`restart_hist` +1、`fail_streak` +1 —— 一次没重启却记一次重启和一次失败）与按 tag 节流用例。`test_night_window.py` 12 例；`test_subscription_parse + test_night_window + test_asip_* + test_warp_line_worker` 共 209 passed / 1 failed（既有 log_file 用例） | 独立审查 |
+| v1.59 | 2026-11-01 | 渠道分配模型落地 + 夜锁分层（docs/warp-channel-allocation.md 七/八节）：① `config.warp.blocks`（9 个 colo 的静态属性 + `channels_per_block` + `enabled`，默认关）+ 导入期校验（colo 重复、`channels_per_block<1`）；② `warp_blocks.py` 从「只有渠道清单」补成完整模型：`order_nodes`（纯读延迟，未知排尾）、`plan_lines`（渠道→线路，后备先同块）、`night_line_tags`（块→线路，未知 colo 保留）、`build_map`（**按出口 IP 聚合**：一个 IP 常被 2 节点共用，按节点聚合会把同一份观测算两遍）；③ `warp_wg.apply` 新增选点分叉：`blocks.enabled` 时走 `plan_lines`，注册/写盘/发布共用，两条路径只在「选哪个节点」处不同；④ 夜锁策略拆到 `warp_night.py`（`window`/`active`/`restart_allowed`/`label`，纯函数），daemon 保留同名门面做 IO，白名单改由块生成（`_block_night_tags` 30s 缓存，异常退回配置 allow）；⑤ `warp_diag.py` 替代 `/tmp` 里那份自己拼配置的探针 —— 配置只从 `warp_wg.build_line_config` 生成，失败分 config/port/handshake/ok。**旧探针的教训**：它自拼配置（DoH、节点 tag 改名、缺 `domain_resolver`）且端口用「基准+偏移」与残留进程撞车，44 个节点全报「握手失败」，其中 15 个 UDP:53 是通的 —— 探针在测自己。回归：`test_warp_blocks.py` 22 例新绿；`test_daemon_unit + test_warp_refresh + test_portability + test_warp_line_worker + test_asip_*` 改前改后同为 **472 passed / 14 failed**（14 例为既有红，已在改动前的副本上逐例复现）；`test_night_window + test_warp_prober_gates` 44 passed / 1 既有红 | 主人需求 + 自对抗 |
