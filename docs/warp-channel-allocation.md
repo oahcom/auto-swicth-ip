@@ -843,5 +843,71 @@ CF 的 MASQUE vhost 已可达且支持扩展 CONNECT，CONNECT-IP 请求被 `EOF
 > 注：usque 是上游第三方 fork，修复在 `/tmp/usque-fork`（本地提交 `4d47f9e`），
 > 真正接入产线还需把它 vendored/替换为带补丁的构建。
 
+### H2 路线终局：CF 的 MASQUE 只在 HTTP/3，H2 是私有实现（2026-11-02 03:50）
+
+上节「只差最后一点对齐」的乐观判断被推翻。这一轮把 usque 的参数搞对（`-P` 是
+**endpoint 端口**、`-p` 是 SOCKS 端口，之前混用了）后重测，拿到确定结论：
+
+**1. usque H2 直连 CF（不经任何中继）也失败**
+
+```
+$ usque-h2c socks --http2 --insecure --always-reconnect \
+    -s consumer-masque-proxy.cloudflareclient.com -c usque10/config.json -P 443 -p 11601
+Failed to connect tunnel: failed dial connect-ip over HTTP/2:
+  connect-ip: failed to send request:
+  Connect "https://consumer-masque-proxy.cloudflareclient.com/":
+  net/http: extended connect not supported by peer
+```
+
+注意 `--always-reconnect` 是必需的：SOCKS 模式下 TUN 设备不会有流量，不开这个
+flag 隧道永远停在 `Tunnel idle`（这是 usque 的行为，不是 bug）。
+
+**关键**：这是**直连 162.159.198.2:443**，完全绕开了机场中继。所以
+`extended connect not supported by peer` **与中继无关**——是 CF 这个 vhost
+在 H2 上**根本不发 `SETTINGS_ENABLE_CONNECT_PROTOCOL`**。
+
+**2. 中继侧用 curl 做的 SNI 矩阵，印证同一结论**
+
+| SNI（SOCKS 目标=162.159.192.1，绕过主机名黑名单）| curl 结果 | 含义 |
+|---|---|---|
+| `consumer-masque-proxy.cloudflareclient.com` | **530 / error 1016** | TLS 通，CF 报「源站 DNS 失败」 |
+| `consumer-masque.cloudflareclient.com` | reset | 被掐 |
+| `consumer.cloudflareclient.com` | reset | 被掐 |
+| `cloudflareclient.com` | **522** | TLS 通，CF 报「源站超时」 |
+| `engage.cloudflareclient.com` | **403** | TLS 通，正常 API 响应 |
+
+`error 1016` 是 Cloudflare 的「源站 DNS 解析失败」。也就是说：`consumer-masque-proxy`
+这个 vhost 在 CF 的边缘**没有配 MASQUE 源站**，它只是个占位/内部域名。真正的
+MASQUE 服务不在 H2 上。
+
+**3. Go 的 ClientHello 被单独拦（次要但真实的坑）**
+
+同一节点、同一目标 IP、同一时刻：
+
+| 客户端 | SNI=consumer-masque-proxy | SNI=engage / discord / api |
+|---|---|---|
+| curl（ClientHello 1597 字节，带 X25519MLKEM768）| ✅ TLS 1.3 通过 | ✅ |
+| Go（ClientHello ~300 字节）| ❌ `EOF` | ✅ |
+
+中继对「小 ClientHello + 敏感 SNI」有指纹规则。但这已不重要——即使把 ClientHello
+伪装过，CF 那边也没有 H2 MASQUE 服务。
+
+**4. 最终定性**
+
+```
+QUIC / HTTP3：  ✅ CF 唯一真实提供的 MASQUE 通道 → 6/44 节点实测 warp=on
+H2 / TCP：      ❌ CF 侧无服务（不是中继问题，不是 usque 问题）
+```
+
+usque 的 H2 实现本身没写错（我们补的 `:protocol` 是必要且正确的），但它**服务
+的对象在 CF 侧不存在**。官方 warp-cli 的 `h2` 模式能跑，是因为它连的是另一个
+内部端点（`consumer-masque.cloudflareclient.com`，且需要 WARP 会话 token 走
+私有 header），公开的 `:protocol: connect-ip` 路径拿不到。
+
+**所以「44 个节点的 TCP 全部变成 WARP 承载」这个设想不成立**——卡点不在机场，
+在 Cloudflare。除非 CF 未来公开 H2 MASQUE 端点，否则这条路彻底封死。
+
+**净结论不变**：这个机场上 WARP 借道的唯一通道仍是 UDP（QUIC 桥），上限 6/44。
+
 
 
