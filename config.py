@@ -225,8 +225,11 @@ CFG = {
         "enabled": True,
         # socket 放项目目录而不是 /run：/run 归 root，非 root 进程建不了目录；
         # 要用 /run 得给 unit 加 RuntimeDirectory=，部署面变大。
-        "socket_path": "/home/administrator/auto-swicth-ip/run/rotate.sock",
-        "token_path": "/home/administrator/auto-swicth-ip/run/api-token",
+        # 按 PROJECT_DIR 推导，不写死家目录：换用户/换机器直接失效（实测在
+        # Ubuntu 上以 ubuntu 运行时报 Permission denied: '/home/administrator'，
+        # daemon 启动即退，systemd 无限 auto-restart）。
+        "socket_path": os.path.join(PROJECT_DIR, "run", "rotate.sock"),
+        "token_path": os.path.join(PROJECT_DIR, "run", "api-token"),
         # 并发去重窗口：同一次故障的多发请求只切一次。
         "coalesce_ms": 800,
         # 限速按「上一次切到的线是否已验证」分档：
@@ -557,6 +560,25 @@ CFG = {
         # 但错误路径上每多等一秒，坏出口就多服务一秒失败请求 —— 实测 40s 上限
         # 把「首错→换线生效」拉到 p90=25s / max=206s。
         "fallback_idle_wait_sec": 3,
+        # 夜间刷新锁：窗口内只刷新「隔夜存活」的线，其余线的重启一律跳过。
+        # WHY：上游免费层配额在次日 08:00 重置，20:00→08:00 之间被判 quota 的
+        # 出口重启动也只会拿到另一个同样 quota 的新 /128 —— 10-31 夜里实测
+        # 17036 次重启、0 次刷新成功，全是白烧。活下来的是那几条地址本身没
+        # 被烧完的线，夜里该把新地址都花在它们身上。
+        # allow 里的 tag 还会与 sing-box 实际成员取交集：不在 `opencode-out`
+        # 里的线（如尚未并入 .warp/warp-outbound.json 的 CF-E/CF-F/WG-13）
+        # 刷出地址也切不过去，自动被排除。
+        "night_window": {
+            "enabled": True,
+            "start_hour": 20,
+            "end_hour": 8,
+            "allow": [
+                # 10-31 20:00 → 11-01 08:00 存活榜（daemon.log 逐线 OK 计数）：
+                # CF 9 / CF-B 9 / CF-F 6 / CF-E 6 / CF-D 6 / WG-13 5 / WG-5 5 / WG-6 5
+                "WARP-CF", "WARP-CF-B", "WARP-CF-D", "WARP-CF-E", "WARP-CF-F",
+                "WARP-WG-5", "WARP-WG-6", "WARP-WG-13",
+            ],
+        },
         # 每条隧道一个常驻 worker（warp_line_worker.py）：「判断→执行」同循环，
         # 不再经预热/脏线抽检/补刷三个调度器排队。enabled=False 时完全走旧的
         # 三守护路径，行为与之前逐字节一致，便于回滚。
@@ -594,6 +616,36 @@ CFG = {
             "peer_v6": "[2606:4700:103::2]:2408",
             "mtu": 1280,
             "keepalive": 25,
+        },
+        # 渠道分配模型：块 = colo，渠道 = (类型, 块, 序号)。
+        # 设计依据 docs/warp-channel-allocation.md；模型在 warp_blocks.py（纯读，
+        # 不测量、不写盘），这里只放**块的静态属性**。
+        #
+        # 块成员（哪个节点属于哪个 colo）不写在这里：它来自实测表
+        # `.warp/block-map.json`（gitignored，由 `warp_blocks.py build-map` 生成）。
+        # 两处各存一份节点清单必然会漂移 —— 配置里的这份永远是上个星期的事实。
+        #
+        # enabled=False：模型不接管现网拓扑，apply 仍走 assign_nodes 的轮转分配。
+        # 打开前先跑 `python3 warp_blocks.py plan` 看渠道清单，别在夜里开。
+        "blocks": {
+            "enabled": _env_bool("ASIP_WARP_BLOCKS", False),
+            # 每块每类几条渠道。2 是「同 colo 一主一备」：同块两条线共用一个段池，
+            # 再多只会互相抢地址，不会多出可用地址。
+            "channels_per_block": _env_int("ASIP_WARP_BLOCK_CHANNELS", 2) or 2,
+            "table": [
+                # ban_rate 是 2026-11-01 实测的**段封禁率**，只用于夜间取舍：
+                # 1.0 的块夜里重启动只会换到另一个同样被封的 /128。
+                # None = 没测过（HKG/TPE/ORD/PIT 当天才首现），夜间必须保留。
+                {"colo": "NRT", "loc": "东京",     "carrier": "proxy",  "ban_rate": 1.0},
+                {"colo": "PHX", "loc": "凤凰城",   "carrier": "proxy",  "ban_rate": 0.792},
+                {"colo": "LAX", "loc": "洛杉矶",   "carrier": "both",   "ban_rate": 0.266},
+                {"colo": "SJC", "loc": "圣何塞",   "carrier": "both",   "ban_rate": 0.25},
+                {"colo": "SIN", "loc": "新加坡",   "carrier": "both",   "ban_rate": 0.152},
+                {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None},
+                {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None},
+                {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None},
+                {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None},
+            ],
         },
     },
     # Vercel 中继线路 —— 第三条地址空间（见 asip/vercel_relay.py 的模块注释）。
@@ -679,6 +731,29 @@ TRANSPORT_LOOKBACK_SEC = 180
 # 订阅源顺序即合并优先级（okz 主力，其余补充）。值为空表示未配置。
 SUBSCRIPTION_KEYS = ("okz", "hd23n", "dasho", "dasho_alt")
 
+# 机场自有域名体系 —— 这些域名在公网 DNS 上是 NXDOMAIN，或被解析到**真实**的
+# bing.com（202.89.233.x），而节点要连的是机场自己的前置 IP。
+#
+# 放在 config 而不是 parse_subscription：**主配置和单线配置都要解析它们**。
+# 只写在 parse_subscription 里时，`warp_wg.build_line_config` 造出来的线只有
+# 本机 DNS —— 节点入口 `hk-aws-54.acczzz.com` 直接 NXDOMAIN，隧道永远起不来，
+# 而报错是 `failed to create session: lookup …`，看起来像节点挂了。
+# 2026-11-01 用探针复现：44 个「不能承载 WARP」的节点里，凡是入口是机场域名的
+# 都是这个死法（`us.bing.com`、`hk-aws-*.acczzz.com`、`unamecf*`）。
+AIRPORT_DNS_SUFFIXES = ("okzdns.com", "juhazf.cn", "hi2026.net", "acczzz.com",
+                        "bing.com")
+AIRPORT_DNS_URL = "https://custom.juhazf.cn/inst"
+AIRPORT_DNS_TAG = "dns-airport"
+AIRPORT_DNS_HOST = "custom.juhazf.cn"
+AIRPORT_DNS_PATH = "/inst"
+
+
+def needs_airport_dns(server: str | None) -> bool:
+    """该节点入口是否必须走机场 DoH 才能解析出前置 IP。"""
+    s = str(server or "")
+    return any(s.endswith(suffix) for suffix in AIRPORT_DNS_SUFFIXES)
+
+
 
 def subscription_urls() -> list[str]:
     """Configured subscription URLs, in merge order, empty entries dropped."""
@@ -692,6 +767,48 @@ if _w.get("proactive_mode") not in ("fixed", "requests"):
     raise SystemExit(f"✗ warp.proactive_mode 只能是 fixed/requests，实际 {_w.get('proactive_mode')!r}")
 if _w["proactive_mode"] == "requests" and not _w.get("proactive_quota_model"):
     raise SystemExit("✗ warp.proactive_quota_model 未配置，requests 模式无法计数")
+
+# 夜间锁：窗口反了就是「全天锁死」或「永不生效」，两者都只在夜里才被发现 ——
+# 那时已经没人看日志了。allow 为空同理：一条都不许重启 = 夜里彻底停止刷新。
+_nw = _w.get("night_window") or {}
+if _nw.get("enabled"):
+    _sh, _eh = _nw.get("start_hour"), _nw.get("end_hour")
+    for _k, _v in (("start_hour", _sh), ("end_hour", _eh)):
+        # bool 是 int 子类，`isinstance(True, int)` 为真 —— 写成 True 能悄悄
+        # 通过并变成「1 点」，必须单独挡掉。
+        if isinstance(_v, bool) or not isinstance(_v, int) or not 0 <= _v <= 23:
+            raise SystemExit(f"✗ warp.night_window.{_k} 必须是 0~23 的整数，实际 {_v!r}")
+    if _sh == _eh:
+        raise SystemExit(
+            f"✗ warp.night_window 起止小时相同（{_sh}）＝全天生效。"
+            "要关就用 enabled: False")
+    _allow = _nw.get("allow")
+    if not isinstance(_allow, list) or not _allow:
+        raise SystemExit("✗ warp.night_window.allow 为空 —— 窗口内将没有任何线可刷新")
+    # 非字符串元素会被 daemon._night_allow_tags 的 isinstance 过滤悄悄丢掉，
+    # 全丢光就变成「夜里一条都不许重启」—— 正好是设计要避免的那一侧。
+    if not all(isinstance(t, str) and t.strip() for t in _allow):
+        raise SystemExit(f"✗ warp.night_window.allow 含非字符串/空串: {_allow!r}")
+    # 不在这里校验 tag 是否存在：成员集合随 WARP_WG_* 环境变量变（没 source
+    # `.env` 时 WG 线根本不在 CFG 里），拿它当导入期断言会让「配置没问题、
+    # 只是环境没加载」变成启动失败。交集在 daemon._night_allow_tags 里做。
+
+# 块表：colo 是主键，重复会让 channels() 给同一个块开两倍渠道、白名单算重。
+# channels_per_block < 1 展开出 0 条渠道，而 apply 会因此报「渠道不足」——
+# 报在 apply 时读起来像是实测表的问题，其实是一条配置写错了。
+_blk = _w.get("blocks") or {}
+if _blk:
+    _tbl = _blk.get("table")
+    if not isinstance(_tbl, list):
+        raise SystemExit(f"✗ warp.blocks.table 必须是列表，实际 {type(_tbl).__name__}")
+    _colos = [b.get("colo") for b in _tbl if isinstance(b, dict)]
+    if len(_colos) != len(_tbl) or any(not isinstance(c, str) or not c for c in _colos):
+        raise SystemExit("✗ warp.blocks.table 每项必须是带非空 colo 的字典")
+    if len(set(_colos)) != len(_colos):
+        raise SystemExit(f"✗ warp.blocks.table 里 colo 重复: {_colos}")
+    if int(_blk.get("channels_per_block") or 0) < 1:
+        raise SystemExit(
+            f"✗ warp.blocks.channels_per_block 必须 ≥1，实际 {_blk.get('channels_per_block')!r}")
 
 # ============= provider 常量 =============
 # OPENCODE_FREE_PROVIDER: 9router providerStrategies 中的 key = "opencode"

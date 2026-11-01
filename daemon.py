@@ -53,6 +53,12 @@ from asip.clash_client import ClashClient
 from asip.egress import TRACE_URL, probe_egress
 from asip.redact import redact_secrets as _redact_secrets
 
+# WARP 渠道模型（块 = colo）与夜间锁策略。两者都是纯函数模块，import 它们不会
+# 触发任何 IO；daemon 只在这里取策略，不再自己算窗口与白名单。
+import warp_blocks
+import warp_night
+import warp_wg
+
 # Clash API 的唯一 HTTP 通道。daemon 侧保留 `singbox_api` 这个名字是因为
 # 测试与兄弟工具都以它为边界；内部实现统一到 asip，避免每个调用点各写一遍
 # 状态码/超时/JSON 解析。
@@ -2418,10 +2424,13 @@ def _restart_warp_line(member: dict, rebind: bool = False) -> bool:
     # 全局限速装在真正动手的地方：除了 _warp_line_restart，还有
     # _refresh_idle_warp / _inplace_reconnect / 脏线守护三条旁路，闸只开在
     # 上层会被绕过（2026-10-28 三方审查 P1-3）。
+    if _night_block_restart(member["tag"], "刷新", time.time()):
+        return False
     if not _restart_rate_allow(time.time()):
         return False
     if rebind and member.get("kind") == "wg" and member.get("family") == "v4":
         try:
+            # 本地导入：测试用 sys.modules 换掉整个 warp_wg 来隔离真服务操作。
             import warp_wg
             if warp_wg.rebind(int(member["index"])):
                 log(f"  ⇄ {member['tag']} 换节点（v4 出口随 colo 走，重启不会换址）")
@@ -2882,6 +2891,103 @@ def _line_probe_cadence() -> float:
     return float(_warp().get("line_probe_cadence_sec", 60))
 
 
+# ── 夜间刷新锁 ──────────────────────────────────────────────
+# 策略（窗口算术、放行判定）在 warp_night.py：纯函数、能单测、不用起线程。
+# 这里剩下的全是 IO —— 读 CFG、查当前出口、打日志、按块生成白名单。
+# WHY 夜间要锁：上游免费层配额按出口 IP 计，次日 08:00 才重置。20:00→08:00
+# 之间被烧的地址，重启只会换到另一个同样被烧的新 /128 —— 10-31 夜间实测
+# 17036 次重启、0 次刷新成功，全部白烧，还把每条线在途连接掐断了一万多次。
+_NIGHT_LOG_TS: dict[str, float] = {}
+# 块白名单缓存：(取数时刻, 线路 tag 集合)。夜里每条线的每次重启判定都会问
+# 一遍，而实测表 127KB、线路台账只在 apply 时变。
+_BLOCK_ALLOW_TTL = 30.0
+_block_allow_cache: tuple[float, frozenset[str]] | None = None
+
+
+def _night_window() -> dict:
+    return warp_night.window(CFG)
+
+
+def _night_active(now: float | None = None) -> bool:
+    return warp_night.active(_night_window(), now)
+
+
+def _block_night_tags() -> set[str]:
+    """按块生成的夜间白名单（线路 tag）。块模型未启用时返回空集。
+
+    模板是块、落点是线路：块回答「哪个 colo 夜里还值得刷」（封禁率 < 100%），
+    线路台账回答「哪条线现在落在那个 colo」。拿渠道名当白名单会是空的 ——
+    现网成员叫 `WARP-WG-7`，不叫 `WARP-BLK-NRT-REG-0`。
+
+    任何异常都退回空集（＝沿用配置里的 allow）：夜里最坏的结果是「按老名单锁」，
+    而抛出去会让重启判定直接崩掉，那等于整池不设防。
+    """
+    global _block_allow_cache
+    if not warp_blocks.enabled(CFG):
+        return set()
+    now = time.time()
+    if _block_allow_cache and now - _block_allow_cache[0] < _BLOCK_ALLOW_TTL:
+        return set(_block_allow_cache[1])
+    try:
+        tags = warp_blocks.night_line_tags(CFG, warp_wg.line_nodes())
+    except Exception as e:
+        log(f"  · 块白名单生成失败，退回配置 allow：{type(e).__name__}: {e}")
+        return set()
+    _block_allow_cache = (now, frozenset(tags))
+    return tags
+
+
+def _night_allow_tags() -> set[str]:
+    """白名单与 sing-box 实际成员取交集。
+
+    不在 `opencode-out` 里的线刷出地址也切不过去 —— `.warp/warp-outbound.json`
+    自 10-28 就没再更新，CF-E/CF-F/WG-13 至今不在里面。让它们占着白名单只会把
+    夜里有限的刷新次数花在切不走的地址上。快照未建立时（启动早期）退回全量。
+
+    块模型启用时白名单由块生成（docs/warp-channel-allocation.md 第四节），配置
+    里的 `allow` 只在块表不可用时兜底 —— 两处同时生效就退回「硬编码 8 个 tag」
+    的老毛病：块扩到 28 条渠道后，名单里还是那 8 个。
+    """
+    allow = _block_night_tags() or {
+        t for t in (_night_window().get("allow") or []) if isinstance(t, str)}
+    snap = _clash_snapshot(_warp()["selector"])
+    members = snap.get("all") if snap else None
+    if not members:
+        return allow
+    inter = allow & set(members)
+    # 交集为空（配置改了但 warp-outbound 没重建）时退回不锁：照交集执行等于
+    # 夜里一条线都不许刷，比不锁更糟 —— 失败要落在「无限制」这一侧。
+    return inter or allow
+
+
+def _night_block_restart(tag: str, reason: str, now: float) -> bool:
+    """夜间窗口内非白名单线的重启拦下，返回 True 表示已拦。
+
+    只管重启，不管探测：探到 quota 照样记账，只是不花一次重启去换一个同样
+    quota 的地址。当前出口例外 —— 它不走重启换线，而 `_restart_warp_inplace`
+    是「所有备线都不新鲜」时的最后兜底，锁住它等于夜里彻底断流。
+    """
+    # 窗口判定放在最前：它是纯本地算术，而 active_warp_tag() 在快照未建立时
+    # 是一发 HTTP。白天不该为了一条永不生效的闸多付这次调用。
+    nw = _night_window()
+    if not _night_active(now):
+        return False
+    if warp_night.restart_allowed(nw, now, tag, active_warp_tag(), _night_allow_tags()):
+        return False
+    # 按 tag 节流：单时间戳会让 20 条线夜里 30 秒内只打一条，读日志的人
+    # 会以为只有那一条被拦，实际整池都在锁里。
+    if now - _NIGHT_LOG_TS.get(tag, 0.0) > 30.0:
+        _NIGHT_LOG_TS[tag] = now
+        log(f"  · 夜间锁 {nw.get('start_hour')}:00-{nw.get('end_hour')}:00 "
+            f"{tag} 不在存活白名单，跳过重启（{reason}）")
+    return True
+
+
+def _night_label(now: float) -> str:
+    """健康行里的夜锁摘要：`关` / `20-8:3线` / `待20点/3线`。"""
+    return warp_night.label(_night_window(), now, len(_night_allow_tags()))
+
+
 def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
     """是否需要探测，以及下一次最早该看的时刻。
 
@@ -3213,6 +3319,8 @@ def _warp_line_restart(member: dict, reason: str) -> bool:
         log(f"  · 当前出口 {tag} 不重启（失败时换线，{reason}）")
         return False
     now = time.time()
+    if _night_block_restart(tag, reason, now):
+        return False
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
         if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
@@ -4544,6 +4652,11 @@ def _refresh_idle_warp(member: dict, reason_hint: str | None = None) -> str | No
               else f"预热/{reason}")
     backoff = _warp()["retry_backoff_sec"]
     for attempt in range(1, _warp()["max_attempts"] + 1):
+        # 夜间锁在进入重试循环前短路：否则 3 次尝试 × 退避全部空转，日志还
+        # 会写成「端口未就绪」，把运维眼里的「被锁」误报成「线路故障」。
+        if _night_block_restart(member["tag"], reason, time.time()):
+            log(f"  · {member['tag']} 夜间锁生效，跳过刷新（{reason}）")
+            return None
         _invalidate_warp_line_ip(member["tag"])  # 重启后旧地址必然失效
         try:
             ok = (_restart_warp_line(
@@ -5199,6 +5312,18 @@ def _reconnect_warp_by_table(reason: str, interrupt: bool = True,
     if not cands:
         log("  ⚠ 新鲜备线均与当前出口同址，本次不切")
         return False
+    # 与 selector 实际成员取交集：`.warp/warp-outbound.json` 落后于 members 时，
+    # 这些线切过去只会拿到 400。2026-11-01 实测 CF-E/CF-F/WG-13 两小时内吃掉
+    # 524 次失败尝试，换线成功率被拖到 38%，出口还在原地卡了 71 秒。
+    # 快照未建立（启动早期）时不过滤，退回原行为 —— 宁可多试一次，也不能
+    # 因为查不到快照就把所有备线判死。
+    sel = (_clash_snapshot(_warp()["selector"]) or {}).get("all") or []
+    if sel:
+        sel_set = set(sel)
+        cands = [(m, ip) for m, ip in cands if m["tag"] in sel_set]
+        if not cands:
+            log("  ⚠ 备线均不在 selector 成员里（warp-outbound 未重建），本次不切")
+            return False
     for m, ip in cands:
         if not _acquire_refresh_slot(m["tag"]):
             continue
@@ -6999,6 +7124,7 @@ def _rebind_wg_lines_after_refresh() -> None:
     if not ((_warp().get("wg") or {}).get("enabled")):
         return
     try:
+        # 同上：换绑定这条路径在 test_night_window 里以 sys.modules 替换验证。
         import warp_wg
         moved = warp_wg.validate_bindings()
     except Exception as e:
@@ -7009,7 +7135,16 @@ def _rebind_wg_lines_after_refresh() -> None:
     by_tag = {m["tag"]: m for m in _warp()["members"]}
     for tag in moved:
         m = by_tag.get(tag)
-        if m and _restart_service(m["service"], tag):
+        if not m:
+            continue
+        # 与其余三条刷新路径同源：夜间锁管的是「重启换地址」这个动作，
+        # 换绑定也是一次重启。白名单外的线留到 08:00 之后再换 —— 反正它
+        # 绑定的节点已经下架，多冻一夜不影响它本来就不通畅的事实。
+        # 逐条取时间：这一批重启可能跨过 08:00，用循环外的一次快照会让
+        # 后半段白等一夜（或反向该锁的时候没锁）。
+        if _night_block_restart(tag, "订阅刷新换绑定", time.time()):
+            continue
+        if _restart_service(m["service"], tag):
             log(f"  ⇄ {tag} 绑定节点已下架，已换节点并重启")
 
 
@@ -8082,6 +8217,7 @@ def main():
                        f" dead={dead_count} cool={cool_count} 策略={_strategy_mode}"
                        f" 观测={'on' if observe else 'off(blind→时间轮换)'}"
                        f" 轮换W={_proactive_progress}轮换P={_POOL_PROACTIVE_LABEL}"
+                       f" 夜锁={_night_label(now)}"
                        f" singbox={'🟢' if rc_display==0 else '🔴'}")
 
         except KeyboardInterrupt:

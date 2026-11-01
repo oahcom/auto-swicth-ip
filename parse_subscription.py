@@ -18,6 +18,19 @@ from config import CFG, get_lan_auth, get_singbox_secret
 
 LAN_INBOUND_TAG = "mixed-lan"
 
+# 机场自有域名体系（常量已移到 config.py：单线配置 `warp_wg.build_line_config`
+# 也要用它，写在这里会让那个模块反向依赖一个订阅解析脚本）。
+#
+# 保留这三个名字是因为既有单测与文档按 `parse_subscription.AIRPORT_DNS_*` 引用。
+# 少了这条：`cn.bing.com` 走系统 DNS → 真 Bing → 拿到的是 Microsoft 的证书，
+# 与节点要求的 `*.okzdns.com` 不符 → 握手失败。2026-11-01 实测：
+#   系统 DNS  cn.bing.com -> 202.89.233.101（真 Bing，证书 CN=www.bing.com）
+#   机场 DNS  cn.bing.com -> 172.247.99.x / 115.89.129.x（前置，证书 CN=*.okzdns.com）
+# bing.com 必须在内：机场拿它当跳板，只有解析到自己的前置 IP 才有意义。
+AIRPORT_DNS_SUFFIXES = config.AIRPORT_DNS_SUFFIXES
+AIRPORT_DNS_URL = config.AIRPORT_DNS_URL
+AIRPORT_DNS_TAG = config.AIRPORT_DNS_TAG
+
 
 # ============= 解析订阅 =============
 def fetch_and_decode_sub(url: str) -> list[str]:
@@ -226,6 +239,20 @@ def parse_hysteria2(url: str) -> dict:
         "obfs": ({"type": p["obfs"][0], "password": urllib.parse.unquote(p.get("obfs-password", [""])[0])}
                  if "obfs" in p else None),
     }
+
+def _tls_alpn(p: dict) -> list[str] | None:
+    """从订阅参数里取 alpn。
+
+    机场把 `alpn: [h2, http/1.1]` 写在**订阅的 Clash 版本**里，base64 版本
+    不带。anytls 服务端按 alpn 选协议，客户端不声明就协商不出可用的那个，
+    连接会卡在握手后静默超时（日志只有 INFO 没有 ERROR，看着像节点死了）。
+    """
+    raw = p.get("alpn")
+    if not raw:
+        return None
+    vals = [v for v in (raw[0] if isinstance(raw, list) else raw).split(",") if v]
+    return vals or None
+
 
 def parse_anytls(url: str) -> dict:
     u = urllib.parse.urlparse(url)
@@ -776,6 +803,15 @@ def make_config(nodes: list[dict], listen_port: int = 0,
               file=sys.stderr)
     outbounds = nodes[:] + dormant + warps
     outbounds.append({"type": "direct", "tag": "direct"})
+    # 机场自有机型（bing 前置 / okzdns / acczzz / hi2026）必须用机场 DoH 解析，
+    # 不能在节点上省略 domain_resolver 让它退回 route.default_domain_resolver:
+    # 后者是系统 DNS，`cn.bing.com` 会被解到真 Bing（202.89.233.x），握手时
+    # 证书是 Microsoft 的而不是 `*.okzdns.com`，报 `not tw-mik-55.okzdns.com`。
+    # 2026-11-01 实测：补上后 119 个节点从全不通变成可连（对照实验见 TEST_PLAN v1.57）。
+    for o in outbounds:
+        srv = str(o.get("server") or "")
+        if any(srv.endswith(s) for s in AIRPORT_DNS_SUFFIXES):
+            o.setdefault("domain_resolver", AIRPORT_DNS_TAG)
 
     # 沉睡池：出站全留着（参数、tag、订阅里的原样都在），但**池子成员按实测进出**。
     # `.dormant_state.json` 由 dormant_probe.py 写：alive:false = 刚探过、确实不通。
@@ -842,9 +878,18 @@ def make_config(nodes: list[dict], listen_port: int = 0,
         "dns": {
             "servers": [
                 {"type": "https", "tag": "dns-opencode", "server": "223.5.5.5"},
+                # 机场 DoH：只用来解析节点自己的域名（见 AIRPORT_DNS_SUFFIXES）。
+                # domain_resolver 必须指向 dns-default —— 它自己的 host 名
+                # 只能靠系统 DNS 解，指回自己会 circular（实测 FATAL）。
+                {"type": "https", "tag": AIRPORT_DNS_TAG, "server": "custom.juhazf.cn",
+                 "path": "/inst", "domain_resolver": "dns-default"},
                 {"type": "local", "tag": "dns-default"},
             ],
             "rules": [
+                # 机场域名必须先于 opencode 规则：这些域名解析到前置 IP 才连得通，
+                # 落到系统 DNS 就是「真 bing + 假证书」。
+                {"domain_suffix": list(AIRPORT_DNS_SUFFIXES),
+                 "server": AIRPORT_DNS_TAG, "strategy": "ipv4_only"},
                 {"domain_suffix": ["opencode.ai", ".opencode.ai"],
                  "server": "dns-opencode"},
             ],

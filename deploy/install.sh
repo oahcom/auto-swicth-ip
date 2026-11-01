@@ -230,6 +230,11 @@ RestartSec=10
 # 默认 KillMode=control-group 会让每次 restart 连带杀掉 sing-box → daemon 置 bypass 直连
 # → opencode 看到本地 IP 直接 403。实测三次重启各触发 ~50-100 条 403。
 KillMode=process
+# 夜间刷新锁按**本地小时**判窗口（daemon._night_active 用 localtime）。
+# 主机时区若被改成 UTC（WSL 重建/容器常见），20:00→08:00 会整体偏移 8h，
+# 变成白天锁、夜里不锁 —— 那正是这套锁要修的事故形态，且只在特定时段可见。
+# 钉死在 Asia/Shanghai 与上游免费层 08:00 配额重置同源。
+Environment=TZ=Asia/Shanghai
 EnvironmentFile=-$DIR/.env
 StandardOutput=journal
 StandardError=journal

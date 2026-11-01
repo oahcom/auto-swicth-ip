@@ -34,7 +34,12 @@ import time
 from pathlib import Path
 
 from asip.atomic_io import write_json
-from config import CFG, PROJECT_DIR
+from config import (AIRPORT_DNS_HOST, AIRPORT_DNS_PATH, AIRPORT_DNS_SUFFIXES,
+                    AIRPORT_DNS_TAG, CFG, PROJECT_DIR, needs_airport_dns)
+
+# 渠道模型（块 = colo）。import 方向只能是 warp_wg → warp_blocks：模型不知道
+# 线路、端口、单元名这些东西，反过来 import 会让「纯模型」变成第二个 daemon。
+import warp_blocks as blocks
 
 # config.py 导出的 PROJECT_DIR 是 str（历史原因）；路径运算统一走 Path。
 PROJECT = Path(PROJECT_DIR)
@@ -242,6 +247,28 @@ def _split_peer(peer: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def prepare_node(node: dict) -> dict:
+    """单线配置里的节点出站：入口是机场域名时，必须挂机场 DoH。
+
+    WHY 不是「本机 DNS 也能解析」：机场拿 `cn.bing.com` / `us.bing.com` /
+    `hk-aws-*.acczzz.com` 这些**别人的域名**当跳板，公网上它们要么 NXDOMAIN，
+    要么解析到真 Bing（202.89.233.x）。真 Bing 的证书是 Microsoft 的，
+    机场前置要的是 `*.okzdns.com` —— 于是握手报「证书不属于本域」，
+    看起来像节点坏了。2026-11-01 实测：补上 `domain_resolver` 后 okz 系
+    节点 0/54 → 50/54（TEST_PLAN v1.57）。
+
+    主配置由 `parse_subscription` 负责这件事；单线配置原先漏了，后果是
+    「块模型挑出来的节点一写成线就连不上」—— 而这批节点恰恰是实测 WARP
+    可用的那批。
+    """
+    n = json.loads(json.dumps(node))
+    if needs_airport_dns(n.get("server")):
+        n["domain_resolver"] = AIRPORT_DNS_TAG
+    else:
+        n.setdefault("domain_resolver", "dns-default")
+    return n
+
+
 def build_line_config(profile: dict, port: int, node: dict, peer: str,
                       family: str = "v6") -> dict:
     """单条线的完整 sing-box 配置。
@@ -254,6 +281,7 @@ def build_line_config(profile: dict, port: int, node: dict, peer: str,
     反之亦然。不能用 ``ipv4_only``——那会让只有 AAAA 的目标直接不可达。
     """
     host, peer_port = _split_peer(peer)
+    node = prepare_node(node)
     node_tag = node["tag"]
     return {
         "log": {"level": "warn", "timestamp": True},
@@ -262,13 +290,27 @@ def build_line_config(profile: dict, port: int, node: dict, peer: str,
             "listen": _wg()["listen_host"], "listen_port": port,
         }],
         "outbounds": [node],
-        # DNS 用本机解析器，和主配置的 dns-default 同一形态。
+        # 两个 DNS server，和主配置同一形态：
+        #   dns-airport —— 只解析机场域名（节点入口），必须走它才拿到前置 IP；
+        #   dns-default —— 本机解析器，兜住其余一切，也是 dns-airport 自己的
+        #                  resolver（指回自己会 circular，实测 FATAL）。
         # WHY 不做 detour：节点 server 是域名，若 DNS 也 detour 到该节点，
         # 解析节点本身就要先连上节点 —— 环路，sing-box 报
         # "DNS query loopback in transport[dns]"，握手永远起不来。
-        "dns": {"servers": [{"type": "local", "tag": "dns-default"}],
-                "final": "dns-default",
-                "strategy": "prefer_ipv4" if family == "v4" else "prefer_ipv6"},
+        "dns": {
+            "servers": [
+                {"type": "https", "tag": AIRPORT_DNS_TAG,
+                 "server": AIRPORT_DNS_HOST, "path": AIRPORT_DNS_PATH,
+                 "domain_resolver": "dns-default"},
+                {"type": "local", "tag": "dns-default"},
+            ],
+            # 机场域名钉死 ipv4：前置只有 A 记录，走 v6 会拿到空答案后回落，
+            # 白等一轮超时。这条规则只影响这些域名，不影响隧道出口的选择。
+            "rules": [{"domain_suffix": list(AIRPORT_DNS_SUFFIXES),
+                       "server": AIRPORT_DNS_TAG, "strategy": "ipv4_only"}],
+            "final": "dns-default",
+            "strategy": "prefer_ipv4" if family == "v4" else "prefer_ipv6",
+        },
         "endpoints": [{
             "type": "wireguard", "tag": "warp",
             "address": profile["address"],
@@ -553,6 +595,20 @@ def _read_state() -> dict:
         return {"lines": {}}
 
 
+def line_nodes() -> dict[str, str]:
+    """`{线路 tag: 该线当前落地节点}`，取自已落盘的线路台账。
+
+    给夜间白名单用：块说「哪个 colo 还值得刷」，这份台账说「哪条线现在落在
+    那个 colo」。台账缺失时返回空 dict —— 调用方据此退回配置里的静态名单，
+    而不是猜一个「全保留」。
+    """
+    out = {}
+    for tag, line in (_read_state().get("lines") or {}).items():
+        if isinstance(line, dict) and line.get("node"):
+            out[tag] = line["node"]
+    return out
+
+
 def _rotation_for(home: dict, pool: list[dict], size: int) -> list[str]:
     """后备顺序：先别的出口组，再同组。
 
@@ -568,12 +624,22 @@ def _rotation_for(home: dict, pool: list[dict], size: int) -> list[str]:
 
 def apply(count: int | None = None, nodes: list[str] | None = None,
           start: int = 0, probe: bool = False, dry_run: bool = False,
-          publish: bool = True) -> dict:
+          publish: bool = True, delays: dict | None = None) -> dict:
     """按「落地节点 × 渠道模式」生成全部线路。
 
     每条线 = 一个 WARP 设备 + 一个 sing-box 进程 + 一个 socks 端口。
     同一落地节点上挂 per_node 条渠道（families 的长度），各自带一份在后备
     节点列表里轮转的配置，daemon 侧看到的就是普通成员。
+
+    分配逻辑有两个来源，由 `warp.blocks.enabled` 决定（默认关）：
+
+    | 来源 | 分组依据 | 用途 |
+    |---|---|---|
+    | `assign_nodes`（旧） | colo 轮转，尽量让每条线落不同主机 | 现网拓扑，保持不变 |
+    | `warp_blocks.plan_lines`（新） | 渠道 = (类型, 块, 序号) | 按块开渠道，见 docs/warp-channel-allocation.md |
+
+    两条路径共用后面的注册、写配置、发布步骤 —— 分叉只在这里，因为「选哪个
+    节点」是唯一真正不同的地方；把写盘也复制一份，两边就会各自漂移。
     """
     wg = _wg()
     families = list(wg.get("families") or ["v6"])
@@ -617,40 +683,64 @@ def apply(count: int | None = None, nodes: list[str] | None = None,
         print("  ⚠ 台账里所有节点都被标死，退回全部节点当落地点候选"
               "（这些线大概率连不上）", file=sys.stderr)
         usable = pool
-    if nodes:
-        missing = [t for t in nodes if t not in by_tag]
-        if missing:
-            raise SystemExit(f"节点不在当前订阅里或 UDP 不可用: {missing}")
-        # 显式 --nodes 原本绕过 ok 过滤：指定一个实测死的节点会被照单收下，
-        # home 直接写进线配置、那条线从此连不上。照用但要说一声。
-        dead = [t for t in nodes if (colo.get(t) or {}).get("ok") is False]
-        if dead:
-            print(f"  ⚠ 显式指定的节点里有台账判死的 {dead}；照用，线可能连不上",
-                  file=sys.stderr)
-        home_nodes = [by_tag[t] for t in nodes][:homes]
-        if len(home_nodes) < homes:
-            raise SystemExit(f"落地节点不足：需要 {homes} 个，给了 {len(home_nodes)} 个")
-    else:
-        # 按实测 colo 分组：v4 出口只由 colo 决定，同 colo 多挂 v4 线只会
-        # 抢同一个地址池（实测同节点重启即在 .211/.243 间跳，与节点无关）。
-        known = {str(v.get("colo")) for v in colo.values() if v.get("colo")}
-        home_nodes = assign_nodes(
-            usable, homes, start, key=region_key,
-            rank=lambda k: 0 if k in known else 1)
-
     rot_size = max(1, int(wg.get("rotation_size") or 8))
+    plan = None
+    if blocks.enabled(CFG) and not nodes:
+        # 渠道清单已按块排好序，这里只截断到线路数：多出来的渠道是备选池，
+        # 不是「该多开几条线」—— 线路数由 WARP_WG_COUNT 决定，不由块数决定。
+        plan = blocks.plan_lines(blocks.channels(CFG, delays=delays), total,
+                                 rotation_size=rot_size)
+        missing = [p["node"] for p in plan if p["node"] not in by_tag]
+        if missing:
+            raise SystemExit(
+                f"✗ 块模型选的节点不在当前 UDP 可用池里: {missing[:3]}…"
+                f"（.warp/block-map.json 与本次 udp_capable 结果不一致，"
+                f"先跑 `warp_blocks.py build-map` 重建实测表）")
+        print(f"  块模型接管分配：{len(plan)} 条渠道 → {total} 条线路", file=sys.stderr)
+
+    # 选了块模型就不再跑 `assign_nodes`：那是另一套选点逻辑，它算出来的
+    # `home_nodes` 一条也不会被用到，但它会先在「可用节点不足」时 SystemExit
+    # —— 明明块表够用，却被一条不生效的路径拦住。
+    home_nodes: list[dict] = []
+    if plan is None:
+        if nodes:
+            missing = [t for t in nodes if t not in by_tag]
+            if missing:
+                raise SystemExit(f"节点不在当前订阅里或 UDP 不可用: {missing}")
+            # 显式 --nodes 原本绕过 ok 过滤：指定一个实测死的节点会被照单收下，
+            # home 直接写进线配置、那条线从此连不上。照用但要说一声。
+            dead = [t for t in nodes if (colo.get(t) or {}).get("ok") is False]
+            if dead:
+                print(f"  ⚠ 显式指定的节点里有台账判死的 {dead}；照用，线可能连不上",
+                      file=sys.stderr)
+            home_nodes = [by_tag[t] for t in nodes][:homes]
+            if len(home_nodes) < homes:
+                raise SystemExit(f"落地节点不足：需要 {homes} 个，给了 {len(home_nodes)} 个")
+        else:
+            # 按实测 colo 分组：v4 出口只由 colo 决定，同 colo 多挂 v4 线只会
+            # 抢同一个地址池（实测同节点重启即在 .211/.243 间跳，与节点无关）。
+            known = {str(v.get("colo")) for v in colo.values() if v.get("colo")}
+            home_nodes = assign_nodes(
+                usable, homes, start, key=region_key,
+                rank=lambda k: 0 if k in known else 1)
     state = {"lines": {}, "updated": int(time.time())}
     for i in range(1, total + 1):
         group = (i - 1) // per
-        home = home_nodes[group]
-        rotation = _rotation_for(home, usable, rot_size)
+        if plan:
+            p = plan[i - 1]
+            home = by_tag[p["node"]]
+            family = p["family"]
+            rotation = p["rotation"]
+        else:
+            home = home_nodes[group]
+            rotation = _rotation_for(home, usable, rot_size)
+            family = families[(i - 1) % per]
         # 同组的兄弟线错开后备顺序，避免三条线同时跳去同一个节点。
         off = (i - 1) % per
         head, tail = rotation[0], rotation[1:]
         if tail:
             off %= len(tail)
             tail = tail[off:] + tail[:off]
-        family = families[(i - 1) % per]
         state["lines"][line_tag(i)] = {
             "unit": unit_name(i),
             "port": wg["base_port"] + i - 1,
