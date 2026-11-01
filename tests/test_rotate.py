@@ -28,6 +28,8 @@ assert r['reason'] == 'too_frequent' and r['ok'] is False, r
 print('T7 PASS  间隔内拒绝')
 
 # ---- T7b: 无备线 ----
+_SAVED = {k: getattr(d, k) for k in
+          ("_reconnect_warp_by_table", "_mark_warp_ip_used", "_warp_line_ip", "active_warp_tag")}
 d._last_rotate_ts = 0
 d._reconnect_warp_by_table = lambda reason, interrupt=True, out=None: False
 r = d._rotate_once('rate429')
@@ -61,3 +63,9 @@ d._last_rotate_ts = 0
 r = d._rotate_once('proactive')
 assert r['ok'] and marked == [], marked
 print('T21b PASS  主动轮换不拉黑')
+
+# 本文件是脚本式用例（模块导入期直接跑），改写的是 daemon 的模块属性本身：
+# 不还原的话，同一 pytest 进程里后续任何碰这些函数的用例都会撞上这里的替身
+# （实测 test_warp_prober.py 的端到端用例在单跑时绿、全量收集时红）。
+for _k, _v in _SAVED.items():
+    setattr(d, _k, _v)

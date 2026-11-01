@@ -57,6 +57,33 @@ def test_reconnect_waits_and_does_not_switch_without_fresh(monkeypatch):
     assert switched == []
 
 
+def test_reconnect_wait_deadline_ends_before_client_gives_up(monkeypatch):
+    """端到端：等到什么时候放弃，必须早于调用方 9router 的 2s 超时。
+
+    原值 switch_wait_sec=3s 的每一步都在客户端挂断之后（实测 1521 次可配对的
+    等待里 1042 次走满 3s），而 _rotate_once 全程持 _API_LOCK —— 等的时候
+    别人也换不了线。这里不 monkeypatch `_warp_line_wait_fresh`，让它收到真
+    deadline 再立刻返回。
+    """
+    seen = {}
+
+    def _capture(exclude, deadline):
+        seen["deadline"] = deadline
+        return []
+
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: None)
+    monkeypatch.setattr(daemon, "_warp_line_fresh_candidates",
+                        lambda exclude, now=None: [])
+    monkeypatch.setattr(daemon, "_warp_line_wait_fresh", _capture)
+    t0 = time.time()
+    assert daemon._reconnect_warp_by_table("test") is False
+    budget = seen["deadline"] - t0
+    assert budget <= 1.3, (
+        f"无候选时等了 {budget:.2f}s —— 晚于调用方 2s 超时"
+        "（ASIP_TIMEOUT_MS=2000，且 _rotate_once 全程持 _API_LOCK）"
+    )
+
+
 def test_reconnect_switches_to_fresh_candidate(monkeypatch):
     m = _member()
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: None)
