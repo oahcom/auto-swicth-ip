@@ -178,58 +178,68 @@ UDP 转发不通 6 个；WARP 握手 3 轮全失败 18/18。
 **配置里没有 `nodes[]`**（第 158 行原计划有）。块成员只能来自实测，配置里再存一份
 等于让「上周的事实」和「今天的观测」赛跑，输的那份没有人会去删。
 
-### 7.5 扩容执行记录（2026-11-01 20:30，现网）
+### 7.5 扩容执行记录（2026-11-01 20:30 → 21:55，现网）
 
-| 项 | 之前 | 之后 |
-|---|---|---|
-| WARP-WG 线 | 12 条（4 落地 × v4,v6,v6） | **20 条**（块模型分配，全 v6） |
-| 每节点渠道 | 3（v4+v6+v6） | 1（一条线一个渠道，按块分散） |
-| 已注册设备 | 16 | **22**（line17..22 新注册，2 台不在用） |
-| 夜间锁 | 开（8 条白名单） | **关**（第一阶段不锁，见第四节注） |
-| `channels_per_block` | 2 | 3（排掉 NRT 后仍能铺满 20 条） |
-| 排除块 | — | `["NRT"]`（12/12 段全封，占设备不产出） |
+| 项 | 之前 | 20:30 | 21:55（全量） |
+|---|---|---|---|
+| WARP-WG 线 | 12（4 落地 × v4,v6,v6） | 20 | **28**（9 个 colo 全开） |
+| 每节点渠道 | 3（v4+v6+v6） | 1 | 1 |
+| 已注册设备 | 16 | 22 | **28** |
+| 夜间锁 | 开（8 条白名单） | 关 | 关 |
+| `channels_per_block` | 2 | 3 | 3 |
+| 排除块 | — | `["NRT"]` | **`[]`**（主人定：全部块一起测） |
 
-块表：PHX 3 · LAX 3 · SJC 4 · SIN 3 · TPE 3 · HKG 4 · ORD 1（+ v4 合并块 3 条留作
-备选，本轮 20 条线全是 v6，v4 保底仍由 usque CF-D/E 承担）。
+块表（28 条，全 v6）：NRT 6 · HKG 5 · SJC 4 · PHX 3 · LAX 3 · SIN 3 · TPE 3 · ORD 1
+（v4 合并块的 3 条渠道暂不开：成员 `family` 语义还没跟着渠道走，v4 保底先由
+usque CF-D/E 承担）。
+
+两次上线后的实测（每条约 10s 超时、串行探测）：
+
+| 时间 | 线数 | 拿到 `warp=on` | 分布 |
+|---|---:|---:|---|
+| 20:47（排除 NRT） | 20 | **13** | PHX3 SJC3 SIN3 TPE4 LAX1 HKG0 ORD0 |
+| 22:04（全量） | 28 | **17** | NRT3 TPE5 PHX2 LAX1 SJC2 SIN3 HKG1 ORD1 |
+
+20:47 那批是「先排掉 NRT」的版本，22:04 是「全块一起跑」的版本 —— 后者把
+NRT 又从 0 条拉到 3 条、HKG/ORD 各拉起 1 条，代价是 28 条里有 11 条暂时起不来
+（HKG 5 条占多数）。两种都能给第一期的夜间样本，差别只是「覆盖率 vs 设备利用率」。
+
+**同一个接口在两条路上都成立**：`ASIP_WARP_BLOCK_CHANNELS` 控制每块深度，
+`exclude_colos` 控制排不排块 —— 改这两个值 + 重跑 `deploy/wg-lines-install.sh`
+即可在「全量测」和「集中产出」之间切换，不用改代码。
 
 复现这套拓扑只需要 `.env` 四行（`.env` gitignored，所以记在这里）：
 
 ```bash
 WARP_WG_FAMILIES=v6      # 本轮不做 v4 渠道：v4 保底由 usque CF-D/E 承担
-WARP_WG_NODES=20         # 线路数 = 1 × 20
+WARP_WG_NODES=28         # 线路数 = 1 × 28
 ASIP_WARP_BLOCKS=1       # 块模型接管选点
 ASIP_WARP_BLOCK_CHANNELS=3
 ```
 
 然后 `./deploy/wg-lines-install.sh`（以 root 跑，`ASIP_RUN_USER=administrator`）——
-它会 apply 写 20 份单线配置、渲染 20 个单元并重启；主 sing-box 另需
-`deploy/patch-wg-outbounds.py` + 重启才看得到新出口。
+它会 apply 写单线配置、渲染单元并重启；主 sing-box 另需
+`deploy/patch-wg-outbounds.py` + 重启才看得到新出口，daemon 也要重启一次
+（members 是 import 时冻结的）。
 
-**上线后 15 分钟实测（20:47）**：20 条里 **13 条拿到 `warp=on`**
-—— PHX 3/3、SJC 3/3、SIN 3/3、TPE 4/4、LAX 1/3、HKG 0/4、ORD 0/1。
-daemon 随后落到 `WARP-WG-7`（TPE），健康行 `错误=0/5`、`轮换W=requests 4/150格`
-—— 夜里（20:43）开始正常消耗配额，这是关闭夜锁前做不到的。
+**夜间唯一真正出货的 colo（20:30–21:52 实测）**：82 分钟里 6186 次重启、
+2975 次 `模型层: quota`，模型层 OK 只有 **9 次，全部来自 TPE**
+（WARP-WG-7/14/15 各 3 次）。也就是说「隧道起得来」和「出口能用」是两件事：
+NRT/PHX/LAX/SJC/SIN 的隧道大多能建（13~17/28），但出口 IP 几乎全在限额里。
+这条数据直接指向第二期的筛选方向：**先按 colo 保 TPE，再按段测其余**。
 
-排除 NRT 前后的对比很直接：同一批 20 条线，**含 NRT 时 5/20 可用，排除后 13/20**。
-NRT 的 4 条线一条也没起来过（段全封，握手能过、配额 100% 拒），把设备从死块上
-挪走就是这轮最实在的扩容。
 
-**HKG / ORD 当前 0/4 + 0/1**：这两个块是当天才首现的池子，夜间样本本来就少。
-它们留在线上继续跑，正是第一阶段要的夜间数据；若连续几晚都为 0，第二期把
-`exclude_colos` 加上 HKG/ORD 即可（一行配置，不用改代码）。
-
-**22 条渠道 vs 第 82 行表格的 28 条**：差的 6 条是**本机直连 WARP** 的
-`WARP-CF/CF-B/CF-D/CF-E/CF-F/WG-13`。它们不经代理出口，而 `block-map.json`
-是由「代理出口 → 真建隧道 → trace 取 colo」生成的 —— 把直连线硬塞进这张表，
-表里就会出现没有观测来源的 colo 行。它们继续按 `warp.members` 的老路走
-（其中 LAX 两条是 v4 保底线，夜间白名单按「colo 未知 → 保留」自动留下）。
+**28 条 WG 线 = 28 个代理承载渠道**；本机直连 WARP 的 5 条（`WARP-CF/CF-B/CF-D/CF-E/CF-F`）
+不经代理出口，仍按 `warp.members` 的老路走 —— `block-map.json` 是由「代理出口 →
+真建隧道 → trace 取 colo」生成的，把直连线硬塞进去会出现没有观测来源的 colo 行。
+v4 保底也在这 5 条里（CF-D / CF-E 是 v4 usque）。
 
 **这一轮明确没做的两件（别以为已经生效）**：
 
 | 计划里的项 | 现状 | 为什么没做 |
 |---|---|---|
 | 延迟排序接 `_NODE_DELAYS` | `order_nodes(nodes, delays)` 接口在，`plan` CLI 传 `None`，`apply(delays=)` 也还没人传 | 延迟缓存在 daemon 内存里，没有落盘快照；要做就得让 `_health_pool` 定期写一份（新 IO），或者让 apply 去查 Clash API（进同步路径）。按第三节的规矩，宁可不接，也不把测量塞进换线路径 |
-| `warp.night_extra_channels`（夜里额外加隧道） | 键不存在 | 「加隧道」等于临时增开 systemd 单元 + 新注册 WARP 设备，是部署动作不是运行期动作；夜里（20:00 后）做这件事的收益/风险都没测过。先用「白名单 + 现有 12 条线」跑几个夜晚，用夜间的产出率决定要不要扩 |
+| `warp.night_extra_channels`（夜里额外加隧道） | 键不存在，但**线已经加过了**：12 → 28 条常驻线，夜里全部参与 | 「夜间临时扩」是部署动作不是运行期动作。这一轮改的是「常态就多铺线」，等于把扩容前移到部署期；真要按分钟级临时加线，得先有预注册的空闲设备池，等第二期按块筛完再说 |
 
 ## 八、分层（这次的架构改动）
 
@@ -346,9 +356,21 @@ ERROR endpoint/wireguard[warp]: connect to server: failed to create session:
    （regular 33 / irregular 18）。这个判定已可复现：
    `warp_diag.py --job … --out diag44.jsonl --rounds 3` → `warp_blocks.py build-map`。
 
+**第三次复测（21:00-21:52，用空闲设备 21/22）**：44/44 仍然全是 `handshake`，
+0 个 config、0 个 port。这一轮的意义是排除了「设备身份打架」这个混杂因素 ——
+前两次跑的时候探针借的是 line1..4 的线上设备（同一 WireGuard 身份不能两会话，
+探针和生产线互踢）。换成两个从没在跑的槽位之后结论不变，说明这 44 个节点
+确实不能承载 WARP，不是被线上线挤掉的。
+
+以后跑这个诊断只需要一条命令，槽位自动挑（active 单元 + 线路台账之外的那些）：
+
+```bash
+python3 warp_diag.py --job /tmp/opencode/dead44_inputs.json --out /tmp/opencode/diag44c.jsonl --rounds 2
+```
+
 数据留档（都在 `/tmp/opencode/`，重启即失，要长期保留就拷进 `.warp/`）：
-`diag44.jsonl`（最终）、`diag44-dns-broken.jsonl`（作废探针的留档，勿引用）、
-`diag_ctrl2.jsonl`（对照）。
+`diag44.jsonl`（第二次，借产线设备）、`diag44c.jsonl`（第三次，空闲设备，最新结论）、
+`diag44-dns-broken.jsonl`（作废探针的留档，勿引用）、`diag_ctrl2.jsonl`（对照）。
 
 
 
