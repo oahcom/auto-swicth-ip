@@ -786,5 +786,62 @@ SNI 改写即可接上。
 `diag44.jsonl`（第二次，借产线设备）、`diag44c.jsonl`（第三次，空闲设备，最新结论）、
 `diag44-dns-broken.jsonl`（作废探针的留档，勿引用）、`diag_ctrl2.jsonl`（对照）。
 
+### TCP 路线反转：中继可承载 MASQUE，usque H2 修复已生效（2026-11-02 03:30）
+
+之前那句「TCP 路线 0/44 死」是**错的**，错在把「SNI 路由器」当成了按 TLS SNI 拦截。
+这一轮把三层都打通了，结论是：**这条机场的中继能承载 WARP over TCP，usque 的 H2
+实现只差最后一点对齐**。
+
+**1. usque H2 的真 bug（已在 fork 修掉）**
+
+之前 usque H2 走 CF 一直 400，根因不在 SNI 而在协议：connect-ip-go 的 `DialH2`
+用 `http.MethodConnect` 发的是**普通 CONNECT**（RFC 7540），没有 `:protocol` 伪头，
+CF 的 MASQUE handler 直接 400。但 Go 的 `golang.org/x/net/http2` 客户端在
+`req.Header` 含有 `:protocol` 时会发 **RFC 9298 扩展 CONNECT**（transport.go:1451
+`if req.Method=="CONNECT" && req.Header.Get(":protocol")!=""`）。
+
+两处修复（fork `Diniboy1123/usque`，提交 `4d47f9e`）：
+
+* `api/masque.go` H2 分支给 `h2Headers` 加 `:protocol: connect-ip`；
+* `internal/consts.go` 的 `ConnectURI` 从 `cloudflareaccess.com` 改为
+  `consumer-masque-proxy.cloudflareclient.com/`（正确的 `:authority` + 非空 `:path`）。
+
+**2. 中继黑名单的真相（关键反转）**
+
+机场节点是 SNI 路由器，但黑名单是按 **SOCKS 目标主机名** 匹配的，**不是按 TLS SNI**。
+
+| 方式 | SOCKS 目标 | TLS SNI | 结果 |
+|---|---|---|---|
+| `curl --proxy socks5h://`（目标=主机名）| `consumer-masque-proxy.cloudflareclient.com` | 同 | ❌ 掐断 |
+| `curl --proxy socks5:// --resolve ...:162.159.192.1`（目标=IP）| `162.159.192.1` | `consumer-masque-proxy.cloudflareclient.com` | ✅ TLS 成功，拿到 MASQUE 证书 |
+
+即：中继转发器只要把 SOCKS 目标设成 **IP**（`tools/tcp_relay.py` 的 `--dst` 本就是
+IP），就不触发黑名单，真正的 MASQUE SNI 能原样送达 CF。之前所有「TCP 全灭」的测试
+都误用了 `socks5h`（目标=主机名），自己踩了黑名单。
+
+**3. 验证链（经节点，SOCKS 目标=IP）**
+
+* `SNI=engage` + `:protocol` → `extended connect not supported by peer`
+  （engage 是 WARP **API** vhost，不做 MASQUE，证据铁证）；
+* `SNI=consumer-masque-proxy` + `:protocol` + SOCKS目标=IP → **不再报 not supported**
+  （已进入 CF 的 MASQUE vhost，它确实支持扩展 CONNECT），但 CF 把 CONNECT-IP 请求
+  以连接层 `EOF` 关闭。
+
+**4. 剩余 gap（很窄，不再是死结）**
+
+CF 的 MASQUE vhost 已可达且支持扩展 CONNECT，CONNECT-IP 请求被 `EOF` 拒。
+设备用的是 `usque10`（属 `DEVICES=[10..20]` 池，同池设备 QUIC 已实测 `warp=on`），
+所以**不是设备鉴权问题**，而是 usque H2 的 CONNECT-IP 请求格式/会话细节与 QUIC 路径
+有差异。最可疑的一点：QUIC 的 `connectip.Dial(..., "cf-connect-ip", ...)` 传了协议串
+`"cf-connect-ip"`，而 H2 的 `DialH2` 无对应参数（H2 用 `:protocol: connect-ip` 等价，
+但 CF 在 H2 上可能还要别的字段，比如 WARP 会话 token 的承载方式）。
+
+**结论**：TCP over 中继承载 WARP **是可行的**，usque 修复已生效（顺带让 usque 在
+「MASQUE SNI 不被拦」的网络上 H2 直接可用）。最后这一步是把 usque H2 的 CONNECT-IP
+请求逐字段对齐 QUIC / 官方 warp-svc 抓包，工程量中等、方向明确。
+
+> 注：usque 是上游第三方 fork，修复在 `/tmp/usque-fork`（本地提交 `4d47f9e`），
+> 真正接入产线还需把它 vendored/替换为带补丁的构建。
+
 
 
