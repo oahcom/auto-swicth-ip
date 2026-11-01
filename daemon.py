@@ -5168,6 +5168,26 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
     return False
 
 
+_SWITCH_WAIT_CAP_SEC = 1.2   # 见 _warp_switch_wait_deadline
+
+
+def _warp_switch_wait_deadline(now: float) -> float:
+    """无备线时的等待上限。
+
+    调用方 9router 的 ASIP_TIMEOUT_MS=2000，而 _rotate_once 全程持 _API_LOCK：
+    客户端 2s 挂断后 _rotate_once 仍在锁里等，超时的代价是「客户端在旧隧道上
+    重放、出口却已经换了」（asipRotate.js:17-19），不是只丢一个响应。
+
+    实测 2026-10-31 19:31 起 159258 行日志：进入本分支 1608 次，1521 次能配上
+    它自己的超时行，其中 1042 次（68.5%）整整走满 3s —— 那 1s 是在客户端已经
+    挂断之后才等的，且此刻快照里本就没有备线，多等也变不出来。
+
+    上限是常量不是配置项：它由调用方超时反推，改了客户端就得跟着改，不该被
+    「调一调试试」。
+    """
+    return now + min(float(_warp().get("switch_wait_sec", 3)), _SWITCH_WAIT_CAP_SEC)
+
+
 def _reconnect_warp_by_table(reason: str, interrupt: bool = True,
                               out: dict | None = None) -> bool:
     """只读状态表换线：无 120s 内 OK 就等待，不现场探测、不重启、不落池。"""
@@ -5188,7 +5208,7 @@ def _reconnect_warp_by_table(reason: str, interrupt: bool = True,
         # 实测 74 次换线里 73 次走这条路。
         with _WARP_LINE_CV:
             _WARP_LINE_CV.notify_all()
-        deadline = now + float(_warp().get("switch_wait_sec", 3))
+        deadline = _warp_switch_wait_deadline(now)
         log("  · 暂无 120s 内 OK 的备线，已催探测器，短等写入")
         cands = _warp_line_wait_fresh(
             active["tag"] if active else None, deadline)

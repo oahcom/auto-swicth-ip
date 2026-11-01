@@ -143,7 +143,9 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
 - 动作（2026-10-26 起）：`warp-prober` 是唯一探测器，持续把每条线的
   `last_ok_ts/last_ok_ip` 写进 per-line 状态表；`reconnect_warp` **只读表**。
   120s 内 OK 的线直接 `PUT /proxies/opencode-out` 切过去；没有新鲜 OK 就先 `notify_all()`
-  催醒探测器、再在条件变量上等 `switch_wait_sec`(3s)，超时本次放弃，不现场探测、不盲切、
+  催醒探测器、再在条件变量上等 `switch_wait_sec`(3s)，**但实际封顶在 1.2s**
+（`daemon.py` 的 `_SWITCH_WAIT_CAP_SEC`）——调用方 9router 的 `ASIP_TIMEOUT_MS=2000`，等满 3s 的每一步
+都在客户端挂断之后（实测 1521 次可配对的等待里 1042 次走满 3s）。超时本次放弃，不现场探测、不盲切、
   不原地重连、不落 proxy。旧实现只等不催（20s）：实测 74 次换线里 73 次等满 20s 照样
   放弃，空转 24.7 分钟 —— 等待期间没有任何人能让「新鲜度」变好，所以必须催。
   换线路径不再重启目标线；重启只由探测器在**确定失败**时触发。
