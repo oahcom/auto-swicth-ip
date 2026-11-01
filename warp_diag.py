@@ -254,6 +254,114 @@ def diagnose(item: dict, rounds: int, family: str = "v6",
     return rec
 
 
+# ---------------------------------------------------------------- 逐层拆解
+
+def _socks_node(node: dict) -> tuple[subprocess.Popen, int, Path]:
+    """起一个「只有该节点、只有 socks 入站」的 sing-box，用来手工发 UDP。"""
+    port = free_port()
+    tmp = Path(tempfile.mkdtemp(prefix="diaglayers-"))
+    n = normalize_node(node)
+    cfg = {
+        "log": {"level": "error"},
+        "inbounds": [{"type": "socks", "tag": "in", "listen": "127.0.0.1",
+                      "listen_port": port}],
+        "outbounds": [n],
+        # 机场域名的 resolver 必须就地定义：只引用不定义会 FATAL，这正是
+        # 第一版 44 个节点全灭的原因之一。
+        "dns": {
+            "servers": [
+                {"type": "https", "tag": "dns-airport",
+                 "server": "custom.juhazf.cn", "path": "/inst",
+                 "domain_resolver": "dns-default"},
+                {"type": "local", "tag": "dns-default"},
+            ],
+            "rules": [{"domain_suffix": ["okzdns.com", "juhazf.cn", "hi2026.net",
+                                         "acczzz.com", "bing.com"],
+                       "server": "dns-airport", "strategy": "ipv4_only"}],
+            "final": "dns-default",
+        },
+        "route": {"final": n["tag"],
+                  "default_domain_resolver": {"server": "dns-default"}},
+    }
+    cp = tmp / "c.json"
+    cp.write_text(json.dumps(cfg, ensure_ascii=False))
+    proc = _start(cp, tmp / "sb.log")
+    for _ in range(60):
+        if proc.poll() is not None:
+            break
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
+            break
+        except OSError:
+            time.sleep(0.2)
+    return proc, port, tmp
+
+
+def _stun(pad: int = 0) -> bytes:
+    """STUN binding request；pad>0 时用 PADDING 属性把包撑到 pad 字节。"""
+    import struct
+    body = b""
+    if pad > 20:
+        n = (pad - 20) // 4 * 4 - 4
+        body = struct.pack(">HH", 0x0026, n) + b"\x00" * n
+    return struct.pack(">HHI", 0x0001, len(body), 0x2112A442) + os.urandom(12) + body
+
+
+def explain(item: dict, slot: int) -> dict:
+    """这个节点为什么承载不了 WARP：先证明「UDP 本身通」，再看「WARP 端点回不回」。
+
+    判据链（缺一条都会得出错误结论）：
+      · DNS 53 + STUN 19302 + 1400 字节包都通 → 中继不限端口/长度/包数
+      · Cloudflare 的 STUN 通 → CF 的主网段没问题
+      · WARP 端点全静默 → 只剩「机场封了 WARP 专属网段」这一种解释
+    """
+    proc, port, tmp = _socks_node(item["node"])
+    out: dict = {"tag": item["tag"], "layers": {}}
+    try:
+        dns = _dns_payload()
+        out["layers"]["dns/53"] = bool(warp_wg._socks_udp(port, ("8.8.8.8", 53), dns))
+        google = _resolve("stun.l.google.com")
+        cf = _resolve("stun.cloudflare.com")
+        if google:
+            out["layers"]["stun/google"] = bool(
+                warp_wg._socks_udp(port, (google, 19302), _stun()))
+            out["layers"]["stun/1400B"] = bool(
+                warp_wg._socks_udp(port, (google, 19302), _stun(1400)))
+        if cf:
+            out["layers"]["stun/cloudflare"] = bool(
+                warp_wg._socks_udp(port, (cf, 3478), _stun()))
+    finally:
+        _stop(proc)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    endpoints = {}
+    for peer in ("162.159.192.1:2408", "162.159.192.1:500", "188.114.96.1:2408"):
+        saved = warp_wg._wg()["peer_v4"]
+        warp_wg._wg()["peer_v4"] = peer
+        try:
+            r = run_round(item["node"], "v6", slot, wait_ready=15.0, wait_warp=20.0)
+        finally:
+            warp_wg._wg()["peer_v4"] = saved
+        endpoints[peer] = r.get("stage")
+    out["endpoints"] = endpoints
+    return out
+
+
+def _resolve(host: str) -> str | None:
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return None
+
+
+def _dns_payload() -> bytes:
+    import struct
+    q = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+    for part in b"example.com".split(b"."):
+        q += bytes([len(part)]) + part
+    return q + b"\x00\x00\x01\x00\x01"
+
+
 # ---------------------------------------------------------------- CLI
 
 def _load_job(path: str) -> list[dict]:
@@ -310,10 +418,21 @@ def main() -> None:
                     help="跳过 --out 里已有的 tag（中断后续跑）")
     ap.add_argument("--summarize", help="只汇总已有的 JSONL，不跑探测")
     ap.add_argument("--slots", help="逗号分隔的备用设备槽位（默认 14,15,16）")
+    ap.add_argument("--explain", help="对一个 tag 逐层拆解（UDP 层 + WARP 端点），"
+                                     "需要同时给 --job")
     args = ap.parse_args()
 
     if args.summarize:
         summarize(args.summarize)
+        return
+    if args.explain:
+        if not args.job:
+            raise SystemExit("--explain 需要 --job（同一个 job 文件里找 tag）")
+        item = next((x for x in _load_job(args.job) if x["tag"] == args.explain), None)
+        if item is None:
+            raise SystemExit(f"--job 里没有 {args.explain}")
+        out = explain(item, spare_slots()[0])
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return
     if not args.job or not args.out:
         raise SystemExit("需要 --job 与 --out（或 --summarize）")

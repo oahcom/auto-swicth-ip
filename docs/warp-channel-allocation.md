@@ -376,8 +376,66 @@ ERROR endpoint/wireguard[warp]: connect to server: failed to create session:
 python3 warp_diag.py --job /tmp/opencode/dead44_inputs.json --out /tmp/opencode/diag44c.jsonl --rounds 2
 ```
 
-### 连通性 ≠ 承载能力（2026-11-01 22:20 补测）
+### 问题点定位（2026-11-01 22:30，最低延迟节点逐层拆）
 
+挑延迟最低的两个（`jp-aws-117` 358ms、`cn.bing.com:443~18-any` 468ms），一层层
+往里剥。表里是「经这个节点能不能拿到回包」：
+
+| 探测 | 目标 | 结果 |
+|---|---|---|
+| DNS UDP/53 | 8.8.8.8 | ✅ 71B |
+| STUN UDP/3478 | stun.l.google.com | ✅ 42B |
+| STUN UDP/3478 | stun.cloudflare.com | ✅ 42B（**Cloudflare 自己的服务通**） |
+| STUN UDP/**19302** | stun.l.google.com | ✅（端口不是 53/3478 也行） |
+| STUN 包长 40→1400B | stun.l.google.com:19302 | ✅ 全通过 |
+| 同一关联连发 5 个 | 同上 | ✅ OOOOO（关联不会被关） |
+| WG 握手 148B | 162.159.192.1:**2408** | ❌ 一个回包都没有 |
+
+再用 debug 日志看 sing-box 到底做了没有：
+
+```
+DEBUG endpoint/wireguard[warp]: peer(bmXO…fgyo) - sending handshake initiation
+DEBUG ...: handshake did not complete after 5 seconds, retrying (try 2/3/4)
+```
+
+**发得出去，一个包都没回来。** 于是把「封端口」和「封网段」分开验，7 个端点全试：
+
+| 端点 | 结果 |
+|---|---|
+| 162.159.192.1 : 2408 / 500 / 1701 / 4500 | ❌ 全不通 |
+| 162.159.193.10:2408 | ❌ |
+| 188.114.96.1:2408、188.114.97.1:2408 | ❌ |
+| [2606:4700:103::2]:2408、[2606:4700:100::2]:2408（v6） | ❌ |
+
+结论（也是这批节点的**共性**）：
+
+1. 中继本身没问题 —— 任意 UDP 端口、任意长度、连续多包都通；
+2. Cloudflare 也没问题 —— `stun.cloudflare.com` 走同一个节点是通的；
+3. 唯一不通的是 **Cloudflare WARP 专属网段**（`162.159.192.0/23`、`188.114.96.0/23`）
+   上的 2408/500/1701/4500，v4 v6 都封。
+
+所以不是延迟、不是设备、不是配置，是**机场在这批出口上封了 WARP 端点**。机场
+普遍这么干（防止用户拿它跑 WARP 白嫖带宽），客户端侧没有绕法 —— WARP 只有
+UDP 这一条路，TCP 443 的 MASQUE（usque）又不支持指定上游代理。
+
+**共性还表现在出口 IP 上**：95 个出口 IP 里，失败的 44 个 IP **没有一个**同时挂着
+「能承载」的节点（混挂 0 个）。说明这是**中继主机级的策略**，不是协议或入口域名：
+`cn.bing.com` 既有能跑的（~21/22/23，SIN 块）也有不能跑的（~18 等）——差别在它
+当时被分到哪台中继，而不在节点配置。
+
+**能做的只有两件**：① 继续用它们当普通代理（现状，已在 159 节点池里）；
+② 定期重测——机场换中继/改策略时它们会自己活过来。两条命令都在工具里：
+
+```bash
+# 单个节点逐层拆解（UDP 层 + 3 个 WARP 端点，约 1 分钟）
+python3 warp_diag.py --job /tmp/opencode/dead44_inputs.json --explain <tag>
+
+# 全量重测（自动挑空闲设备，没空闲会拒绝运行）
+python3 warp_diag.py --job /tmp/opencode/dead44_inputs.json \
+    --out /tmp/opencode/diag44-$(date +%m%d).jsonl --rounds 2
+```
+
+### 连通性 ≠ 承载能力（2026-11-01 22:20 补测）
 主人问的一句话点到了要害：「如果有联通的，代表一定有能够连接的，只不过延迟大」。
 于是补了两组测量，把两个口径分开摆：
 
