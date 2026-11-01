@@ -624,6 +624,48 @@ SOCKS5-UDP 打四个不同目标（DNS 8.8.8.8/1.1.1.1、STUN google:19302、STU
 净收益：44 个判死节点里救回 **6 条真实出口**（HKG×1 / NRT×3 / LAX×1，
 比之前 51 节点的 colo 版图多出 HKG），成本是每节点 3 个常驻进程。
 
+### SNI 改写实验：原理性不可行 + 黑名单范围（2026-11-02 03:00）
+
+主机追问「社区有没有办法」后补的三块拼图：
+
+**1. 黑名单只匹配一个域名**（SNI 对照，全部经节点到 162.159.192.1）：
+
+| SNI | 结果 |
+|---|---|
+| consumer-masque-proxy.cloudflareclient.com | ❌ 掐断（唯一被黑） |
+| **engage.cloudflareclient.com**（解析到 162.159.192.1，WARP API 域名） | ✅ 真 CF 证书 |
+| api.cloudflareclient.com | ✅ 真 CF 证书 |
+| *.pages.dev / *.workers.dev / *.cfargotunnel.com | ❌ 掐断（CF 自家服务被针对） |
+| discord.com / www.apple.com | ✅ 真站点证书 |
+
+**2. SNI 改写转发器（tools/sni_relay.py）做到字节级正确**
+（解析 ClientHello、改 SNI、修 5 层长度字段，单测回读一致），
+端到端结果是 `bad record mac` —— **TLS 1.3 的 Finished 校验覆盖
+ClientHello 本身**，改写后客户端与服务器 transcript 不一致、密钥派生
+失败。这是原理性障碍：**端到端 TLS 下，中间人改 SNI 必然破坏握手**。
+社区常用的 domain fronting 之所以曾经可行，是因为 SNI 与 HTTP Host
+分离（HTTP 层不受 transcript 保护）；而 MASQUE 的 :authority 与 SNI
+绑定由客户端决定，客户端不给口子。
+
+**3. 死结的完整表述**：
+
+* warp-svc：协议正确，但 SNI 硬编码且无配置口子 → 被 SNI 路由器黑
+* usque：有 `-s` 改 SNI（客户端自己改，transcript 一致，TLS 能过），
+  但 H2 的 CONNECT-IP 被 CF 400（协议实现差距，等上游）
+* 所以 TCP 路线在「SNI 路由器 + 这个黑名单」组合下无解，除非：
+  a) usque 修好 H2（跟踪 issue #32）；
+  b) 出现「解析到 WARP 端点、且不被黑」的第三方域名（SNI 路由按域名
+     解析连接真实 IP —— engage 就是现成例子，但它属于 CF 官方域名，
+     若 CF 未来给 WARP 端点挂多个别名，可直接用 sni_relay.py 接上）。
+
+**社区对「SNI 路由器」的成熟绕法**（评估记录，待主机拍板）：
+vless+ws+tls over CF Workers（BPB Panel 等 10K+ stars 项目）—— 客户端
+SNI 用自己的 Worker 域名（正常 CF 站点，路由器放行），Worker 在 CF
+内部接流量并从 CF 的出口 IP 出。44 个节点的 TCP 全部可用作入口线
+（SNI 路由器对正常站点是放行的），出口换成一族全新 IP 池；需要一个
+CF 账号。自有 VPS + vless/wstunnel 同理（SNI=自己域名，中继按域名
+送到真实站点 = 自己的 VPS）。
+
 ### 定性：这家机场的 TCP 中继是 SNI 路由器，TCP 路线客户端侧无解（2026-11-02 02:45）
 
 对 44 个节点全量做「SNI×IP」矩阵测试（SNI 取 CF 真域名 / 机场白名单域名 /
