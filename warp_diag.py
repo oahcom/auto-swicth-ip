@@ -41,9 +41,15 @@ from config import PROJECT_DIR
 PROJECT = Path(PROJECT_DIR)
 SINGBOX = str(PROJECT / "sing-box")
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
-# profile 槽位数量：每条线一份独立 WARP 设备。同一份 profile 被两个实例共用会
-# 互相踢下线（同一个 WireGuard 身份不能同时有两个会话）。
-PROFILE_SLOTS = 4
+
+# 探测必须用**没在跑**的设备身份。第一版拿 line1..4 的 profile 去探，那 4 份
+# 是 WARP-WG-1..4 的线上设备：同一个 WireGuard 身份不能有两个会话，服务端只
+# 认最后一次握手 —— 谁的包晚到谁掉线，日志里就是
+# `read packet: use of closed network connection`。于是探针把线上线踢掉、
+# 线上线把探针踢掉，44 个节点全判死里有一份是这么来的。
+#
+# 槽位不写死：扩容后 14..16 也会变成生产线，写死等于把雷埋到下一轮。
+WLINES = "wglines"
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -59,6 +65,62 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def registered_slots() -> list[int]:
+    """已注册（有 profile.conf）的设备槽位。"""
+    base = PROJECT / ".warp" / WLINES
+    out = []
+    for d in base.glob("line*"):
+        tail = d.name[4:]
+        if tail.isdigit() and (d / "profile.conf").exists():
+            out.append(int(tail))
+    return sorted(out)
+
+
+def active_slots() -> set[int]:
+    """正在跑的生产线路序号：systemd 里 active 的 `warp-wg-N` + 线路台账。
+
+    两处都看：台账可能落后于单元（刚 register 还没进 state），单元可能是
+    手工起的（不在台账里）。探测拿其中任何一个当自己的设备都会打架。
+    """
+    used: set[int] = set()
+    try:
+        out = subprocess.run(
+            ["systemctl", "list-units", "--plain", "--no-legend",
+             "--state=active", "warp-wg-*.service"],
+            capture_output=True, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            name = line.split()[0] if line.split() else ""
+            tail = name.rsplit("-", 1)[-1].split(".")[0]
+            if tail.isdigit():
+                used.add(int(tail))
+    except (subprocess.SubprocessError, OSError, IndexError):
+        pass
+    try:
+        for tag in warp_wg.line_nodes():
+            tail = tag.rsplit("-", 1)[-1]
+            if tail.isdigit():
+                used.add(int(tail))
+    except (OSError, ValueError):
+        pass
+    return used
+
+
+def spare_slots() -> list[int]:
+    """已注册但没在跑的设备；一个都没有时直接停手。
+
+    拿线上设备探测不只是「结果不准」——它会真的把在用的线踢下线。宁可
+    报错让人补注册设备，也不要在诊断工具里埋一颗能打断生产的雷。
+    """
+    used = active_slots()
+    free = [s for s in registered_slots() if s not in used]
+    if not free:
+        raise SystemExit(
+            f"✗ 没有空闲的 WARP 设备可用来探测（已注册 {registered_slots()}，"
+            f"其中 active {sorted(used)}）。先 register 一条新线再探 —— "
+            f"用线上设备的身份探测会抢掉那条线的会话。")
+    return free
+
+
 # 节点出站的加工也走 `warp_wg.prepare_node` —— 探针如果自己写一份
 # `domain_resolver` 规则，就会和生产配置分叉，而分叉的探针得出的结论
 # 不适合用来判节点。这里只保留函数名，实现完全委托。
@@ -67,7 +129,7 @@ def normalize_node(node: dict) -> dict:
 
 
 def _profile(slot: int) -> dict:
-    return warp_wg.read_profile(warp_wg.line_dir(1 + slot % PROFILE_SLOTS) / "profile.conf")
+    return warp_wg.read_profile(warp_wg.line_dir(slot) / "profile.conf")
 
 
 def _trace(port: int, timeout: float) -> dict | None:
@@ -169,13 +231,18 @@ def run_round(node: dict, family: str, slot: int,
 
 
 def diagnose(item: dict, rounds: int, family: str = "v6",
-             stagger: float = 0.4) -> dict:
+             stagger: float = 0.4, slots: list[int] | None = None) -> dict:
     """多轮判定。单轮失败不足以定论：同一节点时通时不通（实测首轮 58/190，
-    补测后 86/190），这是 UDP 转发的随机性，不是我们的判据不稳。"""
+    补测后 86/190），这是 UDP 转发的随机性，不是我们的判据不稳。
+
+    每轮换一个**备用**设备槽位：同一份 profile 连测多轮会连续复用同一个
+    WireGuard 会话，第一轮失败后服务端还记着旧会话，第二轮容易延续同一个结果。
+    """
+    slots = slots or spare_slots()
     rec = {"tag": item["tag"], "egress_ip": item.get("egress_ip"),
            "country": item.get("country"), "family": family, "rounds": []}
     for r in range(rounds):
-        res = run_round(item["node"], family, r)
+        res = run_round(item["node"], family, slots[r % len(slots)])
         rec["rounds"].append(res)
         if res["ok"]:
             break  # 一次建成即证明能承载，不必继续烧设备会话
@@ -242,6 +309,7 @@ def main() -> None:
     ap.add_argument("--skip-done", action="store_true",
                     help="跳过 --out 里已有的 tag（中断后续跑）")
     ap.add_argument("--summarize", help="只汇总已有的 JSONL，不跑探测")
+    ap.add_argument("--slots", help="逗号分隔的备用设备槽位（默认 14,15,16）")
     args = ap.parse_args()
 
     if args.summarize:
@@ -249,6 +317,10 @@ def main() -> None:
         return
     if not args.job or not args.out:
         raise SystemExit("需要 --job 与 --out（或 --summarize）")
+    slots = ([int(s) for s in args.slots.split(",") if s.strip()]
+             if args.slots else spare_slots())
+    print(f"设备槽位 {slots}（active 线路 {sorted(active_slots())} 已排除）",
+          file=sys.stderr)
 
     todo = _load_job(args.job)
     if args.only:
@@ -266,7 +338,7 @@ def main() -> None:
 
     with open(args.out, "a", encoding="utf-8") as fh:
         for k, item in enumerate(todo, 1):
-            rec = diagnose(item, args.rounds, args.family)
+            rec = diagnose(item, args.rounds, args.family, slots=slots)
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
             detail = [(x["stage"], x.get("colo") or x.get("ip")) for x in rec["rounds"]]
