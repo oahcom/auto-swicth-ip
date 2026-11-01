@@ -624,6 +624,43 @@ SOCKS5-UDP 打四个不同目标（DNS 8.8.8.8/1.1.1.1、STUN google:19302、STU
 净收益：44 个判死节点里救回 **6 条真实出口**（HKG×1 / NRT×3 / LAX×1，
 比之前 51 节点的 colo 版图多出 HKG），成本是每节点 3 个常驻进程。
 
+### 定性：这家机场的 TCP 中继是 SNI 路由器，TCP 路线客户端侧无解（2026-11-02 02:45）
+
+对 44 个节点全量做「SNI×IP」矩阵测试（SNI 取 CF 真域名 / 机场白名单域名 /
+知名域名 / 未知域名，IP 取 162.159.192.1，全部经节点），证据链：
+
+| SNI | 结果 | 说明 |
+|---|---|---|
+| consumer-masque-proxy.cloudflareclient.com | ❌ decode error / eof | **全局黑名单**，44/44 一致 |
+| www.apple.com / www.twitch.tv | TLS 通，但回**真 Apple / 真 Twitch 证书** | 连接被导向真实站点，目的 IP 被无视 |
+| cn.bing.com（机场白名单）| TLS 通，回 Microsoft 的 bing 证书 | 中继伪造/劫持 |
+| 不存在的域名 | ❌ 掐断 | |
+| 无 SNI（IP 直连）| 192.1 回 handshake failure | |
+
+即：**中继按 ClientHello 的 SNI 决定去向，目的 IP 完全不参与路由**。
+全量判定分布：SNI路由 39 / TCP死 4 / 异常 1 → **透明转发 0/44**。
+
+这一定性同时解释了此前所有现象：
+
+* **为什么 UDP 桥能通**：UDP 没有 ClientHello，中继对 UDP 只能按目的 IP
+  透明转发 → usque 的 QUIC 直达 162.159.198.2 的 MASQUE 服务。
+* **为什么 warp-svc 的 H2 必死**：它的 SNI 是硬编码的
+  `consumer-masque-proxy.cloudflareclient.com`，正好踩黑名单，且客户端
+  不给改 SNI 的口子；转发器做 SNI 改写也没用 —— 改成任何域名，中继都
+  不会把连接送到 162.159.192.1（SNI 路由不看 IP），而是导向那个域名的
+  真实站点，那里没有 MASQUE 服务。
+* **为什么 usque 的 H2 直连是 400**：直连不经过中继，SNI 直达 CF，
+  TLS 与 HTTP 层都正常到达 —— 400 是 CF 对 usque 两实现 CONNECT-IP
+  构造的拒绝，与中继无关（故 usque 侧无解，等上游）。
+
+TCP 路线的剩余可能性只有一条：找到一个「解析到 WARP 端点 IP、且不在
+黑名单」的域名当 SNI —— 中继会按域名解析连到真端点。但这要求该域名
+恰好解析到 162.159.192.0/24 且中继黑名单只匹配 cloudflareclient.com
+后缀，基本不存在；若未来发现此类域名，用 `tools/tcp_relay.py` 加
+SNI 改写即可接上。
+
+**结论：这个机场上，WARP 借道的唯一通道是 UDP（QUIC 桥），上限 6/44。**
+
 ### 走 HTTP/2 over TCP 的那条路：通到最后一公里被 SNI 拦（2026-11-02 02:10）
 
 主机一句「不是走的 http 吗」点破了绕远的地方：MASQUE 本来就是 HTTP，
