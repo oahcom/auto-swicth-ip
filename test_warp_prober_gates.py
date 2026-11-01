@@ -269,9 +269,11 @@ def test_single_unknown_does_not_restart(monkeypatch):
 def test_switch_wait_deadline_stays_under_client_timeout():
     """无候选时的等待上限必须早于调用方超时（9router ASIP_TIMEOUT_MS=2000）。
 
-    实测 1608 次进入等待：1213 次走满 3s 全部失败，成功的那 326 次 92.9% 在 1s 内
-    返回。等满 3s 的每一步都晚于客户端挂断 → 该次换线的结果没人收，且 3s 在
-    _API_LOCK 内独占，把并发调用一起串行化。
+    实测 2026-10-31 19:31 起 159258 行日志：进入本分支 1608 次，1521 次能配上
+    它自己的超时行，其中 1042 次（68.5%）整整走满 3s。日志里没有「等待成功」的
+    完成标记（`✓ WARP 换线成功` 由别的线程写，无法与单次等待配对），所以这里只
+    报能配对的那部分。走满 3s 的每一步都晚于客户端 2s 挂断，且 3s 在 _API_LOCK
+    内独占，把并发调用一起串行化。
     """
     budget = daemon._warp_switch_wait_deadline(1000.0) - 1000.0
     assert budget <= 1.2 + 1e-6, (
