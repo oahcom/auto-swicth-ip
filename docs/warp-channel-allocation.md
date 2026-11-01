@@ -590,6 +590,45 @@ SOCKS5-UDP 打四个不同目标（DNS 8.8.8.8/1.1.1.1、STUN google:19302、STU
 工具已入库：`tools/masque_bridge.py`（UDP 桥）、`tools/scan_masque_nodes.py`
 （全量扫描）、`tools/probe_udp_quic.py`（UDP/QUIC 分层探测，用于先筛 A 类）。
 
+### 走 HTTP/2 over TCP 的那条路：通到最后一公里被 SNI 拦（2026-11-02 02:10）
+
+主机一句「不是走的 http 吗」点破了绕远的地方：MASQUE 本来就是 HTTP，
+**HTTP/3 跑在 UDP 上，但 HTTP/2 跑在 TCP 上** —— 而这批节点的 TCP 是全通的。
+于是把官方客户端的 H2/TCP 路线走了一遍，全程记录如下（含可复用的接口）：
+
+| 步骤 | 结果 |
+|---|---|
+| `warp-cli tunnel masque-options set h2-only` + connect | ✅ `warp=on`、`http=http/2`（纯 TCP，UDP 没参与）|
+| 它连的端点 | TCP **162.159.192.1:443** |
+| `warp-cli tunnel endpoint set <IP:PORT>` | ✅ 存在，可强制指定端点（无需 iptables）|
+| 转发器收到连接 | ✅ 3-5 条/次（说明 warp-svc 确实经节点发出去了）|
+| MASQUE 建隧道 | ❌ `tls handshake eof` |
+
+**关键坑（都是实测撞出来的，写下来省得再撞）**：
+
+1. **endpoint override 会忽略自定义端口**。日志里写着
+   `Warp endpoint override ports ports=[443, 500, 1701, 4500, 4443, 8443, 8095]`，
+   无论 `set` 里写什么端口，它只用这份列表去连给定 IP。所以转发器**必须监听 443**，
+   写在 9450 上不会有连接进来（第一次试就是这个原因全空）。
+2. **WSL 的 iptables nat REDIRECT 是摆设**：规则能加进去、`-L` 能看到，
+   但实际不生效（转发器零连接）。想改向别用 iptables，用 `tunnel endpoint set`。
+3. **root 跑 sing-box 会让节点全部假死**：`/root/.singbox_secret` 缺失导致机场
+   DoH 失败，同一个节点 root 跑是 000、原用户跑是 204。测试脚本里必须用
+   `sudo -u administrator` 起 sing-box，否则会把「root 环境问题」误判成「节点死」。
+
+**失败原因定性**：转发器侧有连接、warp-svc 侧 `tls handshake eof` —— 与
+之前观察到的一致：**机场中继按 TLS SNI 拦 MASQUE**（`consumer-masque-proxy.cloudflareclient.com` 被 `decode error` 掐断，IP-SNI 则畅通）。官方客户端
+不给改 SNI 的口子，而 TLS 是端到端的、转发器无法代改（改了就破证书固定）。
+抽 6 个节点（含 B 类）全灭：**TCP 路线 0/6**。
+
+所以 MASQUE 借道的天花板由中继策略决定：
+
+* **放行 UDP 的中继** → QUIC 路线可行，全量实测 **4/44**（HKG / NRT×3）
+* **按 SNI 拦 MASQUE 的中继** → TCP 路线也走不通（本次抽样 0/6）
+* 剩下的绝大多数中继：UDP 不转、SNI 也拦 → 两条路都堵
+
+工具：`tools/tcp_relay.py`（转发器）、`/tmp/h2_batch.py`（串行换节点验证）。
+
 ### 连通性 ≠ 承载能力（2026-11-01 22:20 补测）
 主人问的一句话点到了要害：「如果有联通的，代表一定有能够连接的，只不过延迟大」。
 于是补了两组测量，把两个口径分开摆：
