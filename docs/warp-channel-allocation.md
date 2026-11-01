@@ -590,6 +590,40 @@ SOCKS5-UDP 打四个不同目标（DNS 8.8.8.8/1.1.1.1、STUN google:19302、STU
 工具已入库：`tools/masque_bridge.py`（UDP 桥）、`tools/scan_masque_nodes.py`
 （全量扫描）、`tools/probe_udp_quic.py`（UDP/QUIC 分层探测，用于先筛 A 类）。
 
+### A 类筛选后复测：最终 6/44（2026-11-02 02:30）
+
+按「先筛 UDP、再上 MASQUE」的两步法重跑（`/tmp/screen_udp.py` 并发筛 + 串行
+真建隧道，失败者隔一轮重试并重新 enroll）：
+
+| 步骤 | 结果 |
+|---|---|
+| UDP 分层筛选（44 节点，并发 8，~2 分钟） | **A 类 12/44** |
+| A 类 MASQUE 第一轮 | 5/12 |
+| A 类失败者第二轮（带 enroll） | 0/7 |
+
+**最终清单（6/44，全部实测 warp=on）**：
+
+```
+✓ hk-aws-53.acczzz.com:443-any     HK  colo=HKG   （间歇可用：一轮成二轮败）
+✓ jp-aws-110.acczzz.com:443-any    JP  colo=NRT   （此前被「TCP死」误判，实为 root 假死）
+✓ jp-aws-117.acczzz.com:443-tr     JP  colo=NRT
+✓ cn.bing.com:443~18-any           JP  colo=NRT
+✓ cn.bing.com:443~19-any           JP  colo=NRT
+✓ unamecf3.xn--ghqu5fm27b67w.com:443~8-vl  US  colo=LAX
+```
+
+两个教训钉死：
+
+1. **root 跑 sing-box 假死**把 jp-aws-110 冤判了整整一轮 —— 测试基建的
+   环境问题会伪装成节点问题，先验证基建再怀疑节点。
+2. hk-aws-53 一轮成、一轮败：**中继对 CF UDP 的放行是间歇的**，单轮判定
+   的置信度有限；但这批「转 UDP 却建不起 MASQUE」的（cn.bing.com~11/~17、
+   downloadcfpro 系列 5 个）两轮都失败，更像是中继对 UDP/443→CF 有针对性
+   处理（与 STUN CF:3478 在 A 类节点上也普遍不通相印证）。
+
+净收益：44 个判死节点里救回 **6 条真实出口**（HKG×1 / NRT×3 / LAX×1，
+比之前 51 节点的 colo 版图多出 HKG），成本是每节点 3 个常驻进程。
+
 ### 走 HTTP/2 over TCP 的那条路：通到最后一公里被 SNI 拦（2026-11-02 02:10）
 
 主机一句「不是走的 http 吗」点破了绕远的地方：MASQUE 本来就是 HTTP，

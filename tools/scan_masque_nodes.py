@@ -126,6 +126,8 @@ def main() -> int:
                     help="不做 TCP 存活预检（默认做）")
     ap.add_argument("--enroll", action="store_true",
                     help="每个设备用前重新 enroll（token 过期时开）")
+    ap.add_argument("--rounds", type=int, default=1,
+                    help="失败节点重试轮数（hk-aws-53 曾一轮失败二轮成功）")
     args = ap.parse_args()
 
     nodes = json.load(open(args.inputs))
