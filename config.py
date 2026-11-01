@@ -265,8 +265,10 @@ CFG = {
             # 各自独立注册（.warp/usque5 / usque6），不是复制同一份私钥。
             {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
             {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service"},
-            # WG-5 同配置 ×1：落地节点同为 pq.aws63（SIN），独立注册（line13）。
-            {"tag": "WARP-WG-13", "port": 1122, "service": "warp-wg-13.service"},
+            # WARP-WG-13 不再写死在这里：块模型把渠道数从 12 扩到 20 之后，
+            # 第 13 条就是生成成员里的普通一条，写死会得到两个同 tag 成员
+            # （同一端口、同一单元、同一份设备），selector 里重复项直接报错。
+            # 线路数不足 13 的部署仍需要它，见 `_append_wg_members` 末尾。
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
@@ -569,7 +571,13 @@ CFG = {
         # 里的线（如尚未并入 .warp/warp-outbound.json 的 CF-E/CF-F/WG-13）
         # 刷出地址也切不过去，自动被排除。
         "night_window": {
-            "enabled": True,
+            # **第一期不做夜间锁**（2026-11-01 主人定）：第一阶段的目的就是
+            # 「全部渠道白天夜里都跑，测出每个 colo 的夜间封禁率」，锁住一部分
+            # 线等于把要测的样本自己删掉 —— 夜里到底哪条线能出货，就没数据了。
+            # 第二期按实测筛出夜间专用池时再把这条打开，白名单改用
+            # `warp_blocks.night_line_tags`（按块生成，见 docs 第四节）。
+            # 锁的实现留在 warp_night.py，关掉的只是一个开关。
+            "enabled": False,
             "start_hour": 20,
             "end_hour": 8,
             "allow": [
@@ -632,6 +640,12 @@ CFG = {
             # 每块每类几条渠道。2 是「同 colo 一主一备」：同块两条线共用一个段池，
             # 再多只会互相抢地址，不会多出可用地址。
             "channels_per_block": _env_int("ASIP_WARP_BLOCK_CHANNELS", 2) or 2,
+            # 结构性不可用的块：封禁率 100% 意味着这个 colo 的段**已经全封**，
+            # 一条线挂上去拿到的出口必然在限额里，重启只是换到另一个同样被封的
+            # /128。它不是「夜里不行、白天还行」，是两头都不行 —— 所以不占设备。
+            # 第一阶段仍要测夜间封禁率，测的是**还有希望**的块；已经 12/12 全封
+            # 的 NRT 没有可测的余量。
+            "exclude_colos": ["NRT"],
             "table": [
                 # ban_rate 是 2026-11-01 实测的**段封禁率**，只用于夜间取舍：
                 # 1.0 的块夜里重启动只会换到另一个同样被封的 /128。
@@ -709,6 +723,17 @@ def _append_wg_members(cfg: dict) -> None:
             # 第 i 条线属于第几组落地节点，以及该组内的渠道位置。
             "home_group": (i - 1) // per,
             "family": wg["families"][(i - 1) % per],
+        })
+    # 历史遗留的第 13 条线：它原本是「WG-5 同配置 ×1」的额外线（独立注册在
+    # line13）。线路数 ≥13 时生成成员已经覆盖同一个端口/单元/设备，再补一条
+    # 就是重复 tag；只有 12 线这种老配置才需要把它单独补回来。
+    # 注意这里刻意不带 kind/index/family —— 历史行为里 daemon 不把它当
+    # 「可换节点的 v4 线」，补字段会改变它的重启语义。
+    if wg["count"] < 13:
+        cfg["warp"]["members"].append({
+            "tag": "WARP-WG-13",
+            "port": wg["base_port"] + 12,
+            "service": "warp-wg-13.service",
         })
 
 

@@ -122,20 +122,35 @@ def channel_tag(ch: dict) -> str:
     return f"WARP-BLK-{ch['colo']}-{cat}-{ch['index']}"
 
 
+def excluded_colos(cfg: dict) -> set[str]:
+    """结构性不可用的块（封禁率 100%）。设备不往这些块上挂。
+
+    与 `keep_at_night` 的区别：那个是「夜里值不值得花一次重启」，这个连白天
+    都不占设备 —— 一个段全封的 colo，新设备拿到的 /128 必然也在限额里。
+    """
+    return {str(c) for c in (_blocks(cfg).get("exclude_colos") or []) if c}
+
+
 def channels(cfg: dict, nodes_map: dict | None = None,
              delays: dict | None = None) -> list[dict]:
     """展开成渠道清单；未启用返回空列表（默认关闭，不改变现网拓扑）。
 
     每块每类最多 `channels_per_block` 条。池子不够就少给，不拿同一个节点凑
     两条 —— 两条渠道绑同一节点等于一条（重启换的是同一个 colo 的同一个池）。
+
+    `exclude_colos` 里的块整块跳过：封禁率 100% 的 colo 每条 /128 都在限额里，
+    占一条设备就是占着不用（第一阶段的目的是测**还有余量**的块）。
     """
     if not enabled(cfg):
         return []
     per = channels_per_block(cfg)
+    skip = excluded_colos(cfg)
     nodes_map = load_map() if nodes_map is None else nodes_map
     out: list[dict] = []
     for blk in _table(cfg):
         colo = blk.get("colo")
+        if colo in skip:
+            continue
         for cat in CATEGORIES:
             ordered = order_nodes(_pool(nodes_map, colo, cat), delays)
             for i in range(min(per, len(ordered))):

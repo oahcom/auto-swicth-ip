@@ -71,6 +71,20 @@ def test_channel_tag_is_type_block_index():
     assert "WARP-BLK-TPE-REG-0" in tags
 
 
+def test_excluded_colos_do_not_take_devices():
+    """封禁率 100% 的块不占设备：段全封，新设备拿到的 /128 必然也在限额里。
+
+    实测（2026-11-01 夜间）：20 条线里 4 条挂在 NRT，一条也没起来过；
+    把设备从 NRT 挪到 PHX/SJC/SIN/TPE 之后可用数 5/20 → 13/20。
+    """
+    c = cfg()
+    c["warp"]["blocks"]["exclude_colos"] = ["NRT"]
+    chs = wb.channels(c, nodes_map())
+    assert chs, "排除一个块不该把清单清空"
+    assert not any(ch["colo"] == "NRT" for ch in chs)
+    assert {ch["colo"] for ch in chs} == {"SJC", "TPE", wb.V4_COLO}
+
+
 # ---------------------------------------------------------------- 排序
 
 def test_order_known_delay_first_unknown_last():
