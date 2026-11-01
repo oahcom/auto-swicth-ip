@@ -465,6 +465,79 @@ python3 warp_diag.py --job /tmp/opencode/dead44_inputs.json \
 （换端口、换 IP、换协议族 v4/v6、换包长、换设备）全部穷尽，剩下的只有：
 ① 当普通代理用（现状）；② 等机场换中继后重测；③ 换一家不封 WARP 的机场。
 
+### MASQUE-over-TCP：差一步的路（2026-11-02 00:10）
+
+44 个节点被封的只是 UDP，它们的 **TCP 443 到 CF 的 MASQUE-over-H2 端点
+（162.159.198.2）完全畅通**（经节点 TLS 握手成功、HTTP/2 打开）。
+如果 MASQUE 能走 TCP，44 个节点立刻变成 8 个地区的 WARP 承载，UDP 封锁
+形同虚设 —— 这是它们「翻盘」的唯一通道，为此做了全套实验：
+
+| 步骤 | 结果 |
+|---|---|
+| usque main 分支自编译（--http2） | ✅ 跑起来 |
+| tollfree fork（独立 H2 实现，Go 1.25.5 自编译） | ✅ 跑起来 |
+| fork 重新注册新设备 | ✅ 注册成功 |
+| CONNECT-IP over H2 | ❌ **CF 一律回 400**（直连与经节点、新旧实现、新旧设备全一样） |
+
+usque issue #32 里有对照：**官方客户端** `warp-cli tunnel masque-options set
+h2-only` 在 WSL 里跑通了（warp=on，HTTP/2，走到维也纳边缘）——说明 CF 的
+H2 MASQUE 服务是真的，只是 usque 两个实现的 H2 请求都被 CF 拒（400），
+属于 usque 与 CF 协议实现之间的差距（connect-ip-go 原作者也明说没有计划
+支持 HTTP/2，除非有人赞助）。
+
+**后续若要继续**：把官方 WARP 客户端（warp-svc）装进 WSL，`warp-cli tunnel
+masque-options set h2-only` 强制 TCP 模式，再放进网络命名空间逐节点路由
+（命名空间方案已验证可行）。这是「44 个节点翻盘」的最后一公里，也是
+一个独立的小项目，不是今晚一行配置能收尾的。
+
+工具与脚本已留档：`/tmp/usque-h2b`（fork 自编译二进制）、
+`/tmp/relay44.py`（443 经节点转发器）、`/tmp/usque_h2_test.sh`（实验脚本）、
+`/tmp/ns44_setup.sh`（命名空间方案，未用上因 WSL 无 iptables）。
+
+### 突破：44 个「死」节点改用 MASQUE 就活了（2026-11-02 00:30-01:00）
+
+44 个节点被误判的全过程与翻盘方案，这一节是本日最重要的修正：
+
+**误判链**：
+1. 第一版探针拿 line1..4 的线上设备探测 → 设备互踢，结论全废
+2. WG 握手 3 轮全失败 → 判「节点死」。真因：**中继识别并丢弃 WireGuard
+   协议特征**（WG 的 UDP 流量特征极好认），不是不转 UDP —— DNS/STUN 都能过
+3. **MASQUE（HTTP/3/QUIC）长得和普通 QUIC 流量一样，中继不拦**
+
+**翻盘架构**（已验证，2026-11-02 00:28 首例 warp=on colo=NRT）：
+
+```
+usque socks（QUIC 模式, endpoint=127.0.0.2:444xx）
+  → UDP 桥（127.0.0.2:444xx → 节点 SOCKS5-UDP）
+    → 机场节点 → CF MASQUE 端点(162.159.198.2:443) → WARP 出口
+```
+
+全部是 TCP/QUIC 常规流量，机场的 WG 特征过滤形同虚设。usque 不支持上游
+代理，所以桥（`/tmp/bridge44.py`，约 80 行）负责把 usque 的 QUIC 包经节点
+的 SOCKS5-UDP 转发，回包从 127.0.0.2:444xx 原路送回（QUIC 要求源稳定）。
+
+**抽样验证（8 节点，各配一台 usque 设备 usque10-17）**：
+
+| 结果 | 数量 | 明细 |
+|---|---:|---|
+| ✅ warp=on | **2** | cn.bing.com~18（NRT）、us.bing.com~5（LAX）|
+| ⏳ QUIC 无回包（中继连 QUIC/443 也拦或节点抖动） | 4 | cn.bing.com~25/28/30、hk-aws-54 |
+| ❌ 测试实例端口冲突 | 1 | usque12（11452 被旧实例占用，测试事故）|
+| ❌ 节点本身 TCP 断 | 1 | us.bing.com~7（poolcfg/46 探测 000）|
+
+对比：同批节点用 WG 测是 **0/8**。关键坑（都是亲手踩的）：
+- usque 的 `-P` 是**远端端点端口**，不是本地端口；endpoint 要改
+  `endpoint_v4`（QUIC 模式读它，不是 endpoint_h2_v4）
+- usque 的 SOCKS 在隧道断开时**回落直连**（trace 显示 warp=off + 本机 IP，
+  别被它骗成「通了但没 WARP」）
+- 闲置一个月的设备要重新 `enroll`（token 过期，CF 静默丢包）
+- curl 的 `--noproxy "*"` 会把 `--proxy` 一起禁掉（测试脚本连环踩坑的根源）
+
+**生产化路径**：每节点 3 进程（节点socks + 桥 + usque），44 节点全量约 130
+进程，端口规划 200xx/444xx/114xx；出口即 socks 端口，直接并入 selector。
+抽样通率 2/8 是首测（含测试事故），重试与逐节点调优后预计更高 —— 且这
+只是 8 个节点的样本，44 个里 anytls 的 38 个都可能这样救活。
+
 ### 连通性 ≠ 承载能力（2026-11-01 22:20 补测）
 主人问的一句话点到了要害：「如果有联通的，代表一定有能够连接的，只不过延迟大」。
 于是补了两组测量，把两个口径分开摆：
