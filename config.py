@@ -265,6 +265,14 @@ CFG = {
             # 各自独立注册（.warp/usque5 / usque6），不是复制同一份私钥。
             {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
             {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service"},
+            # 2026-11-01 22:20 扩容（第二路径）：WARP 出口不必借机场的 UDP——
+            # usque 走 MASQUE（QUIC 443）本机直连 CF，机场封不封 WARP 网段无关。
+            # 实测 4 条闲置设备拉起即各自拿到独立 v6 出口（1f01/1f06/19c0 段），
+            # 出口池 = 设备数，注册的 20 台全在。WG 线给地点多样性，usque 线给量。
+            {"tag": "WARP-CF-C", "port": 1082, "service": "usque-warp-c.service", "ipv6": True},
+            {"tag": "WARP-CF-G", "port": 1086, "service": "usque-warp-g.service", "ipv6": True},
+            {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service", "ipv6": True},
+            {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service", "ipv6": True},
             # WARP-WG-13 不再写死在这里：块模型把渠道数从 12 扩到 20 之后，
             # 第 13 条就是生成成员里的普通一条，写死会得到两个同 tag 成员
             # （同一端口、同一单元、同一份设备），selector 里重复项直接报错。
