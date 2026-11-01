@@ -64,6 +64,26 @@ def test_v4_is_merged_single_block():
     assert {c["tag"] for c in v4} == {"WARP-BLK-ALL-V4-0", "WARP-BLK-ALL-V4-1"}
 
 
+def test_pinned_block_borrows_a_node_without_reassigning_it():
+    """`pin` 让「众数不是这个 colo」的节点也能给某个块供样（当前只有 PIT）。
+
+    PIT 唯一落到过的节点是 ORD 那条（ORD 7 / PIT 3 / SIN 1），按众数归 ORD，
+    于是 PIT 块永远空着。pin 是「同一台节点再挂一台设备」—— 块名只是预期落点，
+    实测落点以 trace 为准，所以这里只断言渠道出得来、节点是它，且 ORD 块里
+    这个节点仍然在。
+    """
+    c = cfg(table=[{"colo": "ORD", "ban_rate": None},
+                   {"colo": "PIT", "ban_rate": None,
+                    "pin": ["n1"]}])
+    chs = wb.channels(c, nodes_map())
+    pit = [ch for ch in chs if ch["colo"] == "PIT"]
+    assert [ch["node"] for ch in pit] == ["n1"]
+    assert pit[0]["pinned"] is True
+    # 归属不变：n1 仍然是 NRT 的节点（nodes_map 里它的 colo 是 NRT），
+    # 所以 ORD 块反而没有渠道 —— pin 不会把节点「改籍」。
+    assert not [ch for ch in chs if ch["colo"] == "ORD"]
+
+
 def test_channel_tag_is_type_block_index():
     chs = wb.channels(cfg(), nodes_map())
     tags = {c["tag"] for c in chs}

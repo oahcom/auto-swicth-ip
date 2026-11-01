@@ -657,7 +657,14 @@ CFG = {
                 {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None},
                 {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None},
                 {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None},
-                {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None},
+                {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None,
+                 # PIT 没有自己的节点：唯一落到过 PIT 的是 ORD 那条
+                 # `us.bing.com:443~6-any`（5 轮里 ORD 7 / PIT 3 / SIN 1）。
+                 # 按众数它归 ORD，于是 PIT 块永远空着。想拿到 PIT 的样本只能
+                 # 把这条节点**再挂一台设备**（pin），让它在漂到 PIT 的轮次里
+                 # 被记成 PIT —— 代价是七成时间它其实就是一条 ORD 线。
+                 # 这是「测量优先」的取舍，第二期有实测数据后可以撤掉。
+                 "pin": ["us.bing.com:443~6-any"]},
             ],
         },
     },

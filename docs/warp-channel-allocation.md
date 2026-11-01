@@ -193,6 +193,14 @@ UDP 转发不通 6 个；WARP 握手 3 轮全失败 18/18。
 （v4 合并块的 3 条渠道暂不开：成员 `family` 语义还没跟着渠道走，v4 保底先由
 usque CF-D/E 承担）。
 
+**PIT 现在有渠道了（2026-11-01 22:15）**：PIT 从没有过自己的节点 —— 唯一落到
+PIT 的是 ORD 那条 `us.bing.com:443~6-any`（`colo_mix`: ORD 7 / PIT 3 / SIN 1），
+按众数它归 ORD，于是 PIT 块永远空着。加 `"pin": [...]` 让它**再挂一台设备**，
+就多一条「预期落 PIT」的线（第 29 条，端口 1138）。代价说清楚：这条线七成时间
+其实就是一条 ORD 线 —— 块名是预期落点，实测落点以 trace 为准，`build_map` 会把
+漂移写进每个节点的 `colo_mix` / `drift` 字段。首次上线实测落在 ORD（符合 7/10 的
+分布），要拿到 PIT 的样本得等它重连漂过去。
+
 两次上线后的实测（每条约 10s 超时、串行探测）：
 
 | 时间 | 线数 | 拿到 `warp=on` | 分布 |
@@ -367,6 +375,30 @@ ERROR endpoint/wireguard[warp]: connect to server: failed to create session:
 ```bash
 python3 warp_diag.py --job /tmp/opencode/dead44_inputs.json --out /tmp/opencode/diag44c.jsonl --rounds 2
 ```
+
+### 连通性 ≠ 承载能力（2026-11-01 22:20 补测）
+
+主人问的一句话点到了要害：「如果有联通的，代表一定有能够连接的，只不过延迟大」。
+于是补了两组测量，把两个口径分开摆：
+
+| 口径 | 方法 | 结果 |
+|---|---|---|
+| 普通连通性 | Clash API `GET /proxies/{tag}/delay`（8s 超时，gstatic 204） | **39/44 可连**；延迟 min 593 / 中位 1584 / p90 4393 / max 6851 ms |
+| 承载 WARP | `warp_diag.run_round(..., wait_warp=120)`，单轮窗口从 20s 拉到 120s | **0/44**；三个代表节点（快/中/慢）全部停在 `read packet: use of closed network connection` |
+
+结论站得住，而且不是「慢」：
+
+- 窗口从 20s 拉到 **120s**（足够 12 次以上握手重传），失败点一模一样 ——
+  WARP 端点的 UDP socket 每 8~10s 被关一次，**一个包都没回来**。
+  纯延迟问题会在窗口内完成握手（WireGuard 只要 1~2 个 RTT，就算 7s RTT 也在 20s 内）。
+- 这 44 个里 15 个的 **UDP:53 是通的**（能转发 DNS），说明节点不是不转 UDP，
+  而是**不转非 53 的 UDP**；换 WARP 端点（500 / 1701 / 另一台 2408）同样不通。
+- 所以「连通」只证明它是个合格**代理**，不证明它能当 WARP **承载**。这两件事
+  在生产里也一直分开记录：`proxy` 池 159 个节点里就有它们，而 WARP 线只挑
+  能建隧道的 51 个。
+
+**这 44 个现在怎么用**：作为普通代理继续留在池里（延迟中位 1.6s，本来就参与
+`proxy` 兜底与 9router 的出站轮换），只是不进 `block-map`、不占 WARP 设备。
 
 数据留档（都在 `/tmp/opencode/`，重启即失，要长期保留就拷进 `.warp/`）：
 `diag44.jsonl`（第二次，借产线设备）、`diag44c.jsonl`（第三次，空闲设备，最新结论）、

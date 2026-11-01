@@ -151,12 +151,20 @@ def channels(cfg: dict, nodes_map: dict | None = None,
         colo = blk.get("colo")
         if colo in skip:
             continue
+        # `pin`：块里没有「众数是这个 colo」的节点时，显式指定用哪几个节点来
+        # 采样（当前只有 PIT 这么干）。它不改变节点的归属，只是允许同一台节点
+        # 在另一个块里再挂一台设备 —— 所以这类块的块名是「预期落点」，实测
+        # 落点以 trace 为准，`build_map` 会把漂移记进 `drift`。
+        pin = [t for t in (blk.get("pin") or []) if t in nodes_map]
         for cat in CATEGORIES:
-            ordered = order_nodes(_pool(nodes_map, colo, cat), delays)
+            pool = ([t for t in pin
+                     if (nodes_map.get(t) or {}).get("category") == cat]
+                    if pin else _pool(nodes_map, colo, cat))
+            ordered = order_nodes(pool, delays)
             for i in range(min(per, len(ordered))):
                 out.append({"type": "v6", "colo": colo, "category": cat,
                             "index": i, "family": "v6", "node": ordered[i],
-                            "nodes": ordered})
+                            "nodes": ordered, "pinned": bool(pin)})
     merged = order_nodes(_pool(nodes_map, None, None), delays)
     for i in range(min(per, len(merged))):
         out.append({"type": "v4", "colo": V4_COLO, "category": "proxy",
@@ -332,9 +340,15 @@ def build_map(probe_dir: str) -> dict:
         colo = colos[ip].most_common(1)[0][0] if colos.get(ip) else None
         if not colo:
             continue
+        # 漂移记录：colo 取众数（ORD 的节点 5 轮里 3 轮落 ORD、3 轮落 PIT、
+        # 1 轮落 SIN，按众数归 ORD 是对的），但**丢掉其余落点就等于假装它没漂过**。
+        # PIT 至今没有自己的节点，它就活在这条字段里 —— 哪天要单独开 PIT 块，
+        # 得先有一个「众数是 PIT」的出口，而不是把 ORD 的线改个标签。
+        mix = dict(colos[ip].most_common())
+        drift = [c for c in mix if c != colo]
         for tag in tags:
             nodes[tag] = {"colo": colo, "category": cat, "ok": ok, "n": n,
-                          "egress_ip": ip}
+                          "egress_ip": ip, "colo_mix": mix, "drift": drift}
     return {"updated": int(time.time()), "nodes": nodes}
 
 
