@@ -647,6 +647,23 @@ ClientHello 本身**，改写后客户端与服务器 transcript 不一致、密
 分离（HTTP 层不受 transcript 保护）；而 MASQUE 的 :authority 与 SNI
 绑定由客户端决定，客户端不给口子。
 
+**3.5 中继层已突破，死结收窄到 usque 的 H2 协议（2026-11-02 03:55）**
+
+主机点破「usque 的 SNI 本来就能改」后补测了从未测过的组合：
+**usque(fork) +  + 纯 TCP 转发器经节点**——
+结果错误从 （中继掐断）变成 ：**TLS 握手成功、中继层完全通过**
+（客户端自己改 SNI，transcript 一致，这是合法改法，与 sni_relay 的中间人
+改写有本质区别）。至此死结精确表述为：
+
+* 中继层：✅ 已解决（SNI=engage 放行，且 engage 解析到 MASQUE 端点本尊）
+* warp-svc：协议 ✅ / SNI ❌（硬编码被黑，无口子）
+* usque：SNI ✅（-s）/ **协议 ❌（CONNECT-IP over H2 被 CF 400，与
+  SNI 无关——同 SNI 下 QUIC 模式 warp=on，H2 就 400）**
+
+两个客户端各缺半边。让 TCP 路线复活只剩一条技术路径：**修 usque fork 的
+H2 CONNECT-IP 构造**（对照 warp-svc 的抓包逐字段对齐 :authority/:protocol/
+capsule 等），工程量中等；或等上游（issue #32）。
+
 **3. 死结的完整表述**：
 
 * warp-svc：协议正确，但 SNI 硬编码且无配置口子 → 被 SNI 路由器黑
