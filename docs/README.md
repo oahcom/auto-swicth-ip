@@ -121,6 +121,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 |---|---|
 | [colo-segment-map-20261101.md](colo-segment-map-20261101.md) | colo ↔ 地址段映射 |
 | [warp-colo-survey-20261101.md](warp-colo-survey-20261101.md) | 节点 ↔ colo 普查 |
+| [ban-survey-20261103.md](ban-survey-20261103.md) | 18:00 后各渠道/colo ban 率与报错指标 |
 | [review-5d-20261027.md](review-5d-20261027.md) / [review-5d-20261028-audit.md](review-5d-20261028-audit.md) | 五日实测复盘与审计 |
 
 ### 出了事要查

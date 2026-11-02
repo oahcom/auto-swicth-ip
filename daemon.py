@@ -2972,8 +2972,15 @@ def _channel_rehome_target(now: float, exclude: set[str] | None = None
     挤到同一个 colo，下一轮该 colo 立刻烧穿。候选还必须同时在 **UDP 池**里
     （`_rehome_one` 按这个池判成员）——`wg_colo_map` 与实际池不是同一集合，
     NRT 的首位节点就不在池里，写下去只会得到 `gone`。
+
+    跨调用的占用也要排除：同一时刻只锁了一条线时，单轮 `exclude` 是空的，
+    它照样会被分到别的线已经绑着的节点上（既定事实第 20 条）。
     """
-    exclude = exclude or set()
+    exclude = set(exclude or ())
+    try:
+        exclude |= {n for n in warp_wg.line_nodes().values() if n}
+    except Exception:
+        pass
     if not _warp().get("channel_rehome_enabled", True):
         return None
     try:

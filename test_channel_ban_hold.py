@@ -245,6 +245,14 @@ def test_rehome_target_picks_lowest_ban_colo():
         # 本轮已用掉的节点必须排除，否则一批线会挤到同一个节点
         got = daemon._channel_rehome_target(1_000_000.0, {"n-sin", "n-old"})
         assert got is None, f"候选都被排除时应返回 None，实际 {got}"
+        # 跨调用：别的线已经绑着的节点也不能选（既定事实第 20 条）
+        orig_ln = daemon.warp_wg.line_nodes
+        daemon.warp_wg.line_nodes = lambda: {"WARP-WG-9": "n-la"}
+        try:
+            got = daemon._channel_rehome_target(1_000_000.0)
+            assert got == ("SIN", "n-sin"), f"LAX 已被占用，应退到 SIN，实际 {got}"
+        finally:
+            daemon.warp_wg.line_nodes = orig_ln
     finally:
         ipv6_segments.colo_ban_rates = orig_rates
         _rehome_restore(orig)
