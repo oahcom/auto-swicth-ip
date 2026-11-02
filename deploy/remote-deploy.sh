@@ -35,14 +35,28 @@ done
 [ -n "$TARGET" ] || { echo "用法: $0 user@host [--port N] [--dry-run]" >&2; exit 2; }
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p "$PORT")
-run() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
-put() { scp -O -o StrictHostKeyChecking=accept-new -P "$PORT" "$1" "$TARGET:$2"; }
+# --dry-run 必须真的不执行：远端命令里全是 restart / install / register，
+# 只解析参数不短路等于「看起来演练过、实际动了生产」。
+if [ "$DRY" = 1 ]; then
+    # 打到 stderr：调用方普遍用 `$(run ...)` 取输出，写 stdout 会把命令文本
+    # 当成结果（实测 9router 端口探测因此拿到一整段 shell）。
+    run() { printf '  [dry] ssh %s %q\n' "$TARGET" "$1" >&2; }
+    put() { printf '  [dry] scp %s -> %s:%s\n' "$1" "$TARGET" "$2" >&2; }
+else
+    run() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
+    put() { scp -O -o StrictHostKeyChecking=accept-new -P "$PORT" "$1" "$TARGET:$2"; }
+fi
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
 # 远端仓库路径：优先沿用已存在的，否则 ~/auto-swicth-ip
-REMOTE_DIR="$(run 'for d in ~/auto-swicth-ip ~/asip; do [ -d "$d" ] && { echo "$d"; exit; }; done; echo ~/auto-swicth-ip')"
 REMOTE_USER="${TARGET%@*}"
-REMOTE_HOME="$(run 'getent passwd "$(id -un)" | cut -d: -f6')"
+if [ "$DRY" = 1 ]; then
+    # 演练不连远端，用默认值把流程走完即可（这些值只影响打印的命令文本）
+    REMOTE_DIR="~/auto-swicth-ip"; REMOTE_HOME="~"
+else
+    REMOTE_DIR="$(run 'for d in ~/auto-swicth-ip ~/asip; do [ -d "$d" ] && { echo "$d"; exit; }; done; echo ~/auto-swicth-ip')"
+    REMOTE_HOME="$(run 'getent passwd "$(id -un)" | cut -d: -f6')"
+fi
 echo "远端: $TARGET:$REMOTE_DIR  (user=$REMOTE_USER home=$REMOTE_HOME)"
 
 # ---------------------------------------------------------------- 0. 预检
