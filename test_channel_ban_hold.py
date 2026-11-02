@@ -14,6 +14,11 @@ import sys
 import tempfile
 import time
 
+try:                      # 直跑（python3 -I）没有 pytest，本文件要能独立运行
+    import pytest
+except ImportError:
+    pytest = None
+
 _TMP = tempfile.mkdtemp(prefix="asip-banhold-test-")
 os.environ["ASIP_NO_SIDE_EFFECTS"] = "1"
 os.environ.setdefault("WARP_LINE_STATE_FILE_PATH", os.path.join(_TMP, "state.json"))
@@ -30,6 +35,24 @@ def _sync_submit_once(key, fn, *a):
     """同步执行：本文件测的是锁/还原逻辑，不是线程模型。"""
     fn(*a)
     return True
+
+# 本文件会改的全局原值。pytest 和别的测试文件同进程跑，必须还原 ——
+# 不还原的话 `test_daemon_unit.py::test_submit_once_skips_reentry_until_task_
+# finishes` 会红，别的文件的限速断言会静默地跑在「无上限」上。
+_ORIG = {"submit_once": daemon._submit_once,
+         "restart_max_per_minute": W.get("restart_max_per_minute"),
+         "restart_max_per_hour_line": W.get("restart_max_per_hour_per_line")}
+
+def _cleanup_globals():
+    daemon._submit_once = _ORIG["submit_once"]
+    W["restart_max_per_minute"] = _ORIG["restart_max_per_minute"]
+    W["restart_max_per_hour_per_line"] = _ORIG["restart_max_per_hour_line"]
+
+if pytest is not None:
+    @pytest.fixture(autouse=True)
+    def _guard():
+        yield
+        _cleanup_globals()
 
 def _reset():
     W["channel_ban_hold_enabled"] = True
@@ -87,7 +110,11 @@ def test_burst_does_not_lock():
 def test_one_ok_breaks_100_percent():
     _reset()
     now = 1_000_000.0
-    win = [(now - i, True) for i in range(40)] + [(now - 60, False)]
+    # 必须铺满 1800s，否则 cover 判据先返回 False —— 那样删掉 `b != n` 这条
+    # 判据测试也照样绿，等于没测。40 条每 50s 一条，跨 1950s。
+    win = [(now - i * 50, True) for i in range(40)] + [(now - 60, False)]
+    # 先确认这批样本**本来会锁**（全 True 时命中），再看加一条 OK 就不锁。
+    assert daemon._channel_ban_hold_hit([(t, True) for t, _ in win], now) is True
     assert daemon._channel_ban_hold_hit(win, now) is False, "有一次 OK 就不算 100%"
 
 # ---- 记账 → 锁定 ----
@@ -259,7 +286,10 @@ def test_rehome_target_picks_lowest_ban_colo():
         # 本轮已用掉的节点必须排除，否则一批线会挤到同一个节点
         got = daemon._channel_rehome_target(1_000_000.0, {"n-sin", "n-old"})
         assert got is None, f"候选都被排除时应返回 None，实际 {got}"
-        # 跨调用：别的线已经绑着的节点也不能选（既定事实第 20 条）
+        # 跨调用：别的线已经绑着的节点也不能选（既定事实第 20 条）。
+        # 阈值必须先调回 10 —— 上面提到 100 之后 LAX 本来就会被样本闸挡掉，
+        # 那种情况下即使不排除占用也照样返回 SIN，测不出任何东西。
+        W["channel_rehome_min_samples"] = 10
         orig_ln = daemon.warp_wg.line_nodes
         daemon.warp_wg.line_nodes = lambda: {"WARP-WG-9": "n-la"}
         try:
@@ -622,5 +652,7 @@ if __name__ == "__main__":
         except AssertionError as e:
             fails += 1
             print(f"FAIL {name}: {e}")
+        finally:
+            _cleanup_globals()
     print(f"\n{'all passed' if not fails else str(fails) + ' failed'}")
     sys.exit(1 if fails else 0)

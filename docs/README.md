@@ -27,7 +27,7 @@
 sing-box (:7890)          ← 唯一的路由与出口选择点
    ↓ opencode-out selector
    ├── WARP 隧道（usque / MASQUE / WireGuard）
-   └── proxy 池（83 个机场节点，兜底）
+   └── proxy 池（93 个机场节点，兜底）
    ↓
 opencode.ai
 ```
@@ -41,7 +41,7 @@ opencode.ai
 | **直连 WARP** | usque 隧道，不经机场 | `usque-*` 单元 | 重启即换（v6）；v4 需 rebind |
 | **H2（MASQUE over HTTP/2）** | TCP 经机场节点 | `deploy/render_h2_lines.py` | 重启即换 |
 | **WG（WireGuard over UDP）** | UDP 经机场节点中转 | `warp_wg.py` + `warp_blocks.py` | 重启即换（v6）；v4 换 colo |
-| **proxy 池** | 83 个机场节点轮换 | daemon 的换线逻辑 | 换节点 |
+| **proxy 池** | 93 个机场节点轮换 | daemon 的换线逻辑 | 换节点 |
 
 ## 第 4 步：三个守护各管一摊
 
@@ -84,9 +84,18 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文档 | 内容 |
 |---|---|
-| **[established-facts.md](established-facts.md)** | **既定事实，先读这个** |
+| **[established-facts.md](established-facts.md)** | **既定事实（27 条），先读这个** |
 | [glossary.md](glossary.md) | **名词表**：节点/线路/渠道/成员的确切定义 |
 | [BUILD-PLAN.md](BUILD-PLAN.md) | 文档构建计划与更新规范 |
+
+**新增的三条容易踩的**（都在 established-facts 里）：
+
+- **第 25 条** `fail_streak` 只数「拿不到出口地址」，不数「地址被封」——
+  看到「连续 N 次取不到出口地址」先查该线最近一次 `模型层:` 结论。
+- **第 26 条** `config.py` 的 members 是**声明**，不等于单元在跑——
+  disabled 的线仍会被探，`fail_streak` 能涨到 22 万。
+- **第 27 条** v4 线的出口上限 = 落地 colo 数——三条 v4 全落 PHX
+  就会拿到同一个地址。
 
 **架构层**（看代码看不出来的设计）
 
@@ -148,7 +157,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文件 | 作用 |
 |---|---|
-| `CLAUDE.md` | 全局架构 + 配置项 + 坑（886 行） |
+| `CLAUDE.md` | 全局架构 + 配置项 + 坑（约 900 行） |
 | `config.py` | 所有可调参数，**唯一的配置来源** |
 | `daemon.py` | 大脑：探测器、换线、轮回、补刷（7000+ 行） |
 | `warp_blocks.py` | 渠道模型（纯函数，可单测） |
@@ -187,4 +196,4 @@ sudo systemctl restart auto-switch-ip.service
 1. **新增"看起来像 bug 的设计"** → 加进 `established-facts.md`
 2. **新增实测数据** → 写进对应的 `*-YYYYMMDD.md`，不塞进 CLAUDE.md
 3. **改配置项** → 同步 CLAUDE.md 的配置段
-4. **不要在 CLAUDE.md 里堆实测数据** —— 它已经 886 行，再堆就没人读了
+4. **不要在 CLAUDE.md 里堆实测数据** —— 它已经约 900 行，再堆就没人读了

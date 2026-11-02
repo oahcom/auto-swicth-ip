@@ -64,6 +64,29 @@ L2/L3 只链接不重写。
 | **K** | `runbook/add-tunnel.md` | 加一条隧道要做哪几件事（漏一步就是"起着但用不上"） |
 | **L** | `runbook/troubleshoot.md` | 线不通 / 全是 429 / selector 打空，各怎么查 |
 
+## 三之二、进度
+
+更新于 2026-11-03。
+
+| 批次 | 文档 | 状态 |
+|---|---|---|
+| 1 | A `architecture/tunnel-types.md` | ✅ 已完成 |
+| 1 | B `architecture/ip-pools.md` | ✅ 已完成 |
+| 1 | C `architecture/provisioning.md` | ✅ 已完成 |
+| 2 | D `subsystems/prober.md` | ✅ 已完成 |
+| 2 | E `subsystems/switching.md` | ✅ 已完成 |
+| 2 | F `subsystems/locks.md` | ✅ 已完成 |
+| 2 | G `subsystems/refresh.md` | ✅ 已完成 |
+| 3 | H `reference/config.md` | ⬜ 未开始 |
+| 3 | I `reference/state-files.md` | ⬜ 未开始 |
+| 3 | J `reference/ports-units.md` | ⬜ 未开始 |
+| 3 | K `runbook/add-tunnel.md` | ⚠️ 部分覆盖（`provisioning.md` 第二~六节已讲加隧道的完整流程，`runbook` 版应只留速查清单） |
+| 3 | L `runbook/troubleshoot.md` | ⚠️ 部分覆盖（`provisioning.md` §5 有症状对照表；缺「全是 429」「selector 打空」的排查树） |
+
+批次 3 未开始的原因：`reference/*` 是「配置项逐条解释」，而配置项在
+`config.py` 里已有注释，重复抄一遍会立刻过期。**要写就写「改了会怎样」，
+不写「默认值是多少」**——后者 `grep` 就有。
+
 ## 四、子代理分工原则
 
 每个子代理的 brief 必须包含：
@@ -94,7 +117,7 @@ L2/L3 只链接不重写。
 
 1. **不写"因为代码这么写的"** —— 要写实测依据或上游硬约束
 2. **不写没有日期的实测数字** —— 一律 `YYYY-MM-DD 实测`
-3. **CLAUDE.md 不再堆实测数据** —— 它已 886 行，实测进 `docs/`
+3. **CLAUDE.md 不再堆实测数据** —— 它已约 900 行，实测进 `docs/`
 4. **每份文档开头写"本文回答什么问题"** —— 一句话，写不出来说明不该有这份文档
 5. **删除优于新增** —— 文档过期比没有更糟，过期的直接删
 
