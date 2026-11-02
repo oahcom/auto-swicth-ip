@@ -911,3 +911,18 @@ usque 的 H2 实现本身没写错（我们补的 `:protocol` 是必要且正确
 
 
 
+
+---
+
+## ⚠️ 复现 H2 路线测试前必读
+
+2026-11-02 事故：为测本文的 H2 路线，把 warp 切成 `operation_mode=Warp` 且
+`override_warp_endpoint=127.0.0.1:443`，warp 建 `loopback0` 并把
+`ipproto tcp/udp` 全量导进不存在的 `169.254.73.249`，本机 TCP/UDP 出网
+（含局域网）**全部黑洞**，9router 全线 503，且 `warp-svc` 是 enabled 导致
+重启电脑后立刻复发。
+
+完整排查、修复命令与教训见
+[`incident-20261102-9router-network-blackhole.md`](./incident-20261102-9router-network-blackhole.md)。
+
+**测试 warp 一律在独立 netns 内做**，不要在主 netns 切 `mode warp`。
