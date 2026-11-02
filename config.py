@@ -918,6 +918,13 @@ if _nw.get("enabled"):
     # `.env` 时 WG 线根本不在 CFG 里），拿它当导入期断言会让「配置没问题、
     # 只是环境没加载」变成启动失败。交集在 daemon._night_allow_tags 里做。
 
+# 渠道锁解封时刻同样只在「写到锁时」生效一次，写错了要等第二天才发现。
+# `True` 是 int 子类会变成 01:00；`"08:00"` 让每次探测记账都抛 ValueError；
+# 25 会被 mktime 归一化成次日 01:00 —— 三种都不报错，必须挡在导入期。
+_rh = _w.get("channel_ban_reset_hour", 8)
+if isinstance(_rh, bool) or not isinstance(_rh, int) or not 0 <= _rh <= 23:
+    raise SystemExit(f"✗ warp.channel_ban_reset_hour 必须是 0~23 的整数，实际 {_rh!r}")
+
 # 块表：colo 是主键，重复会让 channels() 给同一个块开两倍渠道、白名单算重。
 # channels_per_block < 1 展开出 0 条渠道，而 apply 会因此报「渠道不足」——
 # 报在 apply 时读起来像是实测表的问题，其实是一条配置写错了。

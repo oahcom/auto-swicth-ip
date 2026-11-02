@@ -408,6 +408,31 @@ def test_tunnel_dead_restart_bypasses_hold():
         daemon.active_warp_tag, daemon._restart_warp_line = orig
 
 
+def test_malformed_state_does_not_crash_loader():
+    """盘上写坏一条 ban_window / 时间戳，不能在启动时把进程打崩。
+
+    这两处都在 `_load_warp_line_state` 里，而那里的 try 只包住 open/json.load。
+    崩了 → systemd 10s 后拉起 → 同一个文件再崩，死循环。
+    """
+    _reset()
+    now = time.time()
+    import json
+    path = os.environ["WARP_LINE_STATE_FILE_PATH"]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "lines": {"WARP-WG-4": {
+            "ban_window": [None, [1, 2, 3], 1720000000, [now - 10, True]],
+            "ban_hold_until": "2026-11-03T08:00:00",
+            "ban_hold_ready": "-",
+            "ban_hold_home": {"x": 1},
+            "restart_ts": None}}}, f)
+    daemon._WARP_LINE_STATE.clear()
+    daemon._load_warp_line_state()
+    st = daemon._WARP_LINE_STATE["WARP-WG-4"]
+    assert st["ban_hold_until"] == 0.0 and st["ban_hold_home"] is None
+    assert len(st["ban_window"]) == 1, f"畸形样本应被丢弃，实际 {st['ban_window']}"
+    assert daemon._channel_ban_label(now) == "无", "健康行也不能因此抛异常"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

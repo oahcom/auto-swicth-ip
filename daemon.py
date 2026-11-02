@@ -2850,6 +2850,19 @@ def _load_warp_line_state() -> None:
             st["warming"] = False
             if not isinstance(st.get("quota_until"), (int, float)):
                 st["quota_until"] = 0.0
+            # 同一处净化时间戳字段：下面 `_rehome_held_lines` / `_channel_ban_label`
+            # / `_warp_line_restart` 全是裸 `float(...)`，盘上写个 ISO 字符串
+            # （人改文件最自然的写法）就会让每分钟的 channel-rehome 整趟抛
+            # ValueError，锁的线永远还原不了。
+            for _k in ("ban_hold_until", "ban_hold_ready", "restart_ts",
+                       "last_ok_ts", "next_restart_ts", "next_probe_ts",
+                       "quota_until", "ip_ts"):
+                if not isinstance(st.get(_k), (int, float)) or isinstance(st.get(_k), bool):
+                    st[_k] = 0.0
+            if st.get("ban_hold_home") is not None and not isinstance(st.get("ban_hold_home"), str):
+                st["ban_hold_home"] = None
+            if st.get("ban_hold_node") is not None and not isinstance(st.get("ban_hold_node"), str):
+                st["ban_hold_node"] = None
             if (st.get("last_ok_ip") != st.get("ip")
                     or now - float(st.get("last_ok_ts") or 0) > fresh):
                 st["last_ok_ts"] = 0.0
@@ -2897,9 +2910,17 @@ def _channel_ban_hold_secs(now: float) -> float:
 
 
 def _channel_ban_level(win: list, now: float) -> tuple[int, int]:
-    """窗口内 (实测条数, 其中封禁条数)。只留 window 内的样本，纯函数。"""
+    """窗口内 (实测条数, 其中封禁条数)。只留 window 内的样本，纯函数。
+
+    畸形元素必须在这里丢掉：`_load_warp_line_state` 用它裁剪盘上的
+    `ban_window`，而那里的 try 只包住 open/json.load —— 一条 `[null]` 就能让
+    `for t, b in win` 抛 TypeError，进程退出、systemd 10s 后拉起、同一个文件
+    再崩一次，死循环。执行顺序：先判元素形状，再解包。
+    """
     span = float(_warp().get("channel_ban_window_sec", 1800))
-    keep = [(t, b) for t, b in win if isinstance(t, (int, float)) and now - t <= span]
+    keep = [(e[0], e[1]) for e in win
+            if isinstance(e, (list, tuple)) and len(e) >= 2
+            and isinstance(e[0], (int, float)) and now - e[0] <= span]
     win[:] = keep
     return len(keep), sum(1 for _, b in keep if b)
 
@@ -3192,6 +3213,14 @@ def _same_block_standby(tag: str, now: float) -> str | None:
         return None
     nodes_map = warp_blocks.load_map()
     home_colo = (nodes_map.get(cur) or {}).get("colo")
+    if home_colo is None:
+        # 块表里没有当前节点（`_channel_rehome_target` 挑目标用的是
+        # `load_colo_map()`，两张表不同源；实测 LAX 4 个池内节点只有 1 个在块表）。
+        # 此时 `None == None` 会把**所有块表里同样缺席的节点**都算成「同块」，
+        # v6 线就会被换到另一个 colo —— 而既定事实里 v6 同 colo 换节点就够。
+        # 拿不到当前 colo 就没有「同块」可言：只走别的 colo 会白烧一个池子，
+        # 干脆不动（返回 None 让调用方下轮再看）。
+        return None
     same = [t for t in rot if (nodes_map.get(t) or {}).get("colo") == home_colo]
     others = [t for t in rot if t not in same]
     # v4：跨块优先。同 colo 换节点拿回同一 /24，等于没换地址池。

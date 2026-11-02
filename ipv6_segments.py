@@ -20,6 +20,7 @@ import argparse
 import collections
 import ipaddress
 import json
+import os
 import re
 import subprocess
 import sys
@@ -284,13 +285,20 @@ def colo_ban_rates(window_sec: float = 3600, now: float | None = None) -> dict[s
     now = time.time() if now is None else now
     lo = now - float(window_sec)
     out: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
-    for line in (BASE / ".warp_ip_history.jsonl").open(encoding="utf-8", errors="replace"):
+    # 与 daemon 同源：它认 WARP_IP_HISTORY_FILE_PATH，这里不认的话测试会读到
+    # 生产历史（`.warp_ip_history.jsonl` 是 11.7MB / 16 万行）。
+    path = os.environ.get("WARP_IP_HISTORY_FILE_PATH") or str(BASE / ".warp_ip_history.jsonl")
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return {}          # 历史还没生成 / 被轮换掉：没有样本，不是错误
+    for line in fh:
         try:
             r = json.loads(line)
             ip, t = r["ip"], float(r["t"])
         except (ValueError, KeyError, TypeError):
             continue
-        if t < lo or t > now:
+        if t < lo or t > now or not isinstance(ip, str):
             continue
         try:
             net = ipaddress.ip_network(net64(ip)) if ":" in ip else None
