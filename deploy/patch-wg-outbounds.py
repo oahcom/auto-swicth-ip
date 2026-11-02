@@ -24,7 +24,10 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parent.parent
 CFG = PROJECT / "singbox-config.json"
 WARP = PROJECT / ".warp" / "warp-outbound.json"
-PREFIX = "WARP-WG-"
+# WG 线与 H2 线的出口都要并进来：两者都只存在于 .warp/warp-outbound.json 里，
+# 订阅源为空时主配置不会自己带出来。漏掉 H2 那一半等于 19 条线白铺 ——
+# selector 看不到就不换过去。
+PREFIX = ("WARP-WG-", "WARP-H2-")
 
 
 def main() -> int:

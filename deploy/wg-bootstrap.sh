@@ -309,7 +309,24 @@ N="$(line_count)"
 [ "$DRY_RUN" = 1 ] || [ "$N" -gt 0 ] || die "状态文件里没有线路：$STATE"
 ok "线路 $N 条，端口 $BASE_PORT-$((BASE_PORT + N - 1))"
 # ============================== 6 主配置 ==============================
-step "6/7 并入主配置（无订阅期的必要步骤）"
+step "6/7 H2 线 + 并入主配置（无订阅期的必要步骤）"
+# H2 线（carrier=h2 的渠道）不走 UDP，由 render_h2_lines.py 单独渲染；它只写文件
+# 不启用单元，所以远端的「一条命令到可用」在这里补上启用这一步。块表里没有
+# H2 节点时 render 返回 1 —— 那是正常形态（纯 WG 部署），不该让 bootstrap 失败。
+if [ "$DRY_RUN" = 1 ]; then
+    printf '[dry-run] bash %s/deploy/h2-install.sh\n' "$DIR"
+elif [ -f "$DIR/.warp/block-map.json" ]; then
+    if bash "$DIR/deploy/h2-install.sh"; then
+        ok "H2 线已渲染并启用"
+        # 新渲染的 H2 成员要进 warp-outbound.json，否则下面的并入步骤看不到它们。
+        # apply 已在步骤 5 写过一次，那时 channels.json 还是旧的。
+        py "$DIR/deploy/members.py" --write-warp-outbound >/dev/null
+    else
+        warn "H2 线未启用（无 carrier=h2 渠道或校验失败）；纯 WG 部署可忽略"
+    fi
+else
+    warn "缺 .warp/block-map.json：跳过 H2 线（先跑 tools/merge_h2_blockmap.py）"
+fi
 # 订阅源为空时 refresh_subscription 直接返回「无可用订阅源」，singbox-config.json
 # 不再重生成 —— 新铺的出口进不了 opencode-out selector，换线全部 status=400。
 # 订阅配回来后 parse_subscription 会接管，本步自动退化为 no-op。

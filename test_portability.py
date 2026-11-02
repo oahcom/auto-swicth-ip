@@ -220,12 +220,17 @@ def test_launch_falls_back_to_v4_without_ipv6_route(tmp_path):
 
 
 def test_deploy_renders_every_member(tmp_path):
-    """部署脚本的成员渲染器必须覆盖 config 里的全部隧道，含地址族开关。"""
+    """部署脚本的成员渲染器必须覆盖 config 里的全部 usque 隧道，含地址族开关。
+
+    WG 线（kind=wg）与 H2 线（kind=h2）分别由 deploy/wg-lines-install.sh 和
+    deploy/render_h2_lines.py 生成单元，members.py 不该替它们注册设备。
+    """
     import subprocess
     out = subprocess.run([sys.executable, str(PROJECT / "deploy/members.py")],
                          capture_output=True, text=True, check=True).stdout.split("\n")
     rows = [r.split() for r in out if r.strip()]
-    members = config.CFG["warp"]["members"]
+    members = [m for m in config.CFG["warp"]["members"]
+               if m.get("kind") not in ("wg", "h2")]
     assert len(rows) == len(members)
     for row, m in zip(rows, members):
         assert row[0] == m["tag"] and int(row[1]) == m["port"] and row[2] == m["service"]
@@ -319,7 +324,10 @@ def test_install_renders_units_on_fresh_host(tmp_path):
                          capture_output=True, text=True, timeout=60, env=env)
     assert out.returncode == 0, f"rc={out.returncode}: {out.stderr[-400:]}"
     assert (unit_dir / "auto-switch-ip.service").exists()
-    assert len(list(unit_dir.iterdir())) == len(config.CFG["warp"]["members"]) + 3
+    # install.sh 只负责 usque 线：WG/H2 单元的渲染器各自独立（见 members.py 注释）。
+    usque = [m for m in config.CFG["warp"]["members"]
+             if m.get("kind") not in ("wg", "h2")]
+    assert len(list(unit_dir.iterdir())) == len(usque) + 3
     # 部署必须顺带产出 asip 设置与入口：CLI 不含任何站点设置，缺了它整条运维
     # 命令链（日志/换线/隧道）都不可用，而这些正是部署后第一个要用的东西。
     assert (tmp_path / "home/.config/asip/cli.env").exists(), "未生成 asip 设置"
@@ -373,7 +381,9 @@ def test_asip_cli_reads_everything_from_generated_settings(tmp_path):
     assert str(here) in text, "设置未随 clone 目录变化"
     assert str(PROJECT) not in text, "设置里混入了源仓库路径（说明是写死的）"
     members = config.CFG["warp"]["members"]
-    assert text.count("usque-warp") >= len(members), "隧道清单未写全"
+    # 设置里的隧道清单是 usque 线（WG/H2 线由各自的渲染器管单元与端口）。
+    usque_n = sum(1 for m in members if m.get("kind") not in ("wg", "h2"))
+    assert text.count("usque-warp") >= usque_n, "隧道清单未写全"
     for key in ("ASIP_LOG", "ASIP_SECRET_FILE", "ASIP_CLASH_API", "ASIP_WARP_SELECTOR",
                 "ASIP_UNIT_DIR", "ASIP_IP_USED_FILE", "ASIP_CYCLES_FILE", "ASIP_PY",
                 "ASIP_SOCKS_HOST"):

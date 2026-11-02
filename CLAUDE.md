@@ -1,5 +1,12 @@
 # 项目文档
 
+> **新接手先读 [docs/README.md](docs/README.md)（文档地图），
+> 再读 [docs/established-facts.md](docs/established-facts.md)（既定事实）。**
+>
+> 后者列的全是"看起来像 bug、其实是设计"的决定 —— 早八点解封、v4 跨 colo
+> 换节点、不启动 warp-svc 等等。动代码之前必须读完，否则会把既有决策当问题
+> "修复"掉。本文档继续往下是完整架构与配置细节。
+
 ## 代理架构
 
 ```
@@ -75,6 +82,11 @@ http_proxy=http://lan:<password>@<主机IP>:7891 curl https://api.github.com/zen
 9router（:20127）本来就在 `*:20127` 监听且按请求校验 API key，无需改代码；只需防火墙放行。
 
 ## WARP 专用出口（opencode）
+
+> **前提：WARP 出口 IP 池是全用户共享的。** 我们不用这些地址，它们照样会被别人
+> 烧进 ban 位。池子健康度随时段变化 —— 08:00~16:00 相对好，傍晚恶化，深夜只剩
+> 少数 IP 存活。**不要把"深夜换 IP 后很快又 429"误读成"换 IP 无效"**：那是在用
+> 枯水期的水位论证河里没有水。详见 [docs/established-facts.md](docs/established-facts.md) 第 0 条。
 
 ```
 9router → sing-box:7890 → route: domain_suffix ["opencode.ai"]
@@ -443,13 +455,14 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   —— 同一 N（无重启）下地址也会变，实测同 tag 相邻两次判定间隔 10~30s 时
   99.4% 换了地址、>120s 时只有 28.3% 换。所以「刚 OK 过又判 quota」是那个地址
   被换掉了，不是 OK 结论被无视。13 分钟窗口内 222 次换址发生在 N 不变时。
-- **OK 结论单独一档 TTL（T-225）**：`probe_ok_ttl_sec`=600，既不属于 2min 的
-  瞬时档（`unreachable`/`err`），也不属于 6h 的持久档（`quota`/`flagged`）。
+- **OK 结论单独一档 TTL（T-225，2026-11-02 上调到 1800）**：`probe_ok_ttl_sec`=1800
+  （30min），既不属于 2min 的瞬时档（`unreachable`/`err`），也不属于 10min 的
+  持久档（`quota`/`flagged`）。
   WHY 不能和 `unreachable` 同档：OK 说的同样**是地址状态**，而同一 `(tag, /128)`
   的重探间隔中位 **212s** —— 2min 的档位命中不到自己，同一地址每轮都重探一遍。
-  实测 1980 次「前一次结论是 OK」里 **1831 次（92.5%）结论不变**，按 600s 档可
-  省掉 **33.8%** 的探测量（1748/5166），其中判错的只有 8.0%；600s 已接近饱和
-  （1200s 只多 0.1 个百分点）。WHY 不能直接套 6h：47 例 OK→quota 的间隔中位
+  实测 1980 次「前一次结论是 OK」里 **1831 次（92.5%）结论不变**；600s 时可省
+  **33.8%** 的探测量（1748/5166），而 30min 约合 8.5 轮。WHY 不能直接套 6h：
+  47 例 OK→quota 的间隔中位
   1267s，长 TTL 只是把「凭旧 OK 选线」的窗口拉宽。**真正的安全网是标脏即作废**
   （`_probe_cache_forget` 在 `_mark_warp_ip_used(blocked=True)` 里即时清 OK），
   那 47 例翻脸里 **45 例期间发生过生产侧 429/403 换线**，走的正是这条路径，
@@ -660,6 +673,7 @@ warp.proxy_fallback_enabled: false             # 落池开关（2026-10-26 关�
 warp.probe_cache_ttl_sec: 12                   # 旧路径探测缓存 TTL（出口 IP 新鲜度）
 warp.probe_transient_ttl_sec: 120                 # 探测结论 TTL：OK/unreachable/err（瞬时档）
 warp.probe_persistent_ttl_sec: 600             # 探测结论 TTL：quota/flagged（与探测节奏同量级）
+warp.probe_ok_ttl_sec: 1800                    # 探测结论 TTL：OK（30min，单独一档）
 warp.fallback_idle_wait_sec: 3                 # 旧路径错误换线等备线空闲上限
 # 单实例探测器（2026-10-26，prober_enabled=false 时才走旧路径）
 warp.prober_enabled: true                      # 唯一后台探测器 + 状态表驱动换线

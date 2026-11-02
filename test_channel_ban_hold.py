@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""渠道 ban 率锁自检（离线、无网络、无 pytest）。
+
+规格（2026-11-02 主人定）：
+  - 维度是**渠道**（线路 tag），不是 colo；
+  - 判据：最近 `channel_ban_window_sec`(30min) 内模型层实测全部封禁且样本 ≥2；
+  - 命中后该渠道锁到**次日** `channel_ban_reset_hour`(08:00)，期间不重启；
+  - 样本/锁定跨 daemon 重启保留，窗口外样本在启动时裁掉。
+
+跑法： python3 -I /tmp/opencode/channel_ban_selftest.py
+"""
+import os
+import sys
+import tempfile
+import time
+
+_TMP = tempfile.mkdtemp(prefix="asip-banhold-test-")
+os.environ["ASIP_NO_SIDE_EFFECTS"] = "1"
+os.environ.setdefault("WARP_LINE_STATE_FILE_PATH", os.path.join(_TMP, "state.json"))
+os.environ.setdefault("WARP_IP_USED_FILE_PATH", os.path.join(_TMP, "used.json"))
+os.environ.setdefault("WARP_SEGMENT_FILE_PATH", os.path.join(_TMP, "seg.json"))
+
+sys.path.insert(0, "/home/administrator/auto-swicth-ip")
+import config
+import daemon
+
+W = config.CFG["warp"]
+
+def _reset():
+    W["channel_ban_hold_enabled"] = True
+    W["channel_ban_window_sec"] = 3600
+    W["channel_ban_min_samples"] = 30      # 口径：严格大于 30 条
+    W["channel_ban_reset_hour"] = 8
+    daemon._WARP_LINE_STATE.clear()
+    daemon._NIGHT_LOG_TS.clear()
+
+# ---- 时间算术 ----
+def test_hold_secs_until_next_8am():
+    _reset()
+    # 2026-11-02 16:30 本地 → 次日 08:00 = 15.5h
+    t = time.mktime((2026, 11, 2, 16, 30, 0, 0, 0, -1))
+    assert abs(daemon._channel_ban_hold_secs(t) - 15.5 * 3600) < 1, "应锁到次日 8 点"
+    # 07:30 → 当天 08:00，只有 30min
+    t = time.mktime((2026, 11, 3, 7, 30, 0, 0, 0, -1))
+    assert abs(daemon._channel_ban_hold_secs(t) - 1800) < 1, "8 点前应只锁 30 分钟"
+
+# ---- 窗口与命中 ----
+def test_window_trims_and_counts():
+    _reset()
+    now = 1_000_000.0
+    win = [(now - 4000, True), (now - 100, True), (now - 50, True)]
+    n, b = daemon._channel_ban_level(win, now)
+    assert (n, b) == (2, 2), f"1h 窗口外样本应被裁掉，实际 {n},{b}"
+    assert len(win) == 2, "裁剪要就地生效"
+
+def test_needs_strictly_more_than_30_samples():
+    _reset()
+    now = 1_000_000.0
+    # 样本铺满窗口（每分钟一条），否则会被「铺满窗口」那条判据挡掉。
+    full = lambda k: [(now - i * 60, True) for i in range(k)]
+    assert daemon._channel_ban_hold_hit(full(30), now) is False, "恰好 30 条不锁（严格大于）"
+    assert daemon._channel_ban_hold_hit(full(31), now) is True, "31 条全封且铺满应锁"
+    W["channel_ban_min_samples"] = 1
+    assert daemon._channel_ban_hold_hit(full(31), now) is True
+
+def test_burst_does_not_lock():
+    """31 条挤在 4.7 分钟里不算「持续一小时」——实测 19:43 那批 17 条线就是这样锁的。"""
+    _reset()
+    now = 1_000_000.0
+    burst = [(now - i * 9, True) for i in range(31)]   # 跨度 270s < 1800s
+    assert daemon._channel_ban_hold_hit(burst, now) is False, "连撞 31 次不该锁"
+
+def test_one_ok_breaks_100_percent():
+    _reset()
+    now = 1_000_000.0
+    win = [(now - i, True) for i in range(40)] + [(now - 60, False)]
+    assert daemon._channel_ban_hold_hit(win, now) is False, "有一次 OK 就不算 100%"
+
+# ---- 记账 → 锁定 ----
+def test_note_locks_channel():
+    _reset()
+    now = 1_000_000.0
+    for i in range(31):
+        daemon._channel_ban_note("WARP-WG-3", True, now - 1800 + i * 60)
+    st = daemon._WARP_LINE_STATE["WARP-WG-3"]
+    assert daemon._channel_ban_held("WARP-WG-3", now) is True, "31 条 100% 应锁"
+    assert abs(st["ban_hold_until"] - (now + daemon._channel_ban_hold_secs(now) - 1)) < 2
+
+def test_low_sample_channel_not_locked():
+    """用户口径：WG-4/11/12 那种只有几条实测的 100% 不该锁。"""
+    _reset()
+    now = 1_000_000.0
+    for i in range(6):
+        daemon._channel_ban_note("WARP-WG-12", True, now - 300 + i)
+    assert daemon._channel_ban_held("WARP-WG-12", now) is False, "6 条样本不足以判烧穿"
+
+def test_note_ok_prevents_lock():
+    """窗口内出现过一次 OK 就不是 100%，哪怕封禁条数已经过 30。"""
+    _reset()
+    now = 1_000_000.0
+    for i in range(15):
+        daemon._channel_ban_note("WARP-WG-9", True, now - 600 + i)
+    daemon._channel_ban_note("WARP-WG-9", False, now - 500)
+    for i in range(16):
+        daemon._channel_ban_note("WARP-WG-9", True, now - 400 + i)
+    assert daemon._channel_ban_held("WARP-WG-9", now) is False, "夹一条 OK 不该锁"
+
+def test_held_channel_skips_restart():
+    _reset()
+    W["restart_max_per_minute"] = 0
+    W["restart_max_per_hour_per_line"] = 0
+    tag = "WARP-WG-4"
+    member = {"tag": tag, "port": 11997, "service": "warp-wg-4.service"}
+    now = time.time()
+    daemon._warp_line_update(tag, ban_hold_until=now + 3600,
+                             next_restart_ts=0.0, warming=False)
+    orig_active, orig_restart = daemon.active_warp_tag, daemon._restart_warp_line
+    called = []
+    daemon.active_warp_tag = lambda: "WARP-CF"
+    daemon._restart_warp_line = lambda *a, **k: called.append(a) or True
+    try:
+        assert daemon._warp_line_restart(member, "模型层 quota") is False
+        assert called == [], "锁定渠道不该进重启路径"
+    finally:
+        daemon.active_warp_tag, daemon._restart_warp_line = orig_active, orig_restart
+
+def test_hold_expires_after_reset():
+    _reset()
+    tag = "WARP-WG-1"
+    now = 1_000_000.0
+    daemon._warp_line_update(tag, ban_hold_until=now - 1)
+    assert daemon._channel_ban_held(tag, now) is False, "过了解封时刻就该放行"
+
+def test_expired_hold_can_lock_again():
+    """过期的 ban_hold_until 不能永久挡住重新锁定。
+
+    原实现用 `if st.get("ban_hold_until"):` 判「已经锁过」—— 字段是数值，
+    过期后仍非零，于是渠道只要在前一天被锁过一次，此后永远不会再被锁。
+    远端连续跑几天必然踩到，本地只看单日日志看不出来。
+    """
+    _reset()
+    # 判据是「严格大于 min_samples」，设 2 就要 3 条样本。
+    W["channel_ban_min_samples"] = 2
+    now = 1_000_000.0
+    tag = "WARP-WG-8"
+    daemon._warp_line_update(tag, ban_hold_until=now - 86400)  # 昨天的锁
+    for i in range(3):
+        # 样本要铺满窗口（1h）的一半，否则会被「铺满窗口」判据挡掉。
+        # 跨度取满 1h：第 3 条入账时 now-earliest = 3600 ≥ 1800。
+        daemon._channel_ban_note(tag, True, now - 3600 + i * 1800)
+    assert daemon._channel_ban_held(tag, now) is True, "过期锁之后应能重新锁上"
+
+def test_save_and_reload_keeps_hold_and_trims_window():
+    _reset()
+    now = time.time()
+    tag = "WARP-WG-2"
+    daemon._warp_line_update(
+        tag, ban_hold_until=now + 7200,
+        ban_window=[(now - 60, True), (now - 4000, True)],
+        ip="2a09:bac1:3b00:10::16:181", last_ok_ip="2a09:bac1:3b00:10::16:181")
+    daemon._save_warp_line_state(force=True)
+    daemon._WARP_LINE_STATE.clear()
+    daemon._load_warp_line_state()
+    st = daemon._WARP_LINE_STATE[tag]
+    assert st["ban_hold_until"] > now, "渠道锁必须跨重启保留"
+    assert len(st["ban_window"]) == 1, "窗口外样本应在启动时裁掉"
+
+def test_disabled_switch_is_inert():
+    _reset()
+    W["channel_ban_hold_enabled"] = False
+    now = 1_000_000.0
+    daemon._channel_ban_note("WARP-WG-7", True, now - 10)
+    daemon._channel_ban_note("WARP-WG-7", True, now)
+    assert daemon._channel_ban_held("WARP-WG-7", now) is False
+    assert daemon._channel_ban_label(now) == "关"
+
+def test_label_counts_held_channels():
+    _reset()
+    now = time.time()
+    daemon._warp_line_update("WARP-WG-1", ban_hold_until=now + 600,
+                             ban_hold_ready=now)
+    daemon._warp_line_update("WARP-WG-3", ban_hold_until=now + 600,
+                             ban_hold_ready=now)
+    assert daemon._channel_ban_label(now) == "2线→08:00"
+    # 有一条配置写了但重启没成功 → 必须能看出来，否则「换了」只是台账上的说法
+    daemon._warp_line_update("WARP-WG-3", ban_hold_ready=0.0)
+    assert daemon._channel_ban_label(now) == "2线→08:00·1待重启"
+
+# ---- 重定位 / 次日还原 ----
+def _rehome_env(monkeypatch=None):
+    """把节点/节点池读写全部换成内存替身。
+
+    台账里的 node 用 `_ledger` 模拟：`write_line` 改它、`_line_node` 读它，
+    这样「写完配置后 `_line_node` 应该等于新节点」和「apply 抹回 home 后要
+    补写」都能被测到。`_restarts` 记重启调用，`restart_ok` 控制成功与否。
+    """
+    daemon._rehome_calls = []
+    daemon._ledger = {"WARP-WG-4": "n-old"}
+    daemon._restarts = []
+    daemon.restart_ok = True
+    orig = (daemon.warp_wg.udp_capable, daemon.warp_wg.load_nodes,
+            daemon.warp_wg.write_line, daemon.warp_wg._read_state,
+            daemon.warp_wg.write_json, daemon.warp_wg.state_path,
+            daemon.warp_wg.load_colo_map, daemon._line_node,
+            daemon._warp_line_restart, daemon._warp_member)
+    daemon.warp_wg.load_nodes = lambda: [{"tag": "n-la"}, {"tag": "n-sin"}, {"tag": "n-old"}]
+    daemon.warp_wg.udp_capable = lambda nodes, probe=False: list(nodes)
+    daemon.warp_wg.write_line = lambda i, n, family=None: (
+        daemon._rehome_calls.append((i, n["tag"])),
+        daemon._ledger.__setitem__("WARP-WG-4", n["tag"]))[0]
+    daemon.warp_wg._read_state = lambda: {"lines": {}}
+    daemon.warp_wg.write_json = lambda *a, **k: None
+    daemon.warp_wg.state_path = lambda: "/tmp/unused-state.json"
+    daemon.warp_wg.load_colo_map = lambda: {
+        "n-la": {"colo": "LAX", "ok": True}, "n-sin": {"colo": "SIN", "ok": True},
+        "n-old": {"colo": "SIN", "ok": True}}
+    daemon._line_node = lambda tag: daemon._ledger.get(tag)
+    daemon._warp_member = lambda t: {"tag": t, "kind": "wg", "index": 4,
+                                     "family": "v6", "service": "warp-wg-4.service"}
+    daemon._warp_line_restart = lambda m, r, **k: (
+        daemon._restarts.append((m["tag"], r, k)), daemon.restart_ok)[1]
+    return orig
+
+def _rehome_restore(orig):
+    (daemon.warp_wg.udp_capable, daemon.warp_wg.load_nodes,
+     daemon.warp_wg.write_line, daemon.warp_wg._read_state,
+     daemon.warp_wg.write_json, daemon.warp_wg.state_path,
+     daemon.warp_wg.load_colo_map, daemon._line_node,
+     daemon._warp_line_restart, daemon._warp_member) = orig
+
+def test_rehome_target_picks_lowest_ban_colo():
+    _reset()
+    W["channel_rehome_min_samples"] = 10
+    orig = _rehome_env()
+    cake = lambda win, now: {"SIN": (500, 400), "LAX": (50, 5), "CFB": (3, 0)}
+    import ipv6_segments
+    orig_rates = ipv6_segments.colo_ban_rates
+    ipv6_segments.colo_ban_rates = cake
+    try:
+        got = daemon._channel_rehome_target(1_000_000.0)
+        assert got == ("LAX", "n-la"), f"应选 ban 率最低且有样本的 LAX，实际 {got}"
+        W["channel_rehome_min_samples"] = 100      # CFB 样本不足；LAX 50 也不足
+        got = daemon._channel_rehome_target(1_000_000.0)
+        assert got == ("SIN", "n-sin"), f"样本闸提高后应只剩 SIN，实际 {got}"
+        # 本轮已用掉的节点必须排除，否则一批线会挤到同一个节点
+        got = daemon._channel_rehome_target(1_000_000.0, {"n-sin", "n-old"})
+        assert got is None, f"候选都被排除时应返回 None，实际 {got}"
+    finally:
+        ipv6_segments.colo_ban_rates = orig_rates
+        _rehome_restore(orig)
+
+def test_rehome_restarts_line_after_write():
+    """写完配置必须立刻重启 —— 否则进程仍跑旧节点，锁又挡着重启路径。"""
+    _reset()
+    W["channel_rehome_min_samples"] = 10
+    orig = _rehome_env()
+    import ipv6_segments
+    orig_rates = ipv6_segments.colo_ban_rates
+    ipv6_segments.colo_ban_rates = lambda win, now: {"LAX": (50, 5), "SIN": (500, 400)}
+    now = time.time()
+    try:
+        tag = "WARP-WG-4"
+        daemon._warp_line_update(tag, ban_hold_until=now + 3600)
+        daemon._rehome_held_lines(now)
+        assert daemon._restarts, "重定位后必须重启这条线"
+        assert daemon._restarts[-1][2].get("rebound") is True, "必须走 rebound 分支"
+        assert daemon._WARP_LINE_STATE[tag]["ban_hold_ready"] > 0, "重启成功后要记 ready"
+        # 重启失败 → 不记 ready，下一轮重试
+        daemon.restart_ok = False
+        daemon._WARP_LINE_STATE[tag]["ban_hold_ready"] = 0.0
+        daemon._rehome_held_lines(now)
+        assert daemon._WARP_LINE_STATE[tag]["ban_hold_ready"] == 0.0, "失败不该记 ready"
+    finally:
+        ipv6_segments.colo_ban_rates = orig_rates
+        _rehome_restore(orig)
+
+def test_rehome_rewrites_after_apply_clobber():
+    """apply/订阅换绑定把 node 抹回 home 后，下一轮对账要补写并重启。"""
+    _reset()
+    W["channel_rehome_min_samples"] = 10
+    orig = _rehome_env()
+    import ipv6_segments
+    orig_rates = ipv6_segments.colo_ban_rates
+    ipv6_segments.colo_ban_rates = lambda win, now: {"LAX": (50, 5), "SIN": (500, 400)}
+    now = time.time()
+    try:
+        tag = "WARP-WG-4"
+        daemon._warp_line_update(tag, ban_hold_until=now + 3600)
+        daemon._rehome_held_lines(now)
+        n = len(daemon._rehome_calls)
+        daemon._ledger[tag] = "n-old"          # 模拟 apply 整表重写
+        daemon._WARP_LINE_STATE[tag]["ban_hold_ready"] = 0.0
+        daemon._rehome_held_lines(now)
+        assert len(daemon._rehome_calls) == n + 1, "被抹回 home 后应补写"
+        assert daemon._ledger[tag] == "n-la", "补写后应回到目标节点"
+        assert daemon._WARP_LINE_STATE[tag]["ban_hold_ready"] > 0
+    finally:
+        ipv6_segments.colo_ban_rates = orig_rates
+        _rehome_restore(orig)
+
+def test_restore_clears_home_for_non_wg():
+    """非 WG 线（usque/H2）还原时 _rehome_one 返回 skip，必须当结束处理。
+
+    否则 ban_hold_home 永远留着，主循环每分钟白跑一次还原。
+    """
+    _reset()
+    now = time.time()
+    daemon._WARP_LINE_STATE.clear()
+    daemon._warp_line_update("WARP-CF-D", ban_hold_until=now - 1,
+                             ban_hold_home="n-x", ban_hold_node="n-y")
+    orig = (daemon._rehome_one, daemon._warp_member)
+    daemon._rehome_one = lambda t, n: "skip"
+    daemon._warp_member = lambda t: None
+    try:
+        daemon._rehome_held_lines(now)
+        st = daemon._WARP_LINE_STATE["WARP-CF-D"]
+        assert st["ban_hold_home"] is None, "skip 也要清台账，否则每分钟重试一次"
+        assert st["ban_hold_node"] is None
+    finally:
+        daemon._rehome_one, daemon._warp_member = orig
+
+
+def test_rehome_records_home_then_restores():
+    _reset()
+    W["channel_rehome_min_samples"] = 10
+    orig = _rehome_env()
+    import ipv6_segments
+    orig_rates = ipv6_segments.colo_ban_rates
+    ipv6_segments.colo_ban_rates = lambda win, now: {"LAX": (50, 5), "SIN": (500, 400)}
+    now = time.time()
+    try:
+        tag = "WARP-WG-4"
+        daemon._warp_line_update(tag, ban_hold_until=now + 3600)
+        daemon._rehome_held_lines(now)
+        st = daemon._WARP_LINE_STATE[tag]
+        assert st["ban_hold_home"] == "n-old", "重定位前必须记下原节点"
+        assert st["ban_hold_node"] == "n-la", "目标节点要记账，供对账用"
+        assert daemon._rehome_calls[-1] == (4, "n-la"), "应写到最低 ban 率 colo 的节点"
+        # 配置与台账一致 → 不该反复写
+        n_before = len(daemon._rehome_calls)
+        daemon._rehome_held_lines(now)
+        assert len(daemon._rehome_calls) == n_before, "已重定位的线不该反复改配置"
+        # 锁到期 → 还原
+        daemon._WARP_LINE_STATE[tag]["ban_hold_until"] = now - 1
+        daemon._rehome_held_lines(now)
+        assert daemon._rehome_calls[-1] == (4, "n-old"), "到期应还原到原节点"
+        assert daemon._WARP_LINE_STATE[tag]["ban_hold_home"] is None, "还原后清掉台账"
+    finally:
+        ipv6_segments.colo_ban_rates = orig_rates
+        _rehome_restore(orig)
+
+def test_switch_off_releases_existing_holds():
+    """总闸关掉后，锁要解除，并且停在临时 colo 上的线要还原回原节点。"""
+    _reset()
+    orig = _rehome_env()
+    now = time.time()
+    try:
+        daemon._warp_line_update("WARP-WG-4", ban_hold_until=now + 7200,
+                                 ban_window=[(now - 60, True)],
+                                 ban_hold_home="n-old", ban_hold_node="n-la")
+        daemon._ledger["WARP-WG-4"] = "n-la"
+        W["channel_ban_hold_enabled"] = False
+        daemon._channel_ban_note("WARP-WG-4", True, now)
+        st = daemon._WARP_LINE_STATE["WARP-WG-4"]
+        assert daemon._channel_ban_held("WARP-WG-4", now) is False, "开关关了不该还锁着"
+        assert not st["ban_window"]
+        assert st["ban_hold_home"] == "n-old", "home 不能被清掉，否则永远回不去"
+        daemon._rehome_held_lines(now)
+        assert daemon._ledger["WARP-WG-4"] == "n-old", "关闸后应还原回原节点"
+        assert daemon._WARP_LINE_STATE["WARP-WG-4"]["ban_hold_home"] is None
+        # 关闸后不应再往临时节点搬
+        n = len(daemon._rehome_calls)
+        daemon._warp_line_update("WARP-WG-4", ban_hold_until=now + 7200)
+        daemon._rehome_held_lines(now)
+        assert len(daemon._rehome_calls) == n, "关掉开关后不该再重定位"
+    finally:
+        W["channel_ban_hold_enabled"] = True
+        _rehome_restore(orig)
+
+def test_tunnel_dead_restart_bypasses_hold():
+    """拿不到出口地址是隧道故障，渠道锁不该拦。"""
+    _reset()
+    W["restart_max_per_minute"] = 0
+    W["restart_max_per_hour_per_line"] = 0
+    tag = "WARP-WG-5"
+    now = time.time()
+    daemon._warp_line_update(tag, ban_hold_until=now + 3600, next_restart_ts=0.0)
+    member = {"tag": tag, "port": 11998, "service": "warp-wg-5.service"}
+    calls = []
+    orig = (daemon.active_warp_tag, daemon._restart_warp_line)
+    daemon.active_warp_tag = lambda: "WARP-CF"
+    daemon._restart_warp_line = lambda *a, **k: calls.append(a) or True
+    try:
+        assert daemon._warp_line_restart(member, "模型层 quota") is False
+        assert calls == [], "普通 quota 重启仍应被渠道锁拦下"
+        daemon._warp_line_restart(member, "连续 N 次取不到出口地址",
+                                  tunnel_dead=True)
+        assert calls, "隧道故障的重启不该被渠道锁拦"
+    finally:
+        daemon.active_warp_tag, daemon._restart_warp_line = orig
+
+
+if __name__ == "__main__":
+    fails = 0
+    for name, fn in sorted(globals().items()):
+        if not name.startswith("test_"):
+            continue
+        try:
+            fn()
+            print(f"ok   {name}")
+        except AssertionError as e:
+            fails += 1
+            print(f"FAIL {name}: {e}")
+    print(f"\n{'all passed' if not fails else str(fails) + ' failed'}")
+    sys.exit(1 if fails else 0)

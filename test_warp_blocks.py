@@ -56,12 +56,19 @@ def test_block_cap_and_partial_pool():
     assert len(nrt_irr) == 1  # 池里只有一个非常规节点
 
 
-def test_v4_is_merged_single_block():
-    """v4 只开一个合并块：出口段高度收敛，逐块开只是同段重复。"""
+def test_v4_is_merged_single_block_and_comes_first():
+    """v4 只开一个合并块，且排在清单最前面。
+
+    v4 出口段高度收敛（实测四条线只有 243/237/205 三个 /24），逐块开只是
+    同段重复。但合并块**排在末尾**时会被线路数截断 —— 实测 29 条线时 v4
+    渠道一条都分不到，等于死代码。所以它必须排最前。
+    """
     chs = wb.channels(cfg(), nodes_map())
     v4 = [c for c in chs if c["type"] == "v4"]
     assert len(v4) == 2 and {c["colo"] for c in v4} == {wb.V4_COLO}
     assert {c["tag"] for c in v4} == {"WARP-BLK-ALL-V4-0", "WARP-BLK-ALL-V4-1"}
+    # 排在最前：线路数不足时优先被分到
+    assert [c["type"] for c in chs[:2]] == ["v4", "v4"]
 
 
 def test_pinned_block_borrows_a_node_without_reassigning_it():
@@ -84,6 +91,65 @@ def test_pinned_block_borrows_a_node_without_reassigning_it():
     assert not [ch for ch in chs if ch["colo"] == "ORD"]
 
 
+def test_v4_block_prefers_nodes_that_actually_ran_v4():
+    """v4 合并块按**实测 v4 握手**排序，不按延迟。
+
+    反例来自生产：`cn.bing.com:443` 的 v6 是 regular，却被排在 v4 候选首位，
+    而它两轮 v4 全是 handshake 失败。延迟序对 v4 没有意义 —— 承载不了就是
+    承载不了，快也没用。
+    """
+    m = nodes_map()
+    m["dead-v4"] = {"colo": "TPE", "category": "regular",
+                    "v4_ok": 0, "v4_n": 2}
+    m["good-v4"] = {"colo": "SJC", "category": "regular",
+                    "v4_ok": 2, "v4_n": 2}
+    chs = wb.channels(cfg(), m, delays={"dead-v4": 10, "good-v4": 900})
+    v4 = [c["node"] for c in chs if c["type"] == "v4"]
+    # 实测能跑 v4 的排第一，尽管它的延迟差了 90 倍
+    assert v4[0] == "good-v4"
+    assert "dead-v4" not in v4[:2]
+
+
+def test_v4_block_never_drops_a_node_because_it_failed_once():
+    """握手失败的节点只**排后**，不剔除。
+
+    节点会恢复：机场线路的可用性以分钟计，实测 2026-11-02 上午判死的
+    `unamecf…~4` 下午就通了。把「当前不通」写成「永久不可用」，淘汰掉的
+    节点就再也回不来，池子只会越用越薄。淘汰是运行期的事（同块轮回守护
+    换节点），不是布线期的。
+
+    未知节点排在「实测能用」之后、「实测失败」之前：新节点还没测过，不等于
+    不能用，但也不该顶掉已验证的出口。
+    """
+    m = {
+        "ok-v4": {"colo": "SJC", "category": "regular", "v4_ok": 1, "v4_n": 1},
+        "untested": {"colo": "SJC", "category": "regular"},
+        "bad-v4": {"colo": "SJC", "category": "regular", "v4_ok": 0, "v4_n": 2},
+    }
+    chs = wb.channels(cfg(per=3, table=[{"colo": "SJC", "ban_rate": None}]), m,
+                      delays={"bad-v4": 1, "untested": 2, "ok-v4": 3})
+    v4 = [c["node"] for c in chs if c["type"] == "v4"]
+    assert v4 == ["ok-v4", "untested", "bad-v4"]
+
+
+def test_h2_carrier_nodes_are_not_wg_channels():
+    """h2 承载的节点不归 WG 线管 —— 它在**排序之前**就该出池。
+
+    `apply()` 事后还会按 `carrier != 'h2'` 过滤一遍。若这里先把 h2 节点排进
+    前 `per` 名，过滤后渠道就凭空少几条（实测 NRT 块的前三名全是
+    `bilibili-50037/50041`，过滤后 REG 渠道整个消失）。
+    """
+    m = {
+        "h1": {"colo": "SJC", "category": "regular", "carrier": "h2"},
+        "h2": {"colo": "SJC", "category": "regular", "carrier": "h2"},
+        "w1": {"colo": "SJC", "category": "regular"},
+        "w2": {"colo": "SJC", "category": "regular"},
+    }
+    chs = wb.channels(cfg(per=2, table=[{"colo": "SJC", "ban_rate": None}]), m,
+                      delays={"h1": 1, "h2": 2})
+    assert [c["node"] for c in chs if c["type"] == "v6"] == ["w1", "w2"]
+
+
 def test_channel_tag_is_type_block_index():
     chs = wb.channels(cfg(), nodes_map())
     tags = {c["tag"] for c in chs}
@@ -102,6 +168,7 @@ def test_excluded_colos_do_not_take_devices():
     chs = wb.channels(c, nodes_map())
     assert chs, "排除一个块不该把清单清空"
     assert not any(ch["colo"] == "NRT" for ch in chs)
+    # v4 是独立合并块，不受 colo 排除影响
     assert {ch["colo"] for ch in chs} == {"SJC", "TPE", wb.V4_COLO}
 
 
@@ -131,6 +198,21 @@ def test_category_for(ok, n, expect):
 
 
 # ---------------------------------------------------------------- 线路分配
+
+def test_sibling_lines_stagger_their_rotation():
+    """同一块的兄弟线必须错开后置顺序。
+
+    否则三条线绑同一块时 rotation 一模一样：其中一条的节点挂了，三条会在
+    同一轮全跳到同一个后备节点 —— 那是「集中风险」而不是分散。旧路径
+    `apply()` 的 `off = (i - 1) % per` 就是干这个的，块模型迁移时漏掉了。
+    """
+    rich = cfg(per=3, table=[{"colo": "BIG", "ban_rate": None}])
+    m = {f"b{i}": {"colo": "BIG", "category": "regular", "ok": 1, "n": 1}
+         for i in range(8)}
+    plan = wb.plan_lines(wb.channels(rich, m), 3, rotation_size=8)
+    heads = [p["rotation"][1] for p in plan]
+    assert len(set(heads)) == len(heads), f"兄弟线后备首位重复: {heads}"
+
 
 def test_plan_lines_insufficient_channels_raises():
     with pytest.raises(SystemExit):

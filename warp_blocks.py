@@ -40,8 +40,10 @@ PROJECT = Path(PROJECT_DIR)
 # success/attempts == 1 就进常规块，和本机直连 WARP 的线同等待遇。
 CATEGORIES = ("regular", "irregular")
 
-# v4 只有一个合并块：v4 出口段高度收敛（13 个 /24 集中在 104.28.x.x），
-# 逐块开渠道只是同段重复。
+# v4 只有一个合并块：v4 出口段高度收敛。实测 2026-11-02 四条 v4 线的出口
+# 全部落在 104.28.x.x（243.105 / 237.117 / 205.115 / 205.117，只有三个 /24），
+# 逐块开渠道只是同段重复 —— 拆到 11 个 colo 块各开 3 条并不会多出地址多样性，
+# 反而让同一节点在 v6/v4 两条线里各占一份设备。
 V4_COLO = "ALL"
 
 
@@ -143,6 +145,12 @@ def channels(cfg: dict, nodes_map: dict | None = None,
     """
     if not enabled(cfg):
         return []
+    # **不做 UDP 能力过滤**。`probe_node_udp` 用 STUN(3478) 判定，而 WARP 走的
+    # 是 2408 —— 节点完全可以只放行 2408。实测 `pq.aws48` STUN=False，但它
+    # 承载的 WARP-WG-5 正在正常出 v6 流量（colo=NRT）。拿它过滤会把健康节点
+    # 整批判死（实测 22 条线里 13 条被误伤），v4 合并块更是直接清空。
+    # 节点是否真能承载 WARP，只能靠**实际握手**验证 —— 也就是线路跑起来之后
+    # 的出口探测，`warp_wg.apply()` 与 daemon 已经各自有那套判据。
     per = channels_per_block(cfg)
     skip = excluded_colos(cfg)
     nodes_map = load_map() if nodes_map is None else nodes_map
@@ -160,16 +168,43 @@ def channels(cfg: dict, nodes_map: dict | None = None,
             pool = ([t for t in pin
                      if (nodes_map.get(t) or {}).get("category") == cat]
                     if pin else _pool(nodes_map, colo, cat))
-            ordered = order_nodes(pool, delays)
+            # H2 承载的节点走的是 TCP/HTTP2 隧道（见 deploy/render_h2_lines.py），
+            # 不占 WG 线位。必须在**排序之前**剔掉：`apply()` 事后还会按
+            # `carrier != 'h2'` 过滤一遍，若这里先把 h2 节点排进前 `per` 名，
+            # 过滤后就只剩更少的渠道 —— 实测 2026-11-02 NRT 块的前三名全是
+            # `bilibili-50037/50041`（carrier=h2），过滤后 REG 渠道整个消失。
+            pool = [t for t in pool
+                    if (nodes_map.get(t) or {}).get("carrier") != "h2"]
+            # 排序先按**实测握手**分层，再按延迟：实测 2026-11-02
+            # `us.bing.com:443~5-any` 和 `~7-any` 两轮 v6 全 handshake 失败，
+            # 而它们的延迟很靠前 —— 按延迟排会把两条死线放进前几名。
+            # 同层内保持延迟序（sorted 稳定）。
+            ordered = sorted(order_nodes(pool, delays),
+                             key=lambda t: _alive_rank(t, nodes_map, "v6"))
             for i in range(min(per, len(ordered))):
                 out.append({"type": "v6", "colo": colo, "category": cat,
                             "index": i, "family": "v6", "node": ordered[i],
                             "nodes": ordered, "pinned": bool(pin)})
-    merged = order_nodes(_pool(nodes_map, None, None), delays)
+    # v4 单个合并块，且**排在清单最前面**。
+    # WHY 排最前：它原先排在末尾，线路数不足时整块被截断 —— 实测 29 条线时
+    # v4 渠道一条都分不到，v4 承载等于死代码。排在前面才能保证只要有 v4 渠道
+    # 就一定先被分到线。v6 渠道数量远多于线路数，少几条不影响块覆盖。
+    #
+    # 候选池 = 走**机场代理**的节点（carrier != h2），不含直连 WARP 的那些：
+    # 直连 WARP（usque 隧道）不经过机场，它的 v4 出口是本机 MASQUE 会话直接
+    # 拿到的，与「代理承载」是两条完全不同的链路，混进来会让 v4 块里一半的
+    # 渠道根本不该由 WG 线承担。
+    # 排序先看 **v4 实测**，再看延迟：v6 稳定不等于能跑 v4 —— 实测
+    # `cn.bing.com:443`（v6 regular）两轮 v4 全 handshake 失败，而 `pq.us02`
+    # 两轮都拿到 warp=on。按延迟排会把前三名全给跑不了 v4 的节点。
+    cand = [t for t in _pool(nodes_map, None, None)
+            if (nodes_map.get(t) or {}).get("carrier") != "h2"]
+    merged = sorted(order_nodes(cand, delays),
+                    key=lambda t: _alive_rank(t, nodes_map, "v4"))
     for i in range(min(per, len(merged))):
-        out.append({"type": "v4", "colo": V4_COLO, "category": "proxy",
-                    "index": i, "family": "v4", "node": merged[i],
-                    "nodes": merged})
+        out.insert(i, {"type": "v4", "colo": V4_COLO, "category": "proxy",
+                       "index": i, "family": "v4", "node": merged[i],
+                       "nodes": merged})
     for ch in out:
         ch["tag"] = channel_tag(ch)
     return out
@@ -184,6 +219,9 @@ def plan_lines(chs: list[dict], total: int, base: int = 1,
     线多时按 `channels()` 的顺序截断，少时报错 —— 少一条线等于少一个出口，
     静默用空节点补会导致该线永远连不上。
 
+    同一节点只当一条线的 home（见下面的 `used`）；去重后不足 `total` 时
+    返回**实际**条数 —— 调用方按 len(plan) 建线，不要拿空节点凑数。
+
     `rotation` 是本模块唯一「越界」的地方：块内后备顺序优先同块。同块切换大概率
     拿到同一 colo 的另一个段（v4 地址相同、v6 段不同），跨块切换等于换了个机房，
     应该排在后面 —— 与 `warp_wg._rotation_for` 的「先跨组」相反，那里按
@@ -196,7 +234,20 @@ def plan_lines(chs: list[dict], total: int, base: int = 1,
     nodes_map = load_map() if nodes_map is None else nodes_map
     global_pool = order_nodes(list(nodes_map), delays)
     out = []
+    sibling_idx: dict[str, int] = {}      # 同一块里这是第几条兄弟线
+    # 去重的粒度是 **(块, 出口族, 节点)**，不是节点本身。
+    # 同一节点出现在两个块里是 `pin` 的**设计意图**，不是重复：PIT 没有自己
+    # 的节点，只能借 ORD 那条来采样，而它的漂移轮次里 CF 确实把出口落在 PIT
+    # —— 两条线共用一台落地机、但**出口地域不同**，这正是 pin 要抓的东西。
+    # 同一节点上的 v4 与 v6 也是两条独立的线（不同设备、不同出口族），不算重复。
+    # 真正要挡的是同一块里两条**同族**线绑同一节点：那才是同一个地址池，
+    # 挂两根设备只是多一个地址，没有任何多样性。
+    used: set[tuple[str, str, str]] = set()
     for i, ch in enumerate(chs[:total]):
+        key = (ch["colo"], ch["family"], ch["node"])
+        if key in used:
+            continue
+        used.add(key)
         # 同块（同 colo）的其余节点排前面，跨块的按全局延迟序垫后。
         same = [t for t in ch["nodes"] if t != ch["node"]]
         rotation = [ch["node"]]
@@ -205,6 +256,18 @@ def plan_lines(chs: list[dict], total: int, base: int = 1,
                 rotation.append(t)
             if len(rotation) >= max(1, rotation_size):
                 break
+        # 同块兄弟线错开后置顺序：三条线绑同一块时，若 rotation 一模一样，
+        # 节点失效后它们会在同一轮全跳到同一个后备节点 —— 那台节点瞬间被
+        # 三条线共抢，且这不是「分散风险」而是「集中风险」。
+        # 旧路径 `apply()` 里的 `off = (i - 1) % per` 就是干这个的，块模型
+        # 迁移时漏掉了。错开量按**块内序号**而不是全局序号：全局 i 会让不同
+        # 块的线互相错位，同一块的两条线反而可能对齐。
+        k = sibling_idx.get(ch["colo"], 0)
+        sibling_idx[ch["colo"]] = k + 1
+        if len(rotation) > 1 and k:
+            head, tail = rotation[0], rotation[1:]
+            off = k % len(tail)
+            rotation = [head] + tail[off:] + tail[:off]
         out.append({"line": base + i, "tag": ch["tag"], "node": ch["node"],
                     "family": ch["family"], "colo": ch["colo"],
                     "category": ch["category"], "rotation": rotation})
@@ -269,6 +332,56 @@ def category_for(ok: int, n: int) -> str | None:
     return "regular" if ok >= n else "irregular"
 
 
+def merge_diag(path: Path, rows: list[dict]) -> dict[str, int]:
+    """把 warp_diag 的握手结果并进已有的映射表，按出口族分别记。
+
+    返回 `{"v6": n, "v4": m}`：各更新了几个节点。
+
+    这是**合并**不是重建：diag 只回答「这台机器能不能承载 WARP」，回答不了
+    colo / 类别（那是出口 trace 的产物）。整表重建会把没跑 diag 的节点一起丢掉。
+
+    v6 与 v4 分开存：实测 `cn.bing.com:443` 的 v6 两轮全通，v4 两轮全
+    handshake —— 合并成一份会把「能跑 v6」当成「能跑 v4」。
+    """
+    data = json.loads(path.read_text())
+    nodes = data.setdefault("nodes", {})
+    seen: dict[str, dict[str, list[int]]] = {"v6": {}, "v4": {}}
+    for x in rows:
+        rounds = [r for r in (x.get("rounds") or [])
+                  if r.get("stage") in ("ok", "handshake")]
+        if not rounds:
+            continue
+        fam = "v4" if (x.get("family") or "v6") == "v4" else "v6"
+        hit = seen[fam].setdefault(x["tag"], [0, 0])
+        hit[0] += sum(1 for r in rounds if r.get("ok"))
+        hit[1] += len(rounds)
+    for fam, tbl in seen.items():
+        pre = "wg_" if fam == "v6" else "v4_"
+        for tag, (ok, n) in tbl.items():
+            e = nodes.setdefault(tag, {})
+            e[pre + "ok"] = ok
+            e[pre + "n"] = n
+    from asip.atomic_io import write_json
+    data["updated"] = int(time.time())
+    write_json(str(path), data, mode=0o600, indent=2)
+    return {k: len(v) for k, v in seen.items()}
+
+
+def _alive_rank(tag: str, nodes_map: dict, family: str) -> tuple[int, int]:
+    """排序键：实测能承载(0) < 没测过(1) < 实测不能(2)。
+
+    这是**排序**不是准入：未知节点照样会被选中（新节点还没跑过 diag），只是
+    排在已有实测且能用的之后 —— 拿没测过的线顶掉已验证的出口，等于用猜测
+    换掉事实。实测不能的排最后，但也不剔除：节点会恢复，剔了下次还得重建表。
+    """
+    e = nodes_map.get(tag) or {}
+    pre = "wg_" if family == "v6" else "v4_"
+    n = e.get(pre + "n")
+    if not n:
+        return (1, 0)
+    return (0 if e.get(pre + "ok") else 2, 0)
+
+
 def build_map(probe_dir: str) -> dict:
     """把一轮实测（4 个结果文件）汇总成 `.warp/block-map.json`。
 
@@ -314,13 +427,28 @@ def build_map(probe_dir: str) -> dict:
         rows = [json.loads(l) for l in diag.read_text().splitlines() if l.strip()]
     except (OSError, ValueError):
         rows = []
+    # 按出口族分开记：节点能承载 v6 不等于能承载 v4。实测（2026-11-02）
+    # `cn.bing.com:443`、`bilibili…50025` 的 v6 是 regular，但同一条节点跑 v4
+    # 两轮全是 handshake 失败；反过来 `pq.us02` 两轮都拿到 warp=on。
+    # 合并计数会让排序把「v6 好、v4 死」的节点排进 v4 合并块前三。
+    v4_ok: dict[str, int] = {}
+    v4_n: dict[str, int] = {}
     if rows:
         for x in rows:
             # 只剩握手层的轮次。全是 config/port 时**一次都不记**，不能记成
             # 「跑了 1 次、失败 1 次」—— 那会把探针自己的故障写进节点履历。
             rounds = [r for r in (x.get("rounds") or [])
                       if r.get("stage") in ("ok", "handshake")]
-            if rounds:
+            if not rounds:
+                continue
+            # v6 走原路径（按出口 IP 聚合），v4 单独记在节点上 —— v4 的出口
+            # 由落地 colo 决定，一个 colo 只有几个地址池，按 IP 聚合会把不同
+            # 节点混成一条，反而看不出「这台机器能不能跑 v4」。
+            if (x.get("family") or "v6") == "v4":
+                v4_ok[x["tag"]] = v4_ok.get(x["tag"], 0) + sum(
+                    1 for r in rounds if r.get("ok"))
+                v4_n[x["tag"]] = v4_n.get(x["tag"], 0) + len(rounds)
+            else:
                 note(x["egress_ip"], sum(1 for r in rounds if r.get("ok")), len(rounds))
     else:
         # udp_probe 的 warp_rounds 每个 null 也是一次尝试（没建成），不能只数成功。
@@ -349,6 +477,12 @@ def build_map(probe_dir: str) -> dict:
         for tag in tags:
             nodes[tag] = {"colo": colo, "category": cat, "ok": ok, "n": n,
                           "egress_ip": ip, "colo_mix": mix, "drift": drift}
+    # v4 实测是**节点属性**，不是出口 IP 的属性（v4 出口由落地 colo 的小池子
+    # 抽签，同 colo 的不同节点共用那几个地址）。所以它只挂在跑过 v4 diag 的
+    # 节点上，不进按 IP 聚合的那张表。
+    for tag, n in v4_n.items():
+        nodes.setdefault(tag, {})["v4_ok"] = v4_ok.get(tag, 0)
+        nodes[tag]["v4_n"] = n
     return {"updated": int(time.time()), "nodes": nodes}
 
 
@@ -375,10 +509,20 @@ def main() -> None:
     p = sub.add_parser("build-map", help="由实测结果生成 .warp/block-map.json")
     p.add_argument("probe_dir", help="含 warp_probe/stab_result/… 的目录")
     p.add_argument("--dry-run", action="store_true")
+    q = sub.add_parser("merge-diag",
+                       help="把 warp_diag.py --out 的握手结果并进 block-map.json")
+    q.add_argument("diag_jsonl", help="warp_diag.py --out 的输出文件")
     args = ap.parse_args()
 
     if args.cmd == "plan":
         raise SystemExit(_plan(CFG, None))
+    if args.cmd == "merge-diag":
+        rows = [json.loads(l) for l in
+                Path(args.diag_jsonl).read_text().splitlines() if l.strip()]
+        n = merge_diag(map_path(), rows)
+        print(f"更新 v6 {n['v6']} 个、v4 {n['v4']} 个节点的握手结论",
+              file=sys.stderr)
+        return
     out = build_map(args.probe_dir)
     by_cat = Counter(v["category"] for v in out["nodes"].values())
     by_colo = Counter(v["colo"] for v in out["nodes"].values())

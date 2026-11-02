@@ -467,6 +467,9 @@ python3 warp_diag.py --job /tmp/opencode/dead44_inputs.json \
 
 ### MASQUE-over-TCP：差一步的路（2026-11-02 00:10）
 
+> ⚠️ 本节与下两节已被文末「H2 路线复活（2026-11-02 16:00）」推翻：
+> 真正的原因是**不能发 SNI** + **必须用普通 CONNECT**，不是 CF 无服务。
+
 44 个节点被封的只是 UDP，它们的 **TCP 443 到 CF 的 MASQUE-over-H2 端点
 （162.159.198.2）完全畅通**（经节点 TLS 握手成功、HTTP/2 打开）。
 如果 MASQUE 能走 TCP，44 个节点立刻变成 8 个地区的 WARP 承载，UDP 封锁
@@ -683,6 +686,8 @@ SNI 用自己的 Worker 域名（正常 CF 站点，路由器放行），Worker 
 CF 账号。自有 VPS + vless/wstunnel 同理（SNI=自己域名，中继按域名
 送到真实站点 = 自己的 VPS）。
 
+> **⚠️ 已被推翻（2026-11-02 16:00）**：本节结论「CF 的 MASQUE 只在 HTTP/3 / TCP 路线客户端侧无解」是错的。真正挡路的是**机场中继按 SNI 掐断**——`consumer-masque.cloudflareclient.com` 在 ClientHello 阶段就被 RST，而 `-noservername` 握手正常。usque 的 `-s` 默认值恰是这个 SNI，所以`--http2` 不传 `-s ''` 必然失败。另需用 RFC 7540 普通 CONNECT（服务器不发 SETTINGS_ENABLE_CONNECT_PROTOCOL）。**H2 已复活，全量 44/65 可承载**，详见文末「H2 路线复活」。
+
 ### 定性：这家机场的 TCP 中继是 SNI 路由器，TCP 路线客户端侧无解（2026-11-02 02:45）
 
 对 44 个节点全量做「SNI×IP」矩阵测试（SNI 取 CF 真域名 / 机场白名单域名 /
@@ -719,6 +724,8 @@ TCP 路线的剩余可能性只有一条：找到一个「解析到 WARP 端点 
 SNI 改写即可接上。
 
 **结论：这个机场上，WARP 借道的唯一通道是 UDP（QUIC 桥），上限 6/44。**
+
+> **⚠️ 已被推翻（2026-11-02 16:00）**：本节结论「CF 的 MASQUE 只在 HTTP/3 / TCP 路线客户端侧无解」是错的。真正挡路的是**机场中继按 SNI 掐断**——`consumer-masque.cloudflareclient.com` 在 ClientHello 阶段就被 RST，而 `-noservername` 握手正常。usque 的 `-s` 默认值恰是这个 SNI，所以`--http2` 不传 `-s ''` 必然失败。另需用 RFC 7540 普通 CONNECT（服务器不发 SETTINGS_ENABLE_CONNECT_PROTOCOL）。**H2 已复活，全量 44/65 可承载**，详见文末「H2 路线复活」。
 
 ### 走 HTTP/2 over TCP 的那条路：通到最后一公里被 SNI 拦（2026-11-02 02:10）
 
@@ -843,7 +850,7 @@ CF 的 MASQUE vhost 已可达且支持扩展 CONNECT，CONNECT-IP 请求被 `EOF
 > 注：usque 是上游第三方 fork，修复在 `/tmp/usque-fork`（本地提交 `4d47f9e`），
 > 真正接入产线还需把它 vendored/替换为带补丁的构建。
 
-### H2 路线终局：CF 的 MASQUE 只在 HTTP/3，H2 是私有实现（2026-11-02 03:50）
+### ❌ 本节结论已被推翻，见文末「H2 路线复活（2026-11-02 16:00）」
 
 上节「只差最后一点对齐」的乐观判断被推翻。这一轮把 usque 的参数搞对（`-P` 是
 **endpoint 端口**、`-p` 是 SOCKS 端口，之前混用了）后重测，拿到确定结论：
@@ -896,7 +903,7 @@ MASQUE 服务不在 H2 上。
 
 ```
 QUIC / HTTP3：  ✅ CF 唯一真实提供的 MASQUE 通道 → 6/44 节点实测 warp=on
-H2 / TCP：      ❌ CF 侧无服务（不是中继问题，不是 usque 问题）
+H2 / TCP：      ❌ 当时判死，**已推翻** —— 见文末「H2 路线复活」
 ```
 
 usque 的 H2 实现本身没写错（我们补的 `:protocol` 是必要且正确的），但它**服务
@@ -909,8 +916,105 @@ usque 的 H2 实现本身没写错（我们补的 `:protocol` 是必要且正确
 
 **净结论不变**：这个机场上 WARP 借道的唯一通道仍是 UDP（QUIC 桥），上限 6/44。
 
+---
 
+### H2 路线复活：CF 的 H2 MASQUE 一直在，挡路的是 SNI（2026-11-02 16:00）
 
+上面两节判「H2 已死」都建立在同一个错误前提上：**握手要带 SNI**。实际正相反。
+
+**根因：H2 MASQUE 端点拒收 SNI，不带才通。**
+
+```
+$ openssl s_client -connect 162.159.198.2:443 -noservername -alpn h2 \
+    -groups P-256 -cert device.crt -key device.key
+New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+ALPN protocol: h2                       ← 通
+
+$ 同上但 -servername consumer-masque.cloudflareclient.com
+write:errno=104                         ← ClientHello 阶段就被 RST
+```
+
+usque 的 `-s/--sni-address` **默认值**就是 `consumer-masque.cloudflareclient.com`
+（`internal.ConnectSNI`），所以 `--http2` 开箱必死。warp-svc 成功时的日志
+`TlsInfo { ..., sni: None }` 不是没记到，是它真的没发 SNI。
+
+**第二个坑：CONNECT 不能带 `:scheme`/`:path`。** 服务器不宣告
+`SETTINGS_ENABLE_CONNECT_PROTOCOL (0x8)`，带扩展 CONNECT 三件套会被
+`PROTOCOL_ERROR` 重置。必须用 RFC 7540 普通 CONNECT：
+
+```
+:method CONNECT
+:authority cloudflareaccess.com:443
+cf-connect-proto: cf-connect-ip
+pq-enabled: false
+user-agent: (空)
+→ 200, cf-warp-metal/cf-warp-colo/cf-team  ← 与 warp-svc 日志同形
+```
+
+connect-ip-go 的 `DialH2` 发的是扩展 CONNECT，这解释了「Go 客户端被单独拦」
+的假象（47 行那套「指纹规则」推论不成立）。
+
+**实测链路（三条全通，出口均为 WARP）**
+
+| 路径 | 结果 |
+|---|---|
+| 直连 v4 `162.159.198.2:443` | 200, colo=LAX, 出口 104.28.213.171 |
+| 直连 v6 `2606:4700:103::2:443` | 200, colo=SJC |
+| **经机场节点 relay 127.0.0.1:8443** | 200, colo=HKG, 出口 104.28.215.68 / 104.28.247.68 |
+
+并发 5×2MB + 单流 10MB 全部 200；UDP（SOCKS ASSOCIATE，源端口须与 TCP 相同）
+也能过隧道，DNS 回复正常。**这是完整 IP 级承载，不只是 TCP。**
+
+**可用形态**
+
+```bash
+# 非 root：relay 监听 8443，经机场 mixed/socks 20023 → CF v4:443
+python3 tools/tcp_relay.py --listen 8443 --node-socks 20023 --dst 162.159.198.2:443
+
+# usque 空 SNI + 指向 relay
+usque socks -c config.json --http2 -s '' -P 8443 -b 127.0.0.1 -p 11411
+curl --proxy socks5h://127.0.0.1:11411 https://api.ipify.org   # WARP 出口
+```
+
+`HTTPS_PROXY` 环境变量那条路**不行**：CONNECT 目标是 `cloudflareaccess.com`，
+由节点自行解析，命中的是普通 CF 证书，pinned key 校验失败。必须用 relay 直指 IP。
+
+**`tools/tcp_relay.py` 的 10s 断流 bug（已修）**：`socks_connect` 用
+`create_connection(timeout=10)`，该超时残留在 socket 上，`pump()` 里空闲 10s
+即抛 `TimeoutError`（`OSError` 子类），被 `except OSError` 吞下当成 EOF 关连接。
+症状是长连接每 ~10s 断一次、并发请求全 000，而裸节点 30s 都不动 —— 极易误判成
+机场侧回收。修法是握手后 `s.settimeout(None)`。修复前实测 5 并发全超时，修复后
+5×2MB + 10MB 零断流。
+
+**这意味着 44 个 TCP 通的节点理论上都能做 WARP 承载**，不再受 UDP 限制。
+剩余问题只有吞吐：经节点约 0.5MB/s（裸节点 0.9MB/s），对 API 流量够用。
+
+**全量扫描（2026-11-02 16:40，65 个 dormant 节点，逐个走 H2）**
+
+`dormant-outbounds.json` 全 65 个节点，每个都经 `relay → usque --http2 -s ''`
+建隧道并取 `cdn-cgi/trace`：**44/65 拿到 warp=on**，21 个失败全部是节点自身
+TCP 连不上（sing-box 日志 `dial tcp <ip>:<port>: i/o timeout`），与 H2 无关。
+
+按 WARP 出口 colo 分布（比 QUIC 时代多出 ICN / SLC / ORD 三个落点）：
+
+| colo | 节点数 | 出口 /48 段 |
+|---|---:|---|
+| HKG | 16 | `bac1:3180` `bac1:31a0` `bac1:31c0` `bac1:31e0` `bac5:3980` `bac5:3982` `bac5:3983` `bac5:3984` `bac5:3985` `bac5:3987` |
+| SIN | 9 | `bac1:5140` `bac1:6500` `bac1:6520` `bac5:55fa` `bac5:55fb` `bac5:55fe` `bac5:55ff` |
+| TPE | 6 | `bac1:7400` `bac1:7420` `bac1:7440` `bac5:58eb` `bac5:5902` `bac5:5907` |
+| NRT | 4 | `bac5:4303` `bac5:4304` `bac5:4307` |
+| SLC | 4 | `bac1:7680` `bac1:76a0` `bac5:a539` |
+| ICN | 2 | `bac1:3f40` `bac5:4750` |
+| LAX | 2 | `bac1:76a0` `bac1:76e0` |
+| ORD | 1 | `bac1:76e0` |
+
+（统一前缀 `2a09:`。）**44 个出口段全部不在生产台账 `.warp_ip_used.json` 里**
+——H2 线拿到的是与现有 30 条线不重叠的新鲜地址池，这是它最大的实用价值。
+
+入口地区与落地 colo 不是一一对应的：`hk-aws-*` 5 个全落 HKG，`jp-aws-*` 2 个
+全落 NRT；而 `bilibili-image-cdn.juhazf.cn:*` 这一批 37 个成功节点的落地横跨
+HKG/SIN/TPE/NRT/ICN/SLC/LAX/ORD 八地 —— 同一个入口域名背后是多个出口中继。
+所以「选节点」这件事在 H2 模式下只能按实测 colo 选，不能按节点名猜。
 
 ---
 
@@ -930,3 +1034,235 @@ usque 的 H2 实现本身没写错（我们补的 `:protocol` 是必要且正确
 
 **测试 warp 一律在独立 netns 内做**，不要在主 netns 切 `mode warp`。
 **执行 `wsl --shutdown` 前先确认没有 `claude`/`codex` 交互会话**，它会一并杀掉。
+### H2 路线复活：根因是 SNI 不是 CF（2026-11-02 16:00-16:40）
+
+**这一节推翻本文前面三处结论**，都在原处标注了推翻标记。
+
+#### 根因一：默认 SNI 踩黑名单，不是 CF 不支持 H2
+
+```
+openssl s_client -connect 162.159.198.2:443 -noservername -alpn h2 \
+                 -cert device.crt -key device.key
+→ TLSv1.3, ALPN h2                                  ✅
+
+同一命令 + -servername consumer-masque.cloudflareclient.com
+→ write:errno=104（ClientHello 阶段就被 RST）        ❌
+```
+
+`usque` 的 `-s/--sni-address` 默认值恰好是 `consumer-masque.cloudflareclient.com`，
+所以 `--http2` 不显式传 `-s ''` 必然在握手前被掐。上一节据此判定「CF 的 MASQUE
+只在 HTTP/3」是错的——不是 CF 不支持，是机场中继按 SNI 掐断。
+`warp-svc` 日志里的 `sni: None` 是真实记录，不是漏记。
+
+#### 根因二：服务器不发 SETTINGS_ENABLE_CONNECT_PROTOCOL
+
+带 `:scheme`/`:path` 的扩展 CONNECT（RFC 9298）会被 `PROTOCOL_ERROR` 重置。
+必须用 RFC 7540 的普通 CONNECT。`connect-ip-go` 的 `DialH2` 发的正是扩展 CONNECT，
+这就是上一轮「Go 客户端被指纹拦截」误判的真实来源——不是指纹，是协议用错了。
+
+#### 实测结果
+
+| 路径 | 结果 |
+|---|---|
+| 直连 v4 | 200, colo=LAX, 出口 104.28.213.171 |
+| 直连 v6 | 200, colo=SJC |
+| 经机场节点 relay | 200, colo=HKG, 出口 104.28.215.68 / 104.28.247.68 |
+
+并发 5×2MB + 单流 10MB 全 200，零断流；UDP（SOCKS ASSOCIATE）也能过隧道，
+DNS 回复正常。**是完整 IP 级承载**，不是只能跑 HTTP。
+
+可用形态**不需要 root**：
+
+```
+relay 监听 8443 + usque --http2 -s '' -P 8443
+```
+
+#### 顺带修掉的隐藏 bug：tcp_relay 的 socket 超时残留
+
+`tools/tcp_relay.py` 的 `create_connection(timeout=10)` 会把超时留在 socket 上，
+`pump()` 空闲 10s 抛 `TimeoutError`，而它是 `OSError` 子类，被 `except OSError`
+吞成 EOF 关连接。症状：长连接每 10s 断、并发全 000，但裸节点 30s 不动 →
+极易误判成「机场回收长连接」。修法：握手成功后 `s.settimeout(None)`。
+
+#### 全量扫描结果（2026-11-02 16:37 起，65 节点，H2 版，16:53 完成）
+
+**44/65 = 67.7% 可承载**（此前 UDP 路线只有 6/44 = 13.6%）。
+
+colo 分布（8 个地域）：
+
+```
+HKG 16   SIN 9   TPE 6   NRT 4   SLC 4   ICN 2   LAX 2   ORD 1
+```
+
+21 个失败全部是 `colo=None`（连 trace 都没回），其中：
+- `hk-aws-111` / `sg-aws-109` / `sg-aws-113` — 节点本身 TCP 都不通
+- 其余 18 个是 `bilibili-image-cdn.juhazf.cn` 的特定端口（50027-50039、55079-55105、60194）
+
+**关键结构发现**：`bilibili-image-cdn.juhazf.cn` 一个域名下的不同端口，
+落在完全不同的 colo——
+
+| 端口段 | colo |
+|---|---|
+| 50001-50007 | SIN |
+| 50009 | LAX |
+| 50011 | ORD |
+| 50013-50025 | HKG |
+| 50037 / 50041 | NRT |
+| 55025-55120 | TPE |
+| 55033-55039 / 55093 | SIN |
+| 55067-55069 | ICN |
+| 55071-55077 | SLC |
+
+也就是说**同一个入口机器，按端口分流到不同 CF colo**。出口地域可以用「选端口」
+来挑，而不只是选节点。这对需要特定地域出口的场景（解锁、低延迟）价值很大。
+
+**这是本项目单次最大的产能提升**：可用出口从 6 条 → 44 条，且不需要为每条线
+额外准备 root 权限的 TUN（`relay 8443 + usque --http2 -s '' -P 8443` 即可）。
+
+
+#### 落地产物：`deploy/render_h2_lines.py`（2026-11-02 18:40 渲染完成，未启用）
+
+把上面的扫描结果接进块模型。渲染器只写文件，**不启动任何进程、不 enable 任何单元**。
+
+```bash
+python3 deploy/render_h2_lines.py          # 渲染到 .warp/h2/
+python3 deploy/render_h2_lines.py --print  # 只看会渲染什么
+python3 deploy/verify_h2_render.py         # 静态校验（端口/规则/节点/设备/脚本）
+```
+
+产物（`.warp/h2/`，gitignored）：
+
+| 文件 | 内容 |
+|---|---|
+| `singbox.json` | 1 个 sing-box：N 个 `direct` 入站 + N 个节点出站 + N 条 override 规则 |
+| `conf/N.json` | 每条线一份派生设备配置，`endpoint_h2_v4` 改为 `127.0.0.1` |
+| `usque/N.sh` | `usque -c conf/N.json socks --http2 -s '' -P 2270N -b 127.0.0.1 -p 118N` |
+| `units/usque-h2-N.service` | 每条线一个系统级单元（**未 enable**） |
+| `channels.json` | 渠道 ↔ 端口 ↔ 设备 ↔ 节点台账 |
+
+端口规划：入站 `22700+i`，usque SOCKS 出口 `1180+i`（避开 `warp.members` 的 1080-1099）。
+
+**三个必须踩到的坑（都会伪装成「节点/CF 断流」）**：
+
+1. **`direct` 入站的 override 规则必须写 `"action": "route"`**。sing-box 1.13 里缺省
+   action 的规则被当作 **reject**：连接建立后立刻关，日志只有一行
+   `inbound connection from`，TLS 报 `unexpected eof while reading`，
+   usque 报 `connect-ip: failed to send request: ... EOF`。看起来像机场节点挂了，
+   实际是本机把连接拒了。加上 action 后同一节点立刻通。
+2. **不要 relay**。`direct` 入站收的就是原始 TCP，override 后经节点出站 —— 这正是
+   H2 需要的「裸 TCP 经节点」。早期版本在中间套 `tcp_relay.py`，它按 SOCKS 协议
+   连 `direct` 入站，必然 `上游失败: socks 握手失败`（`direct` 不是 SOCKS 服务）。
+3. **`usque -P` 只换端口，不换 host**。host 仍取 config 的 `endpoint_h2_v4`；
+   不改成 `127.0.0.1` 就会把 `:2270N` 拼到真实 CF IP 上（死端口），且**绕过节点直连**。
+
+**渠道选择按块轮转，不按表顺序平铺**：15 台空闲设备、22 条 H2 渠道（8 块 × 3 条/块
++ 3 条 v4-ALL）时，平铺会整块丢掉表尾的 SLC。轮转后 8 个块各至少一条：
+
+| 单元 | colo | 入口端口 | 单元 | colo | 入口端口 |
+|---|---|---|---|---|---|
+| 0 | NRT | 50037 | 8 | NRT | 50041 |
+| 1 | LAX | 50009 | 9 | LAX | 55115 |
+| 2 | SIN | 50001 | 10 | SIN | 50003 |
+| 3 | TPE | 55025 | 11 | TPE | 55027 |
+| 4 | HKG | 50013 | 12 | HKG | 50015 |
+| 5 | ORD | 50011 | 13 | ICN | 55069 |
+| 6 | ICN | 55067 | 14 | SLC | 55073 |
+| 7 | SLC | 55071 | | | |
+
+（22 条渠道去重后 19 个节点 —— v4-ALL 那 3 条与 SIN 共用节点。ORD 只有一台，
+所以第二轮里 ORD 缺席。剩余 4 条等设备释放。）
+
+**端到端实测（2026-11-02 18:32-18:38）**：LAX 线 `warp=on colo=LAX
+ip=2a09:bac1:76a0:3d0::4e8:27`；SIN 线 `warp=on colo=SIN
+ip=2a09:bac1:6500:8::1f1:1bf`；SOCKS5 UDP ASSOCIATE 正常。NRT:50037 当时
+节点整体不可达（连普通 CF 站也不通），同批 50009/50001/55025/50013/50011 全部正常
+—— 属于机场节点抖动，不是 H2 链路问题。
+
+**尚未做**：①启用任何单元；②把 H2 成员加进 `warp.members` / `.warp/warp-outbound.json`
+（端口 1180-1194 目前不在成员表里，selector 看不到）；③重新生成 `singbox-config.json`。
+### 复测方法论修正：6/44 这个数字被系统性低估了（2026-11-02 15:20-16:20）
+
+重跑筛选时暴露三个**测量 bug**，它们都在压低结果。上一版「最终 6/44」不是节点
+能力的真实上限。
+
+#### bug 1：UDP 筛选的判据漏了 UDP/443
+
+上一版用 `/tmp/screen_udp.py`，只测 `DNS 8.8.8.8:53` + `STUN(19302/3478)`，
+四项全不通才判「不转 UDP」。但**中继是按端口分流的**：同一个节点完全可能
+放行 UDP/443 而掐掉 53/3478。
+
+实测反例（`tools/screen_udp_matrix.py`，65 节点全量 120s）：
+
+```
+hk-aws-122  dns53=通   stun=不通   cf443=通(QUIC VN)
+hk-aws-54   dns53=通   stun=不通   cf443=通
+hk-aws-53   dns53=通   stun=不通   cf443=通
+```
+
+**65 个节点里 STUN 没有一台通，但 cf443 有 29 台通。** 用「STUN 通不通」当
+判据等于全部误杀。
+
+#### bug 2：SOCKS5 UDP 应答头没剥，QUIC VN 永远判不出来
+
+`warp_wg._socks_udp()` 返回的是完整 SOCKS5 UDP 报文：
+
+```
+RSV(2) FRAG(1) ATYP(1) ADDR(4) PORT(2) + DATA
+0000    00      01     a29fc602  01bb     8e000000...
+```
+
+旧代码直接看 `r[0]`，恒为 `0x00`（RSV），`r[0] & 0x80` 永远 False，于是所有
+真实回包都被标成「37B 回包」而认不出是 Version Negotiation。
+`tools/probe_udp_quic.py` 有同样的 bug。修法见 `screen_udp_matrix.strip_socks_udp()`。
+
+#### bug 3：短超时轮询会掐断正在握手的 QUIC
+
+`usque` 的 SOCKS 收到请求才触发隧道重连。用 3s 周期、8s 超时的 curl 轮询 trace，
+每次 abort 都会打断握手：
+
+```
+3s/8s 轮询   → 0/4 成功
+单发 25s     → 稳定成功（hk-aws-53 / hk-aws-122 都是）
+```
+
+另外 usque 首次 dial 常见 `timeout: no recent network activity`，失败后回到
+`Tunnel idle` 等**新的出站活动**才重连。所以要「多轮、每轮一个新请求」，
+不是「一个请求继续等」。正确做法见 `tools/colo_sweep.py`。
+
+#### 附带发现：并发会互相干扰
+
+`colo_sweep` 最初按 tag 起线程但 slot 复用，同 slot 共抢 `21000/45000/12000`
+端口 → 整批 0/29（2 个 tag 时每 worker 只一个线程，所以没暴露）。修掉端口
+冲突后仍有残留串扰：`hk-aws-53` 单独跑 3/3 成功，3 并发时失败。
+**结论：拿可信数字必须 `--workers 1`。**
+
+#### 节点能力的真实形态是「成功率」，不是「能/不能」
+
+同一节点同一设备，间隔几分钟两次测试一次成一次败（hk-aws-122 实测）。
+单次判定的置信度太低，必须多次取成功率。`tools/colo_sweep.py` 就是为此写的。
+
+新增工具（均已入库）：
+
+| 工具 | 用途 |
+|---|---|
+| `tools/screen_udp_matrix.py` | 按端口分级 UDP 能力（dns53/stun/cf443），输出 A/B/C |
+| `tools/burst_probe.py` | 连发 N 个 1200/1400B 包测回包率（验证"能不能撑隧道"） |
+| `tools/colo_sweep.py` | 建链 + 多轮长超时 trace，按成功率与 colo 汇总 |
+| `tools/tunnel_test.py` | 单节点 + 指定设备，用于分离「节点不行」和「设备不行」 |
+
+
+
+---
+
+## 附：2026-11-02 当日终局状态（更正前面若干"尚未做"）
+
+前面几节写下的时候是过程中的快照，这里给一份终局：
+
+- **H2 已全部进生产**：19 条 `WARP-H2-*` 成员，端口 1180-1198，已在
+  `warp.members` 与 `.warp/warp-outbound.json` 里，selector 可见。
+- **WG 22 条**（3 条 v4 + 19 条 v6），块模型接管分配。
+- **渠道清单以 `python3 warp_blocks.py plan` 为准**，不要相信文档里的静态数字
+  —— 它会随实测表变化。
+
+除非本文明确说"当前生效"，否则把本文当作**历史调查记录**读，
+而不是当作现状快照。

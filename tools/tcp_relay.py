@@ -39,6 +39,9 @@ def socks_connect(proxy: tuple[str, int], dst: tuple[str, int],
     r = s.recv(10)
     if len(r) < 2 or r[1] != 0:
         raise RuntimeError(f"socks connect 被拒: {r!r}")
+    # create_connection 的超时会留在 socket 上，pump 里空闲 10s 就抛
+    # TimeoutError（OSError 子类），被当成 EOF 关掉长连接。数据面必须阻塞。
+    s.settimeout(None)
     return s
 
 
@@ -58,16 +61,9 @@ def pump(a: socket.socket, b: socket.socket) -> None:
             pass
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--listen", type=int, required=True, help="本机监听端口")
-    ap.add_argument("--node-socks", type=int, required=True, help="节点 SOCKS5 端口")
-    ap.add_argument("--dst", default="162.159.192.1:443", help="CF MASQUE 端点")
-    args = ap.parse_args()
-
-    ip, _, port = args.dst.rpartition(":")
-    dst = (ip, int(port or 443))
-    proxy = ("127.0.0.1", args.node_socks)
+def serve(listen: int, node_socks: int, dst: tuple[str, int]) -> None:
+    """单端口监听。多端口由多个线程各跑一份，见 --port-map。"""
+    proxy = ("127.0.0.1", node_socks)
 
     n_ok = [0]
 
@@ -76,11 +72,12 @@ def main() -> int:
         try:
             up = socks_connect(proxy, dst)
         except Exception as e:
-            print(f"上游失败: {e}", flush=True)
+            print(f"[{listen}] 上游失败: {e}", flush=True)
             c.close()
             return
         n_ok[0] += 1
-        print(f"连接#{n_ok[0]} 来自 {peer} → 经节点 → {dst}", flush=True)
+        print(f"[{listen}] 连接#{n_ok[0]} 来自 {peer} → 经节点 → {dst}",
+              flush=True)
         t = threading.Thread(target=pump, args=(c, up), daemon=True)
         t.start()
         pump(up, c)
@@ -90,13 +87,47 @@ def main() -> int:
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", args.listen))
+    srv.bind(("127.0.0.1", listen))
     srv.listen(16)
-    print(f"relay 127.0.0.1:{args.listen} → socks {args.node_socks} → {dst}",
-          flush=True)
+    print(f"relay 127.0.0.1:{listen} → socks {node_socks} → {dst}", flush=True)
     while True:
         c, _ = srv.accept()
         threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    # 单端口（旧用法）与多端口（--port-map）二选一。多端口是为了让 N 条 H2 线
+    # 共用一个进程：每条线只要一个本地监听，44 条线不该起 44 个 python。
+    ap.add_argument("--listen", type=int, help="本机监听端口（单端口模式）")
+    ap.add_argument("--port-map", action="append", default=[],
+                    metavar="LISTEN=NODE_SOCKS",
+                    help="多端口模式，可重复；与 --listen/--node-socks 互斥")
+    ap.add_argument("--node-socks", type=int, help="节点 SOCKS5 端口")
+    ap.add_argument("--dst", default="162.159.192.1:443", help="CF MASQUE 端点")
+    args = ap.parse_args()
+
+    ip, _, port = args.dst.rpartition(":")
+    dst = (ip, int(port or 443))
+
+    if args.port_map:
+        if args.listen or args.node_socks:
+            ap.error("--port-map 与 --listen/--node-socks 不能同时用")
+        pairs = []
+        for spec in args.port_map:
+            l, _, n = spec.partition("=")
+            pairs.append((int(l), int(n)))
+        for listen, node_socks in pairs:
+            threading.Thread(target=serve, args=(listen, node_socks, dst),
+                             daemon=True).start()
+        print(f"多端口 relay：{len(pairs)} 条 → {dst}", flush=True)
+        threading.Event().wait()
+        return 0
+
+    if not args.listen or not args.node_socks:
+        ap.error("单端口模式需要 --listen 与 --node-socks")
+    serve(args.listen, args.node_socks, dst)
+    return 0
 
 
 if __name__ == "__main__":

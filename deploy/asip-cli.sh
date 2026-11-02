@@ -62,10 +62,12 @@ else
   JCTL=(journalctl --user)
 fi
 # 查询类动词不需要 root：systemctl is-active 普通用户就能问，而本机 sudoers 只放行了
-# asip-unit，走 sudo -n 会直接报"需要交互认证"，把状态打成空白。
+# asip-unit，走 sudo -n 会直接报"需要交互认证"，把状态打成空白。但 --user 不能丢：
+# 用户级部署里不带它的 is-active 查的是**系统**总线，会把每条隧道都报成 inactive。
 _sctl() {
   case "${1:-}" in
-    is-active|is-enabled|status|show) systemctl "$@" ;;
+    is-active|is-enabled|status|show)
+      if [ "$ASIP_SYSTEMD_SCOPE" = system ]; then systemctl "$@"; else systemctl --user "$@"; fi ;;
     *) "${SCTL[@]}" "$@" ;;
   esac
 }

@@ -41,25 +41,28 @@ LINE_COLO = {
 }
 
 # 段指纹：第三段(/48) + 第四段(/64) → 落地机房。由实测 colo 反推，非猜测范围。
-BAC1_RULES = [(0x3B00, 0x3B60, "NRT"), (0x6500, 0x6560, "SIN"), (0x1980, 0x19E0, "CF")]
+BAC1_RULES = [(0x3B00, 0x3B60, "NRT"), (0x6500, 0x6560, "SIN"), (0x1980, 0x19E0, "CF"),
+              (0x7400, 0x7460, "TPE"), (0x3180, 0x31E0, "HKG")]
 BAC5_RULES = [(0x4300, 0x4307, "NRT"), (0x55F8, 0x55FF, "SIN"), (0x6190, 0x6197, "PHX"),
               (0x6210, 0x6217, "SJC"), (0x1EF0, 0x1EFF, "LAX"), (0x1F00, 0x1F0F, "CFB"),
-              (0x6360, 0x636F, "OLD")]
+              (0x6360, 0x636F, "OLD"), (0x58E8, 0x58EF, "TPE"), (0x5901, 0x5904, "TPE"),
+              (0x3980, 0x3987, "HKG"), (0xA5F8, 0xA5FF, "ORD")]
 
 
 def colo_of(net: ipaddress.IPv6Network) -> str:
-    parts = [int(x, 16) for x in str(net.network_address).split(":")[:4]]
+    # exploded：第四段为 0 时 str() 把地址压缩成 "::"，拆出来是空串 →
+    # int('', 16) 抛 ValueError（bac1:31x0::/64 与 bac1:7400::/64 都命中过）。
+    parts = [int(x, 16) for x in net.network_address.exploded.split(":")[:4]]
     band, p48, p64 = parts[1], parts[2], parts[3]
     if band == 0xBAC1:
         for lo, hi, name in BAC1_RULES:
             if lo <= p48 <= hi:
                 if name == "CF":
                     return "CF"
-                if name in ("NRT", "SIN"):
-                    return name
-                # 76x0 由第四段区分：:28=SJC，其余=PHX
+                # 76x0 由第四段区分：:28=SJC，其余=PHX；其他 bac1 规则直接按表返回
                 if p48 >= 0x7680 and p48 <= 0x76E0:
                     return "SJC" if p64 == 0x28 else "PHX"
+                return name
         if 0x7680 <= p48 <= 0x76E0:
             return "SJC" if p64 == 0x28 else "PHX"
     if band == 0xBAC5:
@@ -270,6 +273,40 @@ def main() -> int:
     for c, v in s["by_colo"].items():
         print(f"  {c:<8} 段={v['segments']:>3} 封禁={v['banned_now']:>3} 可用={v['usable']:>3} /48={len(v['prefixes48'])}")
     return 0
+
+
+def colo_ban_rates(window_sec: float = 3600, now: float | None = None) -> dict[str, tuple[int, int]]:
+    """最近窗口内每个 colo 的 (样本数, 封禁数)，来源 .warp_ip_history.jsonl。
+
+    给 daemon 的「渠道被锁 → 重定位到低 ban 率 colo」用。只按地址段判 colo，
+    不看渠道归属 —— 换线目标是 colo，不是某条线。
+    """
+    now = time.time() if now is None else now
+    lo = now - float(window_sec)
+    out: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
+    for line in (BASE / ".warp_ip_history.jsonl").open(encoding="utf-8", errors="replace"):
+        try:
+            r = json.loads(line)
+            ip, t = r["ip"], float(r["t"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if t < lo or t > now:
+            continue
+        try:
+            net = ipaddress.ip_network(net64(ip)) if ":" in ip else None
+        except ValueError:
+            continue
+        if net is None:
+            continue
+        try:
+            c = colo_of(net)
+        except ValueError:
+            continue
+        d = out[c]
+        d[0] += 1
+        if r.get("b"):
+            d[1] += 1
+    return {c: (n, b) for c, (n, b) in out.items()}
 
 
 if __name__ == "__main__":

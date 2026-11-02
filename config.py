@@ -226,7 +226,7 @@ CFG = {
         # socket 放项目目录而不是 /run：/run 归 root，非 root 进程建不了目录；
         # 要用 /run 得给 unit 加 RuntimeDirectory=，部署面变大。
         # 按 PROJECT_DIR 推导，不写死家目录：换用户/换机器直接失效（实测在
-        # Ubuntu 上以 ubuntu 运行时报 Permission denied: '/home/administrator'，
+        # Ubuntu 上以 ubuntu 运行时报 Permission denied 于旧用户家目录，
         # daemon 启动即退，systemd 无限 auto-restart）。
         "socket_path": os.path.join(PROJECT_DIR, "run", "rotate.sock"),
         "token_path": os.path.join(PROJECT_DIR, "run", "api-token"),
@@ -277,6 +277,14 @@ CFG = {
             # 第 13 条就是生成成员里的普通一条，写死会得到两个同 tag 成员
             # （同一端口、同一单元、同一份设备），selector 里重复项直接报错。
             # 线路数不足 13 的部署仍需要它，见 `_append_wg_members` 末尾。
+            #
+            # 2026-11-02：H2 线路并入。与 usque/WG 的区别是**承载层**——
+            # 本地 usque 走 `--http2 -s ''` 连 `127.0.0.1:2270N`，由 sing-box
+            # 的 direct 入站经机场节点转发到 CF MASQUE 端点。对 daemon 而言
+            # 它就是一条普通 socks 出口，探测/换线/预热路径无需分叉。
+            # 端口落在 1180 段（避开 usque 的 1080-1089 与 WG 的 1110-1138）。
+            # 单元由 deploy/render_h2_lines.py 渲染，tag 里的 colo 是**实测**
+            # 落点，不是预期值（见 docs/warp-channel-allocation.md）。
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
@@ -560,6 +568,42 @@ CFG = {
         # 关掉的代价是恢复保护没了 —— 真遇到账号级配额窗口时会看到 190 次/分
         # 那一类重启风暴，那时把这里改回 True。
         "quota_hold_enabled": False,
+        # 按渠道的 ban 率锁：某条线最近 window_sec 内的模型层实测**全部**判
+        # quota/flagged（且样本数 ≥ min_samples），说明整条渠道（同 colo 全段）
+        # 都烧穿了，重启换地址不会产出，锁到次日 reset_hour 点。
+        # 2026-11-02 实测：中午后 94% 的换址记录都是 ban，89.6% 的地址首用即
+        # quota；WG-1..6 在 NRT 12 个段上 100% 烧穿，每线刷了 1200~1600 次。
+        "channel_ban_hold_enabled": True,
+        # 30min 窗口 + 2 条样本会把 WG-4/11/12 这种低流量线误锁（实测各只有
+        # 3~6 条实测）。改成 1h 窗口、且**严格大于** 30 条实测才算数 ——
+        # 低于这个量级的 100% 只是「还没被打够」，不是烧穿。
+        "channel_ban_window_sec": 3600,
+        "channel_ban_min_samples": 30,
+        # 样本还得铺满窗口的一半。只数条数时实测 31 条只用了 4.7 分钟就锁了
+        # 17 条线 —— 那是「连撞 31 次」，不是「持续一小时都没产出」。
+        "channel_ban_min_cover_ratio": 0.5,
+        "channel_ban_reset_hour": 8,
+        # 命中后不只是停刷：把这条线换到最近 1h ban 率最低的 colo 上重定位，
+        # 次日 08:00 再换回原节点（`rehome_from`）。
+        "channel_rehome_enabled": True,
+        # 目标 colo 至少要有这么多条样本才配当「最低 ban 率」，否则单向 3 条
+        # 零封禁的 colo 会把整批线吸过去。
+        "channel_rehome_min_samples": 10,
+        # 重定位的目标必须落在**这个块里还有节点**的 colo 上：`wg_colo_map.json`
+        # 对远端常常是空/过期（survey 只在 bootstrap 里跑一次），此时候选表
+        # 只剩历史封禁率，挑出来的 colo 可能根本没节点可换。
+        "channel_rehome_require_nodes": True,
+        # 同块节点轮回（2026-11-02 主人定）：脏线守护每轮先看**当前绑定的落地
+        # 节点**还通不通，不通就换到同一个 colo 块里的可用节点再重启。
+        # 与「换线」和「探测」是两件事：换线换出口 IP、探测判 IP 质量，这里只
+        # 判节点本身。WHY 必须独立成一路：`validate_bindings` 只在节点从订阅池
+        # 里消失时才换（节点还在但已经不通就不管），`_restart_warp_line(rebind)`
+        # 只覆盖 v4 线 —— v6 线的节点死掉后 daemon 会一直重启一条注定连不上的线。
+        "node_rotation_enabled": _env_bool("ASIP_NODE_ROTATION", True),
+        # 同一条线两次节点探测的最小间隔。探测 = 起一个 sing-box 进程再连一次，
+        # 5s 一轮 × 29 条线会把机器打满；而节点死亡不是秒级状态。单次不通只记
+        # 一笔，下一轮复查仍不通才换 —— 机场抖动与探测冷启都会让单次探测失败。
+        "node_rotation_interval_sec": 60,
         "restart_concurrency": 12,
         "ip_observe_sec": 120,
         # fixed 模式的提前量：换线从发起到达生效 p50=2s / p90=7s，等满
@@ -665,6 +709,12 @@ CFG = {
                 {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None},
                 {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None},
                 {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None},
+                # 2026-11-02 H2 实测新增（dormant 65 节点里首次出现）。
+                # carrier=proxy：H2 与 WG-over-UDP 同属「代理承载」，区别只在
+                # 传输层（TCP/HTTP2 vs UDP/WireGuard），不改变块的归类。
+                # ban_rate=None：段池从没在生产台账里出现过，夜间必须保留。
+                {"colo": "ICN", "loc": "首尔",     "carrier": "proxy",  "ban_rate": None},
+                {"colo": "SLC", "loc": "盐湖城",   "carrier": "proxy",  "ban_rate": None},
                 {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None,
                  # PIT 没有自己的节点：唯一落到过 PIT 的是 ORD 那条
                  # `us.bing.com:443~6-any`（5 轮里 ORD 7 / PIT 3 / SIN 1）。
@@ -752,6 +802,40 @@ def _append_wg_members(cfg: dict) -> None:
 
 
 _append_wg_members(CFG)
+
+def _append_h2_members(cfg: dict) -> None:
+    """H2 线路并入 members（仅渲染产物存在时）。
+
+    成员的唯一事实来源是 `.warp/h2/channels.json` —— 它是
+    `deploy/render_h2_lines.py` 按块模型 + 设备占用算出来的台账。手抄进
+    `config.py` 必然与渲染产物漂移：改渠道数/换设备后，配置里的端口会指向
+    已经不存在的线，daemon 探测全失败却看不出原因。
+
+    文件不存在（未渲染过）时什么都不做，行为回到旧版。
+    """
+    import json
+    p = os.path.join(PROJECT_DIR, ".warp", "h2", "channels.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            rows = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(rows, list):
+        return
+    for r in rows:
+        try:
+            cfg["warp"]["members"].append({
+                "tag": r["member_tag"],
+                "port": int(r["socks_port"]),
+                "service": r["unit"],
+                "kind": "h2",
+                "index": int(r["index"]),
+                "colo": r["colo"],
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+
+_append_h2_members(CFG)
 
 # ============= 便捷常量 =============
 # ponytail: SINGBOX_SECRET 不在此导出为模块级常量——CFG["singbox"]["secret"] 是 import 时冻结的
