@@ -4179,6 +4179,40 @@ def _quota_hold_skips(tag: str, reason: str) -> bool:
     return True
 
 
+# 单元是否在跑的缓存：{tag: (是否在跑, 检查时刻)}。
+# `systemctl is-active` 每次约 5~15ms，而 prober 每秒遍历全部成员，直接调会把
+# 主循环拖慢；缓存 60s 足够 —— 单元被启停是人工操作，不需要秒级感知。
+_UNIT_RUNNING_CACHE: dict[str, tuple[bool, float]] = {}
+_UNIT_RUNNING_TTL = 60.0
+
+
+def _warp_member_unit_running(member: dict, now: float) -> bool:
+    """该成员对应的 systemd 单元此刻是否在跑。
+
+    WHY 要判这个：`config.py` 的 members 是**声明**，不等于**在跑**。
+    实测 usque-warp-c/g/h/i 四条是 disabled（2026-10-28 缩容时把设备让给了
+    H2），但 members 里仍留着它们。prober 照样每秒探一次，每次都探不到出口，
+    `fail_streak` 累积到 14 万~22 万，日志刷「连续 223495 次取不到出口地址」，
+    把真正的故障埋掉。
+
+    H2 线同理：`usque-h2-*.service` 没装时探它只是白烧一次 socks 连接。
+    """
+    svc = member.get("service")
+    if not svc:
+        return True                      # 没有单元概念（理论上不该出现），照旧探
+    hit = _UNIT_RUNNING_CACHE.get(svc)
+    if hit and now - hit[1] < _UNIT_RUNNING_TTL:
+        return hit[0]
+    try:
+        r = subprocess.run(["systemctl", "is-active", svc],
+                           capture_output=True, text=True, timeout=5)
+        running = r.stdout.strip() == "active"
+    except (OSError, subprocess.TimeoutExpired):
+        running = True                   # 查不到就按在跑处理，不能因为查询失败停探
+    _UNIT_RUNNING_CACHE[svc] = (running, now)
+    return running
+
+
 def _warp_prober_loop() -> None:
     while True:
         now = time.time()
@@ -4186,6 +4220,8 @@ def _warp_prober_loop() -> None:
         due: list[tuple[float, dict]] = []
         for m in _warp()["members"]:
             tag = m["tag"]
+            if not _warp_member_unit_running(m, now):
+                continue
             with _WARP_LINE_CV:
                 if tag in _WARP_PROBING:
                     continue

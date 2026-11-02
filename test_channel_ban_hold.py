@@ -574,6 +574,43 @@ def test_quota_verdict_does_not_accumulate_fail_streak():
     assert daemon._WARP_LINE_STATE[tag]["fail_streak"] == 0, "OK 必须清零"
 
 
+def test_prober_skips_members_whose_unit_is_not_running():
+    """members 是声明，不等于在跑。
+
+    实测 usque-warp-c/g/h/i 是 disabled（设备让给了 H2），但 members 里仍留着。
+    prober 照样每秒探，每次探不到出口，`fail_streak` 累积到 22 万，日志刷
+    「连续 223495 次取不到出口地址」，把真故障埋掉。
+    """
+    _reset()
+    daemon._UNIT_RUNNING_CACHE.clear()
+    orig = daemon.subprocess.run
+
+    class _R:
+        def __init__(self, out): self.stdout = out
+
+    def fake_run(cmd, **kw):
+        svc = cmd[-1]
+        return _R("inactive\n" if svc in ("usque-warp-c.service",
+                                          "usque-warp-g.service") else "active\n")
+
+    daemon.subprocess.run = fake_run
+    try:
+        now = time.time()
+        assert not daemon._warp_member_unit_running(
+            {"tag": "WARP-CF-C", "service": "usque-warp-c.service"}, now)
+        assert daemon._warp_member_unit_running(
+            {"tag": "WARP-CF", "service": "usque-warp.service"}, now)
+        # 缓存生效：第二次不再调 systemctl
+        calls = []
+        daemon.subprocess.run = lambda cmd, **kw: calls.append(cmd) or _R("active\n")
+        daemon._warp_member_unit_running(
+            {"tag": "WARP-CF-C", "service": "usque-warp-c.service"}, now + 1)
+        assert not calls, "60s 内应走缓存，不重复调 systemctl"
+    finally:
+        daemon.subprocess.run = orig
+        daemon._UNIT_RUNNING_CACHE.clear()
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
