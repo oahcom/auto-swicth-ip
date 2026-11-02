@@ -917,12 +917,16 @@ usque 的 H2 实现本身没写错（我们补的 `:protocol` 是必要且正确
 ## ⚠️ 复现 H2 路线测试前必读
 
 2026-11-02 事故：为测本文的 H2 路线，把 warp 切成 `operation_mode=Warp` 且
-`override_warp_endpoint=127.0.0.1:443`，warp 建 `loopback0` 并把
-`ipproto tcp/udp` 全量导进不存在的 `169.254.73.249`，本机 TCP/UDP 出网
-（含局域网）**全部黑洞**，9router 全线 503，且 `warp-svc` 是 enabled 导致
-重启电脑后立刻复发。
+`override_warp_endpoint=127.0.0.1:443`，warp 建全局 TUN、接管整机路由，
+本机 TCP/UDP 出网（含局域网）**全部黑洞**，9router 全线 503。
+`warp-svc` 当时是 `enabled`，导致重启电脑后立刻复发。
 
-完整排查、修复命令与教训见
+事故实际是**两个独立故障叠加**：除上述 warp 劫持外，还有 WSL mirrored
+**端口镜像整体失效**（WSL 内服务正常、宿主机 `netstat` 看不到任何监听端口），
+后者才是「9router 没起来」的直接原因，只能靠 `wsl --shutdown` 恢复。
+
+完整排查、修复命令与 8 条教训见
 [`incident-20261102-9router-network-blackhole.md`](./incident-20261102-9router-network-blackhole.md)。
 
 **测试 warp 一律在独立 netns 内做**，不要在主 netns 切 `mode warp`。
+**执行 `wsl --shutdown` 前先确认没有 `claude`/`codex` 交互会话**，它会一并杀掉。
