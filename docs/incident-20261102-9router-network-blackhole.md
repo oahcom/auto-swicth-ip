@@ -281,3 +281,84 @@ _, errors_after_switch, *_ = get_9router_error_rate(...)
 8. **不要急着下"根因已确认"的结论**。本次三个错误结论（loopback0 是残留、
    12:12 已修好、warp 是唯一原因）都是因为只验证了一半就收工。
    症状消失 ≠ 根因排除，要能解释**每一条**观测到的现象。
+
+## 复发（2026-11-02 14:34 → 15:10）：`restart warp-svc` 会自己把配置写回 `Warp`
+
+**这是故障 A 的完整复发，且触发者是我自己。**
+
+### 触发链
+
+1. 14:33 前后我在收尾时执行了一次 `sudo systemctl restart warp-svc`
+   （sudoers 日志：`COMMAND=/usr/bin/systemctl restart warp-svc`，`PWD=/home/administrator`）。
+2. 14:34:37 `warp-svc` 重启成功；14:34:41 立刻收到
+   `handle_state_request{state_request=SetAlwaysOn { always_on: true }}`。
+3. 同一个 pid 把 `settings.json` 重写成 `operation_mode=Warp` +
+   `override_warp_endpoint=127.0.0.1:443` + `masque_settings=h2_only`
+   （文件 mtime `14:34:41.286`，与上一条日志同秒）。
+4. 全局 TUN 生效 → 出网黑洞。14:38 用户报「9router 又炸了」。
+
+### 为什么 `disable` 挡不住
+
+`systemctl disable` 只删开机自启，**不阻止手动 `restart`**。
+`warp-svc` 进程只要被启动一次，就会把注册态里的 `always_on` 重新应用到
+`settings.json`——所以「先 disable、再改配置」的顺序是错的：
+**改完配置后任何一次误启动都会把 `Warp` 模式复活。**
+
+### 判据（30 秒内可确认）
+
+```bash
+systemctl is-active warp-svc          # active = 已经在跑，危险
+warp-cli --accept-tos status          # "Connecting / happy eyeballs to 127.0.0.1:443"
+warp-cli --accept-tos settings | grep -E "Mode|endpoint"
+#   Mode: Warp + Override WARP endpoint: 127.0.0.1:443  → 就是这个故障
+ip -o link show | grep -E "tun|Cloudflare"            # 有 tun 就是全局劫持已生效
+ping -c2 -4 223.5.5.5                                 # 100% loss 即坐实
+```
+
+注意 `loopback0` 一直在，**它不是判据**（见「重要更正」）。
+
+### 修复（本次实际执行，2 分钟恢复）
+
+```bash
+sudo cp -a /var/lib/cloudflare-warp/settings.json \
+           /var/lib/cloudflare-warp/settings.json.bak-$(date +%H%M%S)
+sudo systemctl stop warp-svc
+sudo systemctl disable warp-svc
+sudo python3 - <<'PY'
+import json
+p = "/var/lib/cloudflare-warp/settings.json"
+d = json.load(open(p))
+d["operation_mode"] = "WarpProxy"
+d.pop("override_warp_endpoint", None)
+d.pop("masque_settings", None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+systemctl is-active warp-svc && systemctl is-enabled warp-svc   # 必须 inactive + disabled
+```
+
+停 `warp-svc` 后**不需要重启 9router**：它的请求走 `127.0.0.1:7890`（sing-box），
+出网一恢复，在途请求下一轮就成功。本次 15:10:52 自动出现
+`Model succeeded / DONE 10535ms`，没有动过 nine-router-src。
+
+### 本次验证（两边都测了）
+
+```
+WSL:   nine-router-src active/enabled   auto-switch-ip active/enabled   warp-svc inactive/disabled
+       mode=WarpProxy  override_warp_endpoint=<absent>
+       curl baidu=200   via 7890=200   ping -4 223.5.5.5 0% loss
+Windows: GET http://localhost:20127/api/health → 200 (0.21s)
+         GET http://localhost:20127/           → 307
+9router 日志: [15:10:52] Model oc/deepseek-v4.1-flash-free succeeded
+             [15:10:54] DONE 10535ms · TTFT 8509ms · OUT 253
+```
+
+### 新增教训
+
+9. **不要把 `restart warp-svc` 当无害操作**。它会把 `settings.json` 里被手工改好的
+   `WarpProxy` 覆盖回 `Warp`（因为注册态 `always_on=true` 会被重放）。
+   要读 warp 状态用 `warp-cli status/settings`，**不要重启它的服务**。
+10. **`disable` ≠ 不可启动**。真正的护栏是「不碰 + 改完配置后复核
+    `is-active`」，必要时用 `systemctl mask warp-svc` 彻底锁死。
+11. **`[HTRANSPORT] sidecar unavailable` 这类文案不要照字面信**。本次同时叠加了
+   两个独立现象：出网黑洞（真因）+ sidecar 报错（表象）。出网修好后
+   503 自动消失，sidecar 一行代码都没改——`bun` 一直是好的 Linux ELF 1.4.4。
