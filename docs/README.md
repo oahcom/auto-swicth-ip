@@ -137,6 +137,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文档 | 内容 |
 |---|---|
+| `deploy/remote-deploy.sh` | **一键复刻本机拓扑到远端**（代码/状态表/设备/单元/验收） |
 | [ops-20261028-security-changes.md](ops-20261028-security-changes.md) | 安全变更操作记录 |
 | [9router-task-book-20261028.md](9router-task-book-20261028.md) | 9router 任务书 |
 | [9router-dev-logic-20261028.md](9router-dev-logic-20261028.md) | 9router 开发逻辑（已不存在于本项目的 proxy-global.js 那一层） |
@@ -170,6 +171,10 @@ python3 warp_diag.py --job job.json --out result.jsonl --rounds 2 --family v6
 
 # 重新布线
 python3 -c "import warp_wg; warp_wg.apply(count=22, publish=True)"
+
+# 把本机拓扑复刻到远端（先 --dry-run 看会执行什么）
+./deploy/remote-deploy.sh user@host --dry-run
+./deploy/remote-deploy.sh user@host --port 22
 
 # 重启 daemon
 sudo systemctl restart auto-switch-ip.service
