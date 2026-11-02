@@ -26,6 +26,11 @@ import daemon
 
 W = config.CFG["warp"]
 
+def _sync_submit_once(key, fn, *a):
+    """同步执行：本文件测的是锁/还原逻辑，不是线程模型。"""
+    fn(*a)
+    return True
+
 def _reset():
     W["channel_ban_hold_enabled"] = True
     W["channel_ban_window_sec"] = 3600
@@ -33,6 +38,11 @@ def _reset():
     W["channel_ban_reset_hour"] = 8
     daemon._WARP_LINE_STATE.clear()
     daemon._NIGHT_LOG_TS.clear()
+    # `_channel_ban_note` 命中时会 `_submit_once("channel-rehome", ...)` 起一个
+    # **后台线程**。测试里不拦它，它就会挑下一个测试跑在半路时才落地，用那个
+    # 测试的 stub 写台账 —— 表现为「跑 5 次有 1 次红」。改成同步执行：本文件
+    # 要测的是锁/还原逻辑本身，不是那个线程模型。
+    daemon._submit_once = _sync_submit_once
 
 # ---- 时间算术 ----
 def test_hold_secs_until_next_8am():
@@ -56,12 +66,16 @@ def test_window_trims_and_counts():
 def test_needs_strictly_more_than_30_samples():
     _reset()
     now = 1_000_000.0
-    # 样本铺满窗口（每分钟一条），否则会被「铺满窗口」那条判据挡掉。
-    full = lambda k: [(now - i * 60, True) for i in range(k)]
+    # 跨度必须 ≥ 1800s 才过得了「铺满窗口」那条判据，否则测的永远是 cover，
+    # 条数判据根本没被执行到 —— 用间隔 63s 让 30 条铺满 1827s。
+    full = lambda k, step=63: [(now - i * step, True) for i in range(k)]
     assert daemon._channel_ban_hold_hit(full(30), now) is False, "恰好 30 条不锁（严格大于）"
     assert daemon._channel_ban_hold_hit(full(31), now) is True, "31 条全封且铺满应锁"
-    W["channel_ban_min_samples"] = 1
-    assert daemon._channel_ban_hold_hit(full(31), now) is True
+    # 同一批样本把阈值降到 29 必须变 True：证明上面那个 False 来自条数判据，
+    # 而不是被 cover 判据顺手挡掉的。
+    W["channel_ban_min_samples"] = 29
+    assert daemon._channel_ban_hold_hit(full(30), now) is True
+    W["channel_ban_min_samples"] = 30
 
 def test_burst_does_not_lock():
     """31 条挤在 4.7 分钟里不算「持续一小时」——实测 19:43 那批 17 条线就是这样锁的。"""
@@ -385,6 +399,76 @@ def test_switch_off_releases_existing_holds():
         W["channel_ban_hold_enabled"] = True
         _rehome_restore(orig)
 
+def test_restore_failure_keeps_home_and_retries():
+    """还原时重启失败不能清 home —— 那是这条线唯一的回程记录。
+
+    清了之后进程仍跑在临时 colo 上，台账却以为已经回家，永远不会再试。
+    """
+    _reset()
+    orig = _rehome_env()
+    now = time.time()
+    calls = []
+    orig_one = daemon._rehome_one
+    daemon._rehome_one = lambda t, n: (calls.append(n), "ok")[1]
+    daemon.restart_ok = False
+    try:
+        daemon._warp_line_update("WARP-WG-4", ban_hold_until=now - 1,
+                                 ban_hold_home="n-old", ban_hold_node="n-la")
+        daemon._rehome_held_lines(now)
+        st = daemon._WARP_LINE_STATE["WARP-WG-4"]
+        assert st["ban_hold_home"] == "n-old", "重启失败时必须保留 home"
+        daemon._rehome_held_lines(now + 1)
+        assert calls == ["n-old", "n-old"], f"下一轮必须重试，实际 {calls}"
+    finally:
+        daemon._rehome_one = orig_one
+        _rehome_restore(orig)
+
+def test_restore_clears_window_so_it_does_not_relock():
+    """还原后必须清 ban_window。
+
+    不清的话，解封前那小时攒的样本还在，08:00 之后再记一条就直接锁到下一个
+    08:00 —— 「锁一天」退化成「永久锁定」（已复现：31 条 → 1 条 → 重锁）。
+    """
+    _reset()
+    orig = _rehome_env()
+    now = time.time()
+    try:
+        for i in range(31):
+            daemon._channel_ban_note("WARP-WG-4", True, now - 1800 + i * 60)
+        st = daemon._WARP_LINE_STATE["WARP-WG-4"]
+        assert st["ban_hold_until"] > now, "31 条应锁上"
+        st["ban_hold_home"] = "n-old"
+        st["ban_hold_node"] = "n-la"
+        st["ban_hold_until"] = now - 1
+        daemon._rehome_held_lines(now)
+        assert not daemon._WARP_LINE_STATE["WARP-WG-4"]["ban_window"], "还原后窗口必须清空"
+        daemon._channel_ban_note("WARP-WG-4", True, now + 60)
+        assert daemon._WARP_LINE_STATE["WARP-WG-4"]["ban_hold_until"] <= now + 60, \
+            "一条新样本不该把整条线重新锁一天"
+    finally:
+        _rehome_restore(orig)
+
+def test_non_wg_line_does_not_consume_target():
+    """非 WG 线不参与重定位，也不该白占候选节点。"""
+    _reset()
+    orig = _rehome_env()
+    try:
+        member_orig = daemon._warp_member
+        daemon._warp_member = lambda t: (
+            {"tag": t, "kind": "h2", "index": 1, "service": "x.service"}
+            if t == "WARP-H2-ORD-9" else
+            {"tag": t, "kind": "wg", "index": 4, "family": "v6",
+             "service": "warp-wg-4.service"})
+        now = time.time()
+        daemon._warp_line_update("WARP-H2-ORD-9", ban_hold_until=now + 3600)
+        n = len(daemon._rehome_calls)
+        daemon._rehome_held_lines(now)
+        assert len(daemon._rehome_calls) == n, "H2 线不该写配置"
+        assert "n-la" not in daemon._ledger.values()
+        daemon._warp_member = member_orig
+    finally:
+        _rehome_restore(orig)
+
 def test_tunnel_dead_restart_bypasses_hold():
     """拿不到出口地址是隧道故障，渠道锁不该拦。"""
     _reset()
@@ -456,6 +540,38 @@ def test_health_pool_accepts_a_full_subscription():
     for f in futs:
         f.result(timeout=30)
     assert len(got) == n, f"只跑了 {len(got)}/{n} 个"
+
+
+def test_quota_verdict_does_not_accumulate_fail_streak():
+    """`fail_streak` 只统计「拿不到出口地址」，不是「地址被封」。
+
+    它唯一的消费点是 `_probe_warp_line` 里「连续 N 次取不到出口地址 → 隧道
+    半死 → 重启」的判据。quota/blocked 说明隧道完全正常、只是这个地址被限流，
+    累加进去会让健康线路被反复重启，日志还写「连续 2457 次取不到出口地址」
+    —— 实测 WARP-WG-17 就是这样，与事实相反。
+    """
+    _reset()
+    tag = "WARP-WG-17"
+    now = time.time()
+
+    # 连续 30 次 quota：隧道每次都拿到了出口地址，不该被算成「取不到地址」
+    for i in range(30):
+        daemon._warp_line_record_observation(
+            tag, f"2a09:bac1:76c0:3d0::{i:x}", "quota", now + i, now + i)
+    st = daemon._WARP_LINE_STATE[tag]
+    assert st["fail_streak"] == 0, (
+        f"quota 不该累加 fail_streak，实际 {st['fail_streak']}")
+    assert st["ip"], "quota 结论下出口地址仍要记下来（隧道是通的）"
+
+    # unknown 才累加：这才是「拿不到出口地址」
+    for i in range(3):
+        daemon._warp_line_record_observation(tag, None, "unknown", now + 100 + i, now + 100 + i)
+    assert daemon._WARP_LINE_STATE[tag]["fail_streak"] == 3, "unknown 必须累加"
+
+    # 任何一次 OK 都要清零
+    daemon._warp_line_record_observation(
+        tag, "2a09:bac1:76c0:3d0::ff", "OK", now + 200, now + 200)
+    assert daemon._WARP_LINE_STATE[tag]["fail_streak"] == 0, "OK 必须清零"
 
 
 if __name__ == "__main__":

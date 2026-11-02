@@ -3083,15 +3083,28 @@ def _rehome_held_lines(now: float | None = None) -> None:
             r = _rehome_one(tag, str(home))
             # "skip" 也算结束：非 WG 线没有可换的落地节点，重试一万次同一个答案。
             if r in ("ok", "gone", "skip"):
-                _warp_line_update(tag, ban_hold_home=None, ban_hold_node=None,
-                                  ban_hold_ready=0.0)
+                ok = True
                 if r == "ok":
-                    if member:
-                        _warp_line_restart(member, "渠道锁到期还原", rebound=True)
-                    log(f"  ⇢ {tag} 渠道锁到期，落地节点还原为 {home}")
-                elif r == "gone":
-                    # 原节点已不在订阅/UDP 池里，还原只会写出连不上的配置。
-                    log(f"  ⚠ {tag} 原节点 {home} 已不可用，放弃还原，保留当前节点")
+                    ok = (bool(member)
+                          and _warp_line_restart(member, "渠道锁到期还原",
+                                                 rebound=True))
+                # 重启没成功就不能清 home：它是这条线停在临时 colo 上的唯一
+                # 记录。清了之后进程仍跑新节点，台账却以为已经回家，永远
+                # 不会再试。留到下一分钟再还原（`_rehome_one` 是幂等的）。
+                if ok:
+                    # **必须一起清 `ban_window`**：不清的话，解封前那一小时
+                    # 攒的 31 条样本还在，08:00 之后再记一条就直接重新锁到
+                    # 次日 08:00 —— "锁一天" 退化成 "永久锁定"。
+                    # 实测复现：31 条样本 → 还原 → 再记 1 条 → 立刻锁到次日。
+                    _warp_line_update(tag, ban_hold_home=None, ban_hold_node=None,
+                                      ban_hold_ready=0.0, ban_window=[])
+                    if r == "ok":
+                        log(f"  ⇢ {tag} 渠道锁到期，落地节点还原为 {home}")
+                    else:
+                        log(f"  ⚠ {tag} 原节点已不可用，放弃还原，保留当前节点")
+                else:
+                    log(f"  ⚠ {tag} 渠道锁到期，但还原重启未成功，"
+                        f"下轮重试（原节点 {home}）")
             continue
         if want:
             used.add(str(want))
@@ -3109,14 +3122,19 @@ def _rehome_held_lines(now: float | None = None) -> None:
             continue
         if home:
             continue
+        # 非 WG 线（CF/H2）没有可换的落地节点，`_rehome_one` 只会返回 "skip"。
+        # 先问再取目标：不然它们每轮都白扫 11.9MB 历史（实测单次 222ms），
+        # 而且 `skip` 时 home 仍是 None，下轮又重来 —— 永不收敛。
+        if not member or member.get("kind") != "wg" or not member.get("index"):
+            continue
         target = _channel_rehome_target(now, used)
         if target is None:
             continue
         colo, node = target
-        used.add(node)
         origin = _line_node(tag) or node
         r = _rehome_one(tag, node)
         if r == "ok":
+            used.add(node)          # 写成功才占位；"gone"/"err" 没落地，不该占
             _warp_line_update(tag, ban_hold_home=origin, ban_hold_node=node,
                               ban_hold_ready=0.0)
             ok = bool(member) and _warp_line_restart(member, "渠道重定位",
@@ -3162,6 +3180,14 @@ def _rehome_one(tag: str, node: str | None) -> str:
         return "ok"
     except Exception as e:
         log(f"  ✗ 渠道重定位 {tag} -> {node} 失败: {e}")
+        return "err"
+    except SystemExit as e:
+        # `warp_wg.load_nodes()` 在读不到 singbox-config.json 时 raise SystemExit
+        # （BaseException，上面那个 except Exception 接不住）。它会顺着
+        # `_rehome_held_lines` / `_node_rotation_pass` 一路冒出线程的
+        # `except Exception`，把 warp-node-rotation 线程**永久打死**，
+        # `_start_node_rotation` 只启动一次、没有自愈。
+        log(f"  ✗ 渠道重定位 {tag} -> {node} 失败（配置不可读）: {e}")
         return "err"
 
 
@@ -3341,6 +3367,11 @@ def _node_rotation_pass(now: float | None = None) -> None:
                     continue
                 _NODE_FAILS[tag]["why"] = "节点 TCP 通但拿不到出口地址(UDP 不通)"
             else:
+                # 节点通、出口也有：这条线是健康的，把上一轮的观察计数清掉。
+                # 不清的话，一次「TCP 通但没出口」留下的 n=1 会一直躺着，下一
+                # 次只要再来一次失败就直接凑够 3 轮换节点 —— 实测 WG-8 在
+                # 22:30 与 23:11 两次换节点，而全日志「首次探测不通」只有 1 条。
+                _NODE_FAILS.pop(tag, None)
                 _NODE_NEXT_CHECK[tag] = now + interval
                 continue
         # 第一次判死只记一笔，下一轮再探：单次失败可能是机场抖动或探测冷启。
@@ -3605,7 +3636,16 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
         else:
             st["last_ok_ts"] = 0.0
             st["last_ok_ip"] = None
-            st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+            # `fail_streak` 只统计 **拿不到出口地址**（unknown）。它的唯一消费点
+            # 是 `_probe_warp_line` 里「连续 N 次取不到出口地址 → 隧道半死」的
+            # 重启判据，而 quota/blocked 说明隧道**完全正常**、只是这个地址被封。
+            # 旧实现无条件累加，实测 WARP-WG-17 因此涨到 2457（它每次都拿到出口
+            # 地址、每次都判 quota），日志写「连续 2457 次取不到出口地址」，
+            # 与事实相反 —— 真故障反而被这堆噪声埋掉。
+            if verdict == "unknown":
+                st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+            else:
+                st["fail_streak"] = 0
             # 非 OK 结论一律回到固定节奏：惩罚期与持久重探地板只说明
             # 「这个地址大概还不能用」，是观测的输入，不是停止观测的理由。
             # unknown（连出口 IP 都没拿到）单独用 _line_unknown_retry()：
