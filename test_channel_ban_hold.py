@@ -433,6 +433,31 @@ def test_malformed_state_does_not_crash_loader():
     assert daemon._channel_ban_label(now) == "无", "健康行也不能因此抛异常"
 
 
+def test_health_pool_accepts_a_full_subscription():
+    """首轮健康检查一次性提交全部节点，不能被队列深度截断。
+
+    节点数随订阅增长（2026-11-03 实测 122 个），而队列原先按 worker 数推导
+    （60×2=120）—— 启动那一秒固定丢 2 个，节点延迟表就缺两条。
+    """
+    n = 160
+    assert daemon._health_pool._sem._value >= n, (
+        f"健康池队列深度 {daemon._health_pool._sem._value} < 节点数 {n}，"
+        "首轮会丢任务")
+    got = []
+    lock = __import__("threading").Lock()
+
+    def fake(node):
+        time.sleep(0.001)
+        with lock:
+            got.append(node)
+
+    futs = [daemon._health_pool.submit(fake, f"n{i}") for i in range(n)]
+    assert all(f is not None for f in futs), "有任务被丢弃"
+    for f in futs:
+        f.result(timeout=30)
+    assert len(got) == n, f"只跑了 {len(got)}/{n} 个"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

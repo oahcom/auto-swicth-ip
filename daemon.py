@@ -996,12 +996,17 @@ _health_check_future = None
 _health_check_nodes = None
 _health_check_current = None
 class _BoundedPool:
-    """有界线程池：队列深度 ≤ max_workers*2，防止 Clash API 挂起队列暴涨 OOM。
-    非阻塞：队列满时丢弃任务并记录警告，不阻塞 asyncio 事件循环。"""
+    """有界线程池：队列深度默认 max_workers*2，防止 Clash API 挂起队列暴涨 OOM。
+    非阻塞：队列满时丢弃任务并记录警告，不阻塞 asyncio 事件循环。
+
+    `queue` 单独可调：首轮健康检查会在**同一瞬间**提交全部机场节点，而节点数
+    随订阅增长（实测 2026-11-03 已到 122 个）。队列深度按 worker 数推导时，
+    122 个任务打 120 个名额，启动那一秒固定丢 2 个，节点延迟表就缺两条。
+    """
     __slots__ = ('_executor', '_sem', '_name')
-    def __init__(self, max_workers: int, name_prefix: str):
+    def __init__(self, max_workers: int, name_prefix: str, queue: int | None = None):
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=name_prefix)
-        self._sem = threading.Semaphore(max_workers * 2)
+        self._sem = threading.Semaphore(queue if queue is not None else max_workers * 2)
         self._name = name_prefix
     def submit(self, fn, /, *args, **kwargs):
         # 非阻塞获取：队列满时返回 None 而非阻塞事件循环
@@ -1015,7 +1020,9 @@ class _BoundedPool:
         self._executor.shutdown(wait=wait)
 
 # 增加 worker 数和队列深度：支持并发测试 90+ 节点不丢任务
-_health_pool = _BoundedPool(max_workers=60, name_prefix="health")
+# 队列给到 4×worker：首轮会把订阅里的**全部**节点一次性提交，队列深度必须
+# 覆盖节点数而不是 worker 数的倍数。256 对当前 122 个节点留了一倍余量。
+_health_pool = _BoundedPool(max_workers=60, name_prefix="health", queue=256)
 _io_pool = _BoundedPool(max_workers=8, name_prefix="io")
 
 _BG_BUSY: set[str] = set()
