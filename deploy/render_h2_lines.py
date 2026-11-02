@@ -81,6 +81,30 @@ def h2_channels() -> list[dict]:
             ch["carrier"] = "h2"
             ch["colo_measured"] = meta.get("colo")
             out.append(ch)
+    # 台账兜底：`.warp/h2/channels.json` 是**已投产**的渠道 ↔ 设备 ↔ 端口分配。
+    # 块模型从 block-map 里筛 h2 会随实测表漂移（`merge_h2_blockmap` 只往原有
+    # 条目里塞 `h2` 字段，不覆盖 `carrier`），于是同一份台账在某个时点重渲染会
+    # 得到 0 条。台账存在时以台账为准 —— 它记录的是线上正在跑的那 19 条。
+    if not out:
+        ledger_path = PROJECT / ".warp" / "h2" / "channels.json"
+        if ledger_path.exists():
+            try:
+                saved = json.loads(ledger_path.read_text())
+            except (OSError, ValueError):
+                saved = []
+            for row in saved:
+                out.append({
+                    "tag": row.get("channel"),
+                    "node": row.get("node"),
+                    "colo": row.get("colo"),
+                    "colo_measured": row.get("colo"),
+                    "carrier": "h2",
+                    "index": row.get("index", 0),
+                    "family": "v4",
+                    "_saved_device": row.get("device"),
+                })
+            print(f"块模型未筛出 h2 渠道，改用台账 {len(out)} 条"
+                  f"（.warp/h2/channels.json）", file=sys.stderr)
     # v4 块（colo=ALL）没有自己的节点，节点与 SIN 那三条重复，排最后。
     out.sort(key=lambda c: (c["index"], blk_pos.get(c["colo"], len(table))))
     return out
@@ -170,7 +194,9 @@ def render(print_only: bool = False) -> int:
 
     inbounds, outbounds, rules, ledger = [], [], [], []
     for i, ch in enumerate(picked):
-        dev = devs[i]
+        # 台账里已有的分配优先（设备 / 端口编号必须与既有部署一致，否则
+        # `WARP-H2-<colo>-<i>` 成员会整体平移，daemon 的台账按 tag 记账全错位）。
+        dev = ch.get("_saved_device") or devs[i]
         inbound_port = BASE_INBOUND + i
         socks_port = BASE_DEVICE_PORT + i
         tag = ch["node"]

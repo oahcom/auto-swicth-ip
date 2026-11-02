@@ -121,7 +121,9 @@ _wg_count = len(_WG_FAMILIES) * _WG_HOME_NODES
 CFG = {
     "9router": {
         "db_path": _env_path("NINE_ROUTER_DB_PATH", os.path.join(HOME_DIR, ".9router/db/data.sqlite")),
-        "base": "http://127.0.0.1:20127",
+        # 监听口随部署而异（本机 20127、云端 20128）。写死会让健康检查在换部署
+        # 时永远失败，而症状是「9router 不可达」而不是「端口配错」。
+        "base": _env_path("NINE_ROUTER_BASE", "http://127.0.0.1:20127"),
     },
     # 9router 流量观测开关（重启 daemon 生效）。false = blind 模式：
     #   换线只按时间判据 —— WARP 出口按 proactive_fixed_sec 定时轮换，
