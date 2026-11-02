@@ -8100,7 +8100,9 @@ def main():
                     # 用户要求：切换后只要出现新的错误就立即再切，不受冷却限制。
                     # max_backoff_ts=上次成功切换时刻，天然排除切换前的旧错误。
                     # 换节点要预检（最慢 30s），丢后台。
-                    _, errors_after_switch, _, _, _ = get_9router_error_rate(
+                    # ponytail: 6 字段（含 transport_errors），用 * 兜住尾部，
+                    # 以后再加字段不会再在主循环里崩。
+                    _, errors_after_switch, *_ = get_9router_error_rate(
                         max_backoff_ts=_last_successful_switch_ts or None
                     )
                     if errors_after_switch >= 3:
