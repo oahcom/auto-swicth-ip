@@ -814,6 +814,10 @@ WG 线（22 条）与 H2 线（19 条）由各自的 install 脚本生成，不�
 单元名必须与 `members[].service` 一致，否则 daemon 的 `systemctl restart` 打空。
 改 `members` 后跑 `./deploy/install.sh --units-only` 重生成（不重启）。
 
+> **改完 daemon.py 必须 `sudo systemctl restart auto-switch-ip.service` 才生效。**
+> 2026-11-03 实测：本地 daemon.py 03:04 改完，进程仍是前一晚 22:28 起的那个 ——
+> 新代码一行没跑，而日志看起来完全正常。
+
 **asip 运维 CLI 的设置同样由代码推导**：`deploy/asip-cli.sh` 里没有一处路径、端口或
 单元名，启动时 source `deploy/asip-cli-conf.sh` 生成的 `~/.config/asip/cli.env`。
 该文件在 install.sh 末尾自动生成，并把 `~/.local/bin/asip` 软链到项目内的脚本 ——
