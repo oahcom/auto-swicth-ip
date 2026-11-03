@@ -35,6 +35,20 @@ done
 [ -n "$TARGET" ] || { echo "用法: $0 user@host [--port N] [--dry-run]" >&2; exit 2; }
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p "$PORT")
+
+# 部署走 `git archive HEAD` + scp，**不经过 origin** —— 所以「部署成功」和
+# 「代码已进仓库」是两件独立的事，漏 push 不会有任何报错。2026-11-03 实测：
+# 一整批提交只在本地，远端靠 scp 覆盖，GitHub 上什么都没有。
+if [ "$DRY" != 1 ]; then
+    UP=$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo "")
+    if [ -z "$UP" ]; then
+        echo "  ⚠ 没有 upstream 或无 origin，跳过「未推送提交」检查" >&2
+    elif [ "$UP" != "0" ]; then
+        echo "✗ 本地有 $UP 个提交未推送 —— 先 git push。" >&2
+        echo "  部署只从本地 HEAD 打包，不 push 意味着线上跑的代码不在仓库里。" >&2
+        exit 1
+    fi
+fi
 # --dry-run 必须真的不执行：远端命令里全是 restart / install / register，
 # 只解析参数不短路等于「看起来演练过、实际动了生产」。
 if [ "$DRY" = 1 ]; then
