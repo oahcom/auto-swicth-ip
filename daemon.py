@@ -3451,7 +3451,11 @@ def _node_rotation_pass(now: float | None = None) -> None:
         # 上限。绕过它等于让两套逻辑对同一条线各重启一次，白烧一次探测。
         # `rebound=True`：刚换过节点，夜间锁/渠道锁/额度隔离/小时配额都得让路
         # —— 它们拦的是「同一个地址池反复重启」，而这里池子已经换了。
-        _warp_line_restart(m, "同块轮回", rebound=True)
+        if (_warp_line_restart(m, "同块轮回", rebound=True)
+                and _channel_ban_held(tag, now)):
+            # 换节点那次重启成功 = 渠道锁想要的「停在新节点上跑」已达成，
+            # 记下 ready，`_rehome_held_lines` 就不会再补一次重定位重启。
+            _warp_line_update(tag, ban_hold_ready=now)
 
 
 def _line_unknown_retry() -> float:
@@ -8221,10 +8225,16 @@ def _wal_checkpoint() -> None:
         log(f"  ⚠ WAL checkpoint 失败: {e}")
 
 
-# 上一次「重建 WARP 出口」的时刻。watchdog 每 30s 一轮，没有它会在配置
-# 修不好时每轮都重启一次 sing-box。模块级而非闭包：`_singbox_watchdog`
-# 由多个线程路径调用，状态必须共享。
+# 上一次「重建 WARP 出口」的时刻，以及连续失败次数。watchdog 每 30s 一轮，
+# 没有它会在配置修不好时每轮都重启一次 sing-box。模块级而非闭包：
+# `_singbox_watchdog` 由多个线程路径调用，状态必须共享。
 _LAST_WARP_REBUILD_TS = 0.0
+_WARP_REBUILD_FAILS = 0
+# 重建失败后的等待时间，按连续失败次数递增：1min → 2 → 4 → 8 → 封顶 10min。
+# 固定 10 分钟是错的：2026-11-03 实测，一次偶发失败（比如 members.py 撞上
+# 订阅源超时）会让恢复白等 10 分钟，而它下一分钟就能成功。反过来完全不退避
+# 又会每 30s 重启一次 sing-box，把在途 SSE 反复掐断。指数退避两边都照顾到。
+_WARP_REBUILD_BACKOFF = (60, 120, 240, 480, 600)
 
 
 def _warp_selector_missing() -> bool:
@@ -8253,6 +8263,18 @@ def _warp_selector_missing() -> bool:
         return True           # selector 在但空着
     # 写进 selector 的线不可能多于 members，少得离谱说明生成端丢了数据
     return len(members) < max(1, len(_warp()["members"]) // 4)
+
+
+def _rebuild_warp_outbounds_watched() -> bool:
+    """调 `_rebuild_warp_outbounds` 并按结果维护退避计数。
+
+    成功一次就把连续失败数清零：下次故障仍从 1 分钟起步，而不是继承上一次
+    故障的 10 分钟。计数只反映「最近这串重建到底有没有成功」。
+    """
+    global _WARP_REBUILD_FAILS
+    ok = _rebuild_warp_outbounds()
+    _WARP_REBUILD_FAILS = 0 if ok else _WARP_REBUILD_FAILS + 1
+    return ok
 
 
 def _rebuild_warp_outbounds() -> bool:
@@ -8323,18 +8345,21 @@ def _singbox_watchdog() -> None:
         # 进程活着不等于配置是对的：WARP 出口整段消失时，探活照样全绿。
         # 这条必须放在探活之后单独判，否则会被「sing-box 活着」直接 return 掉。
         if _warp_selector_missing():
-            # 冷却 10 分钟：重建失败（比如订阅源也挂了）时，不能让 watchdog
-            # 每 30s 重启一次 sing-box —— 那会把在途 SSE 反复掐断，比故障本身
-            # 更糟。冷却期内照样会重新判，只是不再付诸动作。
-            global _LAST_WARP_REBUILD_TS
-            if time.time() - _LAST_WARP_REBUILD_TS > 600:
+            # 退避而不是固定冷却：失败一次等 1 分钟再来，连续失败才逐步拉长到
+            # 10 分钟。既不会每 30s 重启一次 sing-box（掐断在途 SSE），也不会
+            # 让一次偶发失败白等 10 分钟。
+            global _LAST_WARP_REBUILD_TS, _WARP_REBUILD_FAILS
+            wait = _WARP_REBUILD_BACKOFF[min(_WARP_REBUILD_FAILS,
+                                             len(_WARP_REBUILD_BACKOFF) - 1)]
+            left = int(_LAST_WARP_REBUILD_TS + wait - time.time())
+            if left <= 0:
                 _LAST_WARP_REBUILD_TS = time.time()
                 log(f"⚠ 主配置里 {_warp()['selector']} 缺失或成员异常，开始重建"
-                    f"（sing-box 进程本身正常）")
-                _submit_once("rebuild-warp-outbounds", _rebuild_warp_outbounds)
+                    f"（sing-box 进程本身正常，第 {_WARP_REBUILD_FAILS + 1} 次）")
+                _submit_once("rebuild-warp-outbounds",
+                             _rebuild_warp_outbounds_watched)
             else:
-                log(f"⚠ {_warp()['selector']} 仍缺失，等重建冷却"
-                    f"（{int(600 - (time.time() - _LAST_WARP_REBUILD_TS))}s）")
+                log(f"⚠ {_warp()['selector']} 仍缺失，等重建重试（{left}s）")
         return
     with _RESTART_LOCK:
         restart_count = _RESTART_COUNT
