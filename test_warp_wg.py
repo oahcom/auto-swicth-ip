@@ -78,11 +78,29 @@ def test_build_line_config_routes_everything_through_detour():
     assert ep["peers"][0]["allowed_ips"] == ["0.0.0.0/0", "::/0"]
     assert c["route"]["final"] == "warp"
     # 节点 server 是域名；DNS 若也 detour 到该节点会形成解析环路，
-    # 所以必须用本机解析器（与主配置 dns-default 同形态）
-    assert c["dns"]["servers"][0]["type"] == "local"
-    assert "detour" not in c["dns"]["servers"][0]
+    # 所以 DNS server 一律不带 detour。
+    names = {s["tag"]: s for s in c["dns"]["servers"]}
+    assert names["dns-default"]["type"] == "local"
+    assert all("detour" not in s for s in c["dns"]["servers"])
+    # 机场域名必须走机场 DoH：系统 DNS 会把 cn.bing.com 解到真 Bing，
+    # 证书是 Microsoft 的而机场前置要 *.okzdns.com（TEST_PLAN v1.57）。
+    # 单线配置原先只有 local，于是「实测能跑的节点」写成线就是 NXDOMAIN。
+    airport = names["dns-airport"]
+    assert airport["type"] == "https" and airport["path"] == "/inst"
+    assert airport["domain_resolver"] == "dns-default"  # 指回自己会 circular
+    assert any(r.get("server") == "dns-airport" for r in c["dns"]["rules"])
     assert c["route"]["default_domain_resolver"] == {"server": "dns-default"}
     assert c["outbounds"][0]["tag"] == "n1"
+
+
+def test_prepare_node_pins_airport_dns_for_airport_domains():
+    """机场域名钉机场 DoH，其余钉本机解析器 —— 不能只有一个默认值。"""
+    assert warp_wg.prepare_node(
+        {"tag": "a", "server": "hk-aws-54.acczzz.com"})["domain_resolver"] == "dns-airport"
+    assert warp_wg.prepare_node(
+        {"tag": "b", "server": "cn.bing.com"})["domain_resolver"] == "dns-airport"
+    assert warp_wg.prepare_node(
+        {"tag": "c", "server": "pq.aws48.yydjc.top"})["domain_resolver"] == "dns-default"
 
 
 def test_dns_strategy_selects_egress_family():

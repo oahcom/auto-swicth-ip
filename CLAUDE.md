@@ -1,5 +1,12 @@
 # 项目文档
 
+> **新接手先读 [docs/README.md](docs/README.md)（文档地图），
+> 再读 [docs/established-facts.md](docs/established-facts.md)（既定事实）。**
+>
+> 后者列的全是"看起来像 bug、其实是设计"的决定 —— 早八点解封、v4 跨 colo
+> 换节点、不启动 warp-svc 等等。动代码之前必须读完，否则会把既有决策当问题
+> "修复"掉。本文档继续往下是完整架构与配置细节。
+
 ## 代理架构
 
 ```
@@ -13,8 +20,11 @@ Claude Code / AI Client
     ↓
 sing-box (mixed inbound :7890 环回 / :7891 局域网, Clash API :9090 Bearer auth)
     ├── route: domain_suffix ["opencode.ai"] → selector opencode-out
-    │   → 10 条 WARP 隧道 + proxy 池兜底（见下节）
-    └── final: proxy → 83 节点轮换池（实测：54 anytls + 27 vless + 1 trojan + 1 direct）
+    │   → 50 条 WARP 线路（5 直连 + 19 H2 + 22 WG + 4 已停用）
+    │      + proxy 池兜底，共 51 个 selector 成员
+    └── final: proxy → 订阅池 selector（成员数**动态**：按实测判死摘出，
+        见既定事实第 29 条；2026-11-03 两台机器同时观测：远端 120 条、
+        本地 25 条，同一份代码同一批订阅）
 
 daemon.py
     ← 读 9router SQLite requestDetails（只查 provider="opencode"）
@@ -74,27 +84,40 @@ http_proxy=http://lan:<password>@<主机IP>:7891 curl https://api.github.com/zen
 
 9router（:20127）本来就在 `*:20127` 监听且按请求校验 API key，无需改代码；只需防火墙放行。
 
+> **端口不是常量，`NINE_ROUTER_BASE` 必须按单元声明取。** 本机是
+> `custom-server.js --port 20127`；远端那份单元写的是 `Environment=PORT=38731`
+> （ExecStart 不带 `--port`）。两种写法都要认，取并集。
+>
+> 2026-11-03 实测踩坑：旧版 `remote-deploy.sh` 按「20127/20128 哪个端口有人应答」
+> 探测，而 `127.0.0.1:20128` 跑的是 **`relay-guard/guard.mjs`** —— 它对 `/dashboard`
+> 返回 307，探测就把 20128 当成 9router 写进 `.env`。后果是
+> `check_9router_health()` 永远对着 relay-guard 返回健康，**9router 真死了这层
+> 检查也不会说话**。远端该状态持续了整个部署周期，直到核对时才发现。
+>
+> 改完 `.env` 必须重启 daemon：`EnvironmentFile=` 只在进程启动时读一次。
+
 ## WARP 专用出口（opencode）
+
+> **前提：WARP 出口 IP 池是全用户共享的。** 我们不用这些地址，它们照样会被别人
+> 烧进 ban 位。池子健康度随时段变化 —— 08:00~16:00 相对好，傍晚恶化，深夜只剩
+> 少数 IP 存活。**不要把"深夜换 IP 后很快又 429"误读成"换 IP 无效"**：那是在用
+> 枯水期的水位论证河里没有水。详见 [docs/established-facts.md](docs/established-facts.md) 第 0 条。
 
 ```
 9router → sing-box:7890 → route: domain_suffix ["opencode.ai"]
-        → selector opencode-out
-              ├── WARP-CF     socks 127.0.0.1:1080  usque-warp.service   (-6 → SJC)
-              ├── WARP-CF-B   socks 127.0.0.1:1081  usque-warp-b.service (-6 → SJC)
-              ├── WARP-CF-C   socks 127.0.0.1:1082  usque-warp-c.service (-6 → SJC)
-              ├── WARP-CF-D   socks 127.0.0.1:1083  usque-warp-d.service (v4 → LAX，v4 双保底之一)
-              ├── WARP-CF-E   socks 127.0.0.1:1084  usque-warp-e.service (v4 → LAX，v4 双保底之一)
-              ├── WARP-CF-F   socks 127.0.0.1:1085  usque-warp-f.service (-6 → SJC)
-              ├── WARP-CF-G   socks 127.0.0.1:1086  usque-warp-g.service (-6 → SJC)
-              ├── WARP-CF-H   socks 127.0.0.1:1087  usque-warp-h.service (-6 → SJC)
-              ├── WARP-CF-I   socks 127.0.0.1:1088  usque-warp-i.service (-6 → SJC)
-              ├── WARP-CF-J   socks 127.0.0.1:1089  usque-warp-j.service (-6 → SJC)
-              ├── WARP-CF-11…20  socks 127.0.0.1:1090-1099  usque-warp-11..20.service (-6 → SJC)
+        → selector opencode-out（51 成员 = 50 条 WARP 线 + proxy）
+              ├── 直连 WARP（5 条在跑）
+              │     WARP-CF   :1080  WARP-CF-B :1081  WARP-CF-D :1083
+              │     WARP-CF-E :1084  WARP-CF-F :1085      （D/E 是 v4 双保底）
+              ├── H2  19 条  WARP-H2-<COLO>-N  :1180-1198  usque-h2-*.service
+              ├── WG  22 条  WARP-WG-1..22     :1110-1131  warp-wg-*.service
+              ├── 已停用 4 条 WARP-CF-C/G/H/I（仍在 members 里，见既定事实第 26 条）
               └── proxy       轮换池（隧道全不通时兜底）
         → opencode.ai
 ```
 
-**20 条隧道各自的 Cloudflare 设备凭据独立**（`.warp/usque{,2..10,11..20}/config.json`，600，gitignored）。
+**每条 usque 隧道各自的 Cloudflare 设备凭据独立**（`.warp/usque{,2..24}/config.json`，600，gitignored；
+2026-11-03 实测 24 个设备目录，其中 19 个被 H2 线借用，直连只占 5 个）。
 2026-10-26 扩容：单元启动参数统一 `-6`（主机原生 v6 路由已就绪），仅留 D/E 两条 v4
 保底（v6 路由整体故障时仍可换出口）。台账观测：24h 内出现过 4630 个不同 v6 出口 IP、
 分布 ≥20 个 /48 网段——IPv6 池近似无上界，瓶颈在同时在线隧道数与本机 v6 路由，
@@ -211,7 +234,7 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   池有 3h 冷却）。**放在汇合点而非各分支里**：同步刷新分支会往 `probes` 追加
   条目，early 位置上的去重会被它绕过。
   实测依据：2026-10-22 08:03~17:59 共 817 次换线里 **111 次（13.7%）新出口 ==
-  旧出口**，全部由 rate429 触发 —— 每一笔都白重启了一条隧道。当前 20 条隧道
+  旧出口**，全部由 rate429 触发 —— 每一笔都白重启了一条隧道。当时 20 条隧道
   活探 19 条（1 条瞬时探测失败），IP 全不相同。
 - **启动时由探测器接管，不再同步校验出口 (T-199 / 2026-10-26)**：sing-box 重启后
   selector 复位到配置 default（主隧道 WARP-CF），它可能正处 429 惩罚期或被模型层
@@ -320,7 +343,8 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   逻辑仅在开关为 `true` 时生效。禁用原因：池内节点全挂，落池=断流；WARP 全不可用时
   改原地重连。恢复方式：`warp.proxy_fallback_enabled: true`。
 - **落池冷却 `proxy_fallback_cooldown_sec`（默认 3h）**：切到轮换池 `proxy` 后，
-  3 小时内即使隧道全挂也不再落池。WHY：proxy 是 83 节点共享池，落池意味着把流量
+  3 小时内即使隧道全挂也不再落池。WHY：proxy 是共享机场池（成员数随订阅和
+  实测判死动态变化），落池意味着把流量
   交给成功率 3~5% 的兜底资源（INC-002 的失败模式），而 WARP 换一条线只要一次 PUT。
   冷却期内改为**盲切另一条 WARP 成员**（依次试 `_port_open` 通且 ≠ 当前出口的成员，
   不探 IP 新鲜度 —— 备选是让流量停在正在被拦的出口上，盲切至少换一次会话机会；
@@ -332,7 +356,7 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   （90s）让该线闲下来，等不到则**补刷重试**直到 `ip_refresh_retry_sec`（600s）用完。
   WHY 必须补刷：单次超时就放弃会让这条线永远停在旧地址上 —— 实测 WARP-CF-C 被
   换下 8 次仅刷 2 次，13 次换线里 7 次切回同一个 10 分钟前的地址。
-- **补刷并发没有全池上限（T-223）**：20 条隧道互不依赖，`systemctl restart` 各自
+- **补刷并发没有全池上限（T-223）**：46 条在线线路互不依赖，`systemctl restart` 各自
   独立，排队换不来任何东西 —— 刷不完的脏线留在池里冒充候选，换线选中它还得当场
   同步刷新，代价更大。唯一互斥的是**同一条线**（`_acquire_refresh_slot` 只认 tag），
   当前出口本身从不被刷。原来的 `refresh_concurrency` 上限已整项删除。
@@ -445,18 +469,18 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   —— 同一 N（无重启）下地址也会变，实测同 tag 相邻两次判定间隔 10~30s 时
   99.4% 换了地址、>120s 时只有 28.3% 换。所以「刚 OK 过又判 quota」是那个地址
   被换掉了，不是 OK 结论被无视。13 分钟窗口内 222 次换址发生在 N 不变时。
-- **OK 结论单独一档 TTL（T-225）**：`probe_ok_ttl_sec`=1800（2026-10-29 由 600 提高，
-  主人要求「探测过优质 IP 的有效期从 600 秒改到半小时」），既不属于 2min 的
-  瞬时档（`unreachable`/`err`），也不属于 6h 的持久档（`quota`/`flagged`）。
+- **OK 结论单独一档 TTL（T-225，2026-11-02 上调到 1800）**：`probe_ok_ttl_sec`=1800
+  （30min），既不属于 2min 的瞬时档（`unreachable`/`err`），也不属于 10min 的
+  持久档（`quota`/`flagged`）。
   WHY 不能和 `unreachable` 同档：OK 说的同样**是地址状态**，而同一 `(tag, /128)`
   的重探间隔中位 **212s** —— 2min 的档位命中不到自己，同一地址每轮都重探一遍。
-  实测 1980 次「前一次结论是 OK」里 **1831 次（92.5%）结论不变**，按 600s 档可
-  省掉 **33.8%** 的探测量（1748/5166），其中判错的只有 8.0%；600s 已接近饱和
-  （1200s 只多 0.1 个百分点）。1800s 的代价是「凭旧 OK 选线」的窗口从 10min 拉到
-  30min —— 47 例 OK→quota 的间隔中位 1267s，改后会有一部分落在窗口内。
-  **真正的安全网是标脏即作废**（`_probe_cache_forget` 在 `_mark_warp_ip_used(blocked=True)`
-  里即时清 OK），那 47 例翻脸里 **45 例期间发生过生产侧 429/403 换线**，走的正是
-  这条路径，不依赖本 TTL 兜底（变异验证：把该调用换成 `pass`，回归用例立即转红）。
+  实测 1980 次「前一次结论是 OK」里 **1831 次（92.5%）结论不变**；600s 时可省
+  **33.8%** 的探测量（1748/5166），而 30min 约合 8.5 轮。WHY 不能直接套 6h：
+  47 例 OK→quota 的间隔中位
+  1267s，长 TTL 只是把「凭旧 OK 选线」的窗口拉宽。**真正的安全网是标脏即作废**
+  （`_probe_cache_forget` 在 `_mark_warp_ip_used(blocked=True)` 里即时清 OK），
+  那 47 例翻脸里 **45 例期间发生过生产侧 429/403 换线**，走的正是这条路径，
+  不依赖本 TTL 兜底（变异验证：把该调用换成 `pass`，回归用例立即转红）。
 - **别把 `/64` 段状态当选线判据**：段级静置只用于同档内排序（`_warp_prefix_rest`），
   不能升级成准入或跨档比较。时间序回放（段状态取**探前**台账 `blocked_ts`）：
   T0 落在已烧段 OK=56/1024（5.47%），落在干净段反而只有 1/108（0.93%）；
@@ -481,7 +505,7 @@ daemon 随即置 bypass 直连，opencode 看到本地 IP 直接返回 abuse 403
 
 **双向兜底（任一炸了，另一个必须察觉并顶上）**
 
-`opencode-out` 成员含 `proxy`（83 节点池），两个方向都是**主动探测**，不等下游报错：
+`opencode-out` 成员含 `proxy`（订阅池 selector，成员动态），两个方向都是**主动探测**，不等下游报错：
 
 | 方向 | 触发 | 实现 |
 |---|---|---|
@@ -493,7 +517,7 @@ WHY 反向必须主动探：停在 proxy 上时 `opencode_out_on_warp()` 为 Fal
 成功率 3~5%）。靠下游 429 累计到阈值才动，期间流量全废。
 
 WHY 不按「WARP 探测又通了」回切：探测会抖动，实测 00:02:45 落到 proxy、00:02:52
-就因一次探测通过切回（7s），83 节点池一条 opencode 请求都没服务过。代理池是兜底
+就因一次探测通过切回（7s），订阅池一条 opencode 请求都没服务过。代理池是兜底
 资源，能服务流量就该让它服务完；只有池真的不堪用（上面三条判据）才回切。
 池健康采样**随机 3 个节点并发探测**：固定取前 3 个时，这 3 个恰好挂了就把整池判死。
 
@@ -646,43 +670,24 @@ singbox.mixed_port: 7890                       # 环回 mixed 入站（无认证
 singbox.lan_port: 7891                         # 局域网 mixed 入站（0=关闭，需认证文件）
 singbox.lan_cidrs: [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12]  # 局域网入站允许来源
 bad_nodes.ttl_sec: 300                         # bad node TTL (5min)
-# warp（换线核心，勿凭旧记忆猜值）
-warp.block_threshold: 1                        # abuse403 触发阈值
-warp.rate429_threshold: 1                      # rate429 触发阈值
-warp.cooldown_ok_sec: 5                        # 换线成功后冷却（full_err 绕过）
-warp.cooldown_fail_sec: 3                      # 换线失败后冷却
-warp.ip_reuse_guard_sec: 86400                 # 出口 IP 复用窗口（24h）
-# warp.refresh_concurrency 已删除（T-223）：全池并发无上限，只有单条线互斥
-warp.rate429_guard_sec: 86400                  # 429 恢复期（24h）
-warp.proactive_mode: "requests"                # 主动轮换判据（fixed / requests，当前生效）
-warp.proactive_fixed_sec: 60                   # fixed：每 N 秒
-warp.proactive_after_dsv4_ok: 150              # requests：满 N 格成功的 dsv4 调用
-warp.proactive_quota_model: "deepseek-v4.1-flash-free"
-warp.proxy_fallback_cooldown_sec: 10800        # 落池冷却（3h）
-warp.proxy_fallback_enabled: false             # 落池开关（2026-10-26 关闭，池节点全挂）
-warp.probe_cache_ttl_sec: 12                   # 旧路径探测缓存 TTL（出口 IP 新鲜度）
-warp.probe_transient_ttl_sec: 120                 # 探测结论 TTL：OK/unreachable/err（瞬时档）
-warp.probe_persistent_ttl_sec: 600             # 探测结论 TTL：quota/flagged（与探测节奏同量级）
-warp.fallback_idle_wait_sec: 3                 # 旧路径错误换线等备线空闲上限
-# 单实例探测器（2026-10-26，prober_enabled=false 时才走旧路径）
-warp.prober_enabled: true                      # 唯一后台探测器 + 状态表驱动换线
-warp.line_fresh_sec: 120                       # per-line OK 新鲜窗口
-warp.probe_unknown_retry_sec: 5                # IP 未知 / 重启成功后重探间隔
-# 探测节奏：同一线两次观测之间的最小间隔，**只由 last_probe_ts 推出**。
-# 结论决定「探完拿它做什么」，不决定「下次还探不探」 —— 旧实现让 quota 结论
-# 把下次探测推到次日 08:00（=上游 ban_until），20 条线全冻结 56.6 分钟。
-warp.line_probe_cadence_sec: 60
-warp.probe_concurrency: 4                      # 每轮并发探测线数
-warp.model_probe_concurrency: 2                # 模型层并发探测数（每格配额都是钱）
-warp.probe_max_per_min: 30                     # 全局探测速率上限
-warp.prober_idle_wait_sec: 30                  # 探测器空闲等待
-warp.switch_wait_sec: 3                        # 无新鲜 OK 时换线等待上限（等前先催探测器）
-warp.restart_cooldown_sec: 5                   # 同一线重启冷却
-warp.restart_backoff_sec: [2, 5, 10, 20, 60]   # 重启失败指数退避
-warp.restart_backoff_max_sec: 120              # 退避上限
-warp.restart_max_per_hour_per_line: 20         # 每线每小时重启上限（滑动 1h 窗口，计在 systemctl 之前）
-warp.restart_concurrency: 4                    # 全局并发重启上限
-warp.ip_observe_sec: 120                       # 换线后出口观察窗
+
+# warp（换线核心）—— **完整配置说明见 docs/reference/config.md**
+#
+# 这一节 2026-11-03 之前是 config.py 的手抄副本，实测已有 8 项与代码不符
+# （probe_concurrency 4→32、line_probe_cadence_sec 60→0、restart_max_per_hour_per_line
+# 20→0、rate429_guard_sec 86400→60 等）。手抄副本必然过期，不再维护第二份。
+#
+# 只看当前生效值：
+#   python3 -c "import config,json;print(json.dumps(config.CFG['warp'],ensure_ascii=False,indent=1))"
+#
+# 只知道这几个「改了会坏」的就够日常：
+#   · line_probe_cadence_sec / probe_max_per_min / restart_max_per_hour_per_line
+#     在 2026-10-28 按主人要求归零（探测去限流，吞吐 36 → 52.3 条/分钟）。
+#     **不要"恢复"这些上限** —— 理由见 reference/config.md §1.2。
+#   · cooldown_ok_sec 固定 5s，不随失败放大（2^n 退避曾锁死到 600s）。
+#   · proxy_fallback_enabled=false（2026-10-26，池内节点全挂，落池=断流）。
+#   · channel_ban_reset_hour=8 是 opencode 官方的配额重置时刻，不是闹钟。
+#   · prober_enabled=true 时旧路径（_start_line_workers / _dirty_line_janitor）不启动。
 # 连错门控不是配置项，是代码常量：consec_err < 3 → 不换线（daemon.py maybe_reconnect_warp）
 # _DEAD_TTL_STAGES: _generate_ttl_stages() 算法生成（30s→7d），非手写列表
 _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（daemon.py 常量）
@@ -757,7 +762,7 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 
 | 文件 | 行数（2026-10-21 实测 wc -l） | 说明 |
 |------|------|------|
-| `daemon.py` | 4224 | 节点管理 + 错误检测 + 轮换 + WARP 主备换线 |
+| `daemon.py` | 8290 | 节点管理 + 错误检测 + 轮换 + WARP 主备换线（夜锁策略已拆到 `warp_night.py`）|
 | `config.py` | 262 | 共享配置常量（CFG dict） |
 | `singbox-config.json` | 1732 | sing-box 代理节点配置（83 池节点 + 10 WARP + opencode-out） |
 | `.bad_nodes.json` | 动态 | 坏节点文件（daemon 只读；self_evolve 用 flock + 原子写更新） |
@@ -768,7 +773,7 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `test_subscription_parse.py` | 561 | 订阅解析回归单测（无网络，40 个用例：vless/trojan transport/单源失败/rc 检查/URL 文件传参/局域网入站与来源守卫）|
 | `test_warp_refresh.py` | 1243 | WARP 刷新/换线门控单测（22 个用例）|
 | `verify_rotation.py` | 360 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），结束时恢复原选择，`--quick` 约 20s |
-| `deploy/install.sh` | — | 部署脚本：生成密钥 + 注册 20 条隧道 + 由 config.py 推导并写入 23 个 systemd 单元 + enable + 生成 asip 设置与入口 |
+| `deploy/install.sh` | — | 部署脚本：生成密钥 + 注册 usque 成员（当前 9 条）+ 由 config.py 推导并写入 `auto-switch-ip.service` / `asi-selfcheck.{service,timer}` + enable + 生成 asip 设置与入口。WG/H2 单元分别由 `deploy/wg-lines-install.sh`、`deploy/h2-install.sh` 生成 |
 | `deploy/members.py` | — | 把 `CFG["warp"]["members"]` 渲染成 `tag port service dir family`，供 install.sh 用 |
 | `deploy/asip-cli-conf.sh` | — | 从 `config.py` 推导 asip CLI 设置，写 `~/.config/asip/cli.env`（16 项 + 隧道清单）；`--print` 只打印 |
 | `deploy/asip-cli.sh` | — | asip 运维 CLI 源文件（本项目为唯一副本，`~/.local/bin/asip` 是指向它的软链）；自身不含任何站点设置 |
@@ -777,6 +782,10 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写、`append_line`、`update_json`）、`redact`、`clash_client`（`request_json`/`selector_state`/`delay`/`delays`/`connections`）、`egress`（`probe_egress` 保留失败原因）、`proc`（强制超时、无 shell）、`http`（`status=None` 区分传输失败）；daemon 同名门面委托 |
 | `test_asip_*.py` | — | 共享层离线单测：`test_asip_{proc,http,egress,atomic,clash}.py` + `test_asip_integration.py`（daemon 边界）；无 `test_asip_unit.py` 文件 |
 | `warp_line_worker.py` | — | 每条 WARP 隧道常驻 worker：`_plan` 决策与执行分离，`dry_run` 只读；由 `warp.line_worker` 开关接管三个旧守护 |
+| `warp_blocks.py` | 340 | **渠道模型**：块 = colo，渠道 = (类型, 块, 序号)。纯函数（不测量/不写盘，CLI 除外）：`channels()` / `plan_lines()` / `night_line_tags()` / `build_map()`。设计见 `docs/warp-channel-allocation.md` |
+| `warp_night.py` | 80 | **夜锁策略**：`window` / `active` / `restart_allowed` / `label`。纯函数，不读配置不打日志；daemon 保留同名门面处理 IO |
+| `warp_diag.py` | 230 | **单节点 WARP 承载诊断**：配置只从 `warp_wg.build_line_config` 生成（不复刻），失败分 config/port/handshake/ok 四类。`--job` 输入 `{tag,node,egress_ip}` |
+| `test_warp_blocks.py` | — | 上面两个纯模块的单测（22 例）：块的切法、稳定性判定、夜间取舍、探针故障不计入节点履历 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
 
 ## 部署与可移植性（2026-10-22）
@@ -797,9 +806,14 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 `auto-switch-ip.service` 的 `EnvironmentFile=-` 读取。
 
 **部署单元由代码推导，不手写**：`deploy/install.sh` 从 `config.py` 的
-`warp.members` 生成 20 条隧道单元 + `auto-switch-ip.service` + `asi-selfcheck.{service,timer}`。
+`warp.members` 里 kind 为空的 usque 成员生成隧道单元（当前 9 条），再加 `auto-switch-ip.service` + `asi-selfcheck.{service,timer}`。
+WG 线（22 条）与 H2 线（19 条）由各自的 install 脚本生成，不在 `install.sh` 里。
 单元名必须与 `members[].service` 一致，否则 daemon 的 `systemctl restart` 打空。
 改 `members` 后跑 `./deploy/install.sh --units-only` 重生成（不重启）。
+
+> **改完 daemon.py 必须 `sudo systemctl restart auto-switch-ip.service` 才生效。**
+> 2026-11-03 实测：本地 daemon.py 03:04 改完，进程仍是前一晚 22:28 起的那个 ——
+> 新代码一行没跑，而日志看起来完全正常。
 
 **asip 运维 CLI 的设置同样由代码推导**：`deploy/asip-cli.sh` 里没有一处路径、端口或
 单元名，启动时 source `deploy/asip-cli-conf.sh` 生成的 `~/.config/asip/cli.env`。

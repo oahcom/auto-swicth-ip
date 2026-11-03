@@ -7,10 +7,18 @@ asip 现在只有两种出口：sing-box 里的节点池，和 20 条 WARP 隧�
 但它终究是 Cloudflare 的段：上游一旦对整段做信誉，20 条隧道会一起变脏，那时
 换线只是在同一个段里挪位置。
 
-Vercel 中继提供的是另一个段。9router 早就认这套协议（`x-relay-target` +
-`x-relay-path`）：proxyPools 里 `type=vercel` 的条目会被 proxyAwareFetch 挑出来，
-请求打到 relay 部署上，由 Vercel 的出口发往上游；上游看到的是 AWS 的地址，和
-Cloudflare 不相交。这就是「另一个可用地址空间」的实际含义，不是多一种花活。
+中继提供的是另一个段。9router 早就认这套协议（`x-relay-target` + `x-relay-path`）：
+proxyPools 里 `type` 属于 RELAY_KINDS 的条目会被 proxyAwareFetch 挑出来，请求打到
+relay 部署上，由那家平台的出口发往上游。
+
+**同一份协议，多个平台。** 9router 支持 vercel / cloudflare / deno / netlify 四种，
+差别只在 `proxyPools.data.type` 这个字符串 —— headers 完全一样。所以这条链路上
+「换一家平台」的代价只在于部署脚本，不在于接入层；台账里每条 relay 记一个 `kind`，
+同步时写进对应的 type。
+
+诚实地说清一件事：Vercel 与 Netlify 的出口都落在 AWS，**同一段**。多接一家不等于
+多一个段，它换的是「服务商」和「地址池的随机性」，不是 ASN。要真正跳出 AWS，得看
+Cloudflare Workers / Deno Deploy 那两家；本模块留了 kind 的口子，部署脚本没做。
 
 本模块只做三件事，且都不 import config / daemon（调用方把路径传进来）：
 
@@ -38,7 +46,10 @@ from .http import request_json
 
 # 9router 的 relay 协议：目标主机放在头里，路径放在另一个头里。
 # 两个头都必须小写 —— Node 的 Headers 会归一化，但代理/中间层不保证。
+TIMING_HEADER = "x-relay-timing"
 RELAY_TYPE = "vercel"
+# 9router 认的四种中继平台（connectionProxy.js:65）。headers 一样，只有 type 不同。
+RELAY_KINDS = ("vercel", "cloudflare", "deno", "netlify")
 TARGET_HEADER = "x-relay-target"
 PATH_HEADER = "x-relay-path"
 DEFAULT_PROBE_TARGET = "https://api.ipify.org"
@@ -93,6 +104,16 @@ def relay_headers(target: str, path: str = "/") -> dict[str, str]:
     return {TARGET_HEADER: str(target), PATH_HEADER: str(path or "/")}
 
 
+def _kind(value: Any) -> str:
+    """把任意输入收窄成合法的中继类型；不认识的一律当 vercel。
+
+    宁可写错 type 让 9router 当成普通代理，也不能让一条读不懂的字符串进库 ——
+    后者会让整行 proxyPools 在 proxyConfigFromPool 里走进 else 分支。
+    """
+    text = str(value or "").strip().lower()
+    return text if text in RELAY_KINDS else RELAY_TYPE
+
+
 def _valid_ip(text: str) -> str | None:
     try:
         return str(ipaddress.ip_address(text.strip()))
@@ -139,6 +160,96 @@ def probe(url: str, *, target: str = DEFAULT_PROBE_TARGET, path: str = "/",
 
 # ─────────────────────────── 台账 ───────────────────────────
 
+def timing_probe(url: str, *, target: str = DEFAULT_PROBE_TARGET, path: str = "/",
+                 timeout: float = 25.0, session: Any = None) -> dict[str, Any]:
+    """让 relay 自己报账：函数 -> 上游那一段的耗时。
+
+    为什么非要在函数里量：从外部算「经中继多花多少」时，本机网络抖动实测 1–2.5s，
+    比要测的那点开销大一个量级 —— 差值能算出负数。让函数用 Date.now() 自己记，
+    「本地 -> Vercel」这一段就彻底不参与计算了。
+
+    返回的是**测量结果**，不是探针结果；失败时给 ok=False，不抛异常。
+    """
+    norm = normalize_relay_url(url)
+    if norm is None:
+        return {"ok": False, "error": "bad_url"}
+    headers = relay_headers(target, path)
+    headers[TIMING_HEADER] = "full"
+    result = request_json("GET", norm + (path or "/"), headers=headers,
+                          timeout=timeout, session=session, redact=True)
+    if result.status is None:
+        return {"ok": False, "error": result.error or "transport"}
+    if not result.ok:
+        return {"ok": False, "error": f"http_{result.status}", "status": result.status}
+    data = result.data
+    if not isinstance(data, dict):
+        # 老版本函数不认识 x-relay-timing：它会把上游正文透传回来，这里拿到的不是账本。
+        return {"ok": False, "error": "no_timing_support"}
+    return {
+        "ok": True,
+        "status": _as_int(data.get("status")),
+        "region": str(data.get("region") or ""),
+        "runtime": str(data.get("runtime") or ""),
+        "fetch_ms": _as_int(data.get("fetch_ms")),
+        "first_chunk_ms": _as_int(data.get("first_chunk_ms")) or None,
+        "total_ms": _as_int(data.get("total_ms")),
+        "bytes": _as_int(data.get("bytes")),
+    }
+
+
+def record_timing(ledger: dict, relay_id: str, sample: dict,
+                  now: float | None = None) -> None:
+    """把一次自报耗时写进台账（只存 fetch_ms，其余留给 bench 当场打印）。"""
+    entry = ledger["relays"].get(relay_id)
+    if entry is None or not sample.get("ok"):
+        return
+    if sample.get("fetch_ms"):
+        entry["fetch_ms"] = _as_int(sample["fetch_ms"])
+        entry["timing_ts"] = now if now is not None else time.time()
+
+
+def ip_changed(prev: Any, new: Any) -> bool:
+    """重部署到底换没换地址 —— 只能拿前后两次观测比。
+
+    实测重部署不一定换 IP（2026-10-29 五次里换了三次），所以这里不做任何假设：
+    新地址为空（没探到）一律算没换。
+    """
+    old = _valid_ip(str(prev or ""))
+    fresh = _valid_ip(str(new or ""))
+    return bool(fresh) and fresh != old
+
+
+def refresh_until_new_ip(ledger: dict, relay_id: str, redeploy: Any,
+                         probe_fn: Any = None, *, attempts: int = 3,
+                         now: float | None = None) -> dict:
+    """重部署，然后**用现有的探针**看换没换；没换就再来。
+
+    探测不另写一套：probe / record_probe 就是现成的，这里只是把它们串进循环里，
+    顺便把每次的观测留在台账（prev_ip）里 —— 换没换是两次观测的差，不是印象。
+
+    redeploy 由调用方注入（CLI 传 subprocess，单测传个假的），所以这个循环
+    既能在命令行用，也能被以后的 daemon 复用，还不用联网就能测。
+    """
+    entry = ledger["relays"].get(relay_id)
+    if entry is None:
+        return {"ok": False, "error": "unknown_relay", "tries": []}
+    probe_fn = probe_fn or probe
+    old = entry.get("ip")
+    tries: list[dict[str, Any]] = []
+    for i in range(max(1, attempts)):
+        redeploy()
+        result = probe_fn(entry["url"])
+        record_probe(ledger, relay_id, result, now=now)
+        changed = ip_changed(old, result.ip)
+        tries.append({"attempt": i + 1, "ip": result.ip,
+                      "error": result.error, "changed": changed})
+        if changed:
+            return {"ok": True, "old": old, "new": result.ip,
+                    "attempts": i + 1, "tries": tries}
+    return {"ok": False, "old": old, "new": entry.get("ip"),
+            "attempts": len(tries), "tries": tries}
+
+
 def empty_ledger() -> dict:
     return {"version": LEDGER_VERSION, "relays": {}, "ip_used": {},
             "updated_at": 0}
@@ -164,9 +275,23 @@ def _normalize_entry(raw: Any) -> dict | None:
     url = normalize_relay_url(raw.get("url"))
     if url is None:
         return None
+    runtime = str(raw.get("runtime") or "edge").strip().lower()
+    if runtime not in ("edge", "node"):
+        runtime = "edge"
     return {
         "url": url,
         "name": str(raw.get("name") or ""),
+        "kind": _kind(raw.get("kind")),
+        # 可控性的三块料：怎么部署的（runtime/region）、能不能用（enabled）、
+        # 换 IP 时上一版是什么（prev_ip 只用于对账，不参与选路）。
+        "runtime": runtime,
+        "region": str(raw.get("region") or "").strip(),
+        "project": str(raw.get("project") or "").strip(),
+        "enabled": bool(raw.get("enabled", True)),
+        "asn": str(raw.get("asn") or "").strip(),
+        "fetch_ms": _as_int(raw.get("fetch_ms")) or None,
+        "timing_ts": _as_float(raw.get("timing_ts")),
+        "prev_ip": _valid_ip(str(raw.get("prev_ip") or "")) or None,
         "pool_id": str(raw.get("pool_id") or ""),
         "ip": _valid_ip(str(raw.get("ip") or "")) or None,
         "last_ok_ts": _as_float(raw.get("last_ok_ts")),
@@ -218,20 +343,52 @@ def save(path: str, ledger: dict) -> None:
 
 
 def add_relay(ledger: dict, url: str, *, name: str = "",
+              kind: str = RELAY_TYPE,
+              runtime: str = "edge", region: str = "", project: str = "",
               relay_id: str | None = None,
               now: float | None = None) -> str | None:
-    """登记一条 relay（幂等：同 URL 已存在就复用它的 id）。"""
+    """登记一条 relay（幂等：同 URL 已存在就复用它的 id）。
+
+    复用时不改走已有的地址，只补元数据 —— 部署信息（runtime/region/project）
+    是「怎么重来一遍」的说明书，缺了就没法 refresh。
+    """
     norm = normalize_relay_url(url)
     if norm is None:
         return None
+    # 先按项目名认领：重部署会换地址（甚至换出带 hash 的部署专用 URL），
+    # 但「这一个项目」始终是同一张牌。不认项目的话，重来一次就多一条，
+    # 台账会慢慢变成一堆重复项，池子也跟着翻倍。
+    alias = f"https://{project}.vercel.app" if project else ""
+    if project:
+        for rid, entry in ledger["relays"].items():
+            if entry.get("project") == project:
+                if alias and norm == alias:
+                    entry["url"] = alias
+                if runtime:
+                    entry["runtime"] = runtime if runtime in ("edge", "node") else "edge"
+                if region:
+                    entry["region"] = region
+                if name and not entry.get("name"):
+                    entry["name"] = name
+                return rid
     for rid, entry in ledger["relays"].items():
         if entry.get("url") == norm:
             if name and not entry.get("name"):
                 entry["name"] = name
+            if runtime:
+                entry["runtime"] = runtime if runtime in ("edge", "node") else "edge"
+            if region:
+                entry["region"] = region
+            if project:
+                entry["project"] = project
             return rid
     rid = relay_id or uuid.uuid4().hex[:12]
     ledger["relays"][rid] = {
-        "url": norm, "name": name or norm, "pool_id": "", "ip": None,
+        "url": norm, "name": name or norm, "kind": _kind(kind),
+        "runtime": runtime if runtime in ("edge", "node") else "edge",
+        "region": region, "project": project, "enabled": True,
+        "asn": "", "prev_ip": None, "fetch_ms": None, "timing_ts": 0.0,
+        "pool_id": "", "ip": None,
         "last_ok_ts": 0.0, "last_probe_ts": 0.0, "latency_ms": None,
         "fail_streak": 0, "error": None, "burned_until": 0.0,
         "burn_kind": None,
@@ -246,6 +403,8 @@ def record_probe(ledger: dict, relay_id: str, result: ProbeResult,
     entry = ledger["relays"].get(relay_id)
     if entry is None:
         return
+    if result.ok and result.ip and entry.get("ip") and entry["ip"] != result.ip:
+        entry["prev_ip"] = entry["ip"]
     entry["last_probe_ts"] = now
     if result.ok:
         entry["ip"] = result.ip
@@ -359,9 +518,9 @@ POOL_TABLE = "proxyPools"
 _POOL_DATA_DEFAULTS = {"noProxy": "", "strictProxy": False}
 
 
-def pool_payload(name: str, url: str) -> dict:
+def pool_payload(name: str, url: str, kind: str = RELAY_TYPE) -> dict:
     """proxyPools.data 的形状，与 9router 的 createProxyPool 一致。"""
-    payload = {"name": name, "proxyUrl": url, "type": RELAY_TYPE}
+    payload = {"name": name, "proxyUrl": url, "type": _kind(kind)}
     payload.update(_POOL_DATA_DEFAULTS)
     return payload
 
@@ -415,17 +574,18 @@ def sync_pools(db_path: str, ledger: dict, *, dry_run: bool = False,
             mapping[relay_id] = pool_id
             if dry_run:
                 continue
-            payload = pool_payload(entry.get("name") or url, url)
+            payload = pool_payload(entry.get("name") or url, url, entry.get("kind"))
             encoded = json.dumps(payload, ensure_ascii=False)
+            want_active = 1 if entry.get("enabled", True) else 0
             if pool_id in rows:
                 con.execute(
-                    f"UPDATE {POOL_TABLE} SET isActive=1, data=?, updatedAt=? WHERE id=?",
-                    (encoded, stamp, pool_id))
+                    f"UPDATE {POOL_TABLE} SET isActive=?, data=?, updatedAt=? WHERE id=?",
+                    (want_active, encoded, stamp, pool_id))
             else:
                 con.execute(
                     f"INSERT INTO {POOL_TABLE} (id, isActive, testStatus, data, createdAt, updatedAt) "
-                    "VALUES (?, 1, 'active', ?, ?, ?)",
-                    (pool_id, encoded, stamp, stamp))
+                    "VALUES (?, ?, 'active', ?, ?, ?)",
+                    (pool_id, want_active, encoded, stamp, stamp))
             entry["pool_id"] = pool_id
             by_url[url] = pool_id
         if not dry_run:
@@ -507,7 +667,7 @@ def read_provider_strategy(db_path: str, provider: str) -> dict:
 
 
 def list_pools(db_path: str) -> list[dict]:
-    """只读：把 proxyPools 里 type=vercel 的行摊平成 dict 列表。"""
+    """只读：把 proxyPools 里属于中继的行摊平成 dict 列表。"""
     con = _connect(db_path)
     try:
         _require_schema(con)
@@ -517,10 +677,42 @@ def list_pools(db_path: str) -> list[dict]:
                 data = json.loads(row["data"] or "{}")
             except ValueError:
                 continue
-            if not isinstance(data, dict) or data.get("type") != RELAY_TYPE:
+            if not isinstance(data, dict) or data.get("type") not in RELAY_KINDS:
                 continue
             out.append({"id": row["id"], "active": bool(row["isActive"]),
+                        "kind": data.get("type"),
                         "url": data.get("proxyUrl"), "name": data.get("name")})
         return out
     finally:
         con.close()
+
+
+def set_enabled(ledger: dict, relay_id: str, enabled: bool) -> bool:
+    """开/关一条 relay。关掉不等于删掉 —— 地址、region、上次的 IP 都留着，
+    下次还能原地打开（关掉期间池是 isActive=0，9router 不会再挑它）。"""
+    entry = ledger["relays"].get(relay_id)
+    if entry is None:
+        return False
+    entry["enabled"] = bool(enabled)
+    return True
+
+
+def refresh_url(ledger: dict, relay_id: str) -> str | None:
+    """返回这条 relay 的「同一个地址」—— 部署脚本用项目名重来时认这个。
+
+    项目名优先取 entry["project"]；老条目没有就从未部署 URL 里反推
+    （https://<project>.vercel.app 或 https://<project>-<hash>-oahcom.vercel.app）。
+    """
+    entry = ledger["relays"].get(relay_id)
+    if entry is None:
+        return None
+    project = entry.get("project") or ""
+    if project:
+        return project
+    host = normalize_relay_url(entry["url"]) or ""
+    host = host.split("//", 1)[-1].split("/", 1)[0]
+    if not host.endswith(".vercel.app"):
+        return None
+    # 别名就是项目名；部署专用 URL（<project>-<hash>-<team>.vercel.app）在台账里
+    # 早就统一换成了别名，这里只兜底「还是老 URL」的情况。
+    return host[: -len(".vercel.app")]

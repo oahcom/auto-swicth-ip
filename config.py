@@ -121,7 +121,9 @@ _wg_count = len(_WG_FAMILIES) * _WG_HOME_NODES
 CFG = {
     "9router": {
         "db_path": _env_path("NINE_ROUTER_DB_PATH", os.path.join(HOME_DIR, ".9router/db/data.sqlite")),
-        "base": "http://127.0.0.1:20127",
+        # 监听口随部署而异（本机 20127、云端 20128）。写死会让健康检查在换部署
+        # 时永远失败，而症状是「9router 不可达」而不是「端口配错」。
+        "base": _env_path("NINE_ROUTER_BASE", "http://127.0.0.1:20127"),
     },
     # 9router 流量观测开关（重启 daemon 生效）。false = blind 模式：
     #   换线只按时间判据 —— WARP 出口按 proactive_fixed_sec 定时轮换，
@@ -225,8 +227,11 @@ CFG = {
         "enabled": True,
         # socket 放项目目录而不是 /run：/run 归 root，非 root 进程建不了目录；
         # 要用 /run 得给 unit 加 RuntimeDirectory=，部署面变大。
-        "socket_path": "/home/administrator/auto-swicth-ip/run/rotate.sock",
-        "token_path": "/home/administrator/auto-swicth-ip/run/api-token",
+        # 按 PROJECT_DIR 推导，不写死家目录：换用户/换机器直接失效（实测在
+        # Ubuntu 上以 ubuntu 运行时报 Permission denied 于旧用户家目录，
+        # daemon 启动即退，systemd 无限 auto-restart）。
+        "socket_path": os.path.join(PROJECT_DIR, "run", "rotate.sock"),
+        "token_path": os.path.join(PROJECT_DIR, "run", "api-token"),
         # 并发去重窗口：同一次故障的多发请求只切一次。
         "coalesce_ms": 800,
         # 限速按「上一次切到的线是否已验证」分档：
@@ -258,6 +263,30 @@ CFG = {
             {"tag": "WARP-CF", "port": 1080, "service": "usque-warp.service", "ipv6": True},
             {"tag": "WARP-CF-B", "port": 1081, "service": "usque-warp-b.service", "ipv6": True},
             {"tag": "WARP-CF-D", "port": 1083, "service": "usque-warp-d.service"},
+            # 2026-10-30 扩容（主人定）：CF-D 同配置 ×2，v4 传输 → LAX 落地，
+            # 各自独立注册（.warp/usque5 / usque6），不是复制同一份私钥。
+            {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
+            {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service"},
+            # 2026-11-01 22:20 扩容（第二路径）：WARP 出口不必借机场的 UDP——
+            # usque 走 MASQUE（QUIC 443）本机直连 CF，机场封不封 WARP 网段无关。
+            # 实测 4 条闲置设备拉起即各自拿到独立 v6 出口（1f01/1f06/19c0 段），
+            # 出口池 = 设备数，注册的 20 台全在。WG 线给地点多样性，usque 线给量。
+            {"tag": "WARP-CF-C", "port": 1082, "service": "usque-warp-c.service", "ipv6": True},
+            {"tag": "WARP-CF-G", "port": 1086, "service": "usque-warp-g.service", "ipv6": True},
+            {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service", "ipv6": True},
+            {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service", "ipv6": True},
+            # WARP-WG-13 不再写死在这里：块模型把渠道数从 12 扩到 20 之后，
+            # 第 13 条就是生成成员里的普通一条，写死会得到两个同 tag 成员
+            # （同一端口、同一单元、同一份设备），selector 里重复项直接报错。
+            # 线路数不足 13 的部署仍需要它，见 `_append_wg_members` 末尾。
+            #
+            # 2026-11-02：H2 线路并入。与 usque/WG 的区别是**承载层**——
+            # 本地 usque 走 `--http2 -s ''` 连 `127.0.0.1:2270N`，由 sing-box
+            # 的 direct 入站经机场节点转发到 CF MASQUE 端点。对 daemon 而言
+            # 它就是一条普通 socks 出口，探测/换线/预热路径无需分叉。
+            # 端口落在 1180 段（避开 usque 的 1080-1089 与 WG 的 1110-1138）。
+            # 单元由 deploy/render_h2_lines.py 渲染，tag 里的 colo 是**实测**
+            # 落点，不是预期值（见 docs/warp-channel-allocation.md）。
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
@@ -463,10 +492,10 @@ CFG = {
         #     403 惩罚期同量级。
         #   - 瞬时（unreachable/err）：探测侧故障，不代表地址状态（日志实测同一
         #     地址 err 后 66s 即 OK）—— 这一档只留 2min。
-        #   - OK 单独一档 30min：它说的也是地址状态，而重探间隔中位 212s，套 2min
-        #     等于每轮都重探已验过的地址 —— 实测 1980 次「前一次 OK」里 1831 次
-        #     （92.5%）结论不变。地址真被烧时生产侧 `_probe_cache_forget` 会立即
-        #     作废 OK，不靠这个 TTL 兜底。
+        #   - OK 单独一档 30min：它说的也是地址状态，而重探间隔中位 212s，30min
+        #     约合 8.5 轮 —— 实测 1980 次「前一次 OK」里 1831 次（92.5%）结论不变，
+        #     拉长只是少探已验过的地址。地址真被烧时生产侧 `_probe_cache_forget`
+        #     会立即作废 OK，不靠这个 TTL 兜底。
         "probe_transient_ttl_sec": 120,
         "probe_ok_ttl_sec": 1800,
         # 与探测节奏同量级。旧值 21600 是第二道停探闸：结论一落缓存，
@@ -541,6 +570,42 @@ CFG = {
         # 关掉的代价是恢复保护没了 —— 真遇到账号级配额窗口时会看到 190 次/分
         # 那一类重启风暴，那时把这里改回 True。
         "quota_hold_enabled": False,
+        # 按渠道的 ban 率锁：某条线最近 window_sec 内的模型层实测**全部**判
+        # quota/flagged（且样本数 ≥ min_samples），说明整条渠道（同 colo 全段）
+        # 都烧穿了，重启换地址不会产出，锁到次日 reset_hour 点。
+        # 2026-11-02 实测：中午后 94% 的换址记录都是 ban，89.6% 的地址首用即
+        # quota；WG-1..6 在 NRT 12 个段上 100% 烧穿，每线刷了 1200~1600 次。
+        "channel_ban_hold_enabled": True,
+        # 30min 窗口 + 2 条样本会把 WG-4/11/12 这种低流量线误锁（实测各只有
+        # 3~6 条实测）。改成 1h 窗口、且**严格大于** 30 条实测才算数 ——
+        # 低于这个量级的 100% 只是「还没被打够」，不是烧穿。
+        "channel_ban_window_sec": 3600,
+        "channel_ban_min_samples": 30,
+        # 样本还得铺满窗口的一半。只数条数时实测 31 条只用了 4.7 分钟就锁了
+        # 17 条线 —— 那是「连撞 31 次」，不是「持续一小时都没产出」。
+        "channel_ban_min_cover_ratio": 0.5,
+        "channel_ban_reset_hour": 8,
+        # 命中后不只是停刷：把这条线换到最近 1h ban 率最低的 colo 上重定位，
+        # 次日 08:00 再换回原节点（`rehome_from`）。
+        "channel_rehome_enabled": True,
+        # 目标 colo 至少要有这么多条样本才配当「最低 ban 率」，否则单向 3 条
+        # 零封禁的 colo 会把整批线吸过去。
+        "channel_rehome_min_samples": 10,
+        # 重定位的目标必须落在**这个块里还有节点**的 colo 上：`wg_colo_map.json`
+        # 对远端常常是空/过期（survey 只在 bootstrap 里跑一次），此时候选表
+        # 只剩历史封禁率，挑出来的 colo 可能根本没节点可换。
+        "channel_rehome_require_nodes": True,
+        # 同块节点轮回（2026-11-02 主人定）：脏线守护每轮先看**当前绑定的落地
+        # 节点**还通不通，不通就换到同一个 colo 块里的可用节点再重启。
+        # 与「换线」和「探测」是两件事：换线换出口 IP、探测判 IP 质量，这里只
+        # 判节点本身。WHY 必须独立成一路：`validate_bindings` 只在节点从订阅池
+        # 里消失时才换（节点还在但已经不通就不管），`_restart_warp_line(rebind)`
+        # 只覆盖 v4 线 —— v6 线的节点死掉后 daemon 会一直重启一条注定连不上的线。
+        "node_rotation_enabled": _env_bool("ASIP_NODE_ROTATION", True),
+        # 同一条线两次节点探测的最小间隔。探测 = 起一个 sing-box 进程再连一次，
+        # 5s 一轮 × 29 条线会把机器打满；而节点死亡不是秒级状态。单次不通只记
+        # 一笔，下一轮复查仍不通才换 —— 机场抖动与探测冷启都会让单次探测失败。
+        "node_rotation_interval_sec": 60,
         "restart_concurrency": 12,
         "ip_observe_sec": 120,
         # fixed 模式的提前量：换线从发起到达生效 p50=2s / p90=7s，等满
@@ -551,6 +616,31 @@ CFG = {
         # 但错误路径上每多等一秒，坏出口就多服务一秒失败请求 —— 实测 40s 上限
         # 把「首错→换线生效」拉到 p90=25s / max=206s。
         "fallback_idle_wait_sec": 3,
+        # 夜间刷新锁：窗口内只刷新「隔夜存活」的线，其余线的重启一律跳过。
+        # WHY：上游免费层配额在次日 08:00 重置，20:00→08:00 之间被判 quota 的
+        # 出口重启动也只会拿到另一个同样 quota 的新 /128 —— 10-31 夜里实测
+        # 17036 次重启、0 次刷新成功，全是白烧。活下来的是那几条地址本身没
+        # 被烧完的线，夜里该把新地址都花在它们身上。
+        # allow 里的 tag 还会与 sing-box 实际成员取交集：不在 `opencode-out`
+        # 里的线（如尚未并入 .warp/warp-outbound.json 的 CF-E/CF-F/WG-13）
+        # 刷出地址也切不过去，自动被排除。
+        "night_window": {
+            # **第一期不做夜间锁**（2026-11-01 主人定）：第一阶段的目的就是
+            # 「全部渠道白天夜里都跑，测出每个 colo 的夜间封禁率」，锁住一部分
+            # 线等于把要测的样本自己删掉 —— 夜里到底哪条线能出货，就没数据了。
+            # 第二期按实测筛出夜间专用池时再把这条打开，白名单改用
+            # `warp_blocks.night_line_tags`（按块生成，见 docs 第四节）。
+            # 锁的实现留在 warp_night.py，关掉的只是一个开关。
+            "enabled": False,
+            "start_hour": 20,
+            "end_hour": 8,
+            "allow": [
+                # 10-31 20:00 → 11-01 08:00 存活榜（daemon.log 逐线 OK 计数）：
+                # CF 9 / CF-B 9 / CF-F 6 / CF-E 6 / CF-D 6 / WG-13 5 / WG-5 5 / WG-6 5
+                "WARP-CF", "WARP-CF-B", "WARP-CF-D", "WARP-CF-E", "WARP-CF-F",
+                "WARP-WG-5", "WARP-WG-6", "WARP-WG-13",
+            ],
+        },
         # 每条隧道一个常驻 worker（warp_line_worker.py）：「判断→执行」同循环，
         # 不再经预热/脏线抽检/补刷三个调度器排队。enabled=False 时完全走旧的
         # 三守护路径，行为与之前逐字节一致，便于回滚。
@@ -588,6 +678,54 @@ CFG = {
             "peer_v6": "[2606:4700:103::2]:2408",
             "mtu": 1280,
             "keepalive": 25,
+        },
+        # 渠道分配模型：块 = colo，渠道 = (类型, 块, 序号)。
+        # 设计依据 docs/warp-channel-allocation.md；模型在 warp_blocks.py（纯读，
+        # 不测量、不写盘），这里只放**块的静态属性**。
+        #
+        # 块成员（哪个节点属于哪个 colo）不写在这里：它来自实测表
+        # `.warp/block-map.json`（gitignored，由 `warp_blocks.py build-map` 生成）。
+        # 两处各存一份节点清单必然会漂移 —— 配置里的这份永远是上个星期的事实。
+        #
+        # enabled=False：模型不接管现网拓扑，apply 仍走 assign_nodes 的轮转分配。
+        # 打开前先跑 `python3 warp_blocks.py plan` 看渠道清单，别在夜里开。
+        "blocks": {
+            "enabled": _env_bool("ASIP_WARP_BLOCKS", False),
+            # 每块每类几条渠道。2 是「同 colo 一主一备」：同块两条线共用一个段池，
+            # 再多只会互相抢地址，不会多出可用地址。
+            "channels_per_block": _env_int("ASIP_WARP_BLOCK_CHANNELS", 2) or 2,
+            # 结构性不可用的块：封禁率 100% 的 colo 每条 /128 都在限额里，
+            # 挂上去等于占着设备不产出。**第一阶段默认空**（2026-11-01 主人定：
+            # 全部块都开、一起测），只在明确要放弃某个块时才往里加。
+            # 当天实测参考：NRT 4 条线夜里 0 次模型层 OK，PHX/SJC/SIN/TPE 有。
+            "exclude_colos": [],
+            "table": [
+                # ban_rate 是 2026-11-01 实测的**段封禁率**，只用于夜间取舍：
+                # 1.0 的块夜里重启动只会换到另一个同样被封的 /128。
+                # None = 没测过（HKG/TPE/ORD/PIT 当天才首现），夜间必须保留。
+                {"colo": "NRT", "loc": "东京",     "carrier": "proxy",  "ban_rate": 1.0},
+                {"colo": "PHX", "loc": "凤凰城",   "carrier": "proxy",  "ban_rate": 0.792},
+                {"colo": "LAX", "loc": "洛杉矶",   "carrier": "both",   "ban_rate": 0.266},
+                {"colo": "SJC", "loc": "圣何塞",   "carrier": "both",   "ban_rate": 0.25},
+                {"colo": "SIN", "loc": "新加坡",   "carrier": "both",   "ban_rate": 0.152},
+                {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None},
+                {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None},
+                {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None},
+                # 2026-11-02 H2 实测新增（dormant 65 节点里首次出现）。
+                # carrier=proxy：H2 与 WG-over-UDP 同属「代理承载」，区别只在
+                # 传输层（TCP/HTTP2 vs UDP/WireGuard），不改变块的归类。
+                # ban_rate=None：段池从没在生产台账里出现过，夜间必须保留。
+                {"colo": "ICN", "loc": "首尔",     "carrier": "proxy",  "ban_rate": None},
+                {"colo": "SLC", "loc": "盐湖城",   "carrier": "proxy",  "ban_rate": None},
+                {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None,
+                 # PIT 没有自己的节点：唯一落到过 PIT 的是 ORD 那条
+                 # `us.bing.com:443~6-any`（5 轮里 ORD 7 / PIT 3 / SIN 1）。
+                 # 按众数它归 ORD，于是 PIT 块永远空着。想拿到 PIT 的样本只能
+                 # 把这条节点**再挂一台设备**（pin），让它在漂到 PIT 的轮次里
+                 # 被记成 PIT —— 代价是七成时间它其实就是一条 ORD 线。
+                 # 这是「测量优先」的取舍，第二期有实测数据后可以撤掉。
+                 "pin": ["us.bing.com:443~6-any"]},
+            ],
         },
     },
     # Vercel 中继线路 —— 第三条地址空间（见 asip/vercel_relay.py 的模块注释）。
@@ -652,9 +790,54 @@ def _append_wg_members(cfg: dict) -> None:
             "home_group": (i - 1) // per,
             "family": wg["families"][(i - 1) % per],
         })
+    # 历史遗留的第 13 条线：它原本是「WG-5 同配置 ×1」的额外线（独立注册在
+    # line13）。线路数 ≥13 时生成成员已经覆盖同一个端口/单元/设备，再补一条
+    # 就是重复 tag；只有 12 线这种老配置才需要把它单独补回来。
+    # 注意这里刻意不带 kind/index/family —— 历史行为里 daemon 不把它当
+    # 「可换节点的 v4 线」，补字段会改变它的重启语义。
+    if wg["count"] < 13:
+        cfg["warp"]["members"].append({
+            "tag": "WARP-WG-13",
+            "port": wg["base_port"] + 12,
+            "service": "warp-wg-13.service",
+        })
 
 
 _append_wg_members(CFG)
+
+def _append_h2_members(cfg: dict) -> None:
+    """H2 线路并入 members（仅渲染产物存在时）。
+
+    成员的唯一事实来源是 `.warp/h2/channels.json` —— 它是
+    `deploy/render_h2_lines.py` 按块模型 + 设备占用算出来的台账。手抄进
+    `config.py` 必然与渲染产物漂移：改渠道数/换设备后，配置里的端口会指向
+    已经不存在的线，daemon 探测全失败却看不出原因。
+
+    文件不存在（未渲染过）时什么都不做，行为回到旧版。
+    """
+    import json
+    p = os.path.join(PROJECT_DIR, ".warp", "h2", "channels.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            rows = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(rows, list):
+        return
+    for r in rows:
+        try:
+            cfg["warp"]["members"].append({
+                "tag": r["member_tag"],
+                "port": int(r["socks_port"]),
+                "service": r["unit"],
+                "kind": "h2",
+                "index": int(r["index"]),
+                "colo": r["colo"],
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+
+_append_h2_members(CFG)
 
 # ============= 便捷常量 =============
 # ponytail: SINGBOX_SECRET 不在此导出为模块级常量——CFG["singbox"]["secret"] 是 import 时冻结的
@@ -673,6 +856,29 @@ TRANSPORT_LOOKBACK_SEC = 180
 # 订阅源顺序即合并优先级（okz 主力，其余补充）。值为空表示未配置。
 SUBSCRIPTION_KEYS = ("okz", "hd23n", "dasho", "dasho_alt")
 
+# 机场自有域名体系 —— 这些域名在公网 DNS 上是 NXDOMAIN，或被解析到**真实**的
+# bing.com（202.89.233.x），而节点要连的是机场自己的前置 IP。
+#
+# 放在 config 而不是 parse_subscription：**主配置和单线配置都要解析它们**。
+# 只写在 parse_subscription 里时，`warp_wg.build_line_config` 造出来的线只有
+# 本机 DNS —— 节点入口 `hk-aws-54.acczzz.com` 直接 NXDOMAIN，隧道永远起不来，
+# 而报错是 `failed to create session: lookup …`，看起来像节点挂了。
+# 2026-11-01 用探针复现：44 个「不能承载 WARP」的节点里，凡是入口是机场域名的
+# 都是这个死法（`us.bing.com`、`hk-aws-*.acczzz.com`、`unamecf*`）。
+AIRPORT_DNS_SUFFIXES = ("okzdns.com", "juhazf.cn", "hi2026.net", "acczzz.com",
+                        "bing.com")
+AIRPORT_DNS_URL = "https://custom.juhazf.cn/inst"
+AIRPORT_DNS_TAG = "dns-airport"
+AIRPORT_DNS_HOST = "custom.juhazf.cn"
+AIRPORT_DNS_PATH = "/inst"
+
+
+def needs_airport_dns(server: str | None) -> bool:
+    """该节点入口是否必须走机场 DoH 才能解析出前置 IP。"""
+    s = str(server or "")
+    return any(s.endswith(suffix) for suffix in AIRPORT_DNS_SUFFIXES)
+
+
 
 def subscription_urls() -> list[str]:
     """Configured subscription URLs, in merge order, empty entries dropped."""
@@ -686,6 +892,55 @@ if _w.get("proactive_mode") not in ("fixed", "requests"):
     raise SystemExit(f"✗ warp.proactive_mode 只能是 fixed/requests，实际 {_w.get('proactive_mode')!r}")
 if _w["proactive_mode"] == "requests" and not _w.get("proactive_quota_model"):
     raise SystemExit("✗ warp.proactive_quota_model 未配置，requests 模式无法计数")
+
+# 夜间锁：窗口反了就是「全天锁死」或「永不生效」，两者都只在夜里才被发现 ——
+# 那时已经没人看日志了。allow 为空同理：一条都不许重启 = 夜里彻底停止刷新。
+_nw = _w.get("night_window") or {}
+if _nw.get("enabled"):
+    _sh, _eh = _nw.get("start_hour"), _nw.get("end_hour")
+    for _k, _v in (("start_hour", _sh), ("end_hour", _eh)):
+        # bool 是 int 子类，`isinstance(True, int)` 为真 —— 写成 True 能悄悄
+        # 通过并变成「1 点」，必须单独挡掉。
+        if isinstance(_v, bool) or not isinstance(_v, int) or not 0 <= _v <= 23:
+            raise SystemExit(f"✗ warp.night_window.{_k} 必须是 0~23 的整数，实际 {_v!r}")
+    if _sh == _eh:
+        raise SystemExit(
+            f"✗ warp.night_window 起止小时相同（{_sh}）＝全天生效。"
+            "要关就用 enabled: False")
+    _allow = _nw.get("allow")
+    if not isinstance(_allow, list) or not _allow:
+        raise SystemExit("✗ warp.night_window.allow 为空 —— 窗口内将没有任何线可刷新")
+    # 非字符串元素会被 daemon._night_allow_tags 的 isinstance 过滤悄悄丢掉，
+    # 全丢光就变成「夜里一条都不许重启」—— 正好是设计要避免的那一侧。
+    if not all(isinstance(t, str) and t.strip() for t in _allow):
+        raise SystemExit(f"✗ warp.night_window.allow 含非字符串/空串: {_allow!r}")
+    # 不在这里校验 tag 是否存在：成员集合随 WARP_WG_* 环境变量变（没 source
+    # `.env` 时 WG 线根本不在 CFG 里），拿它当导入期断言会让「配置没问题、
+    # 只是环境没加载」变成启动失败。交集在 daemon._night_allow_tags 里做。
+
+# 渠道锁解封时刻同样只在「写到锁时」生效一次，写错了要等第二天才发现。
+# `True` 是 int 子类会变成 01:00；`"08:00"` 让每次探测记账都抛 ValueError；
+# 25 会被 mktime 归一化成次日 01:00 —— 三种都不报错，必须挡在导入期。
+_rh = _w.get("channel_ban_reset_hour", 8)
+if isinstance(_rh, bool) or not isinstance(_rh, int) or not 0 <= _rh <= 23:
+    raise SystemExit(f"✗ warp.channel_ban_reset_hour 必须是 0~23 的整数，实际 {_rh!r}")
+
+# 块表：colo 是主键，重复会让 channels() 给同一个块开两倍渠道、白名单算重。
+# channels_per_block < 1 展开出 0 条渠道，而 apply 会因此报「渠道不足」——
+# 报在 apply 时读起来像是实测表的问题，其实是一条配置写错了。
+_blk = _w.get("blocks") or {}
+if _blk:
+    _tbl = _blk.get("table")
+    if not isinstance(_tbl, list):
+        raise SystemExit(f"✗ warp.blocks.table 必须是列表，实际 {type(_tbl).__name__}")
+    _colos = [b.get("colo") for b in _tbl if isinstance(b, dict)]
+    if len(_colos) != len(_tbl) or any(not isinstance(c, str) or not c for c in _colos):
+        raise SystemExit("✗ warp.blocks.table 每项必须是带非空 colo 的字典")
+    if len(set(_colos)) != len(_colos):
+        raise SystemExit(f"✗ warp.blocks.table 里 colo 重复: {_colos}")
+    if int(_blk.get("channels_per_block") or 0) < 1:
+        raise SystemExit(
+            f"✗ warp.blocks.channels_per_block 必须 ≥1，实际 {_blk.get('channels_per_block')!r}")
 
 # ============= provider 常量 =============
 # OPENCODE_FREE_PROVIDER: 9router providerStrategies 中的 key = "opencode"

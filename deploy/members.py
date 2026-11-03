@@ -35,10 +35,12 @@ if __name__ == "__main__":
         write_warp_outbound(out)
         print(out)
     else:
-        # 只渲染 usque 成员：install.sh 用这行输出注册设备、建目录、生成单元，
-        # 而 WG 线的单元由 deploy/wg-lines-install.sh 单独生成。
+        # 只渲染 usque 成员：install.sh 用这行输出注册设备、建目录、生成单元。
+        # WG 线由 deploy/wg-lines-install.sh、H2 线由 deploy/render_h2_lines.py
+        # 各自生成单元；把它们漏进来会凭空注册设备（CF 限流）并在 1180+ 端口
+        # 上再起一份 usque，和 H2 线抢同一个出口端口。
         for m in CFG["warp"]["members"]:
-            if m.get("kind") == "wg":
+            if m.get("kind") in ("wg", "h2"):
                 continue
             n = m["port"] - 1079
             print(m["tag"], m["port"], m["service"],

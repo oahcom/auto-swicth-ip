@@ -30,7 +30,12 @@ import config  # noqa: E402
 from asip import vercel_relay as vr  # noqa: E402
 
 API = "https://api.vercel.com"
-TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vercel-relay")
+HERE = os.path.dirname(os.path.abspath(__file__))
+# 两份模板：edge 不能选区域、但能长流；node 能钉区域、但有 maxDuration。
+TEMPLATE_DIRS = {
+    "edge": os.path.join(HERE, "vercel-relay"),
+    "node": os.path.join(HERE, "vercel-relay-node"),
+}
 
 
 def load_token() -> str:
@@ -49,14 +54,29 @@ def load_token() -> str:
     return ""
 
 
-def read_template() -> dict:
+def read_template(runtime: str = "edge", region: str = "", max_duration: int = 60) -> dict:
+    """读模板；node 运行时把区域和时长写进 vercel.json。
+
+    区域必须写在 functions.regions 里 —— 实测顶层 regions 对 Edge 无效，
+    而对 Node 函数走 vercel.json 是稳的那条路。
+    """
+    base = TEMPLATE_DIRS.get(runtime)
+    if not base:
+        raise SystemExit(f"✗ 未知运行时：{runtime}")
     files = {}
     for rel in ("api/relay.js", "vercel.json", "package.json"):
-        path = os.path.join(TEMPLATE_DIR, rel)
+        path = os.path.join(base, rel)
         if not os.path.exists(path):
             raise SystemExit(f"✗ 模板缺失：{path}")
         with open(path, encoding="utf-8") as f:
             files[rel] = f.read()
+    if runtime == "node":
+        cfg = json.loads(files["vercel.json"])
+        fn = {"maxDuration": max_duration}
+        if region:
+            fn["regions"] = [region]
+        cfg.setdefault("functions", {})["api/relay.js"] = fn
+        files["vercel.json"] = json.dumps(cfg, indent=2)
     return files
 
 
@@ -112,18 +132,28 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--region", default=config.CFG["vercel"]["deploy"]["region"],
                     help="如 iad1 / sfo1；留空用账号默认")
     ap.add_argument("--prefix", default=config.CFG["vercel"]["deploy"]["project_prefix"])
+    ap.add_argument("--runtime", default="edge", choices=sorted(TEMPLATE_DIRS),
+                    help="edge=可长流但不能选区域；node=能钉区域但有 maxDuration")
+    ap.add_argument("--max-duration", type=int, default=60, help="仅 node：函数时长上限（秒）")
+    ap.add_argument("--name", default="", help="指定项目名（原地重部署用，换 IP 靠它）")
     ap.add_argument("--apply", action="store_true", help="真部署（默认只打印计划）")
     ap.add_argument("--sync", action="store_true", help="部署完同步进 9router proxyPools")
     args = ap.parse_args(argv)
 
     token = load_token()
-    files = read_template()
+    files = read_template(args.runtime, args.region, args.max_duration)
     ledger_path = config.CFG["vercel"]["ledger_path"]
     ledger = vr.load(ledger_path)
     stamp = time.strftime("%m%d%H%M")
 
-    plan = [f"{args.prefix}-{stamp}-{i + 1:02d}" for i in range(max(1, args.count))]
-    print(f"计划部署 {len(plan)} 条（region={args.region or '账号默认'}）：")
+    if args.name:
+        plan = [args.name]
+    else:
+        plan = [f"{args.prefix}-{stamp}-{i + 1:02d}" for i in range(max(1, args.count))]
+    where = args.region or "账号默认"
+    if args.region and args.runtime == "edge":
+        where += "（⚠ Edge 不认 region，出口仍跟边缘节点走）"
+    print(f"计划部署 {len(plan)} 条（runtime={args.runtime} region={where}）：")
     for name in plan:
         print(f"  {name}")
     if not args.apply:
@@ -145,11 +175,25 @@ def main(argv: list[str] | None = None) -> int:
             project_id = dep.get("projectId") or name
             ready = poll_ready(token, dep_id)
             disable_protection(token, project_id)
-            url = "https://" + str(ready.get("url") or dep.get("url")).replace("https://", "")
-            rid = vr.add_relay(ledger, url, name=name)
+            deploy_url = "https://" + str(ready.get("url") or dep.get("url")).replace("https://", "")
+            # 台账里存**项目别名**而不是部署专用 URL：别名在重部署后依然有效，
+            # 而部署 URL 会随下一次部署变成 404 —— 换 IP 的前提是地址能一直用。
+            # 登记的一律是别名：部署专用 URL 带 hash，下次部署就 404，
+            # 而且它和别名对不上 —— 以前探失败就退回去登部署 URL，结果是
+            # 同一个项目在台账里变成两条（2026-10-29 真踩过）。
+            alias = f"https://{name}.vercel.app"
+            timeout = float(config.CFG["vercel"]["probe_timeout_sec"])
+            probed = vr.probe(alias, timeout=timeout)
+            if not probed.ok:
+                probed = vr.probe(deploy_url, timeout=timeout)  # 只用来探，不登记
+            url = alias
+            rid = vr.add_relay(ledger, url, name=name, runtime=args.runtime,
+                               region=args.region, project=name)
+            if rid:
+                vr.record_probe(ledger, rid, probed)
             vr.save(ledger_path, ledger)
             ok.append((name, url))
-            print(f"  ✓ {url}  (relay_id={rid})")
+            print(f"  ✓ {url}  (relay_id={rid}, 出口 {probed.ip or '-'})")
         except Exception as e:  # 一条失败不该带走整批
             failed.append((name, str(e)))
             print(f"  ✗ {name}: {e}", file=sys.stderr)

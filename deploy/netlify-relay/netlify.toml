@@ -1,0 +1,7 @@
+# 所有路径都交给中继函数：9router 只打 base URL，路径在 x-relay-path 里。
+# force = true 是必须的 —— 没有它，Netlify 只在「找不到静态文件」时才走重定向。
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/relay"
+  status = 200
+  force = true

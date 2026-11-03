@@ -11,7 +11,7 @@
 ## 架构
 
 ```
-[openclaw/opencode/etc]  →  9router:20127  →  sing-box:7890  →  83 节点池 + 10 WARP  →  Internet
+[openclaw/opencode/etc]  →  9router:20127  →  sing-box:7890  →  订阅池 + WARP 线  →  Internet
                                        ↑                                ↑
                               outboundProxyUrl = 7890              订阅拉取
                                        ↑
@@ -61,12 +61,12 @@ ELF 架构不符时会自动调用它——所以从 arm64 机器 clone（仓库
 
 `.warp/usque/usque` 必须是**真实文件**，不能是链接：其余 `.warp/usqueN/` 里的
 `usque` 都指向它。脚本建链接时已排除主目录自身（`usque*/` 会匹配到 `usque/`，
-把真二进制换成指向自己的链接 → 20 条隧道全部 `ELOOP`）。
+把真二进制换成指向自己的链接 → 全部 usque 隧道 `ELOOP`）。
 
 ### 1. 一键部署（推荐）
 
 ```bash
-./deploy/install.sh          # 生成密钥 + 注册 20 条隧道 + 写 systemd 单元 + 启用
+./deploy/install.sh          # 生成密钥 + 注册 usque 成员 + 写 systemd 单元 + 启用
 # 若现网单元已指向另一个目录（如从别处 clone），会拒绝覆盖；加 --adopt 确认迁移
 ./deploy/install.sh --adopt
 ```

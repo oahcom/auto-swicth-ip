@@ -34,7 +34,12 @@ import time
 from pathlib import Path
 
 from asip.atomic_io import write_json
-from config import CFG, PROJECT_DIR
+from config import (AIRPORT_DNS_HOST, AIRPORT_DNS_PATH, AIRPORT_DNS_SUFFIXES,
+                    AIRPORT_DNS_TAG, CFG, PROJECT_DIR, needs_airport_dns)
+
+# 渠道模型（块 = colo）。import 方向只能是 warp_wg → warp_blocks：模型不知道
+# 线路、端口、单元名这些东西，反过来 import 会让「纯模型」变成第二个 daemon。
+import warp_blocks as blocks
 
 # config.py 导出的 PROJECT_DIR 是 str（历史原因）；路径运算统一走 Path。
 PROJECT = Path(PROJECT_DIR)
@@ -242,6 +247,28 @@ def _split_peer(peer: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def prepare_node(node: dict) -> dict:
+    """单线配置里的节点出站：入口是机场域名时，必须挂机场 DoH。
+
+    WHY 不是「本机 DNS 也能解析」：机场拿 `cn.bing.com` / `us.bing.com` /
+    `hk-aws-*.acczzz.com` 这些**别人的域名**当跳板，公网上它们要么 NXDOMAIN，
+    要么解析到真 Bing（202.89.233.x）。真 Bing 的证书是 Microsoft 的，
+    机场前置要的是 `*.okzdns.com` —— 于是握手报「证书不属于本域」，
+    看起来像节点坏了。2026-11-01 实测：补上 `domain_resolver` 后 okz 系
+    节点 0/54 → 50/54（TEST_PLAN v1.57）。
+
+    主配置由 `parse_subscription` 负责这件事；单线配置原先漏了，后果是
+    「块模型挑出来的节点一写成线就连不上」—— 而这批节点恰恰是实测 WARP
+    可用的那批。
+    """
+    n = json.loads(json.dumps(node))
+    if needs_airport_dns(n.get("server")):
+        n["domain_resolver"] = AIRPORT_DNS_TAG
+    else:
+        n.setdefault("domain_resolver", "dns-default")
+    return n
+
+
 def build_line_config(profile: dict, port: int, node: dict, peer: str,
                       family: str = "v6") -> dict:
     """单条线的完整 sing-box 配置。
@@ -254,6 +281,7 @@ def build_line_config(profile: dict, port: int, node: dict, peer: str,
     反之亦然。不能用 ``ipv4_only``——那会让只有 AAAA 的目标直接不可达。
     """
     host, peer_port = _split_peer(peer)
+    node = prepare_node(node)
     node_tag = node["tag"]
     return {
         "log": {"level": "warn", "timestamp": True},
@@ -262,13 +290,27 @@ def build_line_config(profile: dict, port: int, node: dict, peer: str,
             "listen": _wg()["listen_host"], "listen_port": port,
         }],
         "outbounds": [node],
-        # DNS 用本机解析器，和主配置的 dns-default 同一形态。
+        # 两个 DNS server，和主配置同一形态：
+        #   dns-airport —— 只解析机场域名（节点入口），必须走它才拿到前置 IP；
+        #   dns-default —— 本机解析器，兜住其余一切，也是 dns-airport 自己的
+        #                  resolver（指回自己会 circular，实测 FATAL）。
         # WHY 不做 detour：节点 server 是域名，若 DNS 也 detour 到该节点，
         # 解析节点本身就要先连上节点 —— 环路，sing-box 报
         # "DNS query loopback in transport[dns]"，握手永远起不来。
-        "dns": {"servers": [{"type": "local", "tag": "dns-default"}],
-                "final": "dns-default",
-                "strategy": "prefer_ipv4" if family == "v4" else "prefer_ipv6"},
+        "dns": {
+            "servers": [
+                {"type": "https", "tag": AIRPORT_DNS_TAG,
+                 "server": AIRPORT_DNS_HOST, "path": AIRPORT_DNS_PATH,
+                 "domain_resolver": "dns-default"},
+                {"type": "local", "tag": "dns-default"},
+            ],
+            # 机场域名钉死 ipv4：前置只有 A 记录，走 v6 会拿到空答案后回落，
+            # 白等一轮超时。这条规则只影响这些域名，不影响隧道出口的选择。
+            "rules": [{"domain_suffix": list(AIRPORT_DNS_SUFFIXES),
+                       "server": AIRPORT_DNS_TAG, "strategy": "ipv4_only"}],
+            "final": "dns-default",
+            "strategy": "prefer_ipv4" if family == "v4" else "prefer_ipv6",
+        },
         "endpoints": [{
             "type": "wireguard", "tag": "warp",
             "address": profile["address"],
@@ -372,43 +414,89 @@ def _socks_udp_inner(proxy_port: int, dst: tuple[str, int], payload: bytes,
         t.close()
 
 
-def probe_node_udp(node: dict, timeout: float = 6.0) -> bool:
-    """用临时 sing-box 验证该节点是否转发任意端口 UDP。
+def node_outbound(tag: str) -> dict | None:
+    """按 tag 从生产配置取节点 outbound（已含 correct server_name/凭据）。
 
-    判据用 STUN（3478）而不是 53：只有 53 通的节点会骗过探测，而 WG 需要
-    2408，属于同一类「非标准端口」能力。
+    不要手搓节点配置：SNI 与凭据必须是订阅给的那份，手写会得到
+    `bilibili-image-cdn.hi2026.net` 这类过期的 server_name（实测踩过）。
+    """
+    try:
+        cfg = json.loads(Path(CFG["singbox"]["config_file"]).read_text())
+    except (OSError, ValueError):
+        return None
+    for o in cfg.get("outbounds", []):
+        if o.get("tag") == tag and o.get("server"):
+            return o
+    return None
+
+
+def probe_node_tcp(node: dict, timeout: float = 6.0,
+                   prod_dns: dict | None = None) -> bool | None:
+    """经临时 sing-box 验证节点能否转发 TCP 到 Cloudflare。None = 测不了。
+
+    WHY 不能在本进程里直接 `socket.create_connection(节点域名)`：机场节点域名
+    只由订阅里的 DoH 解析得了，系统 DNS 一律超时。实测 19 条线全部
+    `TimeoutError/gaierror`，其中 8 条当时正在正常出流量 —— 拿系统 DNS 的
+    失败当节点死亡，会把整批健康线判死并无谓重启。
+
+    这里让 sing-box 自己解析（它配了无人机场的 DNS）并只连一个已知稳定的
+    目标（1.1.1.1:443），所以结论只反映「节点→公网」这一段。
     """
     sb = CFG["singbox"]["binary"]
-    with tempfile.TemporaryDirectory(prefix="wgprobe-") as td:
+    if prod_dns is None:
+        try:
+            prod_dns = json.loads(
+                Path(CFG["singbox"]["config_file"]).read_text())["dns"]
+        except (OSError, ValueError, KeyError):
+            return None
+    with tempfile.TemporaryDirectory(prefix="tcpprobe-") as td:
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
         cfg = {
             "log": {"level": "error"},
-            "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": port}],
+            "inbounds": [{"type": "socks", "listen": "127.0.0.1",
+                          "listen_port": port}],
             "outbounds": [node],
-            "dns": {"servers": [{"type": "local", "tag": "dns-default"}],
-                    "final": "dns-default"},
+            # 必须复用生产 DNS：节点域名（juhazf.cn / acczzz.com 等）只有机场
+            # DoH 解析得了，系统 DNS 一律超时。用 dns-default 会把每条线都
+            # 探成 None（实测 19/19），探测等于没做。
+            "dns": prod_dns,
             "route": {"final": node["tag"],
-                      "default_domain_resolver": {"server": "dns-default"}},
+                      "default_domain_resolver": {"server": "dns-airport"}},
         }
         path = os.path.join(td, "probe.json")
         write_json(path, cfg, mode=0o600, indent=2)
         proc = subprocess.Popen([sb, "run", "-c", path],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
         try:
-            for _ in range(20):
+            for _ in range(25):
                 try:
-                    socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
+                    socket.create_connection(("127.0.0.1", port),
+                                             timeout=0.3).close()
                     break
                 except OSError:
                     time.sleep(0.2)
             else:
-                return False
-            tid = os.urandom(12)
-            pkt = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + tid
-            return _socks_udp(port, ("162.159.207.0", 3478), pkt, timeout) is not None
+                return None
+            try:
+                sock = socket.create_connection(("127.0.0.1", port),
+                                                timeout=timeout)
+            except OSError:
+                return None
+            try:
+                sock.sendall(b"\x05\x01\x00")
+                if sock.recv(2) != b"\x05\x00":
+                    return None
+                sock.sendall(b"\x05\x01\x00\x01"
+                             + socket.inet_aton("1.1.1.1")
+                             + struct.pack("!H", 443))
+                rep = sock.recv(10)
+                return len(rep) >= 2 and rep[1] == 0
+            finally:
+                sock.close()
         finally:
             proc.terminate()
             try:
@@ -417,50 +505,20 @@ def probe_node_udp(node: dict, timeout: float = 6.0) -> bool:
                 proc.kill()
 
 
-def udp_cache_path() -> Path:
-    return PROJECT / ".warp" / "wg_node_udp.json"
-
-
-def load_udp_cache() -> dict:
-    try:
-        return json.loads(udp_cache_path().read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def save_udp_cache(cache: dict) -> None:
-    write_json(str(udp_cache_path()), cache, mode=0o600, indent=2)
-
-
 def udp_capable(nodes: list[dict], probe: bool = False) -> list[dict]:
-    """筛掉不转发 UDP 的节点，结果落缓存（默认 6h）。
+    """**已废弃的 STUN 判据，现在只做原样透传。**
 
-    24 个节点逐个 STUN 要两分钟，每次 apply 都探一遍不现实。缓存未过期就
-    直接复用；没有缓存又没开 --probe 时先放行，由 daemon 的实测失败兜底
-    ——宁可多给一条线一次机会，也不要因为探测缺省就把池子砍半。
+    历史：这里曾用临时 sing-box 向 162.159.207.0:3478 发 STUN，结论落
+    `.warp/wg_node_udp.json` 缓存 6h。它是错的 —— WARP 走 2408，节点完全可以
+    只放行 2408 而不放行 3478。实测 `pq.aws48` STUN=False，但它承载的
+    WARP-WG-5 正在正常出 v6 流量（colo=NRT）。缓存里 228 条有 192 条记成
+    False，`apply()` 据此把 22 条渠道砍到 8 条，v4 合并块直接清空。
+
+    节点能否承载 WARP 只能靠**实际握手**验证：`apply()` 之后每条线跑一次
+    出口探测（`_trace_fields`），daemon 的同块轮回守护也在持续做这件事。
+    `probe` 参数保留只为不破坏调用方签名，传什么都不影响结果。
     """
-    ttl = float(_wg().get("udp_cache_ttl_sec") or 6 * 3600)
-    cache = load_udp_cache()
-    now = time.time()
-    out: list[dict] = []
-    dirty = False
-    for n in nodes:
-        tag = n["tag"]
-        e = cache.get(tag) or {}
-        fresh = now - float(e.get("ts") or 0) < ttl
-        if fresh:
-            good = bool(e.get("ok"))
-        elif probe:
-            good = probe_node_udp(n)
-            cache[tag] = {"ok": good, "ts": int(now)}
-            dirty = True
-        else:
-            good = True
-        if good:
-            out.append(n)
-    if dirty:
-        save_udp_cache(cache)
-    return out
+    return list(nodes)
 
 
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
@@ -553,6 +611,20 @@ def _read_state() -> dict:
         return {"lines": {}}
 
 
+def line_nodes() -> dict[str, str]:
+    """`{线路 tag: 该线当前落地节点}`，取自已落盘的线路台账。
+
+    给夜间白名单用：块说「哪个 colo 还值得刷」，这份台账说「哪条线现在落在
+    那个 colo」。台账缺失时返回空 dict —— 调用方据此退回配置里的静态名单，
+    而不是猜一个「全保留」。
+    """
+    out = {}
+    for tag, line in (_read_state().get("lines") or {}).items():
+        if isinstance(line, dict) and line.get("node"):
+            out[tag] = line["node"]
+    return out
+
+
 def _rotation_for(home: dict, pool: list[dict], size: int) -> list[str]:
     """后备顺序：先别的出口组，再同组。
 
@@ -568,12 +640,22 @@ def _rotation_for(home: dict, pool: list[dict], size: int) -> list[str]:
 
 def apply(count: int | None = None, nodes: list[str] | None = None,
           start: int = 0, probe: bool = False, dry_run: bool = False,
-          publish: bool = True) -> dict:
+          publish: bool = True, delays: dict | None = None) -> dict:
     """按「落地节点 × 渠道模式」生成全部线路。
 
     每条线 = 一个 WARP 设备 + 一个 sing-box 进程 + 一个 socks 端口。
     同一落地节点上挂 per_node 条渠道（families 的长度），各自带一份在后备
     节点列表里轮转的配置，daemon 侧看到的就是普通成员。
+
+    分配逻辑有两个来源，由 `warp.blocks.enabled` 决定（默认关）：
+
+    | 来源 | 分组依据 | 用途 |
+    |---|---|---|
+    | `assign_nodes`（旧） | colo 轮转，尽量让每条线落不同主机 | 现网拓扑，保持不变 |
+    | `warp_blocks.plan_lines`（新） | 渠道 = (类型, 块, 序号) | 按块开渠道，见 docs/warp-channel-allocation.md |
+
+    两条路径共用后面的注册、写配置、发布步骤 —— 分叉只在这里，因为「选哪个
+    节点」是唯一真正不同的地方；把写盘也复制一份，两边就会各自漂移。
     """
     wg = _wg()
     families = list(wg.get("families") or ["v6"])
@@ -617,40 +699,84 @@ def apply(count: int | None = None, nodes: list[str] | None = None,
         print("  ⚠ 台账里所有节点都被标死，退回全部节点当落地点候选"
               "（这些线大概率连不上）", file=sys.stderr)
         usable = pool
-    if nodes:
-        missing = [t for t in nodes if t not in by_tag]
-        if missing:
-            raise SystemExit(f"节点不在当前订阅里或 UDP 不可用: {missing}")
-        # 显式 --nodes 原本绕过 ok 过滤：指定一个实测死的节点会被照单收下，
-        # home 直接写进线配置、那条线从此连不上。照用但要说一声。
-        dead = [t for t in nodes if (colo.get(t) or {}).get("ok") is False]
-        if dead:
-            print(f"  ⚠ 显式指定的节点里有台账判死的 {dead}；照用，线可能连不上",
-                  file=sys.stderr)
-        home_nodes = [by_tag[t] for t in nodes][:homes]
-        if len(home_nodes) < homes:
-            raise SystemExit(f"落地节点不足：需要 {homes} 个，给了 {len(home_nodes)} 个")
-    else:
-        # 按实测 colo 分组：v4 出口只由 colo 决定，同 colo 多挂 v4 线只会
-        # 抢同一个地址池（实测同节点重启即在 .211/.243 间跳，与节点无关）。
-        known = {str(v.get("colo")) for v in colo.values() if v.get("colo")}
-        home_nodes = assign_nodes(
-            usable, homes, start, key=region_key,
-            rank=lambda k: 0 if k in known else 1)
-
     rot_size = max(1, int(wg.get("rotation_size") or 8))
+    plan = None
+    if blocks.enabled(CFG) and not nodes:
+        # 渠道清单已按块排好序，这里只截断到线路数：多出来的渠道是备选池，
+        # 不是「该多开几条线」—— 线路数由 WARP_WG_COUNT 决定，不由块数决定。
+        # 块表里混了两种承载：WG（UDP 经节点）和 H2（TCP 经节点）。`udp_capable`
+        # 对后者必然判 False，而 H2 线由 deploy/render_h2_lines.py 渲染，不归这里。
+        # 不把 H2 渠道剔出去，整次 apply 会直接 SystemExit（实测：udp 缓存一刷新，
+        # 29 条线一条也铺不出来）。远端首次部署时缓存一定是刚测的，这不是边角情况。
+        # 同理剔掉「块表里有、但本次 UDP 池里没有」的节点：那是缓存与实测表
+        # 不同步，不该让整次部署失败。
+        nodes_map = blocks.load_map()
+        chans = blocks.channels(CFG, delays=delays)
+        wg_chans = [c for c in chans
+                    if (nodes_map.get(c["node"]) or {}).get("carrier") != "h2"
+                    and c["node"] in by_tag]
+        h2_n = sum(1 for c in chans
+                   if (nodes_map.get(c["node"]) or {}).get("carrier") == "h2")
+        if h2_n:
+            print(f"  跳过 {h2_n} 条 H2 渠道（不占 WG 线位，见 deploy/render_h2_lines.py）",
+                  file=sys.stderr)
+        # 先展开，再按**实际**条数建线：`plan_lines` 会因「同一节点不当两条线的
+        # home」而少给几条（pin 让同一节点出现在两个块里），拿旧的 total 建线
+        # 会 IndexError。线路数是结果，不是输入。
+        candidate = blocks.plan_lines(
+            wg_chans, min(total, len(wg_chans)), rotation_size=rot_size)
+        if len(candidate) < total:
+            print(f"  ⚠ WG 渠道去重后只有 {len(candidate)} 条（要 {total} 条）；"
+                  f"按实际条数建线", file=sys.stderr)
+        if candidate:
+            plan = candidate
+            total = len(plan)
+            print(f"  块模型接管分配：{len(plan)} 条渠道 → {total} 条线路",
+                  file=sys.stderr)
+
+    # 选了块模型就不再跑 `assign_nodes`：那是另一套选点逻辑，它算出来的
+    # `home_nodes` 一条也不会被用到，但它会先在「可用节点不足」时 SystemExit
+    # —— 明明块表够用，却被一条不生效的路径拦住。
+    home_nodes: list[dict] = []
+    if plan is None:
+        if nodes:
+            missing = [t for t in nodes if t not in by_tag]
+            if missing:
+                raise SystemExit(f"节点不在当前订阅里或 UDP 不可用: {missing}")
+            # 显式 --nodes 原本绕过 ok 过滤：指定一个实测死的节点会被照单收下，
+            # home 直接写进线配置、那条线从此连不上。照用但要说一声。
+            dead = [t for t in nodes if (colo.get(t) or {}).get("ok") is False]
+            if dead:
+                print(f"  ⚠ 显式指定的节点里有台账判死的 {dead}；照用，线可能连不上",
+                      file=sys.stderr)
+            home_nodes = [by_tag[t] for t in nodes][:homes]
+            if len(home_nodes) < homes:
+                raise SystemExit(f"落地节点不足：需要 {homes} 个，给了 {len(home_nodes)} 个")
+        else:
+            # 按实测 colo 分组：v4 出口只由 colo 决定，同 colo 多挂 v4 线只会
+            # 抢同一个地址池（实测同节点重启即在 .211/.243 间跳，与节点无关）。
+            known = {str(v.get("colo")) for v in colo.values() if v.get("colo")}
+            home_nodes = assign_nodes(
+                usable, homes, start, key=region_key,
+                rank=lambda k: 0 if k in known else 1)
     state = {"lines": {}, "updated": int(time.time())}
     for i in range(1, total + 1):
         group = (i - 1) // per
-        home = home_nodes[group]
-        rotation = _rotation_for(home, usable, rot_size)
+        if plan:
+            p = plan[i - 1]
+            home = by_tag[p["node"]]
+            family = p["family"]
+            rotation = p["rotation"]
+        else:
+            home = home_nodes[group]
+            rotation = _rotation_for(home, usable, rot_size)
+            family = families[(i - 1) % per]
         # 同组的兄弟线错开后备顺序，避免三条线同时跳去同一个节点。
         off = (i - 1) % per
         head, tail = rotation[0], rotation[1:]
         if tail:
             off %= len(tail)
             tail = tail[off:] + tail[:off]
-        family = families[(i - 1) % per]
         state["lines"][line_tag(i)] = {
             "unit": unit_name(i),
             "port": wg["base_port"] + i - 1,
@@ -658,7 +784,9 @@ def apply(count: int | None = None, nodes: list[str] | None = None,
             "family": family,
             "home": home["tag"],
             "rotation": [head] + tail,
-            "rebind_ts": 0,
+            # 写成当前时刻而不是 0：daemon 的同块轮回守护用它当「刚动过，先别
+            # 判死」的闸门，0 会让刚 apply 出来的线立刻进入判死计数。
+            "rebind_ts": int(time.time()),
         }
         if dry_run:
             print(f"[dry-run] {line_tag(i)} -> {home['tag']} ({family}, "
@@ -696,7 +824,7 @@ def rebind(i: int, probe: bool = False) -> str | None:
     for tag in rot:
         if tag == cur:
             continue
-        if probe and not probe_node_udp(pool[tag]):
+        if probe and not probe_node_tcp(pool[tag]):
             continue
         write_line(i, pool[tag], family=line.get("family"))
         line["node"] = tag

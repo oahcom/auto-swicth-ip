@@ -113,6 +113,17 @@ if [ "$UNITS_ONLY" = 0 ]; then
         || warn ".warp/usque/usque 缺失（install.sh 会调用 fetch-binaries.sh）"
     [ -f "$DIR/singbox-config.json" ] && ok "singbox-config.json 已生成" \
         || warn "singbox-config.json 未生成：首次启动 daemon 会按 .env 订阅生成"
+    # H2 线（deploy/render_h2_lines.py）的两个硬前提：块模型开着，且块表
+    # 里有 carrier=h2 的节点。缺任一条都渲染出 0 条 —— 远端装完看起来「都绿了」
+    # 却一条 H2 线也没有，所以要在这里点名。
+    if [ -f "$DIR/.warp/block-map.json" ]; then
+        H2N="$("$PYBIN" -c 'import json,sys; d=json.load(open(sys.argv[1])).get("nodes",{}); print(sum(1 for v in d.values() if isinstance(v,dict) and v.get("carrier")=="h2"))' "$DIR/.warp/block-map.json" 2>/dev/null || echo 0)"
+        ok "块实测表 carrier=h2 节点: ${H2N:-0} 个"
+        [ "${H2N:-0}" -gt 0 ] \
+            || warn "  0 个 H2 节点：render_h2_lines.py 会渲染 0 条（先跑 tools/merge_h2_blockmap.py）"
+    else
+        warn "缺 .warp/block-map.json：块模型（ASIP_WARP_BLOCKS=1）无法选点，会退回 assign_nodes"
+    fi
 fi
 
 # 6) 端口占用（软项）

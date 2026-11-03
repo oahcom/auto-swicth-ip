@@ -261,7 +261,7 @@ def test_single_unknown_does_not_restart(monkeypatch):
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda member, reason: restarted.append(member["tag"]) or True)
+                        lambda member, reason, **kw: restarted.append(member["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == []
     assert daemon._warp_line_state("W2")["last_verdict"] == "unknown"

@@ -134,8 +134,9 @@ fi
 # requestDetails 的 403/429 换线。装它不该是让人自己去翻文档的额外步骤。
 
 # 已装好时脚本幂等跳过；ASIP_SKIP_9ROUTER=1 可跳过（只想要 sing-box + WARP 的场景）。
-
-if [ "${ASIP_SKIP_9ROUTER:-0}" != 1 ]; then
+# 只在全量安装时跑：`--units-only` 的语义是「重生成单元」，而 npm install + build
+# 要十分钟，远端改一次 members 就得等一次，且会重启 9router 打断在跑的请求。
+if [ "${ASIP_SKIP_9ROUTER:-0}" != 1 ] && [ "$UNITS_ONLY" = 0 ]; then
 
     bash "$DIR/deploy/install-9router.sh" || {
 
@@ -159,9 +160,14 @@ MEMBERS="$("$PYBIN" "$DIR/deploy/members.py" 2>/dev/null | awk 'NF==5')"
 
 # .warp/warp-outbound.json 是 parse_subscription 生成 WARP 出口的唯一依据，且被
 # gitignore。缺了它配置里不会有 opencode-out，daemon 全部换线打空 —— 从 config 重建。
-[ -f "$DIR/.warp/warp-outbound.json" ] \
-    || { "$PYBIN" "$DIR/deploy/members.py" --write-warp-outbound >/dev/null \
-         && echo "已生成 .warp/warp-outbound.json"; }
+# 不能只在「文件不存在」时重建：成员表会随 H2 渲染、WG 线增减而变，旧文件留着
+# 就是新铺的线永远进不了 selector（daemon 换线全部打空）。生成器是幂等的，
+# 内容不变时不改 mtime，所以每次都跑。
+if "$PYBIN" "$DIR/deploy/members.py" --write-warp-outbound >/dev/null; then
+    echo "已同步 .warp/warp-outbound.json（$(grep -c '"tag"' "$DIR/.warp/warp-outbound.json") 条出口）"
+else
+    echo "✗ 生成 .warp/warp-outbound.json 失败" >&2; exit 1
+fi
 
 # ---- 密钥：缺失时生成，绝不覆盖已有的（改它会让正在跑的 sing-box 掉线）----
 SECRET_FILE="${SINGBOX_SECRET_FILE_PATH:-$HOME_DIR/.singbox_secret}"
@@ -197,18 +203,28 @@ fi
 need_root() {
     if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@" || { echo "✗ 需要 root：$*" >&2; exit 1; }; fi
 }
-need_root mkdir -p "$UNIT_DIR"
+# 系统级目录已存在（/etc/systemd/system），普通用户能 mkdir 就直接建；只有确实
+# 没有权限时才提权。无条件 need_root 会把演练目录（SYSTEMD_DIR=/tmp/x）建成
+# root 属主，后续非 root 写单元全部 Permission denied —— 试跑反而先崩。
+mkdir -p "$UNIT_DIR" 2>/dev/null || need_root mkdir -p "$UNIT_DIR"
 
 # ---- 特权包装：daemon 以非 root 运行，但要重启系统级单元 ----
 # 见 deploy/asip-unit 的注释：sudoers 不允许命令参数带通配符，白名单只能
 # 收在脚本里；polkit 在本机 inactive，也不适合给无交互服务进程配规则。
-need_root install -m 0755 "$DIR/deploy/asip-unit" /usr/local/bin/asip-unit
-SUDOERS_FILE=/etc/sudoers.d/auto-switch-ip
-if [ ! -f "$SUDOERS_FILE" ]; then
-    printf '# 由 deploy/install.sh 生成。只放行 asip-unit 一个入口，白名单在它内部。\n%s ALL=(root) NOPASSWD: /usr/local/bin/asip-unit\n' "$RUN_USER"         | need_root tee "$SUDOERS_FILE" >/dev/null
-    need_root chmod 0440 "$SUDOERS_FILE"
-    need_root visudo -c -f "$SUDOERS_FILE" >/dev/null         || { echo "✗ $SUDOERS_FILE 语法错误" >&2; exit 1; }
-fi
+# 只在单元落进系统级目录时才装：演练目录（SYSTEMD_DIR=/tmp/x）不需要它，
+# 而 `sudo -n install` 在没配免密 sudo 的开发机上会让整次 --units-only 失败。
+case "$UNIT_DIR" in
+    /etc/systemd/*|/usr/lib/systemd/*)
+        need_root install -m 0755 "$DIR/deploy/asip-unit" /usr/local/bin/asip-unit
+        SUDOERS_FILE=/etc/sudoers.d/auto-switch-ip
+        if [ ! -f "$SUDOERS_FILE" ]; then
+            printf '# 由 deploy/install.sh 生成。只放行 asip-unit 一个入口，白名单在它内部。\n%s ALL=(root) NOPASSWD: /usr/local/bin/asip-unit\n' "$RUN_USER"         | need_root tee "$SUDOERS_FILE" >/dev/null
+            need_root chmod 0440 "$SUDOERS_FILE"
+            need_root visudo -c -f "$SUDOERS_FILE" >/dev/null         || { echo "✗ $SUDOERS_FILE 语法错误" >&2; exit 1; }
+        fi
+        ;;
+    *) echo "⚠ 单元写入 $UNIT_DIR（非系统级）：跳过 asip-unit/sudoers 安装" >&2 ;;
+esac
 cat > "$UNIT_DIR/auto-switch-ip.service" <<EOF
 [Unit]
 Description=auto-switch-ip daemon — monitor 9router errors + rotate sing-box proxy nodes
@@ -230,6 +246,11 @@ RestartSec=10
 # 默认 KillMode=control-group 会让每次 restart 连带杀掉 sing-box → daemon 置 bypass 直连
 # → opencode 看到本地 IP 直接 403。实测三次重启各触发 ~50-100 条 403。
 KillMode=process
+# 夜间刷新锁按**本地小时**判窗口（daemon._night_active 用 localtime）。
+# 主机时区若被改成 UTC（WSL 重建/容器常见），20:00→08:00 会整体偏移 8h，
+# 变成白天锁、夜里不锁 —— 那正是这套锁要修的事故形态，且只在特定时段可见。
+# 钉死在 Asia/Shanghai 与上游免费层 08:00 配额重置同源。
+Environment=TZ=Asia/Shanghai
 EnvironmentFile=-$DIR/.env
 StandardOutput=journal
 StandardError=journal

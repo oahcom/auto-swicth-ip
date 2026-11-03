@@ -50,3 +50,6 @@ run/
 # 本地快照（可再生成，不入库）
 backups/
 *.pre-ha-audit
+
+# Vercel/Netlify 中继运行态台账（IP 与探测时间戳，随部署变化，不入库）
+.vercel_relay.json

@@ -52,7 +52,7 @@ def test_reconnect_waits_and_does_not_switch_without_fresh(monkeypatch):
                         lambda exclude, deadline: [])
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp",
-                        lambda tag, interrupt=False: switched.append(tag) or True)
+                        lambda tag, **kw: switched.append(tag) or True)
     assert daemon._reconnect_warp_by_table("test") is False
     assert switched == []
 
@@ -94,7 +94,7 @@ def test_reconnect_switches_to_fresh_candidate(monkeypatch):
     monkeypatch.setattr(daemon, "_release_refresh_slot", lambda tag: None)
     switched = []
     monkeypatch.setattr(daemon, "_switch_warp",
-                        lambda tag, interrupt=False: switched.append(tag) or True)
+                        lambda tag, **kw: switched.append(tag) or True)
     marked = []
     monkeypatch.setattr(daemon, "_mark_warp_ip_used",
                         lambda ip, now, **kw: marked.append(ip))
@@ -111,7 +111,7 @@ def test_probe_unknown_ip_does_not_restart(monkeypatch):
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda member, reason: restarted.append(member["tag"]) or True)
+                        lambda member, reason, **kw: restarted.append(member["tag"]) or True)
     daemon._probe_one_line(m)
     st = daemon._warp_line_state("W2")
     assert st["last_verdict"] == "unknown"
@@ -130,7 +130,7 @@ def test_probe_quota_restarts_non_active_line(monkeypatch):
     monkeypatch.setitem(daemon._PROBE_LAST_VERDICT, "W2", "quota")
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda member, reason: restarted.append(member["tag"]) or True)
+                        lambda member, reason, **kw: restarted.append(member["tag"]) or True)
     daemon._probe_one_line(m)
     assert restarted == ["W2"]
     assert daemon._warp_line_state("W2")["last_verdict"] == "quota"
@@ -201,7 +201,7 @@ def test_long_quota_hold_blocks_quota_restart(monkeypatch):
     monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == [], \
         "额度闸开着仍重启 quota 线 —— 换 IP 不能让账号级配额提前恢复"
@@ -219,7 +219,7 @@ def test_quota_hold_also_blocks_penalty_restart(monkeypatch):
     monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == [], \
         "额度闸只拦了 quota 路径，惩罚期路径仍在重启 —— 同一轮风暴从另一半漏过去"
@@ -240,7 +240,7 @@ def test_quota_hold_does_not_block_tunnel_death_restart(monkeypatch):
     monkeypatch.setattr(daemon, "_port_open", lambda port: True)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == ["W2"], \
         "额度闸把隧道半死的自愈路径也挡了 —— 那是地址没了，不是配额没了"
@@ -407,6 +407,6 @@ def test_tunnel_death_port_closed_defers_to_systemd(monkeypatch):
     monkeypatch.setattr(daemon, "_port_open", lambda port: False)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == [], "端口已关还重启，等于抢 systemd 的活"
