@@ -84,7 +84,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文档 | 内容 |
 |---|---|
-| **[established-facts.md](established-facts.md)** | **既定事实（27 条），先读这个** |
+| **[established-facts.md](established-facts.md)** | **既定事实（28 条），先读这个** |
 | [glossary.md](glossary.md) | **名词表**：节点/线路/渠道/成员的确切定义 |
 | [BUILD-PLAN.md](BUILD-PLAN.md) | 文档构建计划与更新规范 |
 
@@ -96,6 +96,8 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
   disabled 的线仍会被探，`fail_streak` 能涨到 22 万。
 - **第 27 条** v4 线的出口上限 = 落地 colo 数——三条 v4 全落 PHX
   就会拿到同一个地址。
+- **第 28 条**「配置里没有 WARP 出口」是一份**合法**配置、探活全绿——
+  2026-11-03 远端因此丢了 3.5 小时出口（30362 次 `status=404`）而日志无声。
 
 **架构层**（看代码看不出来的设计）
 

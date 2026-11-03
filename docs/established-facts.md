@@ -439,6 +439,36 @@ quota / blocked / unknown 一视同仁地往上加。
 
 ---
 
+### 28. 「配置里没有 WARP 出口」是一份**合法**配置，探活发现不了
+
+**看起来像**：`singbox=🟢`、Clash API 通、7890 能连、日志每小时「✓ 订阅刷新完毕」——
+一切正常。
+
+**实际是**：2026-11-03 远端丢了 3 小时 24 分的 WARP 出口，就是从这些绿灯里溜过去的。
+链条：`warp-outbound.json` 属主被 sudo 部署写成 root → daemon 读不到 →
+`parse_subscription.py` 打一行 stderr 后返回 `[]` → 生成一份**没有 `opencode-out`
+selector、没有 opencode 路由规则**的配置 → `sing-box check` 通过（它确实合法）→
+promote 上线 → opencode 流量静默落到 `final: proxy` 的机场池。
+
+daemon 之后每次换线都是 `status=404`（实测 30362 条），而日志里没有任何一条
+说明原因：那行 stderr 以 `WARP` 开头，被「只转发 ⚠ 开头的行」的过滤规则吃掉。
+
+**现在有四道闸**（2026-11-03 起）：
+1. `parse_subscription.py` 遇到**存在但读不了**直接 raise（缺文件仍放行）。
+2. daemon 全量转发刷新 stderr（正常一轮只有 4 行以内，实测）。
+3. watchdog 判 `opencode-out` 缺失/空/成员骤降 → 自动重建（带 10 分钟冷却）。
+4. `remote-deploy.sh` 显式传 `ASIP_RUN_USER` + 末尾统一 chown 兜底。
+
+**判据的边界**：`_warp_selector_missing()` 只看**运行中**的 sing-box。文件读不了
+但进程还在跑旧配置时它不会触发 —— 那是对的，真正的危险时刻是「坏配置被加载」。
+2026-11-03 实测：剥掉全部 WARP 出口后让 sing-box 加载，watchdog 2 秒内发现并
+重建完成。
+
+**不要动**：不要因为「探活全绿」就下结论说出口正常。要看 `opencode-out` 在不在、
+成员数是多少。
+
+---
+
 ## 七、如何验证一条改动没倒退
 
 ```bash
