@@ -155,4 +155,42 @@ with patch.object(daemon, "_warp",
         daemon._node_rotation_pass()
 assert seen_rebound == [True], f"换节点后必须以 rebound=True 重启，实际 {seen_rebound}"
 
-print("✓ 11 项同块轮回自检通过")
+# 12) 被渠道锁住的线：换节点后要把锁的目标节点同步过去，否则每分钟被写回
+# 实测 WG-21 08:50~11:50 被 `同块轮回` 与 `_rehome_held_lines` 来回改了 6 次，
+# 每次白搭一条「渠道重定位」重启。`ban_hold_home` 不能动：08:00 仍要还原到
+# 锁定前的原节点。
+import time as _t
+updates = {}
+hold = _t.time() + 3600
+with patch.object(daemon, "_warp",
+                  return_value={"node_rotation_enabled": True,
+                                "restart_max_per_hour_per_line": 20,
+                                "members": []}), \
+     patch.object(daemon, "_warp_line_state",
+                  side_effect=lambda t: {"restart_hist": [], "ip": "2a09:bac1::1",
+                                         "ban_hold_until": hold}), \
+     patch.object(daemon, "_warp_line_state_locked", return_value={}), \
+     patch.object(daemon, "_warp_line_update",
+                  side_effect=lambda t, **kw: updates.update(kw)), \
+     patch.object(daemon.warp_wg, "_read_state",
+                  side_effect=lambda: copy.deepcopy(LINE)), \
+     patch.object(warp_blocks, "load_map", return_value=NODES), \
+     patch.object(daemon, "active_warp_tag", return_value=None), \
+     patch.object(daemon, "_rehome_one", return_value="ok"), \
+     patch.object(daemon, "_warp_member",
+                  return_value={"tag": "WARP-WG-7",
+                                "service": "warp-wg-7.service"}), \
+     patch.object(daemon, "_warp_line_restart", return_value=True), \
+     patch.object(daemon, "_node_tcp_ok",
+                  side_effect=lambda n: n != "a.nrt:443-any"):
+    daemon._NODE_NEXT_CHECK.clear()
+    daemon._NODE_FAILS.clear()
+    for _ in range(2):
+        daemon._NODE_NEXT_CHECK.clear()
+        daemon._node_rotation_pass()
+assert updates.get("ban_hold_node") == "b.nrt:443-any", \
+    f"锁定中的线换节点后要同步锁目标，实际 {updates}"
+assert "ban_hold_home" not in updates, "还原目标不能动"
+assert updates.get("ban_hold_ready"), "换节点重启成功要记 ready，免得再补一次重启"
+
+print("✓ 12 项同块轮回自检通过")

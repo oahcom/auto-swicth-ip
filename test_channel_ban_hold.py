@@ -453,6 +453,51 @@ def test_restore_failure_keeps_home_and_retries():
         daemon._rehome_one = orig_one
         _rehome_restore(orig)
 
+def test_restore_converges_when_already_home_and_restarted():
+    """已停在原节点、且写回后重启过 → 直接收尾，别再写配置再重启一次。
+
+    实测 08:00~11:50：978 次「还原重启未成功」只换来 4 次成功，其中 14 条线
+    当前节点本来就等于 home；每分钟一次的重写还把 `rebind_ts` 顶住，同块轮回
+    对这批线永远不跑。
+    """
+    _reset()
+    orig = _rehome_env()
+    now = time.time()
+    try:
+        daemon._ledger["WARP-WG-4"] = "n-old"        # 已经在 home 上
+        daemon.warp_wg._read_state = lambda: {
+            "lines": {"WARP-WG-4": {"node": "n-old", "rebind_ts": int(now) - 60}}}
+        daemon._warp_line_update("WARP-WG-4", ban_hold_until=now - 1,
+                                 ban_hold_home="n-old", ban_hold_node="n-la",
+                                 ban_window=[(now - 60, True)], restart_ts=now - 30)
+        daemon._rehome_held_lines(now)
+        st = daemon._WARP_LINE_STATE["WARP-WG-4"]
+        assert st["ban_hold_home"] is None, "已还原的线必须收尾，否则每分钟重来"
+        assert not st["ban_window"], "收尾同样要清窗口，不然会重新锁一天"
+        assert daemon._rehome_calls == [], "不该再写一次配置"
+        assert daemon._restarts == [], "不该再重启一次"
+    finally:
+        _rehome_restore(orig)
+
+def test_restore_rewrites_when_home_but_never_restarted():
+    """配置写回了、进程却没重启过 → 仍要写并重启（不重启等于没生效）。"""
+    _reset()
+    orig = _rehome_env()
+    now = time.time()
+    try:
+        daemon._ledger["WARP-WG-4"] = "n-old"
+        daemon.warp_wg._read_state = lambda: {
+            "lines": {"WARP-WG-4": {"node": "n-old", "rebind_ts": int(now) - 10}}}
+        daemon._warp_line_update("WARP-WG-4", ban_hold_until=now - 1,
+                                 ban_hold_home="n-old", ban_hold_node="n-la",
+                                 restart_ts=now - 300)
+        daemon._rehome_held_lines(now)
+        assert daemon._rehome_calls == [(4, "n-old")], "必须补写配置"
+        assert daemon._restarts, "写回后必须重启，否则进程还在旧节点"
+        assert daemon._WARP_LINE_STATE["WARP-WG-4"]["ban_hold_home"] is None
+    finally:
+        _rehome_restore(orig)
+
 def test_restore_clears_window_so_it_does_not_relock():
     """还原后必须清 ban_window。
 
