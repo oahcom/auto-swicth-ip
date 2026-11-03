@@ -147,10 +147,20 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | [503-root-cause-20261027.md](503-root-cause-20261027.md) | 503 根因分析 |
 | [bug-and-test-plan-20261027.md](bug-and-test-plan-20261027.md) | 缺陷与测试计划（85K） |
 
+### 参考层（查表用）
+
+| 文档 | 内容 |
+|---|---|
+| [reference/config.md](reference/config.md) | 每个配置项**改了会怎样**（不抄默认值） |
+| [reference/state-files.md](reference/state-files.md) | 每个 `.json` 谁写谁读、哪些字段容易误用 |
+| [reference/ports-units.md](reference/ports-units.md) | 端口分配表、单元/tag 命名规则、**20128 是 relay-guard 不是 9router** |
+
 ### 运维流程
 
 | 文档 | 内容 |
 |---|---|
+| [runbook/add-tunnel.md](runbook/add-tunnel.md) | 加隧道速查清单 + 症状对照表 |
+| [runbook/troubleshoot.md](runbook/troubleshoot.md) | 7 条排查树：429 风暴 / selector 打空 / 线不通 / 单元假活 / 9router 假健康 / 两台机器不一致 / 日志无线索 |
 | `deploy/remote-deploy.sh` | **一键复刻本机拓扑到远端**（代码/状态表/设备/单元/验收） |
 | [ops-20261028-security-changes.md](ops-20261028-security-changes.md) | 安全变更操作记录 |
 | [9router-task-book-20261028.md](9router-task-book-20261028.md) | 9router 任务书 |

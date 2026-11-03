@@ -668,48 +668,24 @@ singbox.mixed_port: 7890                       # 环回 mixed 入站（无认证
 singbox.lan_port: 7891                         # 局域网 mixed 入站（0=关闭，需认证文件）
 singbox.lan_cidrs: [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12]  # 局域网入站允许来源
 bad_nodes.ttl_sec: 300                         # bad node TTL (5min)
-# warp（换线核心，勿凭旧记忆猜值）
-warp.block_threshold: 1                        # abuse403 触发阈值
-warp.rate429_threshold: 1                      # rate429 触发阈值
-warp.cooldown_ok_sec: 5                        # 换线成功后冷却（full_err 绕过）
-warp.cooldown_fail_sec: 3                      # 换线失败后冷却
-warp.ip_reuse_guard_sec: 86400                 # 出口 IP 复用窗口（24h）
-# warp.refresh_concurrency 已删除（T-223）：全池并发无上限，只有单条线互斥
-warp.rate429_guard_sec: 86400                  # 429 恢复期（24h）
-warp.proactive_mode: "requests"                # 主动轮换判据（fixed / requests，当前生效）
-warp.proactive_fixed_sec: 60                   # fixed：每 N 秒
-warp.proactive_after_dsv4_ok: 150              # requests：满 N 格成功的 dsv4 调用
-warp.proactive_quota_model: "deepseek-v4.1-flash-free"
-warp.proxy_fallback_cooldown_sec: 10800        # 落池冷却（3h）
-warp.proxy_fallback_enabled: false             # 落池开关（2026-10-26 关闭，池节点全挂）
-warp.probe_cache_ttl_sec: 12                   # 旧路径探测缓存 TTL（出口 IP 新鲜度）
-warp.probe_transient_ttl_sec: 120                 # 探测结论 TTL：OK/unreachable/err（瞬时档）
-warp.probe_persistent_ttl_sec: 600             # 探测结论 TTL：quota/flagged（与探测节奏同量级）
-warp.probe_ok_ttl_sec: 1800                    # 探测结论 TTL：OK（30min，单独一档）
-warp.fallback_idle_wait_sec: 3                 # 旧路径错误换线等备线空闲上限
-# 单实例探测器（2026-10-26，prober_enabled=false 时才走旧路径）
-warp.prober_enabled: true                      # 唯一后台探测器 + 状态表驱动换线
-warp.line_fresh_sec: 120                       # per-line OK 新鲜窗口
-warp.probe_unknown_retry_sec: 5                # IP 未知 / 重启成功后重探间隔
-# 探测节奏：同一线两次观测之间的最小间隔，**只由 last_probe_ts 推出**。
-# 结论决定「探完拿它做什么」，不决定「下次还探不探」 —— 旧实现让 quota 结论
-# 把下次探测推到次日 08:00（=上游 ban_until），20 条线全冻结 56.6 分钟。
-warp.line_probe_cadence_sec: 60
-warp.probe_concurrency: 4                      # 每轮并发探测线数
-warp.model_probe_concurrency: 2                # 模型层并发探测数（每格配额都是钱）
-warp.probe_max_per_min: 30                     # 全局探测速率上限
-warp.prober_idle_wait_sec: 30                  # 探测器空闲等待
-warp.switch_wait_sec: 3                        # 无新鲜 OK 时换线等待上限（等前先催探测器）
-warp.restart_cooldown_sec: 5                   # 同一线重启冷却
-warp.restart_backoff_sec: [2, 5, 10, 20, 60]   # 重启失败指数退避
-warp.restart_backoff_max_sec: 120              # 退避上限
-warp.restart_max_per_hour_per_line: 20         # 每线每小时重启上限（滑动 1h 窗口，计在 systemctl 之前）
-# 渠道模型（warp_blocks.py）。enabled=false 时不接管拓扑：apply 仍走 assign_nodes。
-warp.blocks.enabled: false                     # ASIP_WARP_BLOCKS（默认关，开了才按块开渠道）
-warp.blocks.channels_per_block: 2              # 每块每类几条渠道（同 colo 一主一备）
-warp.blocks.table: [9 个 colo]                 # 只放静态属性（机房/承载/段封禁率），节点清单在 .warp/block-map.json
-warp.restart_concurrency: 4                    # 全局并发重启上限
-warp.ip_observe_sec: 120                       # 换线后出口观察窗
+
+# warp（换线核心）—— **完整配置说明见 docs/reference/config.md**
+#
+# 这一节 2026-11-03 之前是 config.py 的手抄副本，实测已有 8 项与代码不符
+# （probe_concurrency 4→32、line_probe_cadence_sec 60→0、restart_max_per_hour_per_line
+# 20→0、rate429_guard_sec 86400→60 等）。手抄副本必然过期，不再维护第二份。
+#
+# 只看当前生效值：
+#   python3 -c "import config,json;print(json.dumps(config.CFG['warp'],ensure_ascii=False,indent=1))"
+#
+# 只知道这几个「改了会坏」的就够日常：
+#   · line_probe_cadence_sec / probe_max_per_min / restart_max_per_hour_per_line
+#     在 2026-10-28 按主人要求归零（探测去限流，吞吐 36 → 52.3 条/分钟）。
+#     **不要"恢复"这些上限** —— 理由见 reference/config.md §1.2。
+#   · cooldown_ok_sec 固定 5s，不随失败放大（2^n 退避曾锁死到 600s）。
+#   · proxy_fallback_enabled=false（2026-10-26，池内节点全挂，落池=断流）。
+#   · channel_ban_reset_hour=8 是 opencode 官方的配额重置时刻，不是闹钟。
+#   · prober_enabled=true 时旧路径（_start_line_workers / _dirty_line_janitor）不启动。
 # 连错门控不是配置项，是代码常量：consec_err < 3 → 不换线（daemon.py maybe_reconnect_warp）
 # _DEAD_TTL_STAGES: _generate_ttl_stages() 算法生成（30s→7d），非手写列表
 _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（daemon.py 常量）

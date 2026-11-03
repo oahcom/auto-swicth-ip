@@ -77,15 +77,14 @@ L2/L3 只链接不重写。
 | 2 | E `subsystems/switching.md` | ✅ 已完成 |
 | 2 | F `subsystems/locks.md` | ✅ 已完成 |
 | 2 | G `subsystems/refresh.md` | ✅ 已完成 |
-| 3 | H `reference/config.md` | ⬜ 未开始 |
-| 3 | I `reference/state-files.md` | ⬜ 未开始 |
-| 3 | J `reference/ports-units.md` | ⬜ 未开始 |
-| 3 | K `runbook/add-tunnel.md` | ⚠️ 部分覆盖（`provisioning.md` 第二~六节已讲加隧道的完整流程，`runbook` 版应只留速查清单） |
-| 3 | L `runbook/troubleshoot.md` | ⚠️ 部分覆盖（`provisioning.md` §5 有症状对照表；缺「全是 429」「selector 打空」的排查树） |
+| 3 | H `reference/config.md` | ✅ 已完成（2026-11-03） |
+| 3 | I `reference/state-files.md` | ✅ 已完成（2026-11-03） |
+| 3 | J `reference/ports-units.md` | ✅ 已完成（2026-11-03） |
+| 3 | K `runbook/add-tunnel.md` | ✅ 已完成（2026-11-03，只留清单 + 症状对照） |
+| 3 | L `runbook/troubleshoot.md` | ✅ 已完成（2026-11-03，7 条排查树） |
 
-批次 3 未开始的原因：`reference/*` 是「配置项逐条解释」，而配置项在
-`config.py` 里已有注释，重复抄一遍会立刻过期。**要写就写「改了会怎样」，
-不写「默认值是多少」**——后者 `grep` 就有。
+批次 3 的写法：**写「改了会怎样」，不写「默认值是多少」**——后者 `grep` 就有，
+抄一遍会立刻过期（2026-11-03 实测：CLAUDE.md 配置段有 8 项值与 `config.py` 不符）。
 
 ## 四、子代理分工原则
 
