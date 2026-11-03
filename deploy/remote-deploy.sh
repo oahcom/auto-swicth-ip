@@ -110,20 +110,31 @@ while IFS='=' read -r k v; do
 done < /tmp/asip-env.patch
 grep -E '^(WARP_WG_|ASIP_WARP|NINE_ROUTER_BASE)' .env | sed 's/^/  /'"
 
-# 远端 9router 端口可能与本机不同：探测出来覆盖掉，别让健康检查假失败。
-say "2b/7 探测远端 9router 端口"
-# 探 `/dashboard` 而不是 `/v1/models`：后者冷启动实测约 10s，短超时必然
-# 误判成「端口上没有服务」。dashboard 只做跳转，毫秒级返回。
-DETECTED=$(run 'for p in 20127 20128; do
-    code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" "http://127.0.0.1:$p/dashboard" || true)
-    case "$code" in 2*|3*|401|403) echo "$p"; break ;; esac
-done')
+# 远端 9router 端口可能与本机不同，必须以**单元自己声明的端口**为准。
+#
+# WHY 不再按「哪个端口有人应答」探：127.0.0.1:20128 跑的是 relay-guard，
+# 它对 /dashboard 返回 307，于是探测把 20128 当成 9router 写进 .env。
+# 后果是 check_9router_health() 对着 relay-guard 永远返回健康 —— 9router
+# 真死了这层检查也不会说话。2026-11-03 远端实测就是这个状态（20127 根本
+# 没人监听，daemon 却一直读 20128）。
+#
+# 端口在单元里有两处写法，取并集：
+#   · 本机 install-9router.sh 生成的是 `custom-server.js --port 20127`
+#   · 远端那份把端口写成 `Environment=PORT=38731`（ExecStart 不带 --port）
+DETECTED=$(run 'U=nine-router-src.service
+    a=$(systemctl show $U -p ExecStart --value 2>/dev/null \
+        | grep -o -- "--port [0-9]*" | grep -o "[0-9]*" | head -1)
+    b=$(systemctl show $U -p Environment --value 2>/dev/null \
+        | tr " " "\n" | sed -n "s/^PORT=//p" | head -1)
+    echo "${a:-$b}"')
 if [ -n "$DETECTED" ]; then
-    echo "  远端 9router 在 :$DETECTED"
+    echo "  远端 9router 在 :$DETECTED（取自 $U 的 $([ -n "$DETECTED" ] && echo 声明)）"
     run "cd $REMOTE_DIR
     sed -i 's#^NINE_ROUTER_BASE=.*#NINE_ROUTER_BASE=http://127.0.0.1:$DETECTED#' .env"
+    # 写进去还不够：daemon 的 EnvironmentFile 只在启动时读一次，不重启就还是旧值。
+    run "sudo systemctl restart auto-switch-ip.service"
 else
-    echo "  ⚠ 未探到 9router（20127/20128 都不通），保留 .env 现值"
+    echo "  ⚠ 从 nine-router-src.service 读不到端口，保留 .env 现值"
 fi
 
 # ---------------------------------------------------------------- 3. 实测表

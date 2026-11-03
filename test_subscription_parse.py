@@ -286,16 +286,15 @@ def test_shrunken_refresh_rejected(monkeypatch, tmp_path):
 def test_parse_failure_makes_refresh_return_false(monkeypatch, tmp_path):
     """rc != 0 时必须返回 False，不得声称刷新成功。
 
-    同时验证不污染生产 daemon.log：refresh_subscription 会写日志，而
-    logging.getLogger("auto-switch-ip") 上已挂着指向生产 daemon.log 的
-    RotatingFileHandler（O_APPEND）。只 addHandler 会多写一份到生产日志，
-    导致下游 grep 到假故障。这里整体接管 handlers + 重定向 log_file。
+    日志走 stdout（pytest 下 `_side_effects_off()` 恒真），不写生产 daemon.log。
     """
     class R:
         returncode = 1
         stderr = "NameError: name 'parse_vless' is not defined"
         stdout = ""
 
+    # pytest 下 `_side_effects_off()` 恒真，日志只进 stdout、不写 daemon.log
+    # （2026-10-28 四轮审查定的），所以这里断言 stdout，不重定向任何文件。
     monkeypatch.setattr(daemon, "_logger", None)          # 强制重新 _init_logger
     # config_file 必须一并重定向：refresh 失败路径会 _discard(config_file + ".tmp")，
     # 不重定向就会删掉生产 singbox-config.json.tmp（含刚拉取的节点凭据）
@@ -306,9 +305,8 @@ def test_parse_failure_makes_refresh_return_false(monkeypatch, tmp_path):
     monkeypatch.setattr(daemon, "restart_singbox",
                         lambda: pytest.fail("不应重启 sing-box"))
     assert daemon.refresh_subscription() is False
-
-    text = (tmp_path / "daemon.log").read_text()
-    assert "订阅解析失败" in text, f"日志未落在 tmp: {text!r}"
+    assert not os.path.exists(tmp_path / "daemon.log"), \
+        "pytest 下不得写日志文件（会把假故障写进生产账本）"
 
 
 def test_refresh_passes_urls_via_file_not_argv(monkeypatch, tmp_path):
@@ -562,6 +560,113 @@ def test_lan_inbound_passes_singbox_check(monkeypatch, tmp_path):
     r = subprocess.run([binary, "check", "-c", str(cfg_file)],
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, f"sing-box check 失败: {r.stderr.strip()[:300]}"
+
+def test_drop_guard_yields_when_live_config_has_no_warp(monkeypatch, tmp_path):
+    """修复动作触发的刷新，在「线上没有 WARP 出口」时必须被放行。
+
+    2026-11-03 实测：自愈重建直接跑裸的 parse_subscription.py，绕过了骤降
+    护栏，把 94 → 26 的产出推上线。改成走 refresh_subscription 后，护栏
+    必须仍能拦住普通的骤降，只在「线上 0 条 WARP、新产出有 WARP」时让路。
+    """
+    import json as _json
+    # 线上：19 个节点，一个 WARP 出口都没有（就是那次事故后的形态）
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(_json.dumps({
+        "outbounds": [
+            {"type": "selector", "tag": daemon.CFG["singbox"]["selector"],
+             "outbounds": [f"n{i}" for i in range(1, 20)] + ["direct"]},
+        ] + [{"type": "trojan", "tag": f"n{i}", "server": f"1.2.3.{i}",
+              "server_port": 443} for i in range(1, 20)]
+          + [{"type": "direct", "tag": "direct"}]}))
+    monkeypatch.setitem(daemon.CFG["singbox"], "config_file", str(cfg))
+    monkeypatch.setattr(daemon, "_SUB_URLS", ["https://example.invalid/sub"])
+    monkeypatch.setattr(daemon, "_read_pool_history", lambda: [])
+    monkeypatch.setattr(daemon, "_record_pool_sample", lambda n: None)
+    monkeypatch.setattr(daemon, "_rebind_wg_lines_after_refresh", lambda: None)
+    monkeypatch.setattr(daemon, "_log_pool_diff", lambda a, b: None)
+    monkeypatch.setattr(daemon, "_config_check_error", lambda p: None)
+    monkeypatch.setattr(daemon, "restart_singbox", lambda: True)
+
+    def fake_run(cmd, **k):
+        out = cmd[cmd.index("--out") + 1]
+        with open(out, "w") as f:
+            _json.dump({"outbounds": [
+                {"type": "socks", "tag": "WARP-CF", "server": "127.0.0.1",
+                 "server_port": 1080, "version": "5"},
+                {"type": "selector", "tag": daemon.CFG["singbox"]["selector"],
+                 "outbounds": ["WARP-CF", "direct"]},
+            ]}, f)
+        # 生成侧总会写 stats；缺了会让 daemon 退回「数出站条数」并本轮不判定。
+        with open(str(out) + ".stats.json", "w") as f:
+            _json.dump({"sub_nodes": 1, "dormant_source_nodes": 0,
+                        "pool_nodes": 1, "dead_nodes": 0, "fallback": False}, f)
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # 1 条远低于 19*0.5 → 本会被拦；因为线上无 WARP，必须放行
+    assert daemon.refresh_subscription(reason="WARP 出口自愈") is True
+    saved = _json.loads(cfg.read_text())
+    assert any(o.get("type") == "socks" for o in saved["outbounds"]), \
+        "带 WARP 的配置被骤降护栏拦下了"
+
+
+def test_drop_guard_still_blocks_repair_without_warp_gain(monkeypatch, tmp_path):
+    """修复动作拿不到任何 WARP 出口时，护栏照旧拦 —— 否则「自愈」等于关护栏。"""
+    import json as _json
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(_json.dumps({
+        "outbounds": [
+            {"type": "socks", "tag": "WARP-CF", "server": "127.0.0.1",
+             "server_port": 1080, "version": "5"},
+            {"type": "selector", "tag": daemon.CFG["singbox"]["selector"],
+             "outbounds": [f"n{i}" for i in range(1, 20)] + ["direct"]},
+        ] + [{"type": "trojan", "tag": f"n{i}", "server": f"1.2.3.{i}",
+              "server_port": 443} for i in range(1, 20)]
+          + [{"type": "direct", "tag": "direct"}]}))
+    monkeypatch.setitem(daemon.CFG["singbox"], "config_file", str(cfg))
+    monkeypatch.setattr(daemon, "_SUB_URLS", ["https://example.invalid/sub"])
+    monkeypatch.setattr(daemon, "_read_pool_history", lambda: [])
+    monkeypatch.setattr(daemon, "_record_pool_sample", lambda n: None)
+    monkeypatch.setattr(daemon, "_rebind_wg_lines_after_refresh", lambda: None)
+    monkeypatch.setattr(daemon, "restart_singbox", lambda: pytest.fail("不应重启"))
+
+    def fake_run(cmd, **k):
+        out = cmd[cmd.index("--out") + 1]
+        with open(out, "w") as f:                       # 产出同样没有 WARP
+            _json.dump({"outbounds": [
+                {"type": "selector", "tag": daemon.CFG["singbox"]["selector"],
+                 "outbounds": ["n1", "direct"]},
+                {"type": "trojan", "tag": "n1", "server": "1.2.3.1",
+                 "server_port": 443}]}, f)
+        with open(str(out) + ".stats.json", "w") as f:
+            _json.dump({"sub_nodes": 1, "dormant_source_nodes": 0,
+                        "pool_nodes": 1, "dead_nodes": 0, "fallback": False}, f)
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    original = cfg.read_text()
+    assert daemon.refresh_subscription(reason="WARP 出口自愈") is False
+    assert cfg.read_text() == original
+
+
+def test_repair_uses_guard_not_raw_parse():
+    """自愈重建不得再直接跑 parse_subscription.py —— 那会绕过骤降护栏。"""
+    src = open("daemon.py", encoding="utf-8").read()
+    start = src.index("def _rebuild_warp_outbounds()")
+    body = src[start:src.index("\ndef ", start + 10)]
+    assert "refresh_subscription(" in body, "重建主配置必须走护栏版刷新"
+    assert '"parse_subscription.py")' not in body, "不得直连裸解析"
+
 
 def test_get_lan_auth_rejects_malformed(tmp_path, monkeypatch):
     """空串、无冒号、空口令都应返回 None，而不是造出半截凭据。"""

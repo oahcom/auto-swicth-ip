@@ -1021,7 +1021,7 @@ class _BoundedPool:
 
 # 增加 worker 数和队列深度：支持并发测试 90+ 节点不丢任务
 # 队列给到 4×worker：首轮会把订阅里的**全部**节点一次性提交，队列深度必须
-# 覆盖节点数而不是 worker 数的倍数。256 对当前 122 个节点留了一倍余量。
+# 覆盖节点数而不是 worker 数的倍数。256 对当前 160 条订阅节点留了余量。
 _health_pool = _BoundedPool(max_workers=60, name_prefix="health", queue=256)
 _io_pool = _BoundedPool(max_workers=8, name_prefix="io")
 
@@ -3681,7 +3681,7 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             st["last_ok_ts"] = 0.0
             st["last_ok_ip"] = None
             # `fail_streak` 只统计 **拿不到出口地址**（unknown）。它的唯一消费点
-            # 是 `_probe_warp_line` 里「连续 N 次取不到出口地址 → 隧道半死」的
+            # 是 `_probe_one_line` 里「连续 N 次取不到出口地址 → 隧道半死」的
             # 重启判据，而 quota/blocked 说明隧道**完全正常**、只是这个地址被封。
             # 旧实现无条件累加，实测 WARP-WG-17 因此涨到 2457（它每次都拿到出口
             # 地址、每次都判 quota），日志写「连续 2457 次取不到出口地址」，
@@ -4223,7 +4223,7 @@ def _quota_hold_skips(tag: str, reason: str) -> bool:
     return True
 
 
-# 单元是否在跑的缓存：{tag: (是否在跑, 检查时刻)}。
+# 单元是否在跑的缓存：{单元名: (是否在跑, 检查时刻)}。
 # `systemctl is-active` 每次约 5~15ms，而 prober 每秒遍历全部成员，直接调会把
 # 主循环拖慢；缓存 60s 足够 —— 单元被启停是人工操作，不需要秒级感知。
 _UNIT_RUNNING_CACHE: dict[str, tuple[bool, float]] = {}
@@ -7890,24 +7890,29 @@ def _rebind_wg_lines_after_refresh() -> None:
             log(f"  ⇄ {tag} 绑定节点已下架，已换节点并重启")
 
 
-def refresh_subscription() -> bool:
+def refresh_subscription(reason: str = "") -> bool:
     """拉所有订阅源 + merge 去重 + 生成 sing-box config + 重启 sing-box
 
     非阻塞获取锁：已有刷新在跑时直接返回 False，不再排队。两个并发刷新
     会写同一个 .tmp（交错内容让 _count_outbounds 读到 0），且第二次
     restart 会 pkill 掉第一次刚恢复的连接。
+
+    `reason` 非空表示这是**修复动作**触发的刷新（目前只有 WARP 出口丢失
+    自愈）。它会走完全相同的骤降护栏 —— 2026-11-03 实测：自愈直接跑裸的
+    `parse_subscription.py`，绕过了护栏，于是护栏刚判定为可疑的那份产出
+    （160 → 28）被原样推上线，池子从 94 掉到 26。
     """
     if not _REFRESH_LOCK.acquire(blocking=False):
         log("⚠ 已有订阅刷新在进行，跳过本次")
         return False
     try:
-        return _refresh_subscription_locked()
+        return _refresh_subscription_locked(reason)
     finally:
         _REFRESH_LOCK.release()
 
-def _refresh_subscription_locked() -> bool:
+def _refresh_subscription_locked(reason: str = "") -> bool:
     global _stats_missing_streak
-    log("🔄 刷新订阅...")
+    log(f"🔄 刷新订阅{'（' + reason + '）' if reason else ''}...")
     try:
         parse_script = os.path.join(os.path.dirname(__file__), "parse_subscription.py")
         config_file = CFG["singbox"]["config_file"]
@@ -8004,17 +8009,29 @@ def _refresh_subscription_locked() -> bool:
             return False
         if not fallback and not unjudgeable and old_n and new_n < old_n * 0.5:
             global _pool_reject_streak
-            _pool_reject_streak += 1
-            log(f"✗ 刷新节点数骤降 ({old_n} → {new_n}，基线是 24h 滚动窗口最大值)，"
-                f"疑似订阅源故障或大批节点下线，保留现有配置")
-            if _pool_reject_streak >= 4:
-                # 基线可能过时（上游真的永久缩水）。不自动放宽 —— 放宽就等于没有
-                # 护栏；但必须喊出来，人看一眼就知道要不要清掉旧样本。
-                log(f"⚠ 已连续 {_pool_reject_streak} 次被骤降护栏拦住，基线 "
-                    f"{old_n} 可能已过时。确认订阅确实缩水了，就删掉 "
-                    f"{POOL_HISTORY} 里旧的样本，让它按新水位重建。")
-            _discard(tmp_file)
-            return False
+            # 唯一的让路条件：线上那份配置**根本没有任何 WARP 出口**，而新产出
+            # 有。护栏防的是「把好池子换成坏池子」，这里是从「opencode 静默落
+            # 机场池」换成「有小池子的可用配置」，严格更好。
+            # 2026-11-03 实测：修复动作直接跑裸 parse_subscription，绕过了护栏，
+            # 于是 94 → 26 那份产出被原样推上线；同一时刻定时刷新正被护栏拦着。
+            if (reason and _config_warp_count(config_file) == 0
+                    and _config_warp_count(tmp_file) > 0):
+                _pool_reject_streak = 0
+                log(f"⚠ 骤降护栏让路（{reason}）：线上配置没有 "
+                    f"{_warp()['selector']}，带 WARP 的 {new_n} 条仍优于无 WARP 的 "
+                    f"{old_n} 条")
+            else:
+                _pool_reject_streak += 1
+                log(f"✗ 刷新节点数骤降 ({old_n} → {new_n}，基线是 24h 滚动窗口最大值)，"
+                    f"疑似订阅源故障或大批节点下线，保留现有配置")
+                if _pool_reject_streak >= 4:
+                    # 基线可能过时（上游真的永久缩水）。不自动放宽 —— 放宽就等于没有
+                    # 护栏；但必须喊出来，人看一眼就知道要不要清掉旧样本。
+                    log(f"⚠ 已连续 {_pool_reject_streak} 次被骤降护栏拦住，基线 "
+                        f"{old_n} 可能已过时。确认订阅确实缩水了，就删掉 "
+                        f"{POOL_HISTORY} 里旧的样本，让它按新水位重建。")
+                _discard(tmp_file)
+                return False
         _pool_reject_streak = 0
         # 最后一道防线：promote 前用 sing-box 自身校验。单个坏节点
         # （非法 pbk/sid、缺 password 等）会让整个配置 FATAL，而一旦覆盖，
@@ -8237,6 +8254,19 @@ _WARP_REBUILD_FAILS = 0
 _WARP_REBUILD_BACKOFF = (60, 120, 240, 480, 600)
 
 
+def _config_warp_count(path: str) -> int:
+    """一份配置里有几条 WARP 出口（socks 出站）。读不了按 0 条算。
+
+    只用于骤降护栏的让路判据：线上 0 条 + 新产出 >0 条 → 严格更好，不该拦。
+    """
+    try:
+        with open(path) as f:
+            obs = json.load(f).get("outbounds") or []
+    except (OSError, ValueError):
+        return 0
+    return sum(1 for o in obs if isinstance(o, dict) and o.get("type") == "socks")
+
+
 def _warp_selector_missing() -> bool:
     """主配置里 `opencode-out` 是否整个消失，或成员数少得不正常。
 
@@ -8300,23 +8330,25 @@ def _rebuild_warp_outbounds() -> bool:
                 log(f"  ⚠ {wo} 属主已按项目目录对齐")
         except (KeyError, OSError) as e:
             log(f"  ⚠ 无法对齐 {wo} 属主: {e}")
-    for cmd, why in (
-        ([sys.executable, os.path.join(proj, "deploy", "members.py"),
-          "--write-warp-outbound"], "warp-outbound.json"),
-        ([sys.executable, os.path.join(proj, "parse_subscription.py")], "主配置"),
-    ):
-        try:
-            r = subprocess.run(cmd, cwd=proj, capture_output=True, text=True,
-                               timeout=180)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            log(f"✗ 重建{why}失败: {e}")
-            return False
-        if r.returncode != 0:
-            tail = (r.stderr or r.stdout or "").strip().splitlines()
-            log(f"✗ 重建{why}失败 (rc={r.returncode}): {tail[-1][:160] if tail else ''}")
-            return False
-    log("✓ WARP 出口已重建，重启 sing-box 加载")
-    return restart_singbox()
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(proj, "deploy", "members.py"),
+             "--write-warp-outbound"],
+            cwd=proj, capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"✗ 重建 warp-outbound.json 失败: {e}")
+        return False
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()
+        log(f"✗ 重建 warp-outbound.json 失败 (rc={r.returncode}): "
+            f"{tail[-1][:160] if tail else ''}")
+        return False
+    # 主配置必须走 `refresh_subscription`，不能直接跑 parse_subscription：
+    # 后者是裸生成，会绕过骤降护栏。2026-11-03 实测：自愈重建把护栏刚判为
+    # 可疑的同一份产出（160 → 28）原样推上线，池子 94 → 26，而同一时刻
+    # 定时刷新正被护栏拦着。护栏只在「线上连 WARP 出口都没有」时让路。
+    log("✓ warp-outbound.json 已重建，重新生成主配置")
+    return refresh_subscription(reason="WARP 出口自愈")
 
 
 def _run_user_name() -> str:
