@@ -27,7 +27,7 @@
 sing-box (:7890)          ← 唯一的路由与出口选择点
    ↓ opencode-out selector
    ├── WARP 隧道（usque / MASQUE / WireGuard）
-   └── proxy 池（93 个机场节点，兜底）
+   └── proxy 池（订阅节点，按实测判死动态进出，兜底）
    ↓
 opencode.ai
 ```
@@ -41,7 +41,7 @@ opencode.ai
 | **直连 WARP** | usque 隧道，不经机场 | `usque-*` 单元 | 重启即换（v6）；v4 需 rebind |
 | **H2（MASQUE over HTTP/2）** | TCP 经机场节点 | `deploy/render_h2_lines.py` | 重启即换 |
 | **WG（WireGuard over UDP）** | UDP 经机场节点中转 | `warp_wg.py` + `warp_blocks.py` | 重启即换（v6）；v4 换 colo |
-| **proxy 池** | 93 个机场节点轮换 | daemon 的换线逻辑 | 换节点 |
+| **proxy 池** | 订阅节点轮换（成员数动态） | daemon 的换线逻辑 | 换节点 |
 
 ## 第 4 步：三个守护各管一摊
 
@@ -84,7 +84,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文档 | 内容 |
 |---|---|
-| **[established-facts.md](established-facts.md)** | **既定事实（28 条），先读这个** |
+| **[established-facts.md](established-facts.md)** | **既定事实（29 条），先读这个** |
 | [glossary.md](glossary.md) | **名词表**：节点/线路/渠道/成员的确切定义 |
 | [BUILD-PLAN.md](BUILD-PLAN.md) | 文档构建计划与更新规范 |
 
@@ -98,6 +98,9 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
   就会拿到同一个地址。
 - **第 28 条**「配置里没有 WARP 出口」是一份**合法**配置、探活全绿——
   2026-11-03 远端因此丢了 3.5 小时出口（30362 次 `status=404`）而日志无声。
+  自愈重建必须走骤降护栏，裸跑 `parse_subscription.py` 会把可疑产出推上线。
+- **第 29 条** `proxy` 池成员数是**动态**的（按实测判死摘出），两台机器同刻
+  可以差 5 倍（远端 120 / 本地 25）。不要把它当故障，也不要写进阈值。
 
 **架构层**（看代码看不出来的设计）
 

@@ -687,6 +687,67 @@ def test_prober_skips_members_whose_unit_is_not_running():
 
 
 # ---- 自愈：主配置丢了 WARP 出口要能被发现 ----
+def test_rebuild_counts_as_failure_when_selector_still_missing():
+    """重建「成功」但 selector 仍缺失 → 必须按失败计，否则退避永远停在 60s。
+
+    重建可能全程返回 0、产出也带 WARP，但 sing-box 起不来（端口被占、
+    二进制坏了）。若按命令返回码判成功，`_WARP_REBUILD_FAILS` 每轮清零，
+    退避恒为 60s —— 每轮「成功」、每轮修不好。
+    """
+    orig_rebuild, orig_missing, orig_fails = (
+        daemon._rebuild_warp_outbounds, daemon._warp_selector_missing,
+        daemon._WARP_REBUILD_FAILS)
+    try:
+        daemon._WARP_REBUILD_FAILS = 0
+        daemon._rebuild_warp_outbounds = lambda: True
+        # 命令成功、但运行中的配置仍缺 WARP
+        daemon._warp_selector_missing = lambda: True
+        assert daemon._rebuild_warp_outbounds_watched() is False
+        assert daemon._WARP_REBUILD_FAILS == 1, "仍缺失却记成成功"
+        # 连续三次失败 → 退避必须已离开 60s 档（索引 3 → 480s）。
+        # 若判据写错成「命令成功即成功」，这里会一直停在 60s。
+        for _ in range(2):
+            daemon._rebuild_warp_outbounds_watched()
+        assert daemon._WARP_REBUILD_FAILS == 3
+        wait = daemon._WARP_REBUILD_BACKOFF[
+            min(daemon._WARP_REBUILD_FAILS, len(daemon._WARP_REBUILD_BACKOFF) - 1)]
+        assert wait == 480, f"退避没有增长: fails={daemon._WARP_REBUILD_FAILS} wait={wait}"
+        # 真的修好了就清零
+        daemon._warp_selector_missing = lambda: False
+        assert daemon._rebuild_warp_outbounds_watched() is True
+        assert daemon._WARP_REBUILD_FAILS == 0
+    finally:
+        daemon._rebuild_warp_outbounds = orig_rebuild
+        daemon._warp_selector_missing = orig_missing
+        daemon._WARP_REBUILD_FAILS = orig_fails
+
+
+def test_watchdog_does_not_burn_backoff_when_submit_skipped():
+    """同名任务在跑时 `_submit_once` 返回 False，此时不得推进重建时间戳。
+
+    先记时间戳再提交，会让这次尝试白记 —— 重建要几分钟，而 watchdog
+    每 30s 一轮，那段空白里日志只会刷「仍缺失」，下一次还得等满退避周期。
+    """
+    orig_submit, orig_ts = daemon._submit_once, daemon._LAST_WARP_REBUILD_TS
+    orig_probe = daemon._probe_singbox_with_retry
+    orig_missing = daemon._warp_selector_missing
+    try:
+        daemon._probe_singbox_with_retry = lambda: True
+        daemon._warp_selector_missing = lambda: True
+        daemon._LAST_WARP_REBUILD_TS = 0          # 退避已过，该提交了
+        daemon._submit_once = lambda *a, **k: False   # 同名任务在跑
+        daemon._singbox_watchdog()
+        assert daemon._LAST_WARP_REBUILD_TS == 0, "没提交却推进了时间戳"
+        daemon._submit_once = lambda *a, **k: True
+        daemon._singbox_watchdog()
+        assert daemon._LAST_WARP_REBUILD_TS > 0, "提交成功却没记时间戳"
+    finally:
+        daemon._submit_once = orig_submit
+        daemon._LAST_WARP_REBUILD_TS = orig_ts
+        daemon._probe_singbox_with_retry = orig_probe
+        daemon._warp_selector_missing = orig_missing
+
+
 def test_warp_selector_missing_detects_lost_outbounds():
     """2026-11-03 远端事故：`warp-outbound.json` 属主被 root 抢走后，
     `parse_subscription.py` 生成了一份**没有 WARP 出口**的合法配置并上线。

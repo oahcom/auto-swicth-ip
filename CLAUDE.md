@@ -22,7 +22,9 @@ sing-box (mixed inbound :7890 环回 / :7891 局域网, Clash API :9090 Bearer a
     ├── route: domain_suffix ["opencode.ai"] → selector opencode-out
     │   → 50 条 WARP 线路（5 直连 + 19 H2 + 22 WG + 4 已停用）
     │      + proxy 池兜底，共 51 个 selector 成员
-    └── final: proxy → 94 成员轮换池（2026-11-03 实测：93 机场节点 = 49 anytls + 44 vless，+ 1 direct 兜底）
+    └── final: proxy → 订阅池 selector（成员数**动态**：按实测判死摘出，
+        见既定事实第 29 条；2026-11-03 两台机器同时观测：远端 120 条、
+        本地 25 条，同一份代码同一批订阅）
 
 daemon.py
     ← 读 9router SQLite requestDetails（只查 provider="opencode"）
@@ -81,6 +83,18 @@ http_proxy=http://lan:<password>@<主机IP>:7891 curl https://api.github.com/zen
 ```
 
 9router（:20127）本来就在 `*:20127` 监听且按请求校验 API key，无需改代码；只需防火墙放行。
+
+> **端口不是常量，`NINE_ROUTER_BASE` 必须按单元声明取。** 本机是
+> `custom-server.js --port 20127`；远端那份单元写的是 `Environment=PORT=38731`
+> （ExecStart 不带 `--port`）。两种写法都要认，取并集。
+>
+> 2026-11-03 实测踩坑：旧版 `remote-deploy.sh` 按「20127/20128 哪个端口有人应答」
+> 探测，而 `127.0.0.1:20128` 跑的是 **`relay-guard/guard.mjs`** —— 它对 `/dashboard`
+> 返回 307，探测就把 20128 当成 9router 写进 `.env`。后果是
+> `check_9router_health()` 永远对着 relay-guard 返回健康，**9router 真死了这层
+> 检查也不会说话**。远端该状态持续了整个部署周期，直到核对时才发现。
+>
+> 改完 `.env` 必须重启 daemon：`EnvironmentFile=` 只在进程启动时读一次。
 
 ## WARP 专用出口（opencode）
 
@@ -327,7 +341,8 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   逻辑仅在开关为 `true` 时生效。禁用原因：池内节点全挂，落池=断流；WARP 全不可用时
   改原地重连。恢复方式：`warp.proxy_fallback_enabled: true`。
 - **落池冷却 `proxy_fallback_cooldown_sec`（默认 3h）**：切到轮换池 `proxy` 后，
-  3 小时内即使隧道全挂也不再落池。WHY：proxy 是 93 节点共享池，落池意味着把流量
+  3 小时内即使隧道全挂也不再落池。WHY：proxy 是共享机场池（成员数随订阅和
+  实测判死动态变化），落池意味着把流量
   交给成功率 3~5% 的兜底资源（INC-002 的失败模式），而 WARP 换一条线只要一次 PUT。
   冷却期内改为**盲切另一条 WARP 成员**（依次试 `_port_open` 通且 ≠ 当前出口的成员，
   不探 IP 新鲜度 —— 备选是让流量停在正在被拦的出口上，盲切至少换一次会话机会；
@@ -488,7 +503,7 @@ daemon 随即置 bypass 直连，opencode 看到本地 IP 直接返回 abuse 403
 
 **双向兜底（任一炸了，另一个必须察觉并顶上）**
 
-`opencode-out` 成员含 `proxy`（93 节点池），两个方向都是**主动探测**，不等下游报错：
+`opencode-out` 成员含 `proxy`（订阅池 selector，成员动态），两个方向都是**主动探测**，不等下游报错：
 
 | 方向 | 触发 | 实现 |
 |---|---|---|
@@ -500,7 +515,7 @@ WHY 反向必须主动探：停在 proxy 上时 `opencode_out_on_warp()` 为 Fal
 成功率 3~5%）。靠下游 429 累计到阈值才动，期间流量全废。
 
 WHY 不按「WARP 探测又通了」回切：探测会抖动，实测 00:02:45 落到 proxy、00:02:52
-就因一次探测通过切回（7s），93 节点池一条 opencode 请求都没服务过。代理池是兜底
+就因一次探测通过切回（7s），订阅池一条 opencode 请求都没服务过。代理池是兜底
 资源，能服务流量就该让它服务完；只有池真的不堪用（上面三条判据）才回切。
 池健康采样**随机 3 个节点并发探测**：固定取前 3 个时，这 3 个恰好挂了就把整池判死。
 

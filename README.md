@@ -11,7 +11,7 @@
 ## 架构
 
 ```
-[openclaw/opencode/etc]  →  9router:20127  →  sing-box:7890  →  93 节点池 + 46 WARP  →  Internet
+[openclaw/opencode/etc]  →  9router:20127  →  sing-box:7890  →  订阅池 + WARP 线  →  Internet
                                        ↑                                ↑
                               outboundProxyUrl = 7890              订阅拉取
                                        ↑

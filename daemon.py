@@ -8303,6 +8303,13 @@ def _rebuild_warp_outbounds_watched() -> bool:
     """
     global _WARP_REBUILD_FAILS
     ok = _rebuild_warp_outbounds()
+    # 判据必须是**效果**而不是「命令返回 0」：重建可能全程成功、产出也带 WARP，
+    # 但 sing-box 起不来（端口被占、二进制坏了），下一轮 watchdog 照样看到
+    # selector 缺失。那种情况退回 60s 起步就成了活锁 —— 每轮都「成功」、
+    # 每轮都修不好，退避永远不增长。
+    if ok and _warp_selector_missing():
+        log("⚠ 重建命令成功，但运行中的配置仍缺 WARP 出口，按失败计")
+        ok = False
     _WARP_REBUILD_FAILS = 0 if ok else _WARP_REBUILD_FAILS + 1
     return ok
 
@@ -8385,11 +8392,17 @@ def _singbox_watchdog() -> None:
                                              len(_WARP_REBUILD_BACKOFF) - 1)]
             left = int(_LAST_WARP_REBUILD_TS + wait - time.time())
             if left <= 0:
-                _LAST_WARP_REBUILD_TS = time.time()
-                log(f"⚠ 主配置里 {_warp()['selector']} 缺失或成员异常，开始重建"
-                    f"（sing-box 进程本身正常，第 {_WARP_REBUILD_FAILS + 1} 次）")
-                _submit_once("rebuild-warp-outbounds",
-                             _rebuild_warp_outbounds_watched)
+                # 时间戳只在**真的提交了**才推进：`_submit_once` 遇到同名任务在跑
+                # 会返回 False，先记时间戳等于把这次尝试白记掉，下一轮再等满一个
+                # 退避周期 —— 而重建可能要几分钟，watchdog 每 30s 一轮，这段空白
+                # 里日志只会刷「仍缺失」。
+                if _submit_once("rebuild-warp-outbounds",
+                                _rebuild_warp_outbounds_watched):
+                    _LAST_WARP_REBUILD_TS = time.time()
+                    log(f"⚠ 主配置里 {_warp()['selector']} 缺失或成员异常，开始重建"
+                        f"（sing-box 进程本身正常，第 {_WARP_REBUILD_FAILS + 1} 次）")
+                else:
+                    log(f"⚠ {_warp()['selector']} 仍缺失，上一轮重建还在跑")
             else:
                 log(f"⚠ {_warp()['selector']} 仍缺失，等重建重试（{left}s）")
         return
