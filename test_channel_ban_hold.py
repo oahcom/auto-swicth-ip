@@ -641,6 +641,44 @@ def test_prober_skips_members_whose_unit_is_not_running():
         daemon._UNIT_RUNNING_CACHE.clear()
 
 
+# ---- 自愈：主配置丢了 WARP 出口要能被发现 ----
+def test_warp_selector_missing_detects_lost_outbounds():
+    """2026-11-03 远端事故：`warp-outbound.json` 属主被 root 抢走后，
+    `parse_subscription.py` 生成了一份**没有 WARP 出口**的合法配置并上线。
+    探活（Clash API 通 + 7890 能连）全绿，`singbox=🟢`，而 opencode 流量
+    已经静默落到机场池 —— 3 小时 24 分、30362 次 `status=404`。
+
+    这条判据必须同时满足：selector 整个消失要算缺失（404），成员骤降也算，
+    但 API 自己不可达/5xx 时**不算**（那是另一条判据，不能在这里重复报）。
+    """
+    orig = daemon.singbox_api
+    try:
+        cases = [
+            ("selector 不存在", (404, None), True),
+            ("正常", (200, {"all": ["WARP-CF"] * 50}), False),
+            ("成员骤降", (200, {"all": ["WARP-CF"] * 3}), True),
+            ("selector 空", (200, {"all": []}), True),
+            ("API 不可达", (0, None), False),
+            ("API 5xx", (500, None), False),
+        ]
+        for name, resp, want in cases:
+            daemon.singbox_api = lambda p, **kw: resp
+            got = daemon._warp_selector_missing()
+            assert got == want, f"{name}: got={got} want={want}"
+    finally:
+        daemon.singbox_api = orig
+
+
+def test_parse_refuses_to_drop_warp_on_read_error():
+    """warp-outbound.json 存在但读不了时必须让解析失败，不能静默产出
+    「没有 WARP 出口」的配置。这是上面那场事故的第一道闸。"""
+    import parse_subscription
+    src = open("parse_subscription.py", encoding="utf-8").read()
+    assert "拒绝生成不含 WARP 的配置" in src, "读取失败必须 raise，不能只 print"
+    # 缺文件仍要放行：全新部署还没生成过，是合法形态
+    assert "except FileNotFoundError:" in src, "缺文件必须仍返回 []"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

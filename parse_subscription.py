@@ -520,10 +520,17 @@ def _load_warp_outbounds() -> list[dict]:
         with open(p) as f:
             data = json.load(f)
     except FileNotFoundError:
+        # 全新部署还没生成过：合法形态，主配置里就是没有 WARP 出口。
         return []
     except (OSError, ValueError) as e:
-        print(f"  WARP 配置读取失败，跳过: {e}", file=sys.stderr)
-        return []
+        # **不能跳过。** 文件在却读不了（典型：属主被 root 抢走，600），
+        # 生成一份「没有 WARP 出口」的配置仍然合法，rc 为 0，于是它会被
+        # promote 上线 —— opencode 流量静默落到机场池，selector 整条消失，
+        # daemon 之后每次换线都是 status=404。2026-11-03 实测：远端因此
+        # 2 小时 24 分无 WARP 出口，日志里一条记录都没有。
+        #
+        # 这里必须让整个解析失败（rc≠0），由调用方保留旧配置。
+        raise SystemExit(f"✗ WARP 出口配置存在但读取失败，拒绝生成不含 WARP 的配置: {e}")
     items = data if isinstance(data, list) else [data]
     out = [o for o in items if isinstance(o, dict) and o.get("tag") and o.get("server_port")]
     if len(out) != len(items):

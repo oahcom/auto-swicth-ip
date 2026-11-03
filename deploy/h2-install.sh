@@ -77,9 +77,20 @@ case "$UNIT_DIR" in
     /etc/systemd/*|/usr/lib/systemd/*) SCTL=(need_root systemctl) ;;
     *) SCTL=(systemctl --user) ;;
 esac
-"${SCTL[@]}" enable --now asip-h2-singbox.service
+# `enable --now` 对**已经在跑**的单元是 no-op：既不改单元内容，也不重启进程。
+# 于是重新渲染出新的 channels/端口后，进程仍跑着旧拓扑，而输出显示"已启用"。
+# 远端实测：asip-h2-singbox 进程起于 02:50:28，配置文件 02:57:40 才写 ——
+# 中间那批新渠道从未加载。所以先 enable，再对 active 的单元显式 restart。
+"${SCTL[@]}" enable asip-h2-singbox.service
 USQUE_UNITS="$(echo $SERVICES | sed 's/asip-h2-singbox.service//' | xargs)"
-[ -z "$USQUE_UNITS" ] || "${SCTL[@]}" enable --now $USQUE_UNITS
+[ -z "$USQUE_UNITS" ] || "${SCTL[@]}" enable $USQUE_UNITS
+for u in asip-h2-singbox.service $USQUE_UNITS; do
+    if "${SCTL[@]}" is-active --quiet "$u"; then
+        "${SCTL[@]}" restart "$u"
+    else
+        "${SCTL[@]}" start "$u"
+    fi
+done
 echo "已启用 $(echo $SERVICES | wc -w) 个单元（1 sing-box + usque 线）"
 
 # 主 sing-box 需要重载才会看到新的 socks 出站（warp-outbound.json 已含 H2 成员）。

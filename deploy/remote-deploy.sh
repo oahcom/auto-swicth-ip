@@ -198,15 +198,27 @@ echo '  · warp-outbound'
 python3 deploy/members.py --write-warp-outbound >/dev/null
 
 echo '  · WG 线'
-sudo env HOME=$REMOTE_HOME WARP_WG_FAMILIES=\"\$WARP_WG_FAMILIES\" \
+# ASIP_RUN_USER 必须显式传：wg-lines-install.sh 的默认值是 $(id -un)，在
+# sudo 下就是 root，于是 apply → members.py 以 root 写出 600 属主的
+# warp-outbound.json，daemon（User=$REMOTE_USER）随后读不到 —— 生成的配置
+# 没有 WARP 出口，opencode 静默落到机场池。2026-11-03 远端因此丢了
+# 2 小时 24 分的 WARP 出口（30362 次 status=404），而日志里一条都没有。
+sudo env HOME=$REMOTE_HOME ASIP_RUN_USER=$REMOTE_USER \
+     ASIP_RUN_GROUP=$REMOTE_USER \
+     WARP_WG_FAMILIES=\"\$WARP_WG_FAMILIES\" \
      WARP_WG_NODES=\"\$WARP_WG_NODES\" ASIP_WARP_BLOCKS=\"\$ASIP_WARP_BLOCKS\" \
      ASIP_WARP_BLOCK_CHANNELS=\"\$ASIP_WARP_BLOCK_CHANNELS\" PYTHON=/usr/bin/python3 \
      ./deploy/wg-lines-install.sh 2>&1 | tail -3
 
 echo '  · H2 线'
-sudo env HOME=$REMOTE_HOME ASIP_WARP_BLOCKS=\"\$ASIP_WARP_BLOCKS\" \
+sudo env HOME=$REMOTE_HOME ASIP_RUN_USER=$REMOTE_USER \
+     ASIP_WARP_BLOCKS=\"\$ASIP_WARP_BLOCKS\" \
      ASIP_WARP_BLOCK_CHANNELS=\"\$ASIP_WARP_BLOCK_CHANNELS\" PYTHON=/usr/bin/python3 \
      ./deploy/h2-install.sh 2>&1 | tail -4
+
+# 兜底：上面任一步以 root 写出文件，这里统一交还。缺了它，一次 sudo 就能让
+# 下一轮订阅刷新产出没有 WARP 的配置。
+sudo chown -R $REMOTE_USER:$REMOTE_USER .warp 2>/dev/null || true
 
 echo '  · asip-unit 白名单'
 sudo install -m 0755 deploy/asip-unit /usr/local/bin/asip-unit
