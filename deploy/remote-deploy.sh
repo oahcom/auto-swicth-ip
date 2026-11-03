@@ -128,7 +128,7 @@ DETECTED=$(run 'U=nine-router-src.service
         | tr " " "\n" | sed -n "s/^PORT=//p" | head -1)
     echo "${a:-$b}"')
 if [ -n "$DETECTED" ]; then
-    echo "  远端 9router 在 :$DETECTED（取自 $U 的 $([ -n "$DETECTED" ] && echo 声明)）"
+    echo "  远端 9router 在 :$DETECTED（取自 nine-router-src.service 声明的端口）"
     run "cd $REMOTE_DIR
     sed -i 's#^NINE_ROUTER_BASE=.*#NINE_ROUTER_BASE=http://127.0.0.1:$DETECTED#' .env"
     # 写进去还不够：daemon 的 EnvironmentFile 只在启动时读一次，不重启就还是旧值。
