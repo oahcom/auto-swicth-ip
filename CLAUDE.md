@@ -22,9 +22,10 @@ sing-box (mixed inbound :7890 环回 / :7891 局域网, Clash API :9090 Bearer a
     ├── route: domain_suffix ["opencode.ai"] → selector opencode-out
     │   → 50 条 WARP 线路（5 直连 + 19 H2 + 22 WG + 4 已停用）
     │      + proxy 池兜底，共 51 个 selector 成员
-    └── final: proxy → 订阅池 selector（成员数**动态**：按实测判死摘出，
-        见既定事实第 29 条；2026-11-03 两台机器同时观测：远端 120 条、
-        本地 25 条，同一份代码同一批订阅）
+    └── final: proxy → 订阅池 selector（成员动态 = 订阅节点 + okz 沉睡池
+        去重 − 实测判死；见既定事实第 29 条。2026-11-03 两台机器同时观测：
+        远端 165 条、本地 25 条。**沉睡池是 okz 旧入口快照**，
+        `dormant-outbounds.json` 65 条，手工固化，非自动生成）
 
 daemon.py
     ← 读 9router SQLite requestDetails（只查 provider="opencode"）
@@ -780,6 +781,10 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `warp_night.py` | 80 | **夜锁策略**：`window` / `active` / `restart_allowed` / `label`。纯函数，不读配置不打日志；daemon 保留同名门面处理 IO |
 | `warp_diag.py` | 230 | **单节点 WARP 承载诊断**：配置只从 `warp_wg.build_line_config` 生成（不复刻），失败分 config/port/handshake/ok 四类。`--job` 输入 `{tag,node,egress_ip}` |
 | `test_warp_blocks.py` | — | 上面两个纯模块的单测（22 例）：块的切法、稳定性判定、夜间取舍、探针故障不计入节点履历 |
+| `tools/channel_report.py` | — | **渠道健康报表**（`asip chan`）：成功率/ban 率/成功失败数/物理落点/colo/订阅源/脱敏订阅地址。纯只读，`--hours` / `--html` / `--json` / `--by` |
+| `test_channel_report.py` | — | 报表纯函数单测（7 例）：verdict 口径、窗口夹零点、在册渠道、tag 漂移按 host:port 兜底、沉睡池标注、重启数取窗口内 |
+| `tools/block_view.py` | — | **块视图**（`asip blk`）：每个 colo 块的节点清单、类别、实测握手、出口 IP、延迟（`--delay` 现测）、当前绑定线 / 块模型选中。含 `block-map.json` 与 `channels()` 的对照 |
+| `test_block_view.py` | — | 块视图纯函数单测（8 例）：按 colo 分组与排序、在用优先于缺 diag（含 H2）、计划≠在用、延迟「没测」≠「不通」、host:port 多义不反查、CJK/emoji 对齐 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
 
 ## 部署与可移植性（2026-10-22）

@@ -42,25 +42,46 @@
 
 **字段**：`ban_hold_until`（默认锁到次日 `channel_ban_reset_hour = 8` 点）
 
-**防什么**：某条线最近 1 小时内的模型层实测**全部**判 quota/flagged，说明整条
+**防什么**：某条线**当天**最近 1000 条模型层实测**全部**判 quota，说明整条
 渠道（同 colo 全段）都烧穿了。这时候重启换地址不会产出。
 
-**三个条件缺一不可**：
-1. 窗口 1 小时（`channel_ban_window_sec = 3600`）
-2. 样本**严格大于** 30 条（`channel_ban_min_samples = 30`）
-3. 样本要铺满窗口的一半（`channel_ban_min_cover_ratio = 0.5`）
+**判据**（`_channel_ban_hold_hit`）：
+1. 样本只算当天（跨过 08:00 自动作废）
+2. 满 `channel_ban_min_samples = 1000` 条才判
+3. 其中**一条** OK / flagged / err 就否决（只有全 quota 才算烧穿）
 
-**为什么三层**：
-- 早先 30min + 2 条样本 → 把 WG-4/11/12 这种低流量线误锁（实测各只有 3~6 条）
-- 只数条数时 → 17 条线的 31 条样本只用了 **4.7 分钟**就锁了，那是“连撞 31 次”，
-  不是“持续一小时都没产出”
+另一条独立判据：连续 `channel_noaddr_hold_sec = 5h` 拿不到出口地址 → 同样锁定
+（隧道/节点已经死了，重启买不到任何东西）。
+
+**锁定期间不重启、不探测**（`stop_probe=True`、`next_probe_ts=until`）：探测出来
+的 quota 会进窗口，到期时互相续期 —— 实测 WG-21 因此锁了 17 小时。
 
 **为什么锁到早八点**：opencode 免费层的配额按自然日重置，重置时刻是 **08:00**
 （本地时间）。这**是上游的重置时间**，不是我们随便定的闹钟。详见
 [established-facts.md](../established-facts.md) 第 1 条。
 
-**什么时候必须让路**：换了节点之后。另外，命中渠道锁时系统会主动**把线重定位到
-最近 1h ban 率最低的 colo**（`channel_rehome_enabled`），次日 08:00 再换回原节点。
+**什么时候必须让路**：换了节点之后。
+
+### 补位渠道（`ban_backfill_*`）
+
+**一个渠道被封，必定要有另外一个渠道补位**（主人 2026-11-04 定）。命中锁后
+`_rehome_held_lines` 每分钟对账一次，缺补位的就开一条：
+
+1. 用**已注册但没启用**的空闲设备线（`lineN/profile.conf` 存在、不在 members
+   里、单元没被 mask）
+2. 落地节点取 ban 率最低的 colo（`_lowest_ban_colos` → `ipv6_segments.colo_ban_rates`）
+3. 写线配置 → 起单元 → 写 `.warp/backfill.json` → 重跑 `deploy/members.py`
+   发布 `.warp/warp-outbound.json` → `refresh_subscription` 重建主配置
+4. 被封的那条正在服务流量时，selector 切到补位渠道
+5. 次日 08:00 解封：selector 切回原线 → 停单元 → 撤成员 → 重发配置
+
+成员身份必须落 `.warp/backfill.json` 而不是只在 daemon 内存里：`deploy/members.py`
+与 `parse_subscription.py` 都是独立进程，只改 `CFG["warp"]["members"]` 它们看不见，
+补位渠道起来了也没人能切过去。`config.py::_append_backfill_members` 读这个文件把
+成员装回 `CFG`，daemon 重启后同样能看见并撤销。
+
+补位渠道不参与同块轮回、也不参与 `_rehome_held_lines` 的重定位 —— 它的落地节点
+就是补位目标本身，搬走就补错地方了。
 
 ---
 
