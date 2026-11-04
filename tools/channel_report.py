@@ -420,80 +420,79 @@ def _pct(v: float | None) -> str:
     return f"{v * 100:.0f}%" if v is not None else "—"
 
 
-def _seg48(name: str) -> str:
-    """`2a09:bac5:55f8:18be`（/64）→ `2a09:bac5:55f8`（/48）。
+def _seg32(name: str) -> str:
+    """`2a09:bac5:55f8:18be`（/64）→ `2a09:bac5`（/32）。
 
-    /48 才是「批次」：同一个 /48 下的 /64 是同一个机房池里的一次抽签，
-    而不同 /48 之间是**不同的地址池**。看覆盖面先看 /48 有几个。
+    /32 是 Cloudflare 的地址批次：`bac1` 与 `bac5` 是两批独立的 anycast 段，
+    一个机房在每批里各有一份池子。再往细看（/48）一条线能有 51 个，
+    读完什么也没记住；/32 只有 2 个，一眼能比。
     """
-    return name.rsplit(":", 1)[0]
+    return ":".join(name.split(":")[:2])
 
 
-def _seg48_groups(r: dict) -> list[tuple[str, int]]:
-    """`[(/48 名, 它下面落过几个 /64)]`，按数值排序。"""
+def _seg32_groups(r: dict) -> list[tuple[str, int, int]]:
+    """`[(/32 名, 它下面几个 /48, 几个 /64)]`，按数值排序。"""
     from collections import Counter
-    c = Counter(_seg48(s) for s in (r.get("seg_v6") or []))
-    return sorted(c.items(), key=lambda kv: _seg_sort(kv[0]))
+    c48: Counter = Counter()
+    c64: Counter = Counter()
+    for s in (r.get("seg_v6") or []):
+        p32 = _seg32(s)
+        c64[p32] += 1
+        c48[(p32, s.rsplit(":", 1)[0])] += 1
+    n48 = Counter(p32 for p32, _ in c48)
+    return [(p32, n48[p32], c64[p32])
+            for p32 in sorted(c64, key=_seg_sort)]
 
 
-def _seg_counts(r: dict) -> tuple[int, int]:
-    """`(v6 /48 个数, v6 /64 个数)`。"""
-    return len(_seg48_groups(r)), len(r.get("seg_v6") or [])
+def _seg_counts(r: dict) -> tuple[int, int, int]:
+    """`(v6 /32 个数, /48 个数, /64 个数)`。"""
+    v6 = r.get("seg_v6") or []
+    return (len({_seg32(s) for s in v6}),
+            len({s.rsplit(":", 1)[0] for s in v6}), len(v6))
 
 
 def print_segments(rows: list[dict]) -> None:
-    """每条渠道：先列 **/48**，再给 /64 个数，最后列 v4 地址。
+    """每条渠道一行：`N 个 /32 · M 个 /48 · K 个 /64`，然后列出每个 /32 的细分。
 
-    列全部 /64 会淹掉屏幕（一条线 60~74 个），而且 /64 是**抽签结果**、不可选；
-    /48 才是不同地址池的边界，一个机房通常只有 8~12 个。所以 /48 全列，
-    /64 只给个数（按 /48 分组时括号里是该 /48 下的个数）。
+    /64 是**抽签结果**、不可选，一条线能有 178 个；/48 是抽签所在的池子，
+    也有 51 个。只有 /32 是可读的规模（实测全场就 `bac1` / `bac5` 两批）。
     """
     if not rows:
         print("（没有渠道数据）")
         return
-    print("\n出口段明细（v6 先列 /48、括号内是该 /48 下的 /64 个数；v4 列地址）")
+    print("\n出口段明细（/32 = 地址批次；括号内是它下面的 /48 与 /64 个数）")
     print("-" * 92)
     width = max((_w(r["tag"]) for r in rows), default=0) + 2
     for r in rows:
-        groups = _seg48_groups(r)
-        n48, n64 = _seg_counts(r)
+        n32, n48, n64 = _seg_counts(r)
         v4 = list(r.get("seg_v4") or [])
-        head = f"{_pad(r['tag'], width)} "
         if n64:
-            head += f"{n48} 个 /48 · {n64} 个 /64"
+            head = f"{n32} 个 /32 · {n48} 个 /48 · {n64} 个 /64"
+        else:
+            head = ""
         if v4:
             head += (" · " if n64 else "") + f"{len(v4)} 个 v4 地址"
-        if not n64 and not v4:
-            print(head + "—")
+        if not head:
+            print(f"{_pad(r['tag'], width)} —")
             continue
-        print(head)
-        indent = " " * (width + 2)
-        line = indent
-        for name, n in groups:
-            token = f"{name}({n})" if n > 1 else name
-            if _w(line) + _w(token) + 2 > 140:
-                print(line)
-                line = indent
-            line += token + "  "
-        for a in v4:
-            if _w(line) + _w(a) + 2 > 140:
-                print(line)
-                line = indent
-            line += a + "  "
-        print(line)
+        detail = "  ".join(f"{p}({a} 个 /48, {b} 个 /64)"
+                           for p, a, b in _seg32_groups(r))
+        print(f"{_pad(r['tag'], width)} {head}")
+        if detail:
+            print(" " * (width + 1) + detail)
 
 
 def _seg_label(r: dict) -> str:
-    """表格里的「出口段」列：`/48 个数 / /64 个数`，v4 追加 `+Nv`。
+    """表格里的「出口段」列：`/32 个数//48 个数//64 个数`，v4 追加 `+Nv`。
 
-    两者都为 0 时显示 `—` 而不是 `0/0` —— 会被读成「一段都没有」，
+    全为 0 时显示 `—` 而不是 `0/0/0` —— 会被读成「一段都没有」，
     实际是「日志里没见过它的出口」（新起的线、日志被轮转过）。
     """
-    n48, n64 = _seg_counts(r)
+    n32, n48, n64 = _seg_counts(r)
     n4 = len(r.get("seg_v4") or [])
     parts = []
     if n64:
-        parts.append(f"{n48}/{n64}")
+        parts.append(f"{n32}/{n48}/{n64}")
     if n4:
         parts.append(f"+{n4}v")
     return " ".join(parts) or "—"
@@ -529,7 +528,7 @@ def print_table(rows: list[dict], hours: float) -> None:
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
-            f"{_pad('colo ban', 9, False)} {_pad('/48,/64', 10, False)} "
+            f"{_pad('colo ban', 9, False)} {_pad('/32,/48,/64', 12, False)} "
             f"{_pad('重启', 6, False)}  "
             f"{_pad('订阅', 8)} {_pad('节点名', 30)} 节点 / 状态")
     print(head)
@@ -658,7 +657,7 @@ footer{{color:var(--muted);font-size:11px;margin-top:14px;line-height:1.7}}
 <th>渠道</th><th>承载</th><th>colo</th><th>机房</th><th>节点名（机场）</th>
 <th>节点地址</th><th>订阅</th><th>订阅地址</th><th>出口 IP</th><th>成功率</th>
 <th>ban 率</th><th>成功/失败</th><th>colo ban</th>
-<th title="v6 出口段：/48 个数 / /64 个数（悬停看每个 /48）。v4 另计">出口段 /48·/64</th>
+<th title="v6 出口段：/32 个数 / /48 个数 / /64 个数（悬停看 /32）。v4 另计">出口段 /32·/48·/64</th>
 <th>重启</th><th>状态</th>
 </tr></thead><tbody>{rows}</tbody></table></div>
 <div class="legend">
@@ -723,7 +722,7 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
             f'<td class="mono">{r["ok"]}/{r["ban"] + r["err"]}</td>'
             f'<td class="mono dim">{_pct(r["colo_ban_rate"])}</td>'
             f'<td class="mono dim seg" title="'
-            f'{html.escape(" ".join(s for s, _ in _seg48_groups(r)))}">'
+            f'{html.escape(" ".join(p for p, _, _ in _seg32_groups(r)))}">'
             f'{html.escape(_seg_label(r))}</td>'
             f'<td class="mono dim">{r["restarts"]}</td>'
             f'<td>{" ".join(pills)}</td></tr>')

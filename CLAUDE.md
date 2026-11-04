@@ -765,7 +765,8 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `.egress_log.jsonl` | 动态 | 出口节点归属日志（每次成功切换 append (ts,node)，供 per-egress 错误率归因）|
 | `asi-selfcheck.timer` | — | systemd 用户定时器：每 10min 触发 asi-selfcheck.service 跑巡检引擎 |
 | `test_daemon_unit.py` | 4177 | 确定性单测（无网络，198 个用例：错误率/策略/评分/坏节点/看门狗/WARP 换线门控）|
-| `test_subscription_parse.py` | 561 | 订阅解析回归单测（无网络，40 个用例：vless/trojan transport/单源失败/rc 检查/URL 文件传参/局域网入站与来源守卫）|
+| `test_subscription_parse.py` | — | 订阅解析回归单测（无网络）：vless/trojan transport、单源失败、rc 检查、URL 文件传参、局域网入站与来源守卫、**源快照**（一次性链接失效时回退上一轮、按源隔离、0600 且文件名不含 token、没快照仍抛）|
+| `test_daemon_autodiag.py` | — | 刷新后自动实测的**调度**单测（9 例）：只挑无 colo 节点、按源轮转、上限、跳过 selector/direct、台账缺失不炸；设备不足才注册、**接着最大槽位编号**、每轮 ≤3 台、429 即停 |
 | `test_warp_refresh.py` | 1243 | WARP 刷新/换线门控单测（22 个用例）|
 | `verify_rotation.py` | 360 | 轮换健康验证（7890 端口 / IP 切换 / 切换合理性），结束时恢复原选择，`--quick` 约 20s |
 | `deploy/install.sh` | — | 部署脚本：生成密钥 + 注册 usque 成员（当前 9 条）+ 由 config.py 推导并写入 `auto-switch-ip.service` / `asi-selfcheck.{service,timer}` + enable + 生成 asip 设置与入口。WG/H2 单元分别由 `deploy/wg-lines-install.sh`、`deploy/h2-install.sh` 生成 |
@@ -781,8 +782,8 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `warp_night.py` | 80 | **夜锁策略**：`window` / `active` / `restart_allowed` / `label`。纯函数，不读配置不打日志；daemon 保留同名门面处理 IO |
 | `warp_diag.py` | 230 | **单节点 WARP 承载诊断**：配置只从 `warp_wg.build_line_config` 生成（不复刻），失败分 config/port/handshake/ok 四类。`--job` 输入 `{tag,node,egress_ip}` |
 | `test_warp_blocks.py` | — | 上面两个纯模块的单测（22 例）：块的切法、稳定性判定、夜间取舍、探针故障不计入节点履历 |
-| `tools/channel_report.py` | — | **渠道健康报表**（`asip chan`）：成功率/ban 率/成功失败数/物理落点/colo/**出口段**/订阅源/脱敏订阅地址。出口段列写 `/48 个数//64 个数`，明细表逐个列 /48 并标该池内抽到几个 /64（从 `daemon.log` 的出口行现算，不按时间窗口截断；台账里没有渠道归属）。纯只读，`--hours` / `--html` / `--json` / `--by` |
-| `test_channel_report.py` | — | 报表纯函数单测（11 例）：verdict 口径、窗口夹零点、在册渠道、tag 漂移按 host:port 兜底、沉睡池节点标 okz 旧入口快照、出口段按 /64 去重、`/48 个数//64 个数` 两数不会混、十六进制排序、`—`≠`0`、重启数取窗口内 |
+| `tools/channel_report.py` | — | **渠道健康报表**（`asip chan`）：成功率/ban 率/成功失败数/物理落点/colo/**出口段**/订阅源/脱敏订阅地址。出口段列写 `/32 个数//48 个数//64 个数`，明细表按 /32 批次分行并给出其下的 /48 与 /64 个数（从 `daemon.log` 的出口行现算，不按时间窗口截断；台账里没有渠道归属）。纯只读，`--hours` / `--html` / `--json` / `--by` |
+| `test_channel_report.py` | — | 报表纯函数单测（11 例）：verdict 口径、窗口夹零点、在册渠道、tag 漂移按 host:port 兜底、沉睡池节点标 okz 旧入口快照、出口段按 /64 去重、`/32//48//64` 三级不会混、按 /32 分组、十六进制排序、`—`≠`0`、重启数取窗口内 |
 | `tools/block_view.py` | — | **块视图**（`asip blk`）：每个 colo 块的节点清单、类别、实测握手、出口 IP、延迟（`--delay` 现测）、当前绑定线 / 块模型选中。`--channels` 换成渠道视角（每条渠道选中的节点、候选池大小、**与哪条渠道撞同一物理出口**），`--pools` 打印完整候选池 |
 | `test_block_view.py` | — | 块视图纯函数单测（11 例）：按 colo 分组与排序、在用优先于缺 diag（含 H2）、计划≠在用、延迟「没测」≠「不通」、host:port 多义不反查、CJK/emoji 对齐、渠道视角、同一物理出口去重 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |
