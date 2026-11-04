@@ -91,6 +91,41 @@ def test_new_colo_gets_a_member_and_old_ones_keep_their_numbers(tmp_path,
     assert order[3] == ("WARP-H2-BOM-16", "BOM")
 
 
+def test_missing_node_skips_one_line_not_the_whole_batch(tmp_path, monkeypatch):
+    """落地节点从订阅里消失时只跳过那一条线。
+
+    2026-11-05 远端部署实测：`normal.cn.greatgameupload.org:25526-any` 既不在
+    主配置也不在沉睡池，`node_outbound` 抛 KeyError 冒到 `render()` 外面 ——
+    H2 渲染整批失败，22 条线一条都没写，输出里只有一段 traceback。
+    """
+    mod = _render_mod()
+    warp = tmp_path / ".warp"
+    (warp / "h2").mkdir(parents=True)
+    for name in ("usque10", "usque11"):
+        (warp / name).mkdir()
+        (warp / name / "config.json").write_text("{}")
+    (warp / "warp-outbound.json").write_text(json.dumps([
+        {"tag": "WARP-H2-NRT-0"}, {"tag": "WARP-H2-NRT-1"}]))
+    monkeypatch.setattr(mod, "PROJECT", tmp_path)
+    monkeypatch.setattr(mod, "free_devices", lambda *a, **k: ["usque10", "usque11"])
+    monkeypatch.setattr(mod, "h2_channels", lambda: [
+        {"tag": "WARP-H2-NRT-0", "member_tag": "WARP-H2-NRT-0", "colo": "NRT",
+         "node": "n-gone", "nodes": ["n-gone"]},
+        {"tag": "WARP-H2-NRT-1", "member_tag": "WARP-H2-NRT-1", "colo": "NRT",
+         "node": "n-ok", "nodes": ["n-ok"]},
+    ])
+
+    def _ob(tag):
+        if tag == "n-gone":
+            raise KeyError(tag)
+        return {"type": "socks", "tag": tag}
+
+    monkeypatch.setattr(mod, "node_outbound", _ob)
+    monkeypatch.setattr(mod, "_alive_many", lambda *a, **k: {})
+    rc = mod.render(print_only=True)
+    assert rc == 0, f"一条线缺节点不该让整批失败 (rc={rc})"
+
+
 def test_ledger_devices_count_as_capacity(tmp_path, monkeypatch):
     """台账里的设备必须算进容量，否则原地重渲染被 `n < live_n` 拒掉。
 

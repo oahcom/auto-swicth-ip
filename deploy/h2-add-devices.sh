@@ -1,8 +1,10 @@
 #!/bin/bash
 # 扩容 H2 承载能力：注册 N 台新 usque 设备，供 render_h2_lines.py 渲染新线路。
 #
-#   ./deploy/h2-add-devices.sh 3          # 注册 3 台（usque-h2-new1..3）
+#   ./deploy/h2-add-devices.sh 3          # 注册 3 台（编号接在现有最大号之后）
 #   ./deploy/h2-add-devices.sh 3 --dry-run
+#
+# 渲染器（render_h2_lines.py）设备不够时会自己调这个脚本，一般不用手跑。
 #
 # 为什么需要单独一条命令：render_h2_lines.py 的线路数 = min(渠道数, 空闲设备数)，
 # 设备用完就渲染不出新线。而扩容不能复用现成的 usque-warp*/usque-h2* 单元 ——

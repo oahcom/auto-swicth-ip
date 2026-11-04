@@ -312,6 +312,18 @@ opencode 限流"，不是"隧道不通"。结果 22 条线全被判死，包括�
 **同块多条线不能重名**：`ch["index"]` 是**块内**序号，同 colo 三条线会全叫
 `NRT-0/1/2`；而成员编号必须是全局唯一的。两者不是一回事。
 
+**新块/新渠道的续号**（2026-11-05 加）：`fixed_order` 原先只读
+`warp-outbound.json`，于是块模型里**没有既有成员**的 colo（实测 BOM/FRA/GIG/LHR）
+永远渲染不出来 —— 块测出来了、线一条没有。现在渲染器在既有成员之后按
+「既有最大编号 + 1」续号补成员（`_member_order`），既有成员的编号/顺序仍
+一位不动。新增 12 条（19 → 31）实测全部一次装成。
+
+**自动同步链**：`_run_h2_probe` 只更新 block-map，不渲染。daemon 的
+`_run_h2_sync`（30min 自限）跑 `render_h2_lines.py --check` 看差集，
+有差集才渲染 → `h2-install.sh --no-render` → `members.py` →
+`patch-wg-outbounds.py` → 重启主 sing-box。渲染必须在提权**之前**以本用户
+完成：root 跑会把 `.warp/h2/*` 属主改成 root，daemon 之后读不回来。
+
 ---
 
 ### 13d. H2 线与 WG 线的「换节点」机制不同（不能互相套用）

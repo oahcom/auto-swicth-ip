@@ -4,12 +4,14 @@
 #   ./deploy/h2-install.sh                 # 全流程（渲染 → 校验 → 安装 → 启用）
 #   ./deploy/h2-install.sh --render-only   # 只重新渲染
 #   ./deploy/h2-install.sh --config-only   # 安装单元但不启用
+#   ./deploy/h2-install.sh --no-render     # 用调用方已渲染的产物（daemon 用）
 #   SYSTEMD_DIR=/tmp/x ./deploy/h2-install.sh --config-only   # 演练
 #
 # 渲染与启用分开，是因为 render_h2_lines.py 特意不 enable 任何单元：它只写文件。
 # 这个脚本负责落进 /etc/systemd/system，并先 reload 再启动 sing-box、最后 usque。
 #
 # 幂等：单元内容没变就不重启；usque 各线互不影响（一条挂了不重启其余）。
+# 换节点只重启 asip-h2-singbox（节点在它那份配置里），不动 usque 进程。
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

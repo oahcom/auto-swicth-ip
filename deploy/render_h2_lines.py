@@ -21,9 +21,14 @@ WHY 一条线一个 usque 进程：usque 的 SOCKS 出口与设备身份一一�
 不能开两个会话（CF 侧互踢）。所以「渠道数 = usque 进程数 = 设备数」是硬约束，
 不能像 sing-box 那样合并。
 
+块模型里多出来的渠道（新 colo、同 colo 多一条）**自动续号补成员**，设备不够
+时自动调 `deploy/h2-add-devices.sh` 注册（CF 限流约 9 台/窗口，注册到几台用几台，
+下轮再补）。既有成员的编号/顺序一位不动。
+
 用法：
-    python3 deploy/render_h2_lines.py            # 渲染
-    python3 deploy/render_h2_lines.py --print    # 只看会渲染什么
+    python3 deploy/render_h2_lines.py            # 渲染（会补成员、补设备）
+    python3 deploy/render_h2_lines.py --print    # 只看会渲染什么（不写文件、不注册）
+    python3 deploy/render_h2_lines.py --check    # 只列待补成员，有差集退出 1
 """
 from __future__ import annotations
 
@@ -462,7 +467,17 @@ def render(print_only: bool = False) -> int:
         inbound_port = BASE_INBOUND + i
         socks_port = BASE_DEVICE_PORT + i
         tag = ch["node"]
-        ob = node_outbound(tag)
+        try:
+            ob = node_outbound(tag)
+        except KeyError:
+            # 节点既不在主配置也不在沉睡池：这条线的落地节点已经从订阅里
+            # 消失（远端 2026-11-05 实测 `normal.cn.greatgameupload.org:25526-any`）。
+            # 一条线缺节点不该让整批 H2 渲染失败 —— 原来这里 KeyError 冒出去，
+            # 22 条线一条都没写，而报错只有一行 traceback 混在部署输出里。
+            print(f"⚠ {ch['member_tag']}: 节点 {tag} 不在主配置/沉睡池，跳过",
+                  file=sys.stderr)
+            continue
+        ob["tag"] = f"h2-{i}-{tag}"[:120]
         ob["tag"] = f"h2-{i}-{tag}"[:120]
         outbounds.append(ob)
         inbounds.append({"type": "direct", "tag": f"h2in-{i}",
