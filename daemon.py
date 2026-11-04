@@ -3117,6 +3117,12 @@ def _channel_noaddr_note(tag: str, got_ip: bool, now: float) -> None:
                 st["ban_noaddr_since"] = 0.0
         return
     hit_sec = float(_warp().get("channel_noaddr_hold_sec", 5 * 3600))
+    # **H2 先换节点**。这条锁的判据是「重启换的是同一节点的地址，白烧」，而
+    # selector 换节点不重启、不断流、零成本 —— 对 H2 不成立。实测 2026-11-05
+    # NRT-13/14、TPE-5/6/18、SLC-11/12 被锁到次日 08:00，其中 NRT 两条当时
+    # 就有 4 个 TCP 可达的候选。整池试遍（`_h2_next_node` 返回 None）才锁。
+    if m and m.get("kind") == "h2" and _h2_repair(m):
+        return
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
         since = float(st.get("ban_noaddr_since") or 0.0)
@@ -3277,6 +3283,16 @@ def _rehome_held_lines(now: float | None = None) -> None:
                              or st.get("ban_backfill_tag")):
             # 解封第一步先撤补位渠道：它就是为了顶这一天的封禁而开的。
             _backfill_close(tag)
+            # **H2 的「取不到出口」锁：先换节点再解锁**。解锁只是让它重新被
+            # 探测；不换节点的话「解锁 → 探测 → 3 次无地址 → 换节点 → 整池试遍
+            # → 5h 又被锁」一圈回到原点，这条线一整天没出过口（实测 NRT-13 /
+            # SLC-11 / TPE-5/6 各 700 分钟无探测）。换节点不重启、无成本。
+            # 只对 `ban_noaddr_since` 锁生效：quota 锁是「地址被烧」，那时节点
+            # 本身是好的，换掉等于白白丢掉一条能用的链路。
+            m = _warp_member(tag)
+            if (m and m.get("kind") == "h2"
+                    and float(st.get("ban_noaddr_since") or 0.0)):
+                _h2_repair(m)
             _warp_line_update(tag, ban_hold_until=0.0, ban_hold_ready=0.0,
                               stop_probe=False, ban_probes=[],
                               ban_noaddr_since=0.0)
@@ -3568,6 +3584,8 @@ def _h2_repair(member: dict | None) -> bool:
     if now < _NODE_NEXT_CHECK.get(tag, 0.0):
         return False
     nxt = _h2_next_node(member)
+    _NODE_NEXT_CHECK[tag] = now + float(
+        _warp().get("node_rotation_interval_sec", 60))
     if not nxt:
         return False                     # 整池都试过了，等重渲染/地址恢复
     if _rehome_one(tag, nxt) != "ok":
@@ -3575,8 +3593,6 @@ def _h2_repair(member: dict | None) -> bool:
     _H2_TRIED.setdefault(tag, set()).add(nxt)
     # 新落地节点的出口地址必然不同：清掉旧地址，让探测器按新链路重新判。
     _invalidate_warp_line_ip(tag)
-    _NODE_NEXT_CHECK[tag] = now + float(
-        _warp().get("node_rotation_interval_sec", 60))
     log(f"  ⇄ {tag} 连续取不到出口 → 换节点 {nxt}（selector，未重启）")
     return True
 
@@ -4219,7 +4235,15 @@ def _node_rotation_pass(now: float | None = None) -> None:
         #    就被判「拿不到出口」，换到了一个已知的死节点）。
         moved = max(float(line.get("rebind_ts") or 0),
                     float(_warp_line_state(tag).get("restart_ts") or 0))
-        if now - moved < interval * 2:
+        # 冷静期是「给刚重启的隧道几十秒起来」。但一条线反复重启、每次还是
+        # 取不到出口，这个前提就不成立了 —— 而每次重启都把 `restart_ts` 顶到
+        # 现在，冷静期便永远成立，轮回一次也轮不到它。实测 2026-11-05
+        # WARP-WG-4 `fail_streak` 13、每 ~40s 重启一次、`restart_ts` 永远是
+        # 新的，轮回日志里从没出现过它。用 `fail_streak` 破这个循环：连续
+        # 取不到出口说明重启已经证明无用，该换的是节点。
+        if (now - moved < interval * 2
+                and int(_warp_line_state(tag).get("fail_streak") or 0)
+                < _UNKNOWN_RESTART_STREAK):
             _NODE_NEXT_CHECK[tag] = now + interval
             continue
         with _NODE_PROBE_SLOTS:

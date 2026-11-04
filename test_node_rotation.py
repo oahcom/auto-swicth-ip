@@ -25,18 +25,21 @@ LINE = {"lines": {"WARP-WG-7": {
 
 
 def run(tcp, active=None, enabled=True, rounds=2, restarts=0,
-        probed=True, ever_ok=True):
+        probed=True, ever_ok=True, fail_streak=0, just_restarted=False):
     """跑 N 轮轮回，返回 (换到的节点, 重启次数)。
 
     默认两轮：首次判死只记一笔、下一轮复查仍不通才换。
 
     `probed=False` → 模拟刚 apply 完、探测器还没碰过这条线；
-    `ever_ok=False` → 模拟节点 TCP 通但从来没取到过出口（UDP 不通）。
+    `ever_ok=False` → 模拟节点 TCP 通但从来没取到过出口（UDP 不通）；
+    `just_restarted=True` → `restart_ts` 就是刚刚（冷静期生效中）。
     """
     moved, restarted = [], []
     import time as _t
     state = {"restart_hist": [_t.time()] * restarts,
              "last_probe_ts": (_t.time() - 300) if probed else 0.0,
+             "restart_ts": _t.time() if just_restarted else 0.0,
+             "fail_streak": fail_streak,
              # `ip` 才是「隧道建起来了」的证据：`last_ok_ts` 在 verdict=blocked
              # 时会被清零（出口 IP 被限流 ≠ 隧道不通），拿它当节点判据会把
              # 健康线全判死。
@@ -121,6 +124,22 @@ assert run({"a.nrt:443-any": True, "b.nrt:443-any": True},
 assert run({"a.nrt:443-any": True, "b.nrt:443-any": True},
            ever_ok=False, rounds=2) == \
     (None, 0), "前两轮只观察，不该换"
+
+# 10b) 冷静期不能因为「一直在重启」而永久成立。
+# 冷静期为的是给刚重启的隧道几十秒起来；但一条线反复重启、每次都还是取不到
+# 出口，这个前提就不成立了 —— 而每次重启都把 `restart_ts` 顶到现在，冷静期
+# 便永远成立。实测 2026-11-05 WARP-WG-4 `fail_streak` 13、每 ~40s 重启一次、
+# `restart_ts` 永远是新的，轮回日志里从没出现过它。
+assert run({"a.nrt:443-any": True, "b.nrt:443-any": True},
+           ever_ok=False, rounds=3, just_restarted=True,
+           fail_streak=daemon._UNKNOWN_RESTART_STREAK) == \
+    ("b.nrt:443-any", 1), \
+    "反复重启仍取不到出口时，冷静期必须让路给换节点"
+# 对照：同样的位形、但没在反复重启（fail_streak 未达阈值）→ 冷静期照旧生效。
+assert run({"a.nrt:443-any": True, "b.nrt:443-any": True},
+           ever_ok=False, rounds=3, just_restarted=True,
+           fail_streak=daemon._UNKNOWN_RESTART_STREAK - 1) == \
+    (None, 0), "刚重启且没在反复失败时，冷静期仍然要挡住换节点"
 
 # 11) 换节点必须带 rebound=True 去重启
 # 换完不重启 = 配置写进文件、进程还在跑旧节点：线照样死，而守护以为自己
