@@ -2770,6 +2770,10 @@ _LINE_DEFAULTS = {
     "last_probe_ts": 0.0,
     "next_probe_ts": 0.0,
     "fail_streak": 0,
+    # 本进程内曾拿到过出口地址。与 `ip` 不同，它**不被隧道重启清空** ——
+    # 「这条线在这台机器上到底通过没有」是判断「惩罚期重启还有没有意义」
+    # 的依据（见 `_line_node_cannot_carry`）。
+    "ever_ip": False,
     # `restart_count`（进程终身累计）已删：全库零读取者，唯一的报表用的是
     # `restart_hist` 的窗口内计数，而它累计到 4 万+ 只是磁盘垃圾。
     "restart_hist": [],
@@ -3946,6 +3950,36 @@ def _node_tcp_ok(node: str, timeout: float = 6.0) -> bool | None:
     return res
 
 
+def _line_node_cannot_carry(tag: str) -> bool:
+    """这个节点在这个「惩罚期重启」路径上**重启没有意义**吗。
+
+    两种都算：
+      1. 节点实测承载不了 WARP（rank 2）—— 换多少次地址都拿不到出口；
+      2. 这条线**从没拿到过出口地址**（`ip` 从未写入）—— 惩罚期重启是为了
+         换一个新的 /128，而「从没出过口」说明问题在节点或链路上，不在地址。
+
+    只看已有结论，不现场探测：这是秒级高频路径，加探测会把主循环拖垮。
+    rank 1（没测过）不算不能承载 —— 未知不等于坏。
+    """
+    try:
+        line = (warp_wg._read_state().get("lines") or {}).get(tag) or {}
+        node = line.get("node")
+        if not node:
+            return False
+        st = _warp_line_state(tag)
+        # **不能只看当前的 `ip`**：`_invalidate_warp_line_ip` 在每次隧道重启时
+        # 都会清空它，刚重启的线必然 `ip=None`。拿它当判据会让这条线永远不再
+        # 重启（连本来能恢复的也停掉）。看的是「这条线在本进程里成功出过口吗」
+        # ——`ever_ip` 由 `_warp_line_record_observation` 在拿到地址时置位。
+        ever = bool(st.get("ever_ip"))
+        if not ever and st.get("last_probe_ts"):
+            return True
+        return _warp_alive_rank(str(node), warp_blocks.load_map(),
+                                line.get("family")) == 2
+    except Exception:
+        return False
+
+
 def _warp_alive_rank(tag: str, nodes_map: dict, family: str | None = None) -> int:
     """节点实测能不能承载 WARP：0 能 / 1 没测过 / 2 实测不能。
 
@@ -4400,6 +4434,10 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             st["ip"] = ip
             st["ip_ts"] = ts
             st["port_ok"] = True
+            # 本进程内**曾经**拿到过出口。与 `ip` 不同，它不被隧道重启清空 ——
+            # 「这条线在这台机器上到底有没有通过」是判断「重启还有没有意义」
+            # 的依据（见 `_line_node_cannot_carry`）。
+            st["ever_ip"] = True
         st["last_verdict"] = verdict
         st["last_probe_ts"] = ts
         if verdict == "OK":
@@ -4920,6 +4958,14 @@ def _probe_one_line(member: dict) -> None:
                          now)
         if tag == active:
             _reconnect_warp_now("探测发现当前出口处于惩罚期", time.time())
+        elif _line_node_cannot_carry(tag):
+            # **节点本身不转发 UDP 时，重启同一个节点是死循环**：惩罚期重启
+            # 换的是这个节点下的新 /128，节点要是不通 2408，换多少次都拿不到
+            # 出口。实测 2026-11-05 WG-4 停在 rank 1 节点上每 8~10s 重启一次、
+            # 日志刷满「出口处于惩罚期」，而 `_same_block_standby` 明明能给它
+            # 选出备线 —— 这条路径根本没问过节点能不能承载。
+            # 换节点交给同块轮回（它有自己的两轮判死节流），这里只是别重启。
+            return
         elif not _quota_hold_skips(tag, "出口处于惩罚期"):
             _warp_line_restart(member, "出口处于惩罚期")
         return

@@ -417,3 +417,55 @@ def test_successful_probe_records_node_colo(monkeypatch, tmp_path):
     daemon._probe_one_line(_member())
     got = json.loads(ledger.read_text())["nodes"]["n.nrt:443-any"]
     assert got["colo"] == "NRT" and got["ok"] is True, got
+
+
+def test_penalty_restart_skipped_when_line_never_got_egress(monkeypatch):
+    """从没拿到过出口的线，惩罚期重启是死循环，不能再重启。
+
+    惩罚期重启的目的是换一个新 /128。但「这条线从没出过口」说明问题在节点
+    或链路，而不在地址 —— 重启一万次还是同一个结论。实测 2026-11-05
+    WG-4 停在 rank 1 节点上每 8~10 秒重启一次，日志刷满「出口处于惩罚期」。
+    """
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: True)
+    monkeypatch.setattr(daemon, "_quarantine_line", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_quota_hold_skips", lambda t, r: False)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "203.0.113.9")
+    monkeypatch.setattr(daemon, "_line_block_remaining", lambda ip, now: 3600)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r, **kw: (restarted.append(r), True)[1])
+    # 只盯**调用点**：判据本身另有单元测试，这里要的是「惩罚期分支确实问了
+    # 这个问题」。不这么做的话，把 `elif _line_node_cannot_carry(tag)` 整段
+    # 删掉这个用例照样绿。
+    monkeypatch.setattr(daemon, "_line_node_cannot_carry", lambda t: True)
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {"last_probe_ts": time.time() - 60,
+                                   "ever_ip": False, "fail_streak": 5})
+    daemon._probe_one_line(_member())
+    assert not restarted, f"节点承载不了时惩罚期不该重启，实际 {restarted}"
+
+
+def test_cannot_carry_judgement(monkeypatch):
+    """判据本身：rank 2、或「探过但从没出过口」都算重启没意义。
+
+    `ever_ip` 而不是 `ip`：`_invalidate_warp_line_ip` 每次隧道重启都会清 `ip`，
+    拿它当判据会让这条线永远不再重启（连本来能恢复的也停掉）。
+    """
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {"last_probe_ts": 0.0, "ever_ip": False})
+    assert daemon._line_node_cannot_carry("WARP-WG-4") is False, \
+        "没探过不能判死（刚启动/刚 apply 的线 last_probe_ts=0）"
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {"last_probe_ts": 12345.0, "ever_ip": False})
+    assert daemon._line_node_cannot_carry("WARP-WG-4") is True, \
+        "探过但从没出过口 → 重启换地址没意义"
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {"last_probe_ts": 12345.0, "ever_ip": True})
+    line = (daemon.warp_wg._read_state().get("lines") or {}).get("WARP-WG-4") or {}
+    rank = daemon._warp_alive_rank(str(line.get("node")),
+                                   daemon.warp_blocks.load_map(),
+                                   line.get("family"))
+    assert daemon._line_node_cannot_carry("WARP-WG-4") is (rank == 2), \
+        f"出过口之后按实测承载能力判，rank={rank}"
