@@ -185,6 +185,18 @@ def test_fp_pools_dedup_three_levels_over_full_log(mod):
     assert mod._fp_pools({}) == {}
 
 
+def test_fp_pools_half_shared_slash48_is_split_by_slash64(mod):
+    """`bac1:7680` 的 /48 里同时有 PHX 与 SJC 的 /64 —— /48 必须跟着 /64 走。
+
+    直接 `colo_of(/48)` 恒判 PHX：`:28` 那批 SJC 的 /64 会被记到 PHX 名下，
+    SJC 的 /48 少算。实测旧口径 SJC 池 `8/52/…`，实际是 `12/52/…`。"""
+    segs = {"WARP-X": {"v6": ["2a09:bac1:7680:8e0", "2a09:bac1:7680:28"], "addr": []}}
+    p = mod._fp_pools(segs)
+    assert "2a09:bac1:7680" in p["PHX"]["48"] and "2a09:bac1:7680" in p["SJC"]["48"]
+    assert p["PHX"]["64"] == {"2a09:bac1:7680:8e0"}
+    assert p["SJC"]["64"] == {"2a09:bac1:7680:28"}
+
+
 def test_seg_label_shows_four_prefix_levels(mod):
     """表格列写 `/32 / /48 / /64 / /128`：只给最细的 /64 看不出跨了几个批次，
     只给 /32 又看不出抽签密度，而没有 /128 就分不清「地址摊开」与「挤在一段」。"""

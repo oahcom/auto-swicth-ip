@@ -84,7 +84,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文档 | 内容 |
 |---|---|
-| **[established-facts.md](established-facts.md)** | **既定事实（29 条），先读这个** |
+| **[established-facts.md](established-facts.md)** | **既定事实（36 条），先读这个** |
 | [glossary.md](glossary.md) | **名词表**：节点/线路/渠道/成员的确切定义 |
 | [BUILD-PLAN.md](BUILD-PLAN.md) | 文档构建计划与更新规范 |
 

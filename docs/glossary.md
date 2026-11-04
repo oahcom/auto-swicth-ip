@@ -88,7 +88,7 @@
 | **段指纹** | `colo_of()` | 由出口 /64 的第三四段反推的**落地机房** | 与渠道声明的 colo（代理节点所在机房）是两件事 |
 
 > 详见：[architecture/ip-pools.md](architecture/ip-pools.md) 第三节、
-> [established-facts.md](established-facts.md) 第七节。
+> [established-facts.md](established-facts.md) 第八节。
 
 ## 七、日志常见词
 

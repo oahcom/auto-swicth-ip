@@ -165,8 +165,8 @@ def channel_segments(log_file: Path | None = None) -> dict[str, dict]:
     `/128` 另外留一份 —— 见下方那条注释。
 
     **不按时间窗口截断**：段列表是「这条线去过哪些地方」，不是随时间衰减的
-    健康指标。限制窗口会让 H2 线显示 0 段（它们的出口日志停在 11-03，
-    之后一直没拿到地址），看起来像「从没出去过」。
+    健康指标。限制窗口会让「最近几小时没拿到地址」的线显示 0 段（H2 线在
+    11-03 之后长期处于这个状态），看起来像「从没出去过」。
 
     v6 的 `v6` 按 /64 计 —— 一次抽签得到的是 /64，同 /64 内的不同 /128 不算
     换段；`addr` 按 /128 计；v4 按地址计（v4 没有段的概念，同一个 colo 池里翻牌）。
@@ -408,9 +408,10 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "colo_samples": cn,
             "colo_ban": cb,
             "colo_ban_rate": (cb / cn) if cn else None,
-            # 窗口内这条线**落过的全部**出口段（v6 段名，v4 地址）。
-            # 不是「池子里有多少段」—— 池子是机房共享的，同一时刻所有线在
-            # 同一个池里抽签；这里说的是**这条线自己的覆盖面**。
+            # 这条线**落过的全部**出口段（v6 段名，v4 地址）。**不受 `--hours`
+            # 约束** —— 段列表是「这条线去过哪些地方」，不是随时间衰减的指标
+            # （见 `channel_segments()`）。不是「池子里有多少段」：池子是机房
+            # 共享的，同一时刻所有线在同一个池里抽签；这里说的是这条线自己的覆盖面。
             "seg_v6": (segs.get(tag) or {}).get("v6") or [],
             # 这条线落过的 /128 个数。和 /64 个数并列才有意义：同样 60 个 /64，
             # 摊着 60 个地址 vs 挤在 1 个 /64 里的 60 个地址，撞车概率差 60 倍。
@@ -471,7 +472,10 @@ def _seg32_groups(r: dict) -> list[tuple[str, int, int, int]]:
 
 
 def _seg_counts(r: dict) -> tuple[int, int, int, int]:
-    """`(v6 /32 个数, /48 个数, /64 个数, /128 个数)`。"""
+    """`(v6 /32 个数, /48 个数, /64 个数, /128 个数)`。
+
+    三级天然嵌套（/48 是 /64 的父段，/128 落在 /64 里），所以 /48 与 /64
+    可以由段名直接数。池子那边不能这么数 —— 见 `_fp_pools`。"""
     v6 = r.get("seg_v6") or []
     return (len({_seg32(s) for s in v6}),
             len({s.rsplit(":", 1)[0] for s in v6}), len(v6),
@@ -481,8 +485,9 @@ def _seg_counts(r: dict) -> tuple[int, int, int, int]:
 def _merge_segs(rs: list[dict]) -> dict:
     """一组渠道的出口**并集**（去重）。
 
-    段是机房共享的池子：同一个 colo 下 12 条线各自的 /32 明细几乎一模一样，
-    逐条印等于把同一份东西印 12 遍。合并后每个 colo 只留一份。
+    段是机房共享的池子：同一个 colo 下多条线抽到的是同一批段，逐条印等于
+    把同一份东西印十几遍。实测（2026-11-04）合并后 /48 少 27%~85%、/64
+    少 11%~81%（NRT 11 条线 297 个 /48 → 44 个）。合并后每个 colo 只留一份。
     """
     v6: set[str] = set()
     addr: set[str] = set()
@@ -502,7 +507,7 @@ def _fp_pools(segments: dict[str, dict]) -> dict[str, dict[str, set]]:
     这是**每个机房真正可抽的池子大小**，按 `ipv6_segments.colo_of()` 的
     段指纹归并。三级并列是必需的：NRT 的 /48 和 SIN 一样是 12 个，但 /64
     只有 12 个而 SIN 有 132 —— 只看 /48 会以为两边等宽，而 NRT 的 /128 级
-    5 分钟重复率是 30%，SIN 只有 0.4%。
+    5 分钟重复率是 36.1%，SIN 只有 0.7%（2026-11-04 18:40 实测）。
 
     收的是**全日志**（含已下线的 tag），不是当前在册的渠道：池子是机房的
     属性，不会因为某条线退役而变小。只算在册渠道会让池子随成员表缩水，
@@ -512,12 +517,17 @@ def _fp_pools(segments: dict[str, dict]) -> dict[str, dict[str, set]]:
         lambda: {"48": set(), "64": set(), "128": set()})
     for v in segments.values():
         for s in v.get("v6") or []:
-            s48 = s.rsplit(":", 1)[0]
+            # /48 的归属由**它下面的 /64** 决定，不能直接 `colo_of(/48)`：
+            # `bac1:7680/76a0/76c0/76e0` 是 PHX 与 SJC 共用的，`colo_of(/48)`
+            # 恒返回 PHX，会把 `:28` 那批 SJC 的 /64 记到 PHX 名下、同时让
+            # SJC 的 /48 少算 4 个（实测旧口径 SJC 8 个 /48，实际 12 个）。
+            # 三级必须**嵌套**（/48 ⊇ /64 ⊇ /128），否则三个数彼此对不上。
             try:
-                colo = ipv6_segments.colo_of(ipaddress.ip_network(s48 + "::/48"))
+                colo = ipv6_segments.colo_of(
+                    ipaddress.ip_network(s + "::/64"))
             except ValueError:
                 continue
-            pools[colo]["48"].add(s48)
+            pools[colo]["48"].add(s.rsplit(":", 1)[0])
             pools[colo]["64"].add(s)
         for ip in v.get("addr") or []:
             try:
@@ -535,12 +545,14 @@ def print_segments(rows: list[dict], segments: dict[str, dict]) -> None:
     三样东西放一起，是因为它们回答的是同一个问题、维度也相同（都是 colo）：
       - **出口段** = 这组线落过哪些 /32 / /48 / /64 / /128；
       - **指纹** = 出口段反推的落地机房分布（与声明 colo 是两件事：WG 线经
-        机场节点中转，声明 NRT 的线可以 72% 落在 SIN）；
+        机场节点中转，声明 NRT 的那组线 68% 落在 SIN）；
       - **池** = 指纹归到该机房的三级去重个数。
 
-    合并是必需的，不是省事：同一 colo 的各条线共用同一个池子，/32 明细本来
-    就是同一份（实测 SIN 的 12 条线全是 `bac1(4) + bac5(8)`）。按渠道逐条印，
-    50 多行里真正不同的只有「哪条线在哪个 colo」。
+    合并是必需的，不是省事：同一 colo 的各条线共用同一个池子，段重叠度极
+    高（实测 2026-11-04：合并后 /48 少 27%~85%、/64 少 11%~81%）。按渠道
+    逐条印，50 多行里真正不同的只有「哪条线在哪个 colo」。
+
+    注意 /48 归属：池子按 /64 的指纹归，`bac1:7680~76e0` 是 PHX/SJC 共用段。
     """
     if not rows:
         print("（没有渠道数据）")
@@ -553,7 +565,7 @@ def print_segments(rows: list[dict], segments: dict[str, dict]) -> None:
         groups[r["colo"] or "?"].append(r)
     pools = _fp_pools(segments)
     head = (f"{_pad('声明', 6)} {_pad('渠道', 5, False)} "
-            f"{_pad('出口段 32/48/64/128', 20, False)} "
+            f"{_pad('出口段 32/48/64/128', _SEG_W, False)} "
             f"{_pad('池 48/64/128', 13, False)}  指纹落点（/64 去重，前 5）")
     print(head)
     width = max((_w(c) for c in groups), default=0) + 2
@@ -593,6 +605,12 @@ def print_segments(rows: list[dict], segments: dict[str, dict]) -> None:
         print("\n".join(tags))
     print("\n  池 = 指纹属于该机房的 /48 / /64 / /128 个数（全部渠道合并去重），越大越不容易撞段。")
     print("  ≠  = 主落点不是声明的机房（WG 线经机场节点中转，节点机房≠出口机房是常态）。")
+
+
+# 表格「出口段」列的宽度。实测最长 `2/51/188/1624 +3v` 是 17 列，
+# 留到 20 能容下 5 位数的 /128 与两位数的 v4 计数 —— 宽度不够时
+# `_pad` 是**截断**而不是折行，会把 `+3v` 截成 `+3`，读起来像多了一级。
+_SEG_W = 20
 
 
 def _seg_label(r: dict) -> str:
@@ -674,7 +692,7 @@ def print_table(rows: list[dict], hours: float) -> None:
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
-            f"{_pad('colo ban', 9, False)} {_pad('/32,/48,/64,/128', 16, False)} "
+            f"{_pad('colo ban', 9, False)} {_pad('/32,/48,/64,/128', _SEG_W, False)} "
             f"{_pad('落点', 8)} {_pad('重启', 6, False)}  "
             f"{_pad('订阅', 8)} {_pad('节点名', 30)} 节点 / 状态")
     print(head)
@@ -696,7 +714,7 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(_pct(r['ban_rate']), 5, False)} "
               f"{_pad(okfail, 7, False)} "
               f"{_pad(_pct(r['colo_ban_rate']), 9, False)} "
-              f"{_pad(_seg_label(r), 16, False)} "
+              f"{_pad(_seg_label(r), _SEG_W, False)} "
               f"{_pad(_fp_label(r), 8)} "
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
