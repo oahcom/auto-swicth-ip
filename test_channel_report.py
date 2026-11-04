@@ -153,6 +153,22 @@ def test_fp_label_marks_only_top_mismatch(mod):
     assert mod._fp_label({"colo": "NRT", "colo_fp": []}) == "—"
 
 
+def test_merge_segs_dedups_across_channels(mod):
+    """同 colo 的线共用同一个池子，合并要**去重**而不是相加。
+
+    实测 SIN 的 12 条线 /32 明细完全一样（`bac1(4) + bac5(8)`）——
+    按渠道相加会把同一份池子印 12 遍，正是「都是重复的」那个毛病。"""
+    a = {"seg_v6": ["2a09:bac5:55f8:18be"], "seg_addr": ["2a09:bac5:55f8:18be::1"],
+         "seg_v4": ["104.28.205.117"]}
+    b = {"seg_v6": ["2a09:bac5:55f8:18be", "2a09:bac5:55f9:2a00"],
+         "seg_addr": ["2a09:bac5:55f8:18be::2", "2a09:bac5:55f9:2a00::1"],
+         "seg_v4": ["104.28.205.117"]}
+    m = mod._merge_segs([a, b])
+    assert m["seg_v6"] == ["2a09:bac5:55f8:18be", "2a09:bac5:55f9:2a00"]
+    assert len(m["seg_addr"]) == 3 and m["seg_v4"] == ["104.28.205.117"]
+    assert mod._merge_segs([]) == {"seg_v6": [], "seg_addr": [], "seg_v4": []}
+
+
 def test_seg_label_shows_four_prefix_levels(mod):
     """表格列写 `/32 / /48 / /64 / /128`：只给最细的 /64 看不出跨了几个批次，
     只给 /32 又看不出抽签密度，而没有 /128 就分不清「地址摊开」与「挤在一段」。"""

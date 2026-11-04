@@ -478,37 +478,66 @@ def _seg_counts(r: dict) -> tuple[int, int, int, int]:
             len(r.get("seg_addr") or []))
 
 
-def print_segments(rows: list[dict]) -> None:
-    """每条渠道一行：`N 个 /32 · M 个 /48 · K 个 /64 · L 个 /128`，再列每个 /32 的细分。
+def _merge_segs(rs: list[dict]) -> dict:
+    """一组渠道的出口**并集**（去重）。
 
-    /64 是**抽签结果**、不可选，一条线能有 178 个；/48 是抽签所在的池子，
-    也有 51 个。只有 /32 是可读的规模（实测全场就 `bac1` / `bac5` 两批）。
-    /128 个数必须和 /64 并肩看：60 个地址摊在 60 个 /64 里和挤在 1 个 /64 里，
-    /64 一列看不出差别，撞车概率却差 60 倍。
+    段是机房共享的池子：同一个 colo 下 12 条线各自的 /32 明细几乎一模一样，
+    逐条印等于把同一份东西印 12 遍。合并后每个 colo 只留一份。
+    """
+    v6: set[str] = set()
+    addr: set[str] = set()
+    v4: set[str] = set()
+    for r in rs:
+        v6.update(r.get("seg_v6") or [])
+        addr.update(r.get("seg_addr") or [])
+        v4.update(r.get("seg_v4") or [])
+    return {"seg_v6": sorted(v6, key=_seg_sort),
+            "seg_addr": sorted(addr, key=_addr_sort),
+            "seg_v4": sorted(v4)}
+
+
+def print_segments(rows: list[dict]) -> None:
+    """**按声明 colo 分组**：每个 colo 一行合计 + 一行 /32 细分 + 成员渠道。
+
+    合并是必需的，不是省事：同一 colo 的各条线共用同一个池子，它们的
+    /32 明细本来就是同一份（实测 SIN 的 12 条线全是 `bac1(4) + bac5(8)`）。
+    按渠道逐条印，50 多行里真正不同的信息只有「哪条线在哪个 colo」。
+
+    表格列已经给了每条线自己的 /32//48//64//128 个数；这里回答的是另一个
+    问题：「这个机房的池子长什么样、里面有哪些线」。
     """
     if not rows:
         print("（没有渠道数据）")
         return
-    print("\n出口段明细（/32 = 地址批次；括号内是它下面的 /48、/64 与 /128 个数）")
+    print("\n出口段明细（按 colo 合并该组全部渠道；/32 = 地址批次，"
+          "括号内是它下面的 /48、/64 与 /128 个数）")
     print("-" * 92)
-    width = max((_w(r["tag"]) for r in rows), default=0) + 2
+    groups: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
-        n32, n48, n64, n128 = _seg_counts(r)
-        v4 = list(r.get("seg_v4") or [])
-        if n64:
-            head = f"{n32} 个 /32 · {n48} 个 /48 · {n64} 个 /64 · {n128} 个 /128"
-        else:
-            head = ""
+        groups[r["colo"] or "?"].append(r)
+    width = max((_w(c) for c in groups), default=0) + 2
+    for colo in sorted(groups):
+        rs = groups[colo]
+        m = _merge_segs(rs)
+        n32, n48, n64, n128 = _seg_counts(m)
+        v4 = m["seg_v4"]
+        head = (f"{len(rs)} 条 · {n32} 个 /32 · {n48} 个 /48 · "
+                f"{n64} 个 /64 · {n128} 个 /128") if n64 else f"{len(rs)} 条"
         if v4:
-            head += (" · " if n64 else "") + f"{len(v4)} 个 v4 地址"
-        if not head:
-            print(f"{_pad(r['tag'], width)} —")
-            continue
-        detail = "  ".join(f"{p}({a} 个 /48, {b} 个 /64, {c} 个 /128)"
-                           for p, a, b, c in _seg32_groups(r))
-        print(f"{_pad(r['tag'], width)} {head}")
-        if detail:
+            head += f" · {len(v4)} 个 v4 地址"
+        print(f"{_pad(colo, width)} {head}")
+        if n64:
+            detail = "  ".join(f"{p}({a} 个 /48, {b} 个 /64, {c} 个 /128)"
+                               for p, a, b, c in _seg32_groups(m))
             print(" " * (width + 1) + detail)
+        tags, line = [], " " * (width + 1)
+        for r in rs:
+            if _w(line) + _w(r["tag"]) + 1 > 92:
+                tags.append(line.rstrip())
+                line = " " * (width + 1)
+            line += r["tag"] + " "
+        tags.append(line.rstrip())
+        print("\n".join(tags))
 
 
 def print_colo_fp(rows: list[dict], segments: dict[str, dict]) -> None:
