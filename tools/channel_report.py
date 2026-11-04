@@ -145,9 +145,26 @@ def _rotated_logs(log_file: Path) -> list[Path]:
     return [p for _, p in sorted(found)]
 
 
-def channel_segments(window_sec: float, now: float | None = None,
-                     log_file: Path | None = None) -> dict[str, dict]:
-    """窗口内每条渠道**落过多少个出口段**：`{tag: {"v6": n, "v4": n}}`。
+def _seg_name(net) -> str:
+    """`/64` → 完整段名 `2a09:bac5:55f8:18be`（四段全给，不省略）。
+
+    只给第四段（`:18be`）认不出落在哪一批；只给 `bac5:55f8:18be` 又丢了
+    第一段。`2a09` 虽然目前所有 WARP 段都一样，但它不是常量保证 ——
+    换 CF 账户或换地址族就可能变，省略它就是埋一个会骗人的假设。
+    """
+    return ":".join(p.lstrip("0") or "0"
+                    for p in net.network_address.exploded.split(":")[:4])
+
+
+def channel_segments(log_file: Path | None = None) -> dict[str, dict]:
+    """每条渠道**落过的每一个出口段**：`{tag: {"v6": [段名...], "v4": [地址...]}}`。
+
+    返回的是**段名列表**而不是计数：只给个数等于什么都没说，要看的是
+    「落过哪几段」，且段名是完整的四段 `2a09:bac5:55f8:18be`。
+
+    **不按时间窗口截断**：段列表是「这条线去过哪些地方」，不是随时间衰减的
+    健康指标。限制窗口会让 H2 线显示 0 段（它们的出口日志停在 11-03，
+    之后一直没拿到地址），看起来像「从没出去过」。
 
     v6 按 /64 计 —— 一次抽签得到的是 /64，同 /64 内的不同 /128 不算换段；
     v4 按地址计（v4 没有段的概念，同一个 colo 池里翻牌）。
@@ -155,32 +172,16 @@ def channel_segments(window_sec: float, now: float | None = None,
     WHY 读日志而不是台账：`.warp_ip_history.jsonl` 只有 `ip/t/b/k`，**没有
     渠道归属**（唯一写入点 `daemon.py:_mark_warp_ip_used` 拿到的就是地址）。
     带渠道归属的只有 daemon 打的两类出口行：`出口 <ip> 模型层` / `重启后出口=<ip>`。
-
-    日志逐行递增、轮转文件 `.N` 越大越旧，所以读到第一条早于窗口的行就停，
-    不必整份扫（全量 25MB 约 1.6s，截断后通常只读当前那份）。
     """
-    now = time.time() if now is None else now
-    lo = now - float(window_sec)
     path = log_file or Path(CFG["log_file"])
     seen: dict[str, dict[str, set]] = defaultdict(lambda: {"v6": set(), "v4": set()})
     for p in _rotated_logs(path):
-        older = False
         try:
             fh = p.open(encoding="utf-8", errors="replace")
         except OSError:
             continue
         with fh:
             for line in fh:
-                m = _LOG_TS.match(line)
-                if not m:
-                    continue
-                try:
-                    t = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
-                except ValueError:
-                    continue
-                if t < lo:
-                    older = True      # 文件内按时间递增，后面只会更旧
-                    break
                 o = _EGRESS_LINE.search(line)
                 if not o:
                     continue
@@ -190,13 +191,25 @@ def channel_segments(window_sec: float, now: float | None = None,
                 except ValueError:
                     continue          # `探测失败` 之类的占位
                 if addr.version == 6:
-                    seen[o.group(1)]["v6"].add(ipv6_segments.net64(ip))
+                    seen[o.group(1)]["v6"].add(
+                        _seg_name(ipaddress.ip_network(ip + "/64", strict=False)))
                 else:
                     seen[o.group(1)]["v4"].add(ip)
-        if older:
-            break                     # 更旧的轮转文件整份在窗口外
-    return {tag: {"v6": len(v["v6"]), "v4": len(v["v4"])}
+    return {tag: {"v6": sorted(v["v6"], key=_seg_sort), "v4": sorted(v["v4"])}
             for tag, v in seen.items()}
+
+
+def _seg_sort(name: str) -> tuple:
+    """段排序：按四段的十六进制值从左到右比，让相邻批次挨在一起。
+
+    纯字符串排序会把 `bac1:19a0:10` 排到 `bac1:9:10` 前面（十六进制当十进制比），
+    列出来像乱序 —— 60 段的线尤其明显。解析不了的原样排最后，不让一行怪数据
+    毁掉整列。
+    """
+    try:
+        return tuple(int(p, 16) for p in name.split(":"))
+    except ValueError:
+        return (0xFFFF,) * 4
 
 
 def _hostport(tag: str) -> str | None:
@@ -378,11 +391,11 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "colo_samples": cn,
             "colo_ban": cb,
             "colo_ban_rate": (cb / cn) if cn else None,
-            # 窗口内这条线**落过**多少个出口段（v6 按 /64，v4 按地址）。
+            # 窗口内这条线**落过的全部**出口段（v6 段名，v4 地址）。
             # 不是「池子里有多少段」—— 池子是机房共享的，同一时刻所有线在
-            # 同一个池里抽签；这个数说的是**这条线自己的覆盖面**。
-            "seg_v6": (segs.get(tag) or {}).get("v6", 0),
-            "seg_v4": (segs.get(tag) or {}).get("v4", 0),
+            # 同一个池里抽签；这里说的是**这条线自己的覆盖面**。
+            "seg_v6": (segs.get(tag) or {}).get("v6") or [],
+            "seg_v4": (segs.get(tag) or {}).get("v4") or [],
             "held": bool(st.get("ban_hold_until") and st["ban_hold_until"] > now),
             "hold_until": st.get("ban_hold_until") or 0,
             "quota_until": st.get("quota_until") or 0,
@@ -407,20 +420,39 @@ def _pct(v: float | None) -> str:
     return f"{v * 100:.0f}%" if v is not None else "—"
 
 
-def _seg_label(r: dict) -> str:
-    """出口段列：v6 就是 /64 个数，v4 加 `v` 后缀（v4 没有段的概念）。
+def _seg_tokens(r: dict) -> list[str]:
+    """出口段列的全部段名：v6 段在前，v4 地址加 `v` 后缀（v4 没有段）。
 
-    两个都为 0 时显示 `—` 而不是 `0` —— 0 会被读成「这条线只有一段」，
-    而实际是「窗口内日志里没见过它的出口」（新起的线、日志被清过）。
+    列表为空时返回 `["—"]` 而不是 `["0"]` —— `0` 会被读成「只有一段」，
+    而实际是「窗口内日志里没见过它的出口」（新起的线、日志被轮转过）。
     """
-    v6, v4 = r.get("seg_v6") or 0, r.get("seg_v4") or 0
-    if v6 and v4:
-        return f"{v6}+{v4}v"
-    if v6:
-        return str(v6)
-    if v4:
-        return f"{v4}v"
-    return "—"
+    v6 = list(r.get("seg_v6") or [])
+    v4 = [a + "v" for a in (r.get("seg_v4") or [])]
+    return v6 + v4 or ["—"]
+
+
+def print_segments(rows: list[dict]) -> None:
+    """每条渠道一段，列出它落过的**全部**出口段（一行放不下就折行）。
+
+    完整段名照抄 `2a09:bac5:55f8:18be` —— 四段缺一不可（见 `_seg_name`）。
+    表格里的「出口段」列只放个数，因为一条线可以有 60+ 段。
+    """
+    if not rows:
+        print("（没有渠道数据）")
+        return
+    print("\n出口段明细（全部轮转日志，v6 按 /64；v4 按地址，后缀 v）")
+    print("-" * 92)
+    width = max((_w(r["tag"]) for r in rows), default=0) + 2
+    for r in rows:
+        segs = _seg_tokens(r)
+        head = f"{_pad(r['tag'], width)} {len(segs) if segs != ['—'] else 0:>3} 段"
+        line = head + "  "
+        for s in segs:
+            if _w(line) + _w(s) + 2 > 140:      # 折行，别让一行跑到屏幕外
+                print(line)
+                line = " " * (width + 7)
+            line += s + "  "
+        print(line)
 
 
 def _w(s: str) -> int:
@@ -475,7 +507,7 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(_pct(r['ban_rate']), 5, False)} "
               f"{_pad(okfail, 7, False)} "
               f"{_pad(_pct(r['colo_ban_rate']), 9, False)} "
-              f"{_pad(_seg_label(r), 7, False)} "
+              f"{_pad(str(len(r['seg_v6']) + len(r['seg_v4']) or '—'), 7, False)} "
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
               f"{r['node']}  {' '.join(flags)}")
@@ -563,6 +595,9 @@ overflow:hidden}}
 .track>i{{display:block;height:100%;border-radius:3px}}
 .pill{{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;
 border:1px solid var(--line);color:var(--muted);white-space:nowrap}}
+.seg{{max-width:420px}}
+.chip{{display:inline-block;margin:1px 3px 1px 0;padding:0 5px;border-radius:4px;
+background:var(--track);font-size:11px;white-space:nowrap}}
 .pill.hold{{border-color:{crit};color:{crit}}}
 .pill.quot{{border-color:{warn};color:{warn}}}
 tr.held td{{background:rgba(208,59,59,.07)}}
@@ -643,7 +678,9 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
             f'<td>{bar(r["ban_rate"], True)}</td>'
             f'<td class="mono">{r["ok"]}/{r["ban"] + r["err"]}</td>'
             f'<td class="mono dim">{_pct(r["colo_ban_rate"])}</td>'
-            f'<td class="mono dim">{_seg_label(r)}</td>'
+            f'<td class="mono dim seg">'
+            f'{"".join(f"<span class=chip>{html.escape(s)}</span>" for s in _seg_tokens(r))}'
+            f'</td>'
             f'<td class="mono dim">{r["restarts"]}</td>'
             f'<td>{" ".join(pills)}</td></tr>')
 
@@ -668,13 +705,14 @@ def main() -> int:
     rows = summarize(state, load_channels(),
                      _read_json(sources_path()) or {},
                      args.hours, dormant=dormant_tags(),
-                     segments=channel_segments(args.hours * 3600))
+                     segments=channel_segments())
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
     elif args.html:
         render_html(rows, args.hours, Path(args.html))
     else:
         print_table(rows, args.hours)
+        print_segments(rows)
     if args.by:
         print_grouped(rows, args.by)
     return 0

@@ -120,18 +120,42 @@ def test_channel_segments_counts_slash64_not_ip(mod, tmp_path):
         f"[{at(200)}]   ✓ WARP-CF-F 重启后出口=104.28.205.117\n"
         f"[{at(100)}]   ✓ WARP-CF-F 重启后出口=104.28.205.117\n"
         f"[{at(86400)}]  ✓ WARP-WG-9 出口 2a09:bac5:1ef8::1:1 模型层: OK\n")
-    got = mod.channel_segments(6 * 3600, now, log)
-    assert got["WARP-WG-1"] == {"v6": 2, "v4": 0}, "同 /64 的两个 /128 只能算一段"
-    assert got["WARP-CF-F"] == {"v6": 0, "v4": 1}, "v4 按地址计且去重"
-    assert "WARP-WG-9" not in got, "窗口外的行不能算进来"
+    got = mod.channel_segments(log)
+    assert got["WARP-WG-1"]["v6"] == ["2a09:bac5:55f8:1d0f", "2a09:bac5:55f9:2a00"], \
+        "同 /64 的两个 /128 只能算一段，且段名要四段齐全"
+    assert got["WARP-CF-F"]["v4"] == ["104.28.205.117"], "v4 按地址计且去重"
+    # 不按时间窗口截断：日志里 24h 前那条也要算
+    assert got["WARP-WG-9"]["v6"] == ["2a09:bac5:1ef8:0"]
 
 
-def test_seg_label_does_not_show_zero(mod):
-    """两者都为 0 时显示 `—`：0 会被读成「只有一段」，实际是「日志里没它的出口」。"""
-    assert mod._seg_label({"seg_v6": 0, "seg_v4": 0}) == "—"
-    assert mod._seg_label({"seg_v6": 12, "seg_v4": 0}) == "12"
-    assert mod._seg_label({"seg_v6": 0, "seg_v4": 3}) == "3v"
-    assert mod._seg_label({"seg_v6": 12, "seg_v4": 3}) == "12+3v"
+def test_seg_tokens_lists_every_segment(mod):
+    """出口段列要给出**全部**段名，不是只给个数。
+
+    段名是完整的四段 —— 只给第四段认不出落在哪一批。"""
+    r = {"seg_v6": ["2a09:bac5:55f8:18be", "2a09:bac1:76a0:8e0"],
+         "seg_v4": ["104.28.205.117"]}
+    assert mod._seg_tokens(r) == ["2a09:bac5:55f8:18be", "2a09:bac1:76a0:8e0",
+                                  "104.28.205.117v"]
+    assert mod._seg_tokens({"seg_v6": [], "seg_v4": []}) == ["—"]
+
+
+def test_seg_name_keeps_all_four_hextets(mod):
+    """段名四段全给：`2a09:` 虽然目前恒定，但不是常量保证。"""
+    import ipaddress
+    assert mod._seg_name(ipaddress.ip_network("2a09:bac5:55f8:18be::/64")) == \
+        "2a09:bac5:55f8:18be"
+    assert mod._seg_name(ipaddress.ip_network("2a09:bac1:7680:3d0::/64")) == \
+        "2a09:bac1:7680:3d0"
+    # 第四段全 0 时 exploded 不会塌成 `::`，但要能正确输出
+    assert mod._seg_name(ipaddress.ip_network("2a09:bac5:55f8::/64")) == \
+        "2a09:bac5:55f8:0"
+
+
+def test_segs_sorted_numerically_hex(mod):
+    """段按十六进制数值排，不是字符串排 —— 否则 `19a0` 会跑到 `9` 前面。"""
+    names = ["2a09:bac5:55f9:1d0f", "2a09:bac5:55f8:2a00", "2a09:bac5:55f9:15f"]
+    assert sorted(names, key=mod._seg_sort) == [
+        "2a09:bac5:55f8:2a00", "2a09:bac5:55f9:15f", "2a09:bac5:55f9:1d0f"]
 
 
 def test_restarts_count_window_not_lifetime_total(mod, tmp_path):
