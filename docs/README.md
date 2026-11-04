@@ -178,6 +178,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | `warp_blocks.py` | 渠道模型（纯函数，可单测） |
 | `warp_wg.py` | WG 线路的生成、探测、apply |
 | `warp_diag.py` | 单节点 WARP 承载诊断（**判断节点能不能用只信它**） |
+| `tools/channel_report.py` | 渠道健康报表（`asip chan`）：成功率 / 出口段四级 / 每 colo 的池与指纹落点，纯只读 |
 | `deploy/render_h2_lines.py` | H2 线路渲染 |
 | `deploy/install.sh` | 单元生成与安装 |
 
@@ -186,6 +187,9 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 ```bash
 # 看当前拓扑
 asip warp status
+
+# 看渠道健康与出口段（纯读；-h 看 --hours/--html/--json/--by）
+asip chan
 
 # 看渠道清单（纯读）
 set -a; . ./.env; set +a; python3 warp_blocks.py plan
