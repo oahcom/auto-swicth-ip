@@ -9,6 +9,7 @@
     .warp/warp_wg_state.json  WG 线当前绑定的节点
     .warp/h2/channels.json    H2 线 ↔ 节点 ↔ 设备
     <config>.sources.json     节点 → 订阅源（parse_subscription 写的）
+    daemon.log[.N]            每条渠道的出口地址 → 「出口段」列（v6 按 /64）
     config.py                 成员表（只认在册渠道）、块表（colo → 机房）
 
 用法：
@@ -120,6 +121,82 @@ def colo_ban_rates(window_sec: float, now: float) -> dict[str, tuple[int, int]]:
             if r.get("b"):
                 d[1] += 1
     return {c: (n, b) for c, (n, b) in out.items()}
+
+
+# daemon 每次探测 / 重启都会打印该线的出口地址；`·` 是 TTL 命中跳过实测那一行，
+# 也带地址。这是**唯一**带渠道归属的出口台账。
+_EGRESS_LINE = re.compile(
+    r"(?:✓|✗|·)\s+(WARP-[A-Z0-9-]+)\s+(?:重启后出口=|出口\s+)([0-9a-fA-F:.]+)")
+_LOG_TS = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
+
+
+def _rotated_logs(log_file: Path) -> list[Path]:
+    """`daemon.log` 与 `daemon.log.N`，**新的在前**（N 越大越旧）。"""
+    prefix, found = log_file.name, []
+    for p in log_file.parent.glob(prefix + "*"):
+        suf = p.name[len(prefix):]
+        if suf == "":
+            rank = 0
+        elif suf.startswith(".") and suf[1:].isdigit():
+            rank = int(suf[1:])
+        else:
+            continue
+        found.append((rank, p))
+    return [p for _, p in sorted(found)]
+
+
+def channel_segments(window_sec: float, now: float | None = None,
+                     log_file: Path | None = None) -> dict[str, dict]:
+    """窗口内每条渠道**落过多少个出口段**：`{tag: {"v6": n, "v4": n}}`。
+
+    v6 按 /64 计 —— 一次抽签得到的是 /64，同 /64 内的不同 /128 不算换段；
+    v4 按地址计（v4 没有段的概念，同一个 colo 池里翻牌）。
+
+    WHY 读日志而不是台账：`.warp_ip_history.jsonl` 只有 `ip/t/b/k`，**没有
+    渠道归属**（唯一写入点 `daemon.py:_mark_warp_ip_used` 拿到的就是地址）。
+    带渠道归属的只有 daemon 打的两类出口行：`出口 <ip> 模型层` / `重启后出口=<ip>`。
+
+    日志逐行递增、轮转文件 `.N` 越大越旧，所以读到第一条早于窗口的行就停，
+    不必整份扫（全量 25MB 约 1.6s，截断后通常只读当前那份）。
+    """
+    now = time.time() if now is None else now
+    lo = now - float(window_sec)
+    path = log_file or Path(CFG["log_file"])
+    seen: dict[str, dict[str, set]] = defaultdict(lambda: {"v6": set(), "v4": set()})
+    for p in _rotated_logs(path):
+        older = False
+        try:
+            fh = p.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                m = _LOG_TS.match(line)
+                if not m:
+                    continue
+                try:
+                    t = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+                except ValueError:
+                    continue
+                if t < lo:
+                    older = True      # 文件内按时间递增，后面只会更旧
+                    break
+                o = _EGRESS_LINE.search(line)
+                if not o:
+                    continue
+                ip = o.group(2)
+                try:
+                    addr = ipaddress.ip_address(ip)
+                except ValueError:
+                    continue          # `探测失败` 之类的占位
+                if addr.version == 6:
+                    seen[o.group(1)]["v6"].add(ipv6_segments.net64(ip))
+                else:
+                    seen[o.group(1)]["v4"].add(ip)
+        if older:
+            break                     # 更旧的轮转文件整份在窗口外
+    return {tag: {"v6": len(v["v6"]), "v4": len(v["v4"])}
+            for tag, v in seen.items()}
 
 
 def _hostport(tag: str) -> str | None:
@@ -241,15 +318,19 @@ def dormant_tags() -> set[str]:
 
 
 def summarize(state: dict, chans: dict, sources: dict, hours: float,
-              now: float | None = None, dormant: set[str] | None = None
-              ) -> list[dict]:
+              now: float | None = None, dormant: set[str] | None = None,
+              segments: dict[str, dict] | None = None) -> list[dict]:
     """每条渠道一行。`ban_probes` 只留当天，故窗口按当地零点夹一次 ——
-    不夹的话「最近 24h」会把今天凌晨那几条样本当成整天的结论。"""
+    不夹的话「最近 24h」会把今天凌晨那几条样本当成整天的结论。
+
+    `segments` 是 `channel_segments()` 的结果；不传就留空（单测与离线调用
+    不必依赖 daemon.log）。"""
     now = time.time() if now is None else now
     cutoff = max(now - hours * 3600, _day_start(now))
     urls = sub_url_map()
     idx = source_index(sources)
     colos = colo_ban_rates(hours * 3600, now)
+    segs = segments or {}
     rows = []
     for tag, meta in chans.items():
         st = state.get(tag) or {}
@@ -297,6 +378,11 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "colo_samples": cn,
             "colo_ban": cb,
             "colo_ban_rate": (cb / cn) if cn else None,
+            # 窗口内这条线**落过**多少个出口段（v6 按 /64，v4 按地址）。
+            # 不是「池子里有多少段」—— 池子是机房共享的，同一时刻所有线在
+            # 同一个池里抽签；这个数说的是**这条线自己的覆盖面**。
+            "seg_v6": (segs.get(tag) or {}).get("v6", 0),
+            "seg_v4": (segs.get(tag) or {}).get("v4", 0),
             "held": bool(st.get("ban_hold_until") and st["ban_hold_until"] > now),
             "hold_until": st.get("ban_hold_until") or 0,
             "quota_until": st.get("quota_until") or 0,
@@ -319,6 +405,22 @@ def _fmt_ts(ts: float) -> str:
 
 def _pct(v: float | None) -> str:
     return f"{v * 100:.0f}%" if v is not None else "—"
+
+
+def _seg_label(r: dict) -> str:
+    """出口段列：v6 就是 /64 个数，v4 加 `v` 后缀（v4 没有段的概念）。
+
+    两个都为 0 时显示 `—` 而不是 `0` —— 0 会被读成「这条线只有一段」，
+    而实际是「窗口内日志里没见过它的出口」（新起的线、日志被清过）。
+    """
+    v6, v4 = r.get("seg_v6") or 0, r.get("seg_v4") or 0
+    if v6 and v4:
+        return f"{v6}+{v4}v"
+    if v6:
+        return str(v6)
+    if v4:
+        return f"{v4}v"
+    return "—"
 
 
 def _w(s: str) -> int:
@@ -351,7 +453,8 @@ def print_table(rows: list[dict], hours: float) -> None:
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
-            f"{_pad('colo ban', 9, False)} {_pad('重启', 6, False)}  "
+            f"{_pad('colo ban', 9, False)} {_pad('出口段', 7, False)} "
+            f"{_pad('重启', 6, False)}  "
             f"{_pad('订阅', 8)} {_pad('节点名', 30)} 节点 / 状态")
     print(head)
     print("-" * (_w(head) + 40))
@@ -372,6 +475,7 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(_pct(r['ban_rate']), 5, False)} "
               f"{_pad(okfail, 7, False)} "
               f"{_pad(_pct(r['colo_ban_rate']), 9, False)} "
+              f"{_pad(_seg_label(r), 7, False)} "
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
               f"{r['node']}  {' '.join(flags)}")
@@ -474,7 +578,9 @@ footer{{color:var(--muted);font-size:11px;margin-top:14px;line-height:1.7}}
 <div class="wrap"><table><thead><tr>
 <th>渠道</th><th>承载</th><th>colo</th><th>机房</th><th>节点名（机场）</th>
 <th>节点地址</th><th>订阅</th><th>订阅地址</th><th>出口 IP</th><th>成功率</th>
-<th>ban 率</th><th>成功/失败</th><th>colo ban</th><th>重启</th><th>状态</th>
+<th>ban 率</th><th>成功/失败</th><th>colo ban</th>
+<th title="窗口内这条渠道落过多少个出口段：v6 按 /64 计，v4 按地址计">出口段</th>
+<th>重启</th><th>状态</th>
 </tr></thead><tbody>{rows}</tbody></table></div>
 <div class="legend">
 <span><i class="dot" style="background:{good}"></i>成功率 ≥90% / ban ≤10%</span>
@@ -537,6 +643,7 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
             f'<td>{bar(r["ban_rate"], True)}</td>'
             f'<td class="mono">{r["ok"]}/{r["ban"] + r["err"]}</td>'
             f'<td class="mono dim">{_pct(r["colo_ban_rate"])}</td>'
+            f'<td class="mono dim">{_seg_label(r)}</td>'
             f'<td class="mono dim">{r["restarts"]}</td>'
             f'<td>{" ".join(pills)}</td></tr>')
 
@@ -560,7 +667,8 @@ def main() -> int:
     state = (_read_json(PROJECT / ".warp_line_state.json") or {}).get("lines") or {}
     rows = summarize(state, load_channels(),
                      _read_json(sources_path()) or {},
-                     args.hours, dormant=dormant_tags())
+                     args.hours, dormant=dormant_tags(),
+                     segments=channel_segments(args.hours * 3600))
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
     elif args.html:

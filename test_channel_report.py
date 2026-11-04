@@ -4,6 +4,7 @@
 """
 import importlib.util
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,37 @@ def test_dormant_nodes_are_labelled_not_dashed(mod, tmp_path):
     assert r["source"] == "okz"
     assert r["source_label"] == "旧入口快照"
     assert r["source_url"] == "-"
+
+
+def test_channel_segments_counts_slash64_not_ip(mod, tmp_path):
+    """出口段按 /64 计，同段内不同 /128 只算一段；v4 按地址计。
+
+    台账 `.warp_ip_history.jsonl` 只有 ip/t/b/k，**没有渠道归属** ——
+    带归属的只有 daemon 打的出口行，所以这一列只能从日志来。"""
+    now = 1_800_000_000.0
+    log = tmp_path / "daemon.log"
+    def at(sec):  # now - sec 的时间戳，格式与 daemon.log 一致
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - sec))
+    log.write_text(
+        f"[{at(600)}]   ✓ WARP-WG-1 出口 2a09:bac5:55f8:1d0f::2e5:5e 模型层: OK\n"
+        f"[{at(500)}]   · WARP-WG-1 出口 2a09:bac5:55f8:1d0f::9:9 TTL 内已有 OK\n"
+        f"[{at(400)}]   ✓ WARP-WG-1 重启后出口=2a09:bac5:55f9:2a00::1:1\n"
+        f"[{at(300)}]   ✗ WARP-WG-1 重启后出口=探测失败\n"
+        f"[{at(200)}]   ✓ WARP-CF-F 重启后出口=104.28.205.117\n"
+        f"[{at(100)}]   ✓ WARP-CF-F 重启后出口=104.28.205.117\n"
+        f"[{at(86400)}]  ✓ WARP-WG-9 出口 2a09:bac5:1ef8::1:1 模型层: OK\n")
+    got = mod.channel_segments(6 * 3600, now, log)
+    assert got["WARP-WG-1"] == {"v6": 2, "v4": 0}, "同 /64 的两个 /128 只能算一段"
+    assert got["WARP-CF-F"] == {"v6": 0, "v4": 1}, "v4 按地址计且去重"
+    assert "WARP-WG-9" not in got, "窗口外的行不能算进来"
+
+
+def test_seg_label_does_not_show_zero(mod):
+    """两者都为 0 时显示 `—`：0 会被读成「只有一段」，实际是「日志里没它的出口」。"""
+    assert mod._seg_label({"seg_v6": 0, "seg_v4": 0}) == "—"
+    assert mod._seg_label({"seg_v6": 12, "seg_v4": 0}) == "12"
+    assert mod._seg_label({"seg_v6": 0, "seg_v4": 3}) == "3v"
+    assert mod._seg_label({"seg_v6": 12, "seg_v4": 3}) == "12+3v"
 
 
 def test_restarts_count_window_not_lifetime_total(mod, tmp_path):
