@@ -260,4 +260,46 @@ with patch.object(daemon.warp_wg, "_read_state",
 assert got == "b.nrt:443-any", \
     f"当前节点不在块表时仍应按承载能力选点，实际 {got}"
 
-print("✓ 16 项同块轮回自检通过")
+# 17) 单条节点的探测超时不能把整轮轮回打成异常。
+# 实测 2026-11-05 3 小时内 18 条 `✗ 同块轮回异常: timed out` —— 一条坏节点
+# 在 `probe_node_tcp` 的 recv 上超时，异常一路冒到 `_node_rotation_pass` 的
+# try 外面，本轮排在它后面的线全部白等一轮。
+import socket as _socket
+
+import warp_wg as _ww
+
+
+class _SlowSock:
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def sendall(self, _b):
+        pass
+
+    def recv(self, _n):
+        raise _socket.timeout("timed out")
+
+    def close(self):
+        pass
+
+
+with patch.object(_ww.subprocess, "Popen"), \
+        patch.object(_ww.os, "makedirs"), \
+        patch.object(_ww, "write_json"), \
+        patch.object(_ww.socket, "create_connection",
+                     side_effect=lambda *a, **k: _SlowSock()):
+    try:
+        got = _ww.probe_node_tcp({"tag": "x", "type": "socks",
+                                  "server": "1.2.3.4", "server_port": 443},
+                                 timeout=0.1)
+    except Exception as e:                                  # noqa: BLE001
+        raise AssertionError(f"探测超时应返回 False，不该抛出：{e!r}") from e
+assert got is False, f"端口接受但不转发时结论应是 False，实际 {got!r}"
+
+print("✓ 17 项同块轮回自检通过")

@@ -495,6 +495,11 @@ def probe_node_tcp(node: dict, timeout: float = 6.0,
                              + struct.pack("!H", 443))
                 rep = sock.recv(10)
                 return len(rep) >= 2 and rep[1] == 0
+            except OSError:
+                # 握手/中继阶段超时 = 节点接了本地端口却不转发，正是要测的那件事。
+                # 让它抛出去会把整轮同块轮回打成异常（实测 3h 18 次
+                # `✗ 同块轮回异常: timed out`），一条坏节点拖住所有线换节点。
+                return False
             finally:
                 sock.close()
         finally:

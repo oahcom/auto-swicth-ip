@@ -389,6 +389,31 @@ def test_tunnel_death_port_closed_defers_to_systemd(monkeypatch):
     assert restarted == [], "端口已关还重启，等于抢 systemd 的活"
 
 
+def test_tunnel_death_restart_skipped_when_node_cannot_carry(monkeypatch):
+    """节点不转发 UDP 时，「连续 N 次取不到出口」的重启同样是死循环。
+
+    与惩罚期那条分支同一个病根，但入口不同：这条路径每次重启都刷新
+    `restart_ts`，而同块轮回的冷静期正是 `restart_ts + 2×60s` ——
+    重启循环把唯一能救它的轮回永远顶在门外。实测 2026-11-05 WG-4
+    `fail_streak` 41、`ever_ip` 始终 False，每 ~60s 重启一次，
+    轮回日志里从没出现过它。
+    """
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            fail_streak=daemon._UNKNOWN_RESTART_STREAK * 3)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
+    # 盯调用点：判据本身由 `test_cannot_carry_judgement` 覆盖。
+    monkeypatch.setattr(daemon, "_line_node_cannot_carry", lambda t: True)
+    daemon._probe_one_line(_member())
+    assert restarted == [], \
+        "节点承载不了时重启只会顶住同块轮回的冷静期，线永远换不了节点"
+
+
 def test_successful_probe_records_node_colo(monkeypatch, tmp_path):
     """探测成功时顺手把「落地节点 → colo」写进台账。
 

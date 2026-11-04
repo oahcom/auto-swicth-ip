@@ -4049,7 +4049,14 @@ def _node_tcp_ok(node: str, timeout: float = 6.0) -> bool | None:
         ob = warp_wg.node_outbound(node)
     except Exception:
         return None
-    res = None if ob is None else warp_wg.probe_node_tcp(ob, timeout=timeout)
+    if ob is None:
+        return None
+    try:
+        res = warp_wg.probe_node_tcp(ob, timeout=timeout)
+    except Exception:
+        # 探测进程自己崩了（写配置失败、subprocess 起不来）是观测者的问题，
+        # 不是节点状态。抛出去会把整轮轮回打成异常，一条节点拖住其余全部。
+        return None
     _NODE_TCP_SEEN[node] = (now, res)
     return res
 
@@ -5045,6 +5052,14 @@ def _probe_one_line(member: dict) -> None:
             return
         if (tag != active and streak >= _UNKNOWN_RESTART_STREAK
                 and _port_open(member["port"])):
+            # 节点根本不转发 UDP 时，重启只是把同一个节点再拉一遍；更糟的是
+            # 每次重启都刷新 `restart_ts`，把同块轮回的冷静期（2×60s）永远
+            # 顶住 —— 轮回一次也轮不到它，线就焊死在这个节点上。实测
+            # 2026-11-05 WG-4 `fail_streak` 41、每 ~60s 重启一次、
+            # `ever_ip` 始终 False，而轮回日志里从没出现过它。
+            # 停掉重启，换节点交给轮回（它换完自己会重启）。
+            if _line_node_cannot_carry(tag):
+                return
             _warp_line_restart(member, f"连续 {streak} 次取不到出口地址",
                                tunnel_dead=True)
         return
