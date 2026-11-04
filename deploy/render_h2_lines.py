@@ -2,7 +2,8 @@
 """把块模型里的 H2 渠道渲染成可部署的产物（**只写文件，不启动任何进程**）。
 
 产物目录 `.warp/h2/`（已 gitignore）：
-  singbox.json      1 个 sing-box：N 个 direct 入站 + N 个节点出站 + override 规则
+  singbox.json      1 个 sing-box：N 个 direct 入站 + 每条线一个 selector
+                    （候选池全预写）+ override 规则 + 专用 Clash API
   conf/N.json       每条线一份派生设备配置（endpoint_h2_v4 → 127.0.0.1）
   usque/N.sh        每条线的 usque 启动命令
   units/*.service   每条线一个 systemd 单元（未 enable）
@@ -57,7 +58,7 @@ if _env_file.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 import warp_blocks  # noqa: E402
-from config import CFG  # noqa: E402
+from config import CFG, get_singbox_secret  # noqa: E402
 
 # 端口规划（与生产错开）
 BASE_INBOUND = 22700      # sing-box direct 入站（usque 直连这里，不经 relay）
@@ -68,6 +69,11 @@ BASE_UNIT = "usque-h2"
 # 会连 endpoint_h2_v6（::1）—— 那条路要么不通、要么绕过节点直连 CF。v6 直连 CF
 # 已验证可用，但那是**不经节点**的路径，与「经机场节点承载」这个目标无关。
 H2_DST = "162.159.198.2:443"
+
+# 只给 daemon 换线用的 Clash API（主配置占 9090）。sing-box **没有**运行时
+# 重载配置的接口，节点不预写进配置就切不过去 —— 所以每条线的候选池全量声明，
+# 换节点 = `PUT /proxies/h2-sel-<i>`，进程不重启、其余 30 条线零影响。
+H2_CLASH_PORT = 9091
 
 
 def h2_channels() -> list[dict]:
@@ -485,6 +491,7 @@ def render(print_only: bool = False) -> int:
         print(f"⚠ 只排到 {len(picked)} 条（{n} 台设备）", file=sys.stderr)
 
     inbounds, outbounds, rules, ledger = [], [], [], []
+    written: set[str] = set()           # 已写过的节点（出站全局去重）
     for j, ch in enumerate(picked):
         # **编号取自成员名**（`WARP-H2-<COLO>-<N>` 的 N），不是循环位置：
         # 两者在「设备数 < 渠道数」时必然不同，而端口 1180+N 是写进
@@ -503,27 +510,48 @@ def render(print_only: bool = False) -> int:
         inbound_port = BASE_INBOUND + i
         socks_port = BASE_DEVICE_PORT + i
         tag = ch["node"]
-        try:
-            ob = node_outbound(tag)
-        except KeyError:
-            # 节点既不在主配置也不在沉睡池：这条线的落地节点已经从订阅里
-            # 消失（远端 2026-11-05 实测 `normal.cn.greatgameupload.org:25526-any`）。
-            # 一条线缺节点不该让整批 H2 渲染失败 —— 原来这里 KeyError 冒出去，
-            # 22 条线一条都没写，而报错只有一行 traceback 混在部署输出里。
-            print(f"⚠ {ch['member_tag']}: 节点 {tag} 不在主配置/沉睡池，跳过",
-                  file=sys.stderr)
+        # 整个候选池都写进配置：sing-box 不支持运行时追加出站，只有已声明的
+        # 出站才能被 selector 切过去。池子里取不到定义的节点跳过（订阅漂移）。
+        # 出站按**节点**全局只写一份，多条线的 selector 共用：anytls 出站是
+        # 无状态的，复制 N 份只是把配置撑大 3 倍（实测 224 份 → 71 份）。
+        cands: list[str] = []
+        for t in [tag, *(ch.get("nodes") or [])]:
+            ob_tag = f"h2-{t}"[:120] if t else ""
+            if not ob_tag or ob_tag in cands:
+                continue
+            if t not in written:
+                try:
+                    c = node_outbound(t)
+                except KeyError:
+                    if t == tag:
+                        # 节点既不在主配置也不在沉睡池：这条线的落地节点已经从订阅
+                        # 里消失（远端 2026-11-05 实测 `normal.cn.greatgameupload.org:25526-any`）。
+                        # 一条线缺节点不该让整批 H2 渲染失败 —— 原来 KeyError 冒出去，
+                        # 22 条线一条都没写，报错只有一行 traceback 混在部署输出里。
+                        print(f"⚠ {ch['member_tag']}: 节点 {tag} 不在主配置/沉睡池，"
+                              f"跳过", file=sys.stderr)
+                    continue
+                c["tag"] = ob_tag
+                outbounds.append(c)
+                written.add(t)
+            cands.append(ob_tag)
+        # 当前节点拿不到定义就整条跳过：默认必须落在台账记的那个节点上，否则
+        # 台账 → selector 的对应关系一渲染就偏（校验器会报「当前节点不在池里」）。
+        if not cands or cands[0] != f"h2-{tag}"[:120]:
             continue
-        ob["tag"] = f"h2-{i}-{tag}"[:120]
-        outbounds.append(ob)
+        default_tag = cands[0]          # 池首 = 块模型选定的落地节点
         inbounds.append({"type": "direct", "tag": f"h2in-{i}",
                          "listen": "127.0.0.1", "listen_port": inbound_port})
+        sel = f"h2-sel-{i}"
+        outbounds.append({"type": "selector", "tag": sel,
+                          "outbounds": cands, "default": default_tag})
         # `action` 必须显式写 "route"。sing-box 1.13 里缺省 action 的规则被当作
         # `reject` —— 连接建立后立刻关，日志里只有一行 inbound connection，
         # 看起来像节点/CF 侧断流，实际是本机把连接拒了（实测踩到）。
         rules.append({"inbound": [f"h2in-{i}"], "action": "route",
                       "override_address": H2_DST.split(":")[0],
                       "override_port": int(H2_DST.split(":")[1]),
-                      "outbound": ob["tag"]})
+                      "outbound": sel})
         ledger.append({
             "index": i, "channel": ch["tag"], "colo": ch.get("colo_measured"),
             "node": tag, "device": dev,
@@ -537,6 +565,10 @@ def render(print_only: bool = False) -> int:
             # 池子写进台账：这条线节点失效时该换到谁。同块多条渠道共用同一个
             # 候选序列（块内池子通用），各自从不同起点开始。
             "pool": [t for t in (ch.get("nodes") or []) if t],
+            # 换节点时 daemon 只 PUT 这个 selector（节点 → 出站 tag 加 `h2-`
+            # 前缀），不重启任何进程。
+            "selector": sel,
+            "candidates": cands,
         })
 
     cfg = {
@@ -546,6 +578,10 @@ def render(print_only: bool = False) -> int:
         "dns": prod_dns,
         "route": {"rules": rules, "final": outbounds[0]["tag"],
                   "default_domain_resolver": {"server": "dns-default"}},
+        "experimental": {"clash_api": {
+            "external_controller": f"127.0.0.1:{H2_CLASH_PORT}",
+            "secret": get_singbox_secret(),
+        }},
     }
 
     if print_only:

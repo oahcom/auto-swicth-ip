@@ -126,6 +126,113 @@ def test_missing_node_skips_one_line_not_the_whole_batch(tmp_path, monkeypatch):
     assert rc == 0, f"一条线缺节点不该让整批失败 (rc={rc})"
 
 
+def _render_full(tmp_path, monkeypatch, mod, nodes):
+    """在 tmp 项目里真的落盘渲染一次，返回生成的 singbox.json。"""
+    warp = tmp_path / ".warp"
+    (warp / "h2").mkdir(parents=True)
+    for name in ("usque10", "usque11"):
+        (warp / name).mkdir()
+        (warp / name / "config.json").write_text("{}")
+    (warp / "warp-outbound.json").write_text(json.dumps([
+        {"tag": "WARP-H2-NRT-0"}, {"tag": "WARP-H2-NRT-1"}]))
+    units = tmp_path / "units"
+    units.mkdir()
+    monkeypatch.setattr(mod, "PROJECT", tmp_path)
+    monkeypatch.setattr(mod, "free_devices",
+                        lambda *a, **k: ["usque10", "usque11"])
+    monkeypatch.setattr(mod, "get_singbox_secret", lambda: "test-secret")
+    monkeypatch.setattr(mod, "_alive_many", lambda *a, **k: {})
+    monkeypatch.setattr(mod, "h2_channels", lambda: [
+        {"tag": "WARP-H2-NRT-0", "member_tag": "WARP-H2-NRT-0", "colo": "NRT",
+         "node": "n1", "nodes": ["n1", "n2"]},
+        {"tag": "WARP-H2-NRT-1", "member_tag": "WARP-H2-NRT-1", "colo": "NRT",
+         "node": "n2", "nodes": ["n2", "n3"]},
+    ])
+    monkeypatch.setattr(mod, "node_outbound",
+                        lambda t: {"type": "socks", "tag": t})
+    monkeypatch.setenv("ASIP_SYSTEM_UNIT_DIR", str(units))
+    assert mod.render() == 0
+    return json.loads((warp / "h2" / "singbox.json").read_text())
+
+
+def test_each_line_routes_through_a_selector(tmp_path, monkeypatch):
+    """换 H2 节点必须能只动一条线：规则落在 selector 上，而不是直接指出站。
+
+    直接指出站时，换节点只能改共享配置并重启 asip-h2-singbox —— 31 条线一起
+    断（既定事实 13d 第 2 条）。selector 让 daemon 用 `PUT /proxies/<sel>`
+    切到已声明的候选出站，进程不动。
+    """
+    mod = _render_mod()
+    cfg = _render_full(tmp_path, monkeypatch, mod, None)
+    outb = {o["tag"]: o for o in cfg["outbounds"]}
+    sels = [o for o in cfg["outbounds"] if o["type"] == "selector"]
+    assert len(sels) == 2, f"每条线一个 selector，实际 {len(sels)}"
+    for rule in cfg["route"]["rules"]:
+        assert outb[rule["outbound"]]["type"] == "selector", rule
+    # 候选池全量声明：不在配置里的出站 PUT 不过去（sing-box 回 400）。
+    # 同块多条线共用整个块池（`pools_by_colo`），当前节点排在各自池首。
+    assert outb["h2-sel-0"]["outbounds"] == ["h2-n1", "h2-n2", "h2-n3"]
+    assert outb["h2-sel-0"]["default"] == "h2-n1"
+    assert outb["h2-sel-1"]["outbounds"] == ["h2-n2", "h2-n1", "h2-n3"]
+    assert outb["h2-sel-1"]["default"] == "h2-n2"
+    # 出站按节点全局去重：n2 被两条线共用，只写一份。
+    assert [o["tag"] for o in cfg["outbounds"]].count("h2-n2") == 1
+    assert cfg["experimental"]["clash_api"]["secret"] == "test-secret"
+
+
+def test_h2_switch_is_a_selector_put_and_never_restarts(monkeypatch):
+    """H2 换节点 = PUT selector；成功即生效，不重启 usque、不重启共享 sing-box。"""
+    import daemon
+
+    calls = []
+
+    class Fake:
+        def request_json(self, method, path, body=None, **k):
+            calls.append((method, path, body))
+            return 204, None
+
+    monkeypatch.setattr(daemon, "_h2_clash", lambda: Fake())
+    m = {"tag": "WARP-H2-NRT-0", "kind": "h2", "index": 0}
+    assert daemon._h2_select(m, "n2") == "ok"
+    assert calls == [("PUT", "proxies/h2-sel-0", {"name": "h2-n2"})], calls
+    # 节点不在候选池 → 400 → "gone"（该重渲染，而不是重试）
+    Fake.request_json = lambda *a, **k: (400, None)
+    assert daemon._h2_select(m, "nope") == "gone"
+
+
+def test_h2_repair_switches_node_before_restarting(monkeypatch):
+    """取不到出口时先换节点：重启 usque 换的是同一节点上的新会话，救不了。"""
+    import daemon
+
+    monkeypatch.setattr(daemon, "_warp", lambda: {"node_rotation_interval_sec": 60})
+    monkeypatch.setattr(daemon, "_warp_member",
+                        lambda t: {"tag": t, "kind": "h2", "index": 3})
+    monkeypatch.setattr(daemon, "_h2_clash", lambda: type("F", (), {
+        "selector_state": lambda self, s: (["h2-a", "h2-b", "h2-c"], "h2-a")})())
+    moved, inval, restarts = [], [], []
+    monkeypatch.setattr(daemon, "_rehome_one",
+                        lambda t, n: (moved.append(n), "ok")[1])
+    monkeypatch.setattr(daemon, "_invalidate_warp_line_ip",
+                        lambda t: inval.append(t))
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda *a, **k: restarts.append(a))
+    daemon._NODE_NEXT_CHECK.clear()
+    assert daemon._h2_repair({"tag": "WARP-H2-X-3", "kind": "h2", "index": 3})
+    # 按池序轮转：当前 a 的下一个是 b
+    assert moved == ["b"] and inval == ["WARP-H2-X-3"]
+    assert restarts == [], "换节点路径不该重启任何东西"
+    # 当前是池尾时回绕到池首
+    monkeypatch.setattr(daemon, "_h2_clash", lambda: type("F", (), {
+        "selector_state": lambda self, s: (["h2-a", "h2-b"], "h2-b")})())
+    daemon._NODE_NEXT_CHECK.clear()
+    daemon._h2_repair({"tag": "WARP-H2-X-3", "kind": "h2", "index": 3})
+    assert moved[-1] == "a", moved
+    # 节流：一个 interval 内不再换
+    daemon._NODE_NEXT_CHECK["WARP-H2-X-3"] = 9e18
+    assert not daemon._h2_repair({"tag": "WARP-H2-X-3", "kind": "h2",
+                                  "index": 3})
+
+
 def test_ledger_devices_count_as_capacity(tmp_path, monkeypatch):
     """台账里的设备必须算进容量，否则原地重渲染被 `n < live_n` 拒掉。
 

@@ -11,7 +11,8 @@
 # 这个脚本负责落进 /etc/systemd/system，并先 reload 再启动 sing-box、最后 usque。
 #
 # 幂等：单元内容没变就不重启；usque 各线互不影响（一条挂了不重启其余）。
-# 换节点只重启 asip-h2-singbox（节点在它那份配置里），不动 usque 进程。
+# 换节点**不需要跑这个脚本**：daemon 直接 PUT 共享 sing-box 里那条线的 selector。
+# 只有改候选池（新节点进池）才要重装，那时只重启 asip-h2-singbox，不动 usque。
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -116,8 +117,19 @@ restart_one() {
         echo "  ＋ $u"
     fi
 }
-if [ "$SB_BEFORE" != "$SB_AFTER" ] || ! active asip-h2-singbox.service; then
+# 判据是「**进程正在跑的那份**配置」是否等于当前文件，而不是本次脚本前后的哈希：
+# `--no-render` 时前后哈希必然相同（中间没有渲染），于是渲染出新节点/新 selector
+# 后这里永远判定「未变」，进程一直跑旧配置 —— 新 selector 根本没加载，
+# `PUT /proxies` 回 404，换线静默失效。哈希由重启那一刻写入 stamp。
+STAMP="${H2_STAMP:-/run/asip-h2-singbox.md5}"
+RUNNING="$(cat "$STAMP" 2>/dev/null || true)"
+if [ "$SB_AFTER" != "$RUNNING" ] || ! active asip-h2-singbox.service; then
     restart_one asip-h2-singbox.service
+    if [ "$(id -u)" = 0 ]; then
+        printf '%s\n' "$SB_AFTER" > "$STAMP" 2>/dev/null || true
+    else
+        printf '%s\n' "$SB_AFTER" | sudo -n tee "$STAMP" >/dev/null 2>&1 || true
+    fi
 else
     echo "  · asip-h2-singbox.service 配置未变，跳过重启"
 fi

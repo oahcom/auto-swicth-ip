@@ -3482,16 +3482,120 @@ def _record_line_colo(tag: str, colo: str | None, loc: str | None,
         log(f"  · {tag} 记录 colo 失败: {e}")
 
 
+_H2_CLASH: ClashClient | None = None
+_H2_CLASH_MTIME = -1.0
+
+
+def _h2_clash() -> ClashClient:
+    """`asip-h2-singbox` 的 Clash API 客户端（端口取自渲染产物，与主配置不同）。"""
+    global _H2_CLASH, _H2_CLASH_MTIME
+    path = os.path.join(_PROJECT, ".warp", "h2", "singbox.json")
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        mtime = 0.0
+    if _H2_CLASH is None or mtime != _H2_CLASH_MTIME:
+        try:
+            with open(path, encoding="utf-8") as f:
+                ctrl = ((json.load(f).get("experimental") or {})
+                        .get("clash_api") or {}).get("external_controller") or ""
+        except (OSError, ValueError):
+            ctrl = ""
+        _H2_CLASH = ClashClient(f"http://{ctrl or '127.0.0.1:9091'}",
+                                get_singbox_secret)
+        _H2_CLASH_MTIME = mtime
+    return _H2_CLASH
+
+
+def _h2_select(member: dict | None, node: str) -> str:
+    """H2 换节点 = `PUT /proxies/h2-sel-<i>`，**不重启任何进程**。
+
+    节点必须已由 `render_h2_lines.py` 预写成候选出站；不在候选里时 sing-box
+    回 400（池子要重渲染，返回 "gone"），selector 不存在回 404（进程还在跑
+    旧配置，换线静默失效 —— 返回 "gone" 让调用方别再每轮重试）。
+    """
+    i = (member or {}).get("index")
+    if i is None:
+        return "skip"
+    ob = f"h2-{node}"[:120]          # 出站按节点全局唯一（渲染器去重）
+    status, _ = _h2_clash().request_json("PUT", f"proxies/h2-sel-{int(i)}",
+                                         body={"name": ob})
+    if status in (200, 204):
+        return "ok"
+    if status in (400, 404):
+        return "gone"
+    return "err"
+
+
+# 每条 H2 线**本轮已试过**的候选节点；拿到出口地址时清空（见 `_probe_one_line`）。
+# 没有它，整池失效的线（实测 ORD 池只有 1 个、SLC/LAX 池全是 bilibili）会每
+# 60s 在死节点之间空转：PUT 本身无害，但每次都会清掉 `ip` 并触发一整轮探测。
+_H2_TRIED: dict[str, set[str]] = {}
+
+
+def _h2_next_node(member: dict | None) -> str | None:
+    """这条 H2 线候选池里**下一个没试过**的节点；整池试遍返回 None。
+
+    不探活：候选池的顺序已经是渲染器按可达性排过的（`_reachable_order`），
+    而这里每探一个都要起一个临时 sing-box（机场域名只有订阅 DoH 解析得了），
+    全池 23 个就是 23 个进程 —— 正是要修的那种风暴。按池序轮转即可。
+    """
+    if not member:
+        return None
+    i = member.get("index")
+    if i is None:
+        return None
+    names, now_ob = _h2_clash().selector_state(f"h2-sel-{int(i)}")
+    cands = [o[len("h2-"):] for o in (names or []) if o.startswith("h2-")]
+    if not cands:
+        return None
+    tried = _H2_TRIED.setdefault(member["tag"], set())
+    k = cands.index(now_ob[len("h2-"):]) if (now_ob or "").startswith("h2-") \
+        and now_ob[len("h2-"):] in cands else -1
+    for step in range(1, len(cands) + 1):
+        node = cands[(k + step) % len(cands)]
+        if node not in tried:
+            return node
+    return None
+
+
+def _h2_repair(member: dict | None) -> bool:
+    """H2 线取不到出口时先换节点（无重启）；换成了返回 True。"""
+    if not member:
+        return False
+    tag = member["tag"]
+    now = time.time()
+    if now < _NODE_NEXT_CHECK.get(tag, 0.0):
+        return False
+    nxt = _h2_next_node(member)
+    if not nxt:
+        return False                     # 整池都试过了，等重渲染/地址恢复
+    if _rehome_one(tag, nxt) != "ok":
+        return False
+    _H2_TRIED.setdefault(tag, set()).add(nxt)
+    # 新落地节点的出口地址必然不同：清掉旧地址，让探测器按新链路重新判。
+    _invalidate_warp_line_ip(tag)
+    _NODE_NEXT_CHECK[tag] = now + float(
+        _warp().get("node_rotation_interval_sec", 60))
+    log(f"  ⇄ {tag} 连续取不到出口 → 换节点 {nxt}（selector，未重启）")
+    return True
+
+
 def _rehome_one(tag: str, node: str | None) -> str:
     """把一条线写到指定落地节点。
 
-    返回 "ok" / "skip"（不是 WG 线或没配 index，不该重试）/ "gone"（节点不在
-    UDP 池里，原节点可能已下架）/ "err"（写失败，可重试）。
-    只处理 WG 线：usque（WARP-CF*）没有可换的落地节点，出口只随本机 colo 变。
+    返回 "ok" / "skip"（不是可换线的成员或没配 index，不该重试）/ "gone"
+    （节点不在可用池里，原节点可能已下架）/ "err"（写失败，可重试）。
+
+    WG 线：写该线自己的 `lineN/singbox.json`，由调用方重启生效。
+    H2 线：`PUT` 共享进程里这条线的 selector，立即生效、不重启（见 `_h2_select`）。
+    usque（WARP-CF*）没有可换的落地节点，出口只随本机 colo 变。
     """
     if not node:
         return "skip"
     m = _warp_member(tag)
+    if m and m.get("kind") == "h2":
+        return _h2_select(m, node)
     if not m or m.get("kind") != "wg" or not m.get("index"):
         return "skip"
     try:
@@ -4933,6 +5037,12 @@ def _probe_one_line(member: dict) -> None:
         # 靠 systemd 的 Restart=always 永远等不到，只能这里重启）。
         # 端口关着则相反：进程已经没了，那是 systemd 的活，再从这儿重启等于抢它的活。
         streak = int(_warp_line_state(tag).get("fail_streak") or 0)
+        # H2 线先换节点：落地节点在共享 sing-box 里，`_rehome_one` 走 selector，
+        # 换完不重启任何进程。连续 3 次拿不到出口就换 —— 重启 usque 换的是同一个
+        # 节点上的新会话，节点不转发 TCP 到 CF 时重启多少次都没用。
+        if (tag != active and member.get("kind") == "h2" and streak >= 3
+                and _h2_repair(member)):
+            return
         if (tag != active and streak >= _UNKNOWN_RESTART_STREAK
                 and _port_open(member["port"])):
             _warp_line_restart(member, f"连续 {streak} 次取不到出口地址",
@@ -4942,6 +5052,9 @@ def _probe_one_line(member: dict) -> None:
     # 否则一条刚恢复的线走「OK 新鲜」早退时计时不清，之后每次失败都从旧起点
     # 算起，5 小时那条判据会被一次历史故障带偏。
     _channel_noaddr_note(tag, True, now)
+    # 这条链路能出地址了：H2 的候选池从头开始记（见 `_h2_next_node`）。
+    if member.get("kind") == "h2":
+        _H2_TRIED.pop(tag, None)
     cur = _warp_line_state(tag)
     if tag != active and _warp_line_ok_fresh(tag, now) and cur.get("ip") == ip:
         return

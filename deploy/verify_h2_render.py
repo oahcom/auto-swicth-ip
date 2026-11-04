@@ -74,7 +74,7 @@ def _is_own_pid(pid: int) -> bool:
 
 def check_rules(cfg: dict) -> None:
     inbounds = {i["tag"] for i in cfg["inbounds"]}
-    outbounds = {o["tag"] for o in cfg["outbounds"]}
+    outbounds = {o["tag"]: o for o in cfg["outbounds"]}
     seen = set()
     for rule in cfg["route"]["rules"]:
         for ib in rule.get("inbound") or []:
@@ -83,8 +83,13 @@ def check_rules(cfg: dict) -> None:
             if ib in seen:
                 err(f"入站 {ib} 有多条规则")
             seen.add(ib)
-        if rule.get("outbound") not in outbounds:
-            err(f"规则引用不存在的出站 {rule.get('outbound')}")
+        tag = rule.get("outbound")
+        if tag not in outbounds:
+            err(f"规则引用不存在的出站 {tag}")
+        elif outbounds[tag].get("type") != "selector":
+            # 规则必须落在 selector 上：直连某个节点时，换节点只能重启整个
+            # asip-h2-singbox，31 条线全断（既定事实 13d 的第 2 条限制）。
+            err(f"规则 {rule.get('inbound')} 的出口 {tag} 不是 selector")
         if rule.get("action") != "route":
             err(f"规则 {rule.get('inbound')} 缺 action=route（缺省会被当 reject）")
         if rule.get("override_address") != "162.159.198.2":
@@ -92,6 +97,50 @@ def check_rules(cfg: dict) -> None:
     missing = inbounds - seen
     if missing:
         err(f"入站没有对应规则: {sorted(missing)}")
+    # selector 的成员必须是已声明的真实出站，且不能指回 selector：
+    # `PUT /proxies/<selector>` 只能切到 `all` 里已有的名字。
+    for o in cfg["outbounds"]:
+        if o.get("type") != "selector":
+            continue
+        members = o.get("outbounds") or []
+        if not members:
+            err(f"selector {o['tag']} 没有成员")
+        if o.get("default") not in members:
+            err(f"selector {o['tag']} 的 default 不在成员里")
+        for m in members:
+            if m not in outbounds:
+                err(f"selector {o['tag']} 成员 {m} 不是已声明的出站")
+            elif outbounds[m].get("type") == "selector":
+                err(f"selector {o['tag']} 成员 {m} 又是 selector")
+    # Clash API 是 daemon 换节点的唯一通道，缺了就只能退回重启。
+    api = (cfg.get("experimental") or {}).get("clash_api") or {}
+    if not api.get("external_controller"):
+        err("缺 experimental.clash_api（daemon 无法无重启换节点）")
+    if not api.get("secret"):
+        err("experimental.clash_api 没有 secret（与主配置共用，不应为空）")
+
+
+def check_selectors(cfg: dict, ledger: list[dict]) -> None:
+    """每条线一个 selector，且当前节点在它的成员里。
+
+    daemon 换节点 = `PUT /proxies/<selector>` + 节点出站 tag，两者都从台账里
+    取；台账与配置对不上时 PUT 会被 sing-box 拒（400），而现象只是「换线没
+    生效」—— 必须在这里静态拦住。
+    """
+    sels = {o["tag"]: o for o in cfg["outbounds"] if o.get("type") == "selector"}
+    for r in ledger:
+        sel = r.get("selector") or f"h2-sel-{r['index']}"
+        o = sels.get(sel)
+        if not o:
+            err(f"{r['unit']}: 配置里没有 {sel}")
+            continue
+        want = f"h2-{r['node']}"[:120]
+        if want not in (o.get("outbounds") or []):
+            err(f"{sel}: 当前节点 {r['node']} 不在候选池里")
+        if o.get("default") != want:
+            err(f"{sel}: default={o.get('default')} 不是当前节点 {want}")
+        if r.get("selector") and r["selector"] != sel:
+            err(f"{r['unit']}: 台账 selector={r['selector']} 与编号不符")
 
 
 def check_nodes(ledger: list[dict]) -> None:
@@ -180,6 +229,7 @@ def main() -> int:
 
     check_ports(cfg, ledger)
     check_rules(cfg)
+    check_selectors(cfg, ledger)
     check_nodes(ledger)
     check_devices(ledger)
     check_units(ledger)
