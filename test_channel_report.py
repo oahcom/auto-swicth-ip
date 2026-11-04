@@ -128,15 +128,24 @@ def test_channel_segments_counts_slash64_not_ip(mod, tmp_path):
     assert got["WARP-WG-9"]["v6"] == ["2a09:bac5:1ef8:0"]
 
 
-def test_seg_tokens_lists_every_segment(mod):
-    """出口段列要给出**全部**段名，不是只给个数。
+def test_seg_label_is_slash48_count_then_slash64_count(mod):
+    """表格列写 `/48 个数 / /64 个数`：/48 是地址池边界，/64 只是抽签结果。
 
-    段名是完整的四段 —— 只给第四段认不出落在哪一批。"""
-    r = {"seg_v6": ["2a09:bac5:55f8:18be", "2a09:bac1:76a0:8e0"],
-         "seg_v4": ["104.28.205.117"]}
-    assert mod._seg_tokens(r) == ["2a09:bac5:55f8:18be", "2a09:bac1:76a0:8e0",
-                                  "104.28.205.117v"]
-    assert mod._seg_tokens({"seg_v6": [], "seg_v4": []}) == ["—"]
+    一个 /48 下抽到 8 个 /64，说明的是「这台机器在这个池子里抽了 8 次」，
+    不是「覆盖了 8 个池子」—— 两者混成一个数字会读错。"""
+    r = {"seg_v6": ["2a09:bac5:55f8:18be", "2a09:bac5:55f8:1d0f",
+                    "2a09:bac5:55f9:2a00", "2a09:bac1:76a0:8e0"],
+         "seg_v4": ["104.28.205.117", "104.28.205.118"]}
+    assert mod._seg_counts(r) == (3, 4)      # 3 个 /48，4 个 /64
+    assert mod._seg_label(r) == "3/4 +2v"
+    assert mod._seg_label({"seg_v6": [], "seg_v4": []}) == "—"
+
+
+def test_seg48_groups_count_per_prefix(mod):
+    """明细表按 /48 分组，括号里是该 /48 下的 /64 个数，按数值排序。"""
+    r = {"seg_v6": ["2a09:bac5:55f9:2a00", "2a09:bac5:55f8:18be",
+                    "2a09:bac5:55f8:1d0f"]}
+    assert mod._seg48_groups(r) == [("2a09:bac5:55f8", 2), ("2a09:bac5:55f9", 1)]
 
 
 def test_seg_name_keeps_all_four_hextets(mod):

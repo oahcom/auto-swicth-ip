@@ -420,39 +420,83 @@ def _pct(v: float | None) -> str:
     return f"{v * 100:.0f}%" if v is not None else "—"
 
 
-def _seg_tokens(r: dict) -> list[str]:
-    """出口段列的全部段名：v6 段在前，v4 地址加 `v` 后缀（v4 没有段）。
+def _seg48(name: str) -> str:
+    """`2a09:bac5:55f8:18be`（/64）→ `2a09:bac5:55f8`（/48）。
 
-    列表为空时返回 `["—"]` 而不是 `["0"]` —— `0` 会被读成「只有一段」，
-    而实际是「窗口内日志里没见过它的出口」（新起的线、日志被轮转过）。
+    /48 才是「批次」：同一个 /48 下的 /64 是同一个机房池里的一次抽签，
+    而不同 /48 之间是**不同的地址池**。看覆盖面先看 /48 有几个。
     """
-    v6 = list(r.get("seg_v6") or [])
-    v4 = [a + "v" for a in (r.get("seg_v4") or [])]
-    return v6 + v4 or ["—"]
+    return name.rsplit(":", 1)[0]
+
+
+def _seg48_groups(r: dict) -> list[tuple[str, int]]:
+    """`[(/48 名, 它下面落过几个 /64)]`，按数值排序。"""
+    from collections import Counter
+    c = Counter(_seg48(s) for s in (r.get("seg_v6") or []))
+    return sorted(c.items(), key=lambda kv: _seg_sort(kv[0]))
+
+
+def _seg_counts(r: dict) -> tuple[int, int]:
+    """`(v6 /48 个数, v6 /64 个数)`。"""
+    return len(_seg48_groups(r)), len(r.get("seg_v6") or [])
 
 
 def print_segments(rows: list[dict]) -> None:
-    """每条渠道一段，列出它落过的**全部**出口段（一行放不下就折行）。
+    """每条渠道：先列 **/48**，再给 /64 个数，最后列 v4 地址。
 
-    完整段名照抄 `2a09:bac5:55f8:18be` —— 四段缺一不可（见 `_seg_name`）。
-    表格里的「出口段」列只放个数，因为一条线可以有 60+ 段。
+    列全部 /64 会淹掉屏幕（一条线 60~74 个），而且 /64 是**抽签结果**、不可选；
+    /48 才是不同地址池的边界，一个机房通常只有 8~12 个。所以 /48 全列，
+    /64 只给个数（按 /48 分组时括号里是该 /48 下的个数）。
     """
     if not rows:
         print("（没有渠道数据）")
         return
-    print("\n出口段明细（全部轮转日志，v6 按 /64；v4 按地址，后缀 v）")
+    print("\n出口段明细（v6 先列 /48、括号内是该 /48 下的 /64 个数；v4 列地址）")
     print("-" * 92)
     width = max((_w(r["tag"]) for r in rows), default=0) + 2
     for r in rows:
-        segs = _seg_tokens(r)
-        head = f"{_pad(r['tag'], width)} {len(segs) if segs != ['—'] else 0:>3} 段"
-        line = head + "  "
-        for s in segs:
-            if _w(line) + _w(s) + 2 > 140:      # 折行，别让一行跑到屏幕外
+        groups = _seg48_groups(r)
+        n48, n64 = _seg_counts(r)
+        v4 = list(r.get("seg_v4") or [])
+        head = f"{_pad(r['tag'], width)} "
+        if n64:
+            head += f"{n48} 个 /48 · {n64} 个 /64"
+        if v4:
+            head += (" · " if n64 else "") + f"{len(v4)} 个 v4 地址"
+        if not n64 and not v4:
+            print(head + "—")
+            continue
+        print(head)
+        indent = " " * (width + 2)
+        line = indent
+        for name, n in groups:
+            token = f"{name}({n})" if n > 1 else name
+            if _w(line) + _w(token) + 2 > 140:
                 print(line)
-                line = " " * (width + 7)
-            line += s + "  "
+                line = indent
+            line += token + "  "
+        for a in v4:
+            if _w(line) + _w(a) + 2 > 140:
+                print(line)
+                line = indent
+            line += a + "  "
         print(line)
+
+
+def _seg_label(r: dict) -> str:
+    """表格里的「出口段」列：`/48 个数 / /64 个数`，v4 追加 `+Nv`。
+
+    两者都为 0 时显示 `—` 而不是 `0/0` —— 会被读成「一段都没有」，
+    实际是「日志里没见过它的出口」（新起的线、日志被轮转过）。
+    """
+    n48, n64 = _seg_counts(r)
+    n4 = len(r.get("seg_v4") or [])
+    parts = []
+    if n64:
+        parts.append(f"{n48}/{n64}")
+    if n4:
+        parts.append(f"+{n4}v")
+    return " ".join(parts) or "—"
 
 
 def _w(s: str) -> int:
@@ -485,7 +529,7 @@ def print_table(rows: list[dict], hours: float) -> None:
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
-            f"{_pad('colo ban', 9, False)} {_pad('出口段', 7, False)} "
+            f"{_pad('colo ban', 9, False)} {_pad('/48,/64', 10, False)} "
             f"{_pad('重启', 6, False)}  "
             f"{_pad('订阅', 8)} {_pad('节点名', 30)} 节点 / 状态")
     print(head)
@@ -507,7 +551,7 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(_pct(r['ban_rate']), 5, False)} "
               f"{_pad(okfail, 7, False)} "
               f"{_pad(_pct(r['colo_ban_rate']), 9, False)} "
-              f"{_pad(str(len(r['seg_v6']) + len(r['seg_v4']) or '—'), 7, False)} "
+              f"{_pad(_seg_label(r), 10, False)} "
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
               f"{r['node']}  {' '.join(flags)}")
@@ -614,7 +658,7 @@ footer{{color:var(--muted);font-size:11px;margin-top:14px;line-height:1.7}}
 <th>渠道</th><th>承载</th><th>colo</th><th>机房</th><th>节点名（机场）</th>
 <th>节点地址</th><th>订阅</th><th>订阅地址</th><th>出口 IP</th><th>成功率</th>
 <th>ban 率</th><th>成功/失败</th><th>colo ban</th>
-<th title="窗口内这条渠道落过多少个出口段：v6 按 /64 计，v4 按地址计">出口段</th>
+<th title="v6 出口段：/48 个数 / /64 个数（悬停看每个 /48）。v4 另计">出口段 /48·/64</th>
 <th>重启</th><th>状态</th>
 </tr></thead><tbody>{rows}</tbody></table></div>
 <div class="legend">
@@ -678,9 +722,9 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
             f'<td>{bar(r["ban_rate"], True)}</td>'
             f'<td class="mono">{r["ok"]}/{r["ban"] + r["err"]}</td>'
             f'<td class="mono dim">{_pct(r["colo_ban_rate"])}</td>'
-            f'<td class="mono dim seg">'
-            f'{"".join(f"<span class=chip>{html.escape(s)}</span>" for s in _seg_tokens(r))}'
-            f'</td>'
+            f'<td class="mono dim seg" title="'
+            f'{html.escape(" ".join(s for s, _ in _seg48_groups(r)))}">'
+            f'{html.escape(_seg_label(r))}</td>'
             f'<td class="mono dim">{r["restarts"]}</td>'
             f'<td>{" ".join(pills)}</td></tr>')
 
