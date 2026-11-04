@@ -123,30 +123,60 @@ def test_channel_segments_counts_slash64_not_ip(mod, tmp_path):
     got = mod.channel_segments(log)
     assert got["WARP-WG-1"]["v6"] == ["2a09:bac5:55f8:1d0f", "2a09:bac5:55f9:2a00"], \
         "同 /64 的两个 /128 只能算一段，且段名要四段齐全"
+    assert got["WARP-WG-1"]["addr"] == ["2a09:bac5:55f8:1d0f::9:9",
+                                       "2a09:bac5:55f8:1d0f::2e5:5e",
+                                       "2a09:bac5:55f9:2a00::1:1"], \
+        "/128 另存一份且按数值排：同段两个地址都要留，不能只留 /64"
     assert got["WARP-CF-F"]["v4"] == ["104.28.205.117"], "v4 按地址计且去重"
     # 不按时间窗口截断：日志里 24h 前那条也要算
     assert got["WARP-WG-9"]["v6"] == ["2a09:bac5:1ef8:0"]
 
 
-def test_seg_label_shows_three_prefix_levels(mod):
-    """表格列写 `/32 / /48 / /64` 三级：只给最细的 /64 看不出跨了几个批次，
-    只给 /32 又看不出抽签密度。"""
+def test_fp_mix_maps_segments_to_fingerprint_colo(mod):
+    """段指纹 colo 与渠道声明的 colo 是两件事：WG 线经机场节点中转，
+    节点在 NRT、出口可以落在 SIN。`_fp_mix` 只做映射，不改声明。"""
+    mix = mod._fp_mix(["2a09:bac1:6500:8", "2a09:bac5:55f8:18be",
+                       "2a09:bac1:3b00:10"])
+    # 6500/55f8 → SIN（2 个），3b00 → NRT（1 个），从多到少
+    assert mix[0][0] == "SIN" and mix[0][1] == 2
+    assert ("NRT", 1) in mix
+    assert mod._fp_mix([]) == []
+
+
+def test_fp_label_marks_only_top_mismatch(mod):
+    """`落点` 列只在**主落点**与声明不同时标 ≠。
+
+    按「是否 100% 一致」标会让几乎每行都带 ≠（多条渠道合并后必然混着
+    几个机房），标记本身就没信息了。"""
+    assert mod._fp_label({"colo": "SIN", "colo_fp": [("SIN", 9), ("SJC", 1)]}) == "SIN"
+    assert mod._fp_label({"colo": "NRT", "colo_fp": [("SIN", 9), ("NRT", 2)]}) == "≠SIN"
+    assert mod._fp_label({"colo": "NRT", "colo_fp": []}) == "—"
+
+
+def test_seg_label_shows_four_prefix_levels(mod):
+    """表格列写 `/32 / /48 / /64 / /128`：只给最细的 /64 看不出跨了几个批次，
+    只给 /32 又看不出抽签密度，而没有 /128 就分不清「地址摊开」与「挤在一段」。"""
     r = {"seg_v6": ["2a09:bac5:55f8:18be", "2a09:bac5:55f8:1d0f",
                     "2a09:bac5:55f9:2a00", "2a09:bac1:76a0:8e0"],
+         "seg_addr": ["2a09:bac5:55f8:18be::1", "2a09:bac5:55f8:1d0f::1",
+                      "2a09:bac5:55f9:2a00::1", "2a09:bac1:76a0:8e0::1",
+                      "2a09:bac1:76a0:8e0::2"],
          "seg_v4": ["104.28.205.117", "104.28.205.118"]}
-    # 2 个 /32（bac1/bac5）、3 个 /48、4 个 /64
-    assert mod._seg_counts(r) == (2, 3, 4)
-    assert mod._seg_label(r) == "2/3/4 +2v"
-    assert mod._seg_label({"seg_v6": [], "seg_v4": []}) == "—"
+    # 2 个 /32（bac1/bac5）、3 个 /48、4 个 /64、5 个 /128
+    assert mod._seg_counts(r) == (2, 3, 4, 5)
+    assert mod._seg_label(r) == "2/3/4/5 +2v"
+    assert mod._seg_label({"seg_v6": [], "seg_addr": [], "seg_v4": []}) == "—"
 
 
 def test_seg32_groups_count_under_each_batch(mod):
-    """明细表按 /32 分组，给出它下面的 /48 与 /64 个数，按数值排序。"""
+    """明细表按 /32 分组，给出它下面的 /48、/64 与 /128 个数，按数值排序。"""
     r = {"seg_v6": ["2a09:bac5:55f9:2a00", "2a09:bac5:55f8:18be",
-                    "2a09:bac5:55f8:1d0f", "2a09:bac1:76a0:8e0"]}
+                    "2a09:bac5:55f8:1d0f", "2a09:bac1:76a0:8e0"],
+         "seg_addr": ["2a09:bac5:55f9:2a00::1", "2a09:bac5:55f9:2a00::2",
+                      "2a09:bac1:76a0:8e0::1"]}
     assert mod._seg32_groups(r) == [
-        ("2a09:bac1", 1, 1),     # bac1: 1 个 /48、1 个 /64
-        ("2a09:bac5", 2, 3),     # bac5: 2 个 /48、3 个 /64
+        ("2a09:bac1", 1, 1, 1),     # bac1: 1 个 /48、1 个 /64、1 个 /128
+        ("2a09:bac5", 2, 3, 2),     # bac5: 2 个 /48、3 个 /64、2 个 /128
     ]
 
 

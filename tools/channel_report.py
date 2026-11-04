@@ -157,24 +157,27 @@ def _seg_name(net) -> str:
 
 
 def channel_segments(log_file: Path | None = None) -> dict[str, dict]:
-    """每条渠道**落过的每一个出口段**：`{tag: {"v6": [段名...], "v4": [地址...]}}`。
+    """每条渠道落过的出口：`{tag: {"v6": [/64 段名...], "addr": [/128...],
+    "v4": [地址...]}}`。
 
-    返回的是**段名列表**而不是计数：只给个数等于什么都没说，要看的是
+    返回的是**列表**而不是计数：只给个数等于什么都没说，要看的是
     「落过哪几段」，且段名是完整的四段 `2a09:bac5:55f8:18be`。
+    `/128` 另外留一份 —— 见下方那条注释。
 
     **不按时间窗口截断**：段列表是「这条线去过哪些地方」，不是随时间衰减的
     健康指标。限制窗口会让 H2 线显示 0 段（它们的出口日志停在 11-03，
     之后一直没拿到地址），看起来像「从没出去过」。
 
-    v6 按 /64 计 —— 一次抽签得到的是 /64，同 /64 内的不同 /128 不算换段；
-    v4 按地址计（v4 没有段的概念，同一个 colo 池里翻牌）。
+    v6 的 `v6` 按 /64 计 —— 一次抽签得到的是 /64，同 /64 内的不同 /128 不算
+    换段；`addr` 按 /128 计；v4 按地址计（v4 没有段的概念，同一个 colo 池里翻牌）。
 
     WHY 读日志而不是台账：`.warp_ip_history.jsonl` 只有 `ip/t/b/k`，**没有
     渠道归属**（唯一写入点 `daemon.py:_mark_warp_ip_used` 拿到的就是地址）。
     带渠道归属的只有 daemon 打的两类出口行：`出口 <ip> 模型层` / `重启后出口=<ip>`。
     """
     path = log_file or Path(CFG["log_file"])
-    seen: dict[str, dict[str, set]] = defaultdict(lambda: {"v6": set(), "v4": set()})
+    seen: dict[str, dict[str, set]] = defaultdict(
+        lambda: {"v6": set(), "addr": set(), "v4": set()})
     for p in _rotated_logs(path):
         try:
             fh = p.open(encoding="utf-8", errors="replace")
@@ -193,10 +196,24 @@ def channel_segments(log_file: Path | None = None) -> dict[str, dict]:
                 if addr.version == 6:
                     seen[o.group(1)]["v6"].add(
                         _seg_name(ipaddress.ip_network(ip + "/64", strict=False)))
+                    # /128 单列一份：段指纹的池子大小要按 /48 /64 /128 三级看，
+                    # 只有 /64 个数会把「64 个地址挤在 1 个 /64 里」和
+                    # 「64 个地址摊在 64 个 /64 里」显示成同一个数。
+                    seen[o.group(1)]["addr"].add(str(addr))
                 else:
                     seen[o.group(1)]["v4"].add(ip)
-    return {tag: {"v6": sorted(v["v6"], key=_seg_sort), "v4": sorted(v["v4"])}
+    return {tag: {"v6": sorted(v["v6"], key=_seg_sort),
+                  "addr": sorted(v["addr"], key=_addr_sort),
+                  "v4": sorted(v["v4"])}
             for tag, v in seen.items()}
+
+
+def _addr_sort(ip: str):
+    """IPv6 地址按数值排序；解析不了的按字符串垫底。"""
+    try:
+        return (0, ipaddress.ip_address(ip))
+    except ValueError:
+        return (1, ip)
 
 
 def _seg_sort(name: str) -> tuple:
@@ -395,7 +412,13 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             # 不是「池子里有多少段」—— 池子是机房共享的，同一时刻所有线在
             # 同一个池里抽签；这里说的是**这条线自己的覆盖面**。
             "seg_v6": (segs.get(tag) or {}).get("v6") or [],
+            # 这条线落过的 /128 个数。和 /64 个数并列才有意义：同样 60 个 /64，
+            # 摊着 60 个地址 vs 挤在 1 个 /64 里的 60 个地址，撞车概率差 60 倍。
+            "seg_addr": (segs.get(tag) or {}).get("addr") or [],
             "seg_v4": (segs.get(tag) or {}).get("v4") or [],
+            # 段指纹反推的落地 colo（`[(colo, /64 个数)]`）。与 `colo` 是两件事：
+            # `colo` 是代理节点所在机房，这里说的是出口地址落在哪个机房。
+            "colo_fp": _fp_mix((segs.get(tag) or {}).get("v6") or []),
             "held": bool(st.get("ban_hold_until") and st["ban_hold_until"] > now),
             "hold_until": st.get("ban_hold_until") or 0,
             "quota_until": st.get("quota_until") or 0,
@@ -430,44 +453,50 @@ def _seg32(name: str) -> str:
     return ":".join(name.split(":")[:2])
 
 
-def _seg32_groups(r: dict) -> list[tuple[str, int, int]]:
-    """`[(/32 名, 它下面几个 /48, 几个 /64)]`，按数值排序。"""
+def _seg32_groups(r: dict) -> list[tuple[str, int, int, int]]:
+    """`[(/32 名, 它下面几个 /48, 几个 /64, 几个 /128)]`，按数值排序。"""
     from collections import Counter
     c48: Counter = Counter()
     c64: Counter = Counter()
+    c128: Counter = Counter()
     for s in (r.get("seg_v6") or []):
         p32 = _seg32(s)
         c64[p32] += 1
         c48[(p32, s.rsplit(":", 1)[0])] += 1
+    for ip in (r.get("seg_addr") or []):
+        c128[_seg32(ip)] += 1
     n48 = Counter(p32 for p32, _ in c48)
-    return [(p32, n48[p32], c64[p32])
+    return [(p32, n48[p32], c64[p32], c128[p32])
             for p32 in sorted(c64, key=_seg_sort)]
 
 
-def _seg_counts(r: dict) -> tuple[int, int, int]:
-    """`(v6 /32 个数, /48 个数, /64 个数)`。"""
+def _seg_counts(r: dict) -> tuple[int, int, int, int]:
+    """`(v6 /32 个数, /48 个数, /64 个数, /128 个数)`。"""
     v6 = r.get("seg_v6") or []
     return (len({_seg32(s) for s in v6}),
-            len({s.rsplit(":", 1)[0] for s in v6}), len(v6))
+            len({s.rsplit(":", 1)[0] for s in v6}), len(v6),
+            len(r.get("seg_addr") or []))
 
 
 def print_segments(rows: list[dict]) -> None:
-    """每条渠道一行：`N 个 /32 · M 个 /48 · K 个 /64`，然后列出每个 /32 的细分。
+    """每条渠道一行：`N 个 /32 · M 个 /48 · K 个 /64 · L 个 /128`，再列每个 /32 的细分。
 
     /64 是**抽签结果**、不可选，一条线能有 178 个；/48 是抽签所在的池子，
     也有 51 个。只有 /32 是可读的规模（实测全场就 `bac1` / `bac5` 两批）。
+    /128 个数必须和 /64 并肩看：60 个地址摊在 60 个 /64 里和挤在 1 个 /64 里，
+    /64 一列看不出差别，撞车概率却差 60 倍。
     """
     if not rows:
         print("（没有渠道数据）")
         return
-    print("\n出口段明细（/32 = 地址批次；括号内是它下面的 /48 与 /64 个数）")
+    print("\n出口段明细（/32 = 地址批次；括号内是它下面的 /48、/64 与 /128 个数）")
     print("-" * 92)
     width = max((_w(r["tag"]) for r in rows), default=0) + 2
     for r in rows:
-        n32, n48, n64 = _seg_counts(r)
+        n32, n48, n64, n128 = _seg_counts(r)
         v4 = list(r.get("seg_v4") or [])
         if n64:
-            head = f"{n32} 个 /32 · {n48} 个 /48 · {n64} 个 /64"
+            head = f"{n32} 个 /32 · {n48} 个 /48 · {n64} 个 /64 · {n128} 个 /128"
         else:
             head = ""
         if v4:
@@ -475,27 +504,130 @@ def print_segments(rows: list[dict]) -> None:
         if not head:
             print(f"{_pad(r['tag'], width)} —")
             continue
-        detail = "  ".join(f"{p}({a} 个 /48, {b} 个 /64)"
-                           for p, a, b in _seg32_groups(r))
+        detail = "  ".join(f"{p}({a} 个 /48, {b} 个 /64, {c} 个 /128)"
+                           for p, a, b, c in _seg32_groups(r))
         print(f"{_pad(r['tag'], width)} {head}")
         if detail:
             print(" " * (width + 1) + detail)
 
 
-def _seg_label(r: dict) -> str:
-    """表格里的「出口段」列：`/32 个数//48 个数//64 个数`，v4 追加 `+Nv`。
+def print_colo_fp(rows: list[dict], segments: dict[str, dict]) -> None:
+    """`colo ↔ 段指纹` 对照：声明机房 vs 出口地址反推的落地机房。
 
-    全为 0 时显示 `—` 而不是 `0/0/0` —— 会被读成「一段都没有」，
-    实际是「日志里没见过它的出口」（新起的线、日志被轮转过）。
+    两个 colo 不是一回事，混着看会得出相反结论：
+      - **声明的 colo** = 这条渠道的代理节点所在机房（`config.py` 的块模型）；
+      - **段指纹 colo** = `ipv6_segments.colo_of()` 按出口 /64 的第三四段反推
+        的落地机房。
+
+    WG 线经机场节点中转，节点在 NRT、出口完全可能落在 SIN —— 实测 WG-4..7
+    声明 NRT，出口 /64 有 73~93 个落在 SIN。块模型按声明 colo 分配渠道，
+    所以这不是 bug；但**按声明 colo 判断段池大小会错**（NRT 声明 7 条渠道，
+    实际只有 12 个 /64 可用，重复率 30%）。
+
+    `池` 列是**指纹属于该 colo 的 /48 · /64 · /128 三级个数**（全部渠道合并），
+    这才是该机房真正可抽的池子大小。三级并列看是必需的：NRT 的 /48 有 12 个
+    和 SIN 一样多，但 /64 只有 12 个而 SIN 有 132 —— 只看 /48 会以为两边池子
+    等大，而 NRT 的 /128 级 5 分钟重复率是 30%，SIN 只有 0.4%。
     """
-    n32, n48, n64 = _seg_counts(r)
+    if not rows:
+        return
+    pools: dict[str, dict[str, set]] = defaultdict(
+        lambda: {"48": set(), "64": set(), "128": set()})
+    for v in segments.values():
+        for s in v.get("v6") or []:
+            s48 = s.rsplit(":", 1)[0]
+            try:
+                colo = ipv6_segments.colo_of(ipaddress.ip_network(s48 + "::/48"))
+            except ValueError:
+                continue
+            pools[colo]["48"].add(s48)
+            pools[colo]["64"].add(s)
+        for ip in v.get("addr") or []:
+            try:
+                colo = ipv6_segments.colo_of(
+                    ipaddress.ip_network(ip + "/64", strict=False))
+            except ValueError:
+                continue
+            pools[colo]["128"].add(ip)
+
+    by_colo: dict[str, dict] = defaultdict(lambda: {"n": 0, "fp": defaultdict(int)})
+    for r in rows:
+        d = by_colo[r["colo"] or "?"]
+        d["n"] += 1
+        for c, n in r.get("colo_fp") or []:
+            d["fp"][c] += n
+
+    print("\ncolo ↔ 段指纹（声明 = 渠道所属机房；指纹 = 出口段反推的落地机房）")
+    print("-" * 92)
+    print(f"{_pad('声明', 6)} {_pad('渠道', 5, False)} {_pad('池 48/64/128', 13, False)}  "
+          f"指纹分布（按 /64 计数，前 5）")
+    for colo, d in sorted(by_colo.items()):
+        fp = sorted(d["fp"].items(), key=lambda kv: -kv[1])
+        total = sum(n for _, n in fp)
+        pool = pools.get(colo) or {}
+        cell = (f"{len(pool['48'])}/{len(pool['64'])}/{len(pool['128'])}"
+                if pool else "—")
+        if not total:
+            print(f"{_pad(colo or '?', 6)} {_pad(str(d['n']), 5, False)} "
+                  f"{_pad(cell, 13, False)}  —")
+            continue
+        dist = " · ".join(f"{c} {n * 100 // total}%" for c, n in fp[:5])
+        # 只在**主落点**与声明不同时标 ≠。多条渠道合并后必然混着几个机房，
+        # 按「是否 100% 一致」标会让几乎每行都带 ≠，标记本身就失去信息。
+        mark = "" if fp[0][0] == colo else "≠"
+        print(f"{_pad(colo or '?', 6)} {_pad(str(d['n']), 5, False)} "
+              f"{_pad(cell, 13, False)}  {mark}{dist}")
+    print("\n  池 = 指纹属于该机房的 /48 / /64 / /128 个数（全部渠道合并），越大越不容易撞段。")
+    print("  ≠  = 出口落在别的机房（WG 线经机场节点中转，节点机房≠出口机房是常态）。")
+
+
+def _seg_label(r: dict) -> str:
+    """表格里的「出口段」列：`/32//48//64//128` 四级个数，v4 追加 `+Nv`。
+
+    全为 0 时显示 `—` 而不是 `0/0/0/0` —— 会被读成「一段都没有」，
+    实际是「日志里没见过它的出口」（新起的线、日志被轮转过）。
+
+    /128 必须带上：`2/25/147/147` 是「每个 /64 只抽到一个地址」，
+    `2/25/147/9` 是「147 个地址反复挤在 9 个 /64 里」—— 前三级一模一样。
+    """
+    n32, n48, n64, n128 = _seg_counts(r)
     n4 = len(r.get("seg_v4") or [])
     parts = []
     if n64:
-        parts.append(f"{n32}/{n48}/{n64}")
+        parts.append(f"{n32}/{n48}/{n64}/{n128}")
     if n4:
         parts.append(f"+{n4}v")
     return " ".join(parts) or "—"
+
+
+def _fp_mix(segs_v6: list[str]) -> list[tuple[str, int]]:
+    """按**段指纹**把一条渠道的 /64 归到 colo，`[(colo, n)]` 从多到少。
+
+    这是 `ipv6_segments.colo_of()` 的口径：由第三/四段反推落地机房。
+    它和渠道自己的 `colo`（代理节点所在机房）是**两件事** —— WG 线经 NRT
+    节点中转，出口完全可能落在 SIN。
+    """
+    import collections
+    c: collections.Counter = collections.Counter()
+    for s in segs_v6:
+        try:
+            c[ipv6_segments.colo_of(ipaddress.ip_network(s + "::/64"))] += 1
+        except ValueError:
+            continue
+    return c.most_common()
+
+
+def _fp_label(r: dict) -> str:
+    """表格「指纹」列：段指纹给出的落地 colo，与声明的 colo 不同时标 `≠`。
+
+    混用多个 colo 时只显示占比最大的那个 —— 61 个 /48 摊在 6 个机房里，
+    一列放不下；要完整分布看下面的明细表。
+    """
+    mix = r.get("colo_fp") or []
+    if not mix:
+        return "—"
+    top, _ = mix[0]
+    return top if top == r.get("colo") else f"≠{top}"
 
 
 def _w(s: str) -> int:
@@ -528,8 +660,8 @@ def print_table(rows: list[dict], hours: float) -> None:
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
-            f"{_pad('colo ban', 9, False)} {_pad('/32,/48,/64', 12, False)} "
-            f"{_pad('重启', 6, False)}  "
+            f"{_pad('colo ban', 9, False)} {_pad('/32,/48,/64,/128', 16, False)} "
+            f"{_pad('落点', 8)} {_pad('重启', 6, False)}  "
             f"{_pad('订阅', 8)} {_pad('节点名', 30)} 节点 / 状态")
     print(head)
     print("-" * (_w(head) + 40))
@@ -550,7 +682,8 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(_pct(r['ban_rate']), 5, False)} "
               f"{_pad(okfail, 7, False)} "
               f"{_pad(_pct(r['colo_ban_rate']), 9, False)} "
-              f"{_pad(_seg_label(r), 10, False)} "
+              f"{_pad(_seg_label(r), 16, False)} "
+              f"{_pad(_fp_label(r), 8)} "
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
               f"{r['node']}  {' '.join(flags)}")
@@ -657,7 +790,8 @@ footer{{color:var(--muted);font-size:11px;margin-top:14px;line-height:1.7}}
 <th>渠道</th><th>承载</th><th>colo</th><th>机房</th><th>节点名（机场）</th>
 <th>节点地址</th><th>订阅</th><th>订阅地址</th><th>出口 IP</th><th>成功率</th>
 <th>ban 率</th><th>成功/失败</th><th>colo ban</th>
-<th title="v6 出口段：/32 个数 / /48 个数 / /64 个数（悬停看 /32）。v4 另计">出口段 /32·/48·/64</th>
+<th title="v6 出口段四级个数：/32 / /48 / /64 / /128（悬停看 /32 批次）。/128 与 /64 并肩看才分得清「地址挤在同一段」和「摊在各个段」。v4 另计">出口段 /32·/48·/64·/128</th>
+<th title="段指纹反推的落地机房。≠ 表示与声明的 colo 不同（WG 线经机场节点中转时是常态）">落点</th>
 <th>重启</th><th>状态</th>
 </tr></thead><tbody>{rows}</tbody></table></div>
 <div class="legend">
@@ -722,8 +856,9 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
             f'<td class="mono">{r["ok"]}/{r["ban"] + r["err"]}</td>'
             f'<td class="mono dim">{_pct(r["colo_ban_rate"])}</td>'
             f'<td class="mono dim seg" title="'
-            f'{html.escape(" ".join(p for p, _, _ in _seg32_groups(r)))}">'
+            f'{html.escape(" ".join(p for p, *_ in _seg32_groups(r)))}">'
             f'{html.escape(_seg_label(r))}</td>'
+            f'<td class="mono dim">{html.escape(_fp_label(r))}</td>'
             f'<td class="mono dim">{r["restarts"]}</td>'
             f'<td>{" ".join(pills)}</td></tr>')
 
@@ -745,10 +880,10 @@ def main() -> int:
     args = ap.parse_args()
 
     state = (_read_json(PROJECT / ".warp_line_state.json") or {}).get("lines") or {}
+    segs = channel_segments()
     rows = summarize(state, load_channels(),
                      _read_json(sources_path()) or {},
-                     args.hours, dormant=dormant_tags(),
-                     segments=channel_segments())
+                     args.hours, dormant=dormant_tags(), segments=segs)
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
     elif args.html:
@@ -756,6 +891,7 @@ def main() -> int:
     else:
         print_table(rows, args.hours)
         print_segments(rows)
+        print_colo_fp(rows, segs)
     if args.by:
         print_grouped(rows, args.by)
     return 0
