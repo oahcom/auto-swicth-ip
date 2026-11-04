@@ -170,6 +170,44 @@ def load_nodes(path: str | None = None) -> dict:
             if o.get("type") not in skip and o.get("server") and o.get("server_port")}
 
 
+def _register_probe_device(d: Path) -> Path | None:
+    """注册一台独立探测设备，返回目录；失败返回 None。
+
+    与 `deploy/h2-add-devices.sh` 同一套 `usque register` 调用，只是名字与
+    用途不同：探测设备**永不**进生产成员表（`render_h2_lines.free_devices`
+    显式排除 `usque-probe*`），所以它只消耗一次 CF 注册配额。
+    """
+    usque = PROJECT / ".warp" / "usque" / "usque"
+    if not usque.exists():
+        return None
+    d.mkdir(parents=True, exist_ok=True)
+    link = d / "usque"
+    if not link.exists():
+        link.symlink_to("../usque/usque")
+    print(f"＋ 注册探测设备 {d.name} …", file=sys.stderr)
+    try:
+        # 必须直连：本机若 export 了 http(s)_proxy，usque 会走代理，CF 返回
+        # 非 JSON 错误页（`failed to parse error response`）。
+        env = {k: v for k, v in os.environ.items()
+               if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+        r = subprocess.run(["./usque", "register", "--accept-tos",
+                            "-n", f"asip-{d.name}"],
+                           cwd=str(d), env=env, capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    cfg = d / "config.json"
+    if r.returncode != 0 or not cfg.exists():
+        tail = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+        print(f"⚠ 注册失败：{tail.splitlines()[-1][:160] if tail else 'rc=%d' % r.returncode}",
+              file=sys.stderr)
+        return None
+    try:
+        cfg.chmod(0o600)
+    except OSError:
+        pass
+    return d
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="H2/MASQUE 承载实测（独立探测设备）")
     ap.add_argument("--tags", nargs="*", help="要测的节点 tag")
@@ -190,7 +228,16 @@ def main() -> int:
 
     devs = [Path(d) for d in args.devices if (Path(d) / "config.json").exists()]
     if not devs:
-        raise SystemExit("✗ 没有可用的探测设备（先用 usque register 建一台）")
+        # **自己注册一台**，不要报错退出。文档说这些设备是「asip 自己注册的」，
+        # 但此前全库没有任何一处真的去注册它们 —— 新机器上这条探测路径永远
+        # 跑不起来（远端 2026-11-05 实测 `--new-only` 直接报「没有可用的探测
+        # 设备」），而 daemon 唯一的 H2 探测入口正是它。结果是 block-map 永远
+        # 补不上新节点、`want_n` 永远小于设备数、自动建线逻辑永远不触发。
+        # 不能复用生产设备：一台 usque 设备 = 一个 CF 会话身份，探测会把正在
+        # 承载流量的那条线踢下线。
+        devs = [_register_probe_device(Path(args.devices[0]))] if args.devices else []
+        if not devs:
+            raise SystemExit("✗ 没有可用的探测设备，且自动注册失败")
 
     nodes = load_nodes(args.config)
     # 已测台账：只跳过**测过且失败**的节点。成功的已经入块了，`new-only`
