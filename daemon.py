@@ -3562,6 +3562,10 @@ def _h2_select(member: dict | None, node: str) -> str:
 # 没有它，整池失效的线（实测 ORD 池只有 1 个、SLC/LAX 池全是 bilibili）会每
 # 60s 在死节点之间空转：PUT 本身无害，但每次都会清掉 `ip` 并触发一整轮探测。
 _H2_TRIED: dict[str, set[str]] = {}
+# 整池试遍仍拿不到出口的 H2 线（`_h2_repair` 最后一次的结果）。重启 usque 换的是
+# 同一个死节点上的新会话，重启没有意义 —— 判据见 `_line_node_cannot_carry`。
+# 拿到出口时清空（与 `_H2_TRIED` 同一处），换节点成功后也清空。
+_H2_POOL_DEAD: set[str] = set()
 
 
 def _h2_next_node(member: dict | None) -> str | None:
@@ -3602,9 +3606,11 @@ def _h2_repair(member: dict | None) -> bool:
     _NODE_NEXT_CHECK[tag] = now + float(
         _warp().get("node_rotation_interval_sec", 60))
     if not nxt:
-        return False                     # 整池都试过了，等重渲染/地址恢复
+        _H2_POOL_DEAD.add(tag)           # 整池都试过了，等重渲染/地址恢复
+        return False
     if _rehome_one(tag, nxt) != "ok":
         return False
+    _H2_POOL_DEAD.discard(tag)
     _H2_TRIED.setdefault(tag, set()).add(nxt)
     # 新落地节点的出口地址必然不同：清掉旧地址，让探测器按新链路重新判。
     _invalidate_warp_line_ip(tag)
@@ -4104,6 +4110,15 @@ def _line_node_cannot_carry(tag: str) -> bool:
     rank 1（没测过）不算不能承载 —— 未知不等于坏。
     """
     try:
+        m = _warp_member(tag)
+        if m and m.get("kind") == "h2":
+            # H2 的落地节点在共享 sing-box 的 selector 里，**不在 `warp_wg` 台账**
+            # —— 查台账永远 `node=None`，下面整段对 H2 从来没生效过。实测
+            # 2026-11-05 SLC-11/12/24 整池（4 个 bilibili 节点）TCP 全死、
+            # `ever_ip` 始终 False，仍每 ~2 分钟重启一次 usque-h2-N。
+            # 判据只用 `_h2_repair` 已经算过的结论（它每 60s 亲自巡一遍池子），
+            # 这里不额外打 Clash API —— 本函数在探测热路径上。
+            return tag in _H2_POOL_DEAD
         line = (warp_wg._read_state().get("lines") or {}).get(tag) or {}
         node = line.get("node")
         if not node:
@@ -5109,6 +5124,7 @@ def _probe_one_line(member: dict) -> None:
     # 这条链路能出地址了：H2 的候选池从头开始记（见 `_h2_next_node`）。
     if member.get("kind") == "h2":
         _H2_TRIED.pop(tag, None)
+        _H2_POOL_DEAD.discard(tag)
     cur = _warp_line_state(tag)
     if tag != active and _warp_line_ok_fresh(tag, now) and cur.get("ip") == ip:
         return

@@ -265,6 +265,45 @@ def test_h2_repair_switches_node_before_restarting(monkeypatch):
                                   "index": 3})
 
 
+def test_h2_exhausted_pool_stops_the_restart_loop(monkeypatch):
+    """整池试遍仍取不到出口 → 判定「重启没意义」，不再每轮重启 usque。
+
+    H2 的落地节点在共享 sing-box 的 selector 里，`warp_wg` 台账里没有它们，
+    所以 `_line_node_cannot_carry` 查台账永远 `node=None`、恒返回 False ——
+    实测 2026-11-05 SLC-11/12/24 的 4 个 bilibili 节点 TCP 全死，`ever_ip`
+    始终 False，仍每 ~2 分钟重启一次 usque-h2-N（fail_streak 1500+）。
+    """
+    import daemon
+
+    monkeypatch.setattr(daemon, "_warp", lambda: {"node_rotation_interval_sec": 60})
+    monkeypatch.setattr(daemon, "_warp_member",
+                        lambda t: {"tag": t, "kind": "h2", "index": 3})
+    names = ["h2-a", "h2-b"]
+    cur = {"now": "h2-a"}
+    monkeypatch.setattr(daemon, "_h2_clash", lambda: type("F", (), {
+        "selector_state": lambda self, s: (names, cur["now"])})())
+    monkeypatch.setattr(daemon, "_rehome_one", lambda t, n: "ok")
+    monkeypatch.setattr(daemon, "_invalidate_warp_line_ip", lambda t: None)
+    daemon._NODE_NEXT_CHECK.clear()
+    daemon._H2_TRIED.clear()
+    daemon._H2_POOL_DEAD.clear()
+    m = {"tag": "WARP-H2-X-3", "kind": "h2", "index": 3}
+    # 还没试过候选：不能判死（刚启动/池子刚重渲染）。
+    assert daemon._line_node_cannot_carry(m["tag"]) is False
+    assert daemon._h2_repair(m)                       # a → b
+    assert daemon._line_node_cannot_carry(m["tag"]) is False
+    cur["now"] = "h2-b"
+    daemon._NODE_NEXT_CHECK.clear()
+    assert daemon._h2_repair(m)                       # b → a
+    # 整池都试过且都不通：重启 usque 换的只是同一个死节点上的新会话。
+    daemon._NODE_NEXT_CHECK.clear()
+    assert not daemon._h2_repair(m), "整池试遍后不该再换"
+    assert daemon._line_node_cannot_carry(m["tag"]) is True
+    # 拿到出口即解除（下一轮探测成功时清空）。
+    daemon._H2_POOL_DEAD.discard(m["tag"])
+    assert daemon._line_node_cannot_carry(m["tag"]) is False
+
+
 def test_noaddr_lock_release_switches_node_first(monkeypatch):
     """「连续 5h 取不到出口」的锁到期时，H2 先后换节点再解锁。
 
