@@ -111,6 +111,42 @@ def h2_channels() -> list[dict]:
                 })
             print(f"块模型未筛出 h2 渠道，改用台账 {len(out)} 条"
                   f"（.warp/h2/channels.json）", file=sys.stderr)
+            # **台账只是起点，不是天花板**：设备够的时候（远端实测 16 台空闲 +
+            # 22 台在册）新 colo 的 h2 节点应当能开新线。否则台账既是渲染器的
+            # 输入又是它的输出，渲染器永远扩张不了 —— 自锁。这里把 block-map
+            # 里还没被台账覆盖的 h2 节点补成新渠道，编号接在既有最大 index
+            # 之后（与 `_member_order` 同一约定）。
+            have = {c["node"] for c in out}
+            cap = int((CFG["warp"].get("blocks") or {})
+                      .get("channels_per_block") or 0)
+            per_colo: dict[str, int] = {}
+            for c in out:
+                if c.get("colo"):
+                    per_colo[c["colo"]] = per_colo.get(c["colo"], 0) + 1
+            # 按 colo 分组、组内按名字排序：同一批新增在两次渲染间保持稳定。
+            cand: dict[str, list[str]] = {}
+            for node, meta in nodes_map.items():
+                if not isinstance(meta, dict) or meta.get("carrier") != "h2":
+                    continue
+                if node not in have:
+                    cand.setdefault(str(meta.get("colo") or "?"), []).append(node)
+            nxt = max([c["index"] for c in out] or [-1]) + 1
+            added = 0
+            for colo in sorted(cand):
+                for node in sorted(cand[colo]):
+                    if cap and per_colo.get(colo, 0) >= cap:
+                        break
+                    out.append({"tag": f"WARP-H2-{colo}-{nxt}",
+                                "node": node, "colo": colo,
+                                "colo_measured": colo, "carrier": "h2",
+                                "index": nxt, "family": "v4",
+                                "_saved_device": None})
+                    per_colo[colo] = per_colo.get(colo, 0) + 1
+                    nxt += 1
+                    added += 1
+            if added:
+                print(f"台账之外按 block-map 补 {added} 条 h2 渠道",
+                      file=sys.stderr)
     # v4 块（colo=ALL）没有自己的节点，节点与 SIN 那三条重复，排最后。
     out.sort(key=lambda c: (c["index"], blk_pos.get(c["colo"], len(table))))
     return out

@@ -171,7 +171,44 @@ run "cd $REMOTE_DIR && mkdir -p .warp/h2
 cp /tmp/block-map.json .warp/block-map.json 2>/dev/null || true
 cp /tmp/channels.json .warp/h2/channels.json 2>/dev/null || true
 chmod 600 .warp/block-map.json 2>/dev/null || true
-echo '  已落盘'"
+echo '  已落盘（按远端订阅过滤见下一步）'"
+
+# 两台机器的**订阅源可以不同**：本机 block-map 里 71 个 h2 节点，远端实测有
+# 28 个根本不在它的主配置/沉睡池里（`greatgame`/`dankenet` 两个域名远端一条
+# 都没有）。把这些节点带过去，`render_h2_lines.py` 会逐条报「不在主配置/沉睡池」
+# 然后跳过 —— 表面看是渲染失败，实际是拓扑不属于这台机器。
+# 所以落盘后按**远端自己**的出站表过滤，只留它真能连上的节点。
+run "cd $REMOTE_DIR && python3 - <<'PY'
+import json
+from pathlib import Path
+proj = Path('.')
+try:
+    cfg = json.loads((proj / 'singbox-config.json').read_text())
+    live = {o['tag'] for o in cfg.get('outbounds', []) if o.get('tag')}
+except (OSError, ValueError):
+    live = set()
+try:
+    dorm = {o['tag'] for o in json.loads((proj / 'dormant-outbounds.json').read_text())}
+except (OSError, ValueError, KeyError, TypeError):
+    dorm = set()
+known = live | dorm
+p = proj / '.warp' / 'block-map.json'
+if known and p.exists():
+    try:
+        m = json.loads(p.read_text())
+    except ValueError:
+        m = {}
+    nodes = m.get('nodes') if isinstance(m.get('nodes'), dict) else m
+    if isinstance(nodes, dict):
+        kept = {k: v for k, v in nodes.items() if k in known}
+        dropped = len(nodes) - len(kept)
+        if m.get('nodes') is nodes:
+            m['nodes'] = kept
+        else:
+            m = kept
+        p.write_text(json.dumps(m, ensure_ascii=False, separators=(',', ':')))
+        print(f'  block-map 过滤：{len(nodes)} → {len(kept)}（本机没有 {dropped} 个节点）')
+PY"
 
 # ---------------------------------------------------------------- 4. 设备
 say "4/7 补齐 usque 设备（每条 H2 线一台，CF 侧同一设备只能一个会话）"
