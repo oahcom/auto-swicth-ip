@@ -288,6 +288,200 @@ opencode 限流"，不是"隧道不通"。结果 22 条线全被判死，包括�
 
 ---
 
+### 13c. H2 线的编号（=端口偏移）是既有部署契约，不能重算
+
+**看起来像**：渲染器按「有多少台设备就取前几条」渲染，顺手重编号更整齐。
+
+**实际是**：`WARP-H2-<COLO>-<N>` 的 **N 就是 SOCKS 端口偏移**（`1180 + N`），
+这套映射同时写进了三处，任何一处对不上就是「线在跑但没人用它」：
+
+| 位置 | 内容 |
+|---|---|
+| `.warp/warp-outbound.json` | 主 sing-box 的 H2 出站成员（tag + server_port） |
+| 主配置 `opencode-out` 的成员表 | selector 可选成员 |
+| `.warp/backfill.json` 的 `backfill_for` | 哪条 WG 线补哪条 H2 线的位 |
+
+2026-11-04 实测教训：渲染器改成按「取前 n 条」重排后，19 条里只有 **2 条**
+能对上主配置成员表。现象极难查 —— 19 条 usque 全 active、SOCKS 口全在监听、
+`curl` 单条直连也能出 `warp=on`，但 selector 指到的名字对应的是别的端口。
+
+**正确做法**：编号取既有成员表的顺序（`.warp/warp-outbound.json` 里
+`WARP-H2-*` 的出现顺序），渲染器**只重选节点**，不改顺序、不改名字。
+设备不够时宁可少渲染几条，也不许改名。
+
+**同块多条线不能重名**：`ch["index"]` 是**块内**序号，同 colo 三条线会全叫
+`NRT-0/1/2`；而成员编号必须是全局唯一的。两者不是一回事。
+
+---
+
+### 13d. H2 线与 WG 线的「换节点」机制不同（不能互相套用）
+
+**看起来像**：WG 有 `warp_wg.rebind()` 能在运行时换节点，H2 照抄一个就行。
+
+**实际是**，两者切换点在**完全不同的地方**，运行时换 H2 节点是做不到的：
+
+| | WG（`warp-wg-N`） | H2（`usque-h2-N`） |
+|---|---|---|
+| 节点写在哪 | 该线**自己的** `singbox.json` 内嵌出站副本 | 19 条线**共享**的 `asip-h2-singbox.service` |
+| 运行时能换吗 | ✅ `rebind()` 改自己那份 + 重启自己那条 | ❌ 要改共享配置，重启就是 19 条一起断 |
+| 正规换法 | 运行时 rebind | **重渲染 + `h2-install.sh`** |
+
+三条硬限制（`daemon.py` 里 `_rehome_one` 对 `kind != "wg"` 直接返回 `"skip"`）：
+
+1. **不能 rehome** —— H2 的落地节点写在渲染产物里，运行时改不了
+2. **换节点只能重渲染** —— 改 `channels.json` 的分配，再跑
+   `render_h2_lines.py` + `h2-install.sh`。代价是那个共享 sing-box 重启，
+   19 条一起断几秒（daemon 的 `_singbox_pkill_argv` 按主配置路径精确匹配，
+   不会误杀它）
+3. **补位是 WG 的活** —— H2 渠道没节点可用时，`_backfill_open` 拉起的是空闲
+   **WG** 设备线（`kind="wg"`），落到 ban 率最低的 colo
+
+**不要**在 `h2_pool.py` 之类的地方造运行时 rebind：它绕过上面三条约束，
+会让编号/端口/`backfill_for` 全部错位。
+
+---
+
+### 13d2. 「设备用完」是两种设备用完了；补位只补 WG 那一种
+
+**看起来像**：补位日志报「没有能起设备的空闲线」，那就再注册几台设备不就完了。
+
+**实际是**，这里的「设备」有两套，互不通用：
+
+| | WG 设备 | H2 设备 |
+|---|---|---|
+| 注册方式 | `wgcf register`（`warp_wg.register_line`） | `usque register`（`deploy/h2-add-devices.sh`） |
+| 落点 | `.warp/wglines/lineN/profile.conf` | `.warp/usque*/config.json` |
+| 占用方 | `warp-wg-N.service` | `usque-warp*.service` + `usque-h2-*.service` |
+| 生成方式 | 注册 + **单元另一步**（`wg-lines-install.sh`） | 注册 + **重渲染**（`render_h2_lines.py`） |
+| 能否补位 | ✅ 直接起一条新线 | ❌ 要重渲染 19 条线，全部断几秒 |
+
+**所以 H2 渠道被封时，自愈动作是造 WG 设备线，不是造 usque 设备**。
+2026-11-04 之前 `_ensure_h2_devices` 走反了方向：它注册 usque 设备，但补位
+判据（`_backfill_spare_indices`）只认 `wglines/lineN`，注册多少台都补不上，
+反而每台烧一格 CF 注册额度、把窗口拉长。
+
+正确路径是 `_ensure_backfill_line()`（2026-11-04 加）：
+
+1. 先找「已注册但**单元没装**」的线 → 跑 `deploy/wg-lines-install.sh --line N`
+   （不烧 CF 注册额度）
+2. 一台都没有 → `warp_wg.register_line(max+1)` + 同一条命令装单元
+3. 每 `_WG_CREATE_GAP`(600s) 最多**注册**一条；CF 对 wgcf 约 9 台/窗口。
+   **装单元不受这条限速**（不烧额度），且限速依据是磁盘上最新
+   `profile.conf` 的 mtime，不是进程内变量 —— 后者 daemon 一重启就归零，
+   实测 19:35 重启后 8 秒内连造两条线
+4. 线号硬上限 `_WG_MAX_LINES`=64：补位判据哪天回归出 bug（新线装完单元却
+   不被认），这条路径会每 10 分钟烧一台 CF 设备。宁可停下报错，不无声膨胀
+
+**mask 的线（软链 `/dev/null`）永不自动恢复**：那是主人手工停用的，
+不是「没部署」。
+
+**为什么单元是独立一步**：`register_line` 只写 profile，单元由
+`deploy/wg-lines-install.sh` 生成。只注册不装单元 = 那条线不存在 ——
+实测 line31 注册了一整晚，补位日志每轮仍报「没有能起设备的空闲线」，
+因为 `_backfill_spare_indices` 要求单元文件真实存在。
+
+**装单元必须走 `systemd-run`，不能直接 `sudo`**：`auto-switch-ip.service`
+带 `ProtectSystem=strict`，`/etc` 在**它的 mount namespace** 里是只读的，
+而 `sudo` 不换 namespace —— 直接跑脚本会报
+`/etc/systemd/system/warp-wg-32.service: Read-only file system`
+（实测 2026-11-04 连挂两次）。`systemd-run` 新起一个独立 transient 单元，
+在宿主 namespace 里跑，不受这份沙箱约束。
+
+顺带：以 root 跑脚本时 `id -u`=0、`getent passwd 0` 得 `/root`，单元会被
+写成 `User=root` + `HOME=/root`；凭据属 administrator，那条线起来读不到自己
+的配置。调用方必须显式传 `ASIP_RUN_USER` / `ASIP_RUN_GROUP` / `ASIP_HOME_DIR`
+（`_install_wg_unit` 从 `pwd.getpwuid(os.getuid())` 取）。
+
+---
+
+### 13e. 承载口径：三种 WARP 路径各有名字，`proxy` 只指「纯代理」
+
+**看起来像**：`asip blk` 里 `承载=proxy`，所以这些节点「只是在用代理」。
+
+**实际是**，`proxy` 这个词过去被当成三种东西的统称，必须拆开：
+
+| 叫法 | 含义 | 判据 | 故障表现 |
+|---|---|---|---|
+| `warp-proxy` | WG over UDP，经机场节点中转 | UDP 2408 握手 | UDP 被封就死，TCP 通没用 |
+| `h2-warp` | MASQUE over HTTP/2，裸 TCP 经节点 | CF trace 里 `warp=on` | 只要 TCP 通就能活 |
+| `warp-direct` | 直连 WARP（usque 隧道，不经节点） | MASQUE 直连 CF | 与机场完全无关 |
+| **`proxy`** | **纯代理，不承载 WARP** | 只是订阅池的轮换成员 | 与 WARP 无关 |
+
+前三种都是「拿 WARP 出口」，差别在**用什么协议穿过去**；第四种根本没有
+WARP 出口，它只是把流量转给机场。把它们都显示成 `proxy`，会让人以为
+「这些节点只是在当代理用」，而实际上前三种都在产出 WARP 出口地址。
+
+配置里的 `carrier` 字段（`proxy` / `both` / `h2`）是**块侧的口径**
+（这个 colo 允许走哪几条路），对外展示必须翻译成上表的名字 ——
+`tools/block_view.py` 的 `CARRIER_LABEL` 就是这张映射表。
+
+---
+
+### 13f. 块 = 该 colo 下**全部**适配节点；`channels_per_block` 只决定几条线位
+
+**看起来像**：`asip blk --channels` 里 HKG 块只显示 3 行，所以这个块只有
+3 个节点，其余 18 个「没进块」。
+
+**实际是**：块的定义就是「同 colo 的节点放一块」，**块内所有适配节点都算
+成员**。`channels_per_block`（默认 3）决定的是从这个池子里拉几条**线位**
+（WG 线 / usque 设备），拉不完的留在池子里当候补。
+
+实测 HKG 块：池 21 个节点、排成线位 3 个、候补 18 个。候补不是被丢弃 ——
+前 3 个死了后面的顶上，这正是池子深度的意义。
+
+**看块要看 `asip blk --blocks`**（块池视角：列出全部节点并标出谁有线位），
+`--channels` 是「线位视角」，两者回答的不是同一个问题。
+
+---
+
+### 13g. 自动化探测的两条路必须用**各自的**台账
+
+**看起来像**：`block-map` 里有 colo 就算测过了，自动探测据此跳过。
+
+**实际是**：`colo` 是 **WG** 探测写的，`carrier=h2` 是 **H2** 探测写的，
+两者互不代表。共用判据的后果是 H2 探测永远认为「已测过」——
+实测 296 个生产节点里只有 61 个有 h2 结论，其余 235 个从没测过 H2，
+`carrier=h2` 再也不会增加，H2 池子死在老节点上。
+
+`_pending_probe_nodes(limit, state_path=...)` 因此分两种口径：
+- WG：`block-map` 里没有 colo
+- H2：**H2 自己的** `h2_probe_state.json` 里没有「测过且失败」
+
+两边都遵守同一条：**测过且成功的不跳过**——成功不等于已入块，没跑 merge
+的节点 colo 只留在 JSONL 里。
+
+---
+
+### 13h. 部分 H2 线绑在死节点上是**预期状态**，不是故障
+
+**看起来像**：19 条 H2 里有 8 条 `curl` 不通、绑的是 `bilibili-image-cdn.juhazf.cn`，
+显然是没修完。
+
+**实际是**，这是池子容量的真实约束，改了反而更糟：
+
+- okz 那批节点（`bilibili-image-cdn.juhazf.cn`）最近系统性超时 —— 这是机场侧
+  现状，不是探测或配置问题
+- 能承载 H2 的**活**节点集中在 **etcloud**（18 个），只覆盖 **6 个 colo**：
+  NRT / LAX / SIN / HKG / ICN / BOM
+- **TPE / ORD / SLC 三个 colo 里一个可达节点都没有**，绑在那些 colo 的线
+  （TPE-5/6、ORD-9、SLC-11/12、TPE-18，以及 NRT-13/14）必然显示不通
+
+2026-11-04 实测终态：**13/19 条 `warp=on`**。剩下 6 条不是 bug。
+
+**为什么不能「优化」掉**：
+- 把它们换成别的 colo 的活节点 = 块模型失去了「一条线一个 colo」的意义，
+  colo 分布退化成少数几个落点
+- 删掉它们 = 那 6 台 usque 设备被释放，但飞机场侧一旦恢复（okz 的节点只是
+  超时、DNS 还在），这批线需要重新注册设备才能回来
+
+**该等的**：okz 恢复、或多测出 TPE/ORD/SLC 的 H2 承载节点（`probe_h2_nodes.py`
+只测过 etcloud 的 18 个；yyd2tett 的 49 个与 dasho 的 46 个从未测过 H2）。
+
+**补位不救它**，也别误会：这些线不通时 `_backfill_open` 会给它们开 WG 补位线，
+那是「被封渠道另有渠道顶上」，与「这条 H2 线自己恢复」是两回事（见 13d2）。
+
+---
+
 ### 14. WG 线必须经代理节点中转，直连不通
 
 **看起来像**：为什么要绕这一层，直连不是更快吗？
@@ -372,6 +566,82 @@ WARP 会话身份，导致所有隧道互相踢下线。
 `_same_block_standby` 会跳过已被其他线绑着的节点
 （实测踩过：一轮误换后 WG-1/WG-2 同时绑 `cn.bing.com~13`、WG-8/WG-9 同时绑
 `pq.aws48`）。
+
+---
+
+### 20b. 轮换候选必须按「实测能不能承载 WARP」排序，块序不是判据
+
+**看起来像**：`rotation` 列表已经按「同块优先」排好了，照着取第一个可达的就行。
+
+**实际是**：`rotation` 是 `warp_wg.apply()` 那一刻按**延迟**（`order_nodes`）
+生成的，之后不再重建 —— 它反映的是「当时哪台网络快」，不是「哪台能跑 WARP」。
+实测 2026-11-04：22 条 WG 线的 176 个 rotation 槽位里 **135 个（77%）从没有过
+WG 实测记录**；块内实测可用的节点被 rotation 覆盖的比例：NRT 14 台里只覆盖 1 台
+（7%）、SIN 11 台里 0 台（0%）、LAX 8 台里 1 台（12%）。
+
+后果是轮换在赌：WG-1 在两个 `wg=0/4` 的节点之间来回换了 12 次，每次都是
+「节点 TCP 通但拿不到出口地址」；39 次同块轮换里 5 分钟内拿到出口的只有
+15 次（38%）。
+
+**处置**：`_warp_alive_rank()` 给候选分三档 —— 0 实测能承载 / 1 从没测过 /
+2 实测不能。**只排序、不淘汰**（节点会恢复；剔除会让新加的、还没跑过 diag 的
+节点永远上不了线）。同块/跨块顺序先定，再在同档内保持原序（稳定排序）。
+`_channel_rehome_target()` 与 `_same_block_standby()` 两处共用同一个键。
+
+`family=None`（换线目标先于线号确定）时两族都要看：已测的族**全部**失败
+才算 rank 2。实测两族都测过的 5 台节点里 0 台出现「v6 死但 v4 活」或反向，
+跨族兜底不会把能用的判死。
+
+**残留问题（未修）**：`rotation` 本身仍只在 `apply()` 时生成，不会自己变新鲜。
+修好排序只能保证「在已有的 8 个候选里挑对」，不能把块里另外 13 台可用节点
+拉进候选池。
+
+---
+
+### 20c. 渠道锁的目标节点落在死节点上时，重启永不收敛
+
+**看起来像**：`ban_hold_ready=0` 就再重启一次，这是「重启没成功就重试」的正常逻辑。
+
+**实际是**：它只在**节点能出出口**时才收敛。实测 WG-1 被锁到
+`cn.bing.com:443~13-any`（`wg=0/4`，节点收 TCP 不转发 UDP:2408）后，
+每次重启都拿不到出口 → `ban_hold_ready` 永远写不进去 → 每分钟重定位一次。
+近 30 分钟 119 次「渠道重定位」重启里它占 71 次（WG-22 占 47 次，同因）。
+
+**处置**：`ban_hold_node` 的承载能力是 rank 2（实测不能）时，不再原地重启，
+改投另一个通过承载能力排序的节点（`_channel_rehome_target`）。
+**只有 rank 2 才改投** —— rank 1 是「没测过」，那正是待验证状态，不该因为
+没数据就搬走。
+
+实测改投后 WG-1 立刻拿到出口（`pq.aws63`，`2a09:bac5:55fa:25cd::3c4:53`），
+重启次数从 71 次/30min 降到 1 次/h，`ban_hold_ready` 正常置位。
+
+### 20d. `ban_probes` 落盘是游程，不是逐条样本
+
+**看起来像**：状态表里 `ban_probes` 应该是 `[(ts, verdict), ...]`，报表直接遍历。
+
+**实际是**：daemon 存的是**段** `[起, 止, 条数, 结论]`。判据只问「当天是否
+全部 quota」，条数不丢，丢的是重复时间戳 —— 实测 19k 条样本里只有 484 段
+连续同结论，压缩 39 倍（526 KB → 14 KB）。
+
+WHY 必须压：探测是秒级写入，状态表按 5s 节流落盘。不压之前整个文件 565 KB，
+**9.4 GB/天** 的磁盘写；压完 62 KB / 1.0 GB/天。不能改成按条数截断 ——
+主人 2026-11-04 明确要求「ban_probes 得留多点」，截断会把排查用的时序丢掉。
+
+两个格式都认（旧的两元组读进来会在 `_channel_ban_trim` 里就地压成段）；
+结论在 **e[3]**，不是 e[1]（e[1] 是段尾时间戳）。读侧用
+`_channel_ban_expand()`（daemon）或 `_expand_ban_probes()`（`tools/channel_report.py`）。
+
+### 20e. 补位渠道永不被渠道锁
+
+**看起来像**：所有线一视同仁，连续 5h 拿不到出口地址就锁。
+
+**实际是**：补位渠道必须排除。它的意义就是「顶替一条被封的线」，锁住它等于
+让被顶的那条线整夜没人补位。实测 2026-11-04：补位线 WG-23/24/25 被锁到
+`ban_hold_until` 剩余约 **57 年**，当天三条 H2 线（SLC-11/12、NRT-13）整夜
+没有补位。`_channel_ban_note` 的 quota 分支早就有这道跳过，`_channel_noaddr_note`
+（连续无地址）漏了 —— 两条判据都要挡。
+
+补位线坏了由 `_backfill_open` 重开，不需要用锁把它冻住。
 
 ---
 
@@ -462,6 +732,29 @@ quota / blocked / unknown 一视同仁地往上加。
 
 **推论**：想让一条线彻底退出调度，光把它 disable 不够——还要从 members 里
 删掉，或者靠这层过滤兜住。
+
+### 26b. 一条线跑 v4 还是 v6，**只认配置声明**，状态表里的 `family` 可能是旧世代残留
+
+**看起来像**：`.warp/warp_wg_state.json` 记着每条线的 `family`，那是
+`warp_wg.apply()` 写进去的实际值，应该比 `config.py` 的声明更可信。
+
+**实际是反过来的**：状态表的 `family` 只在 `apply()` 那一刻写一次，之后
+**既不重建也不随配置更新**。改过拓扑的机器上它是上一代的残留值。
+
+实测本机（2026-11-04）：`.env` 是 `WARP_WG_FAMILIES=v6`（22 节点 × 1 渠道，全 v6），
+而 `.warp/warp_wg_state.json` 里 WG-1/2/3 还记着上一代 `v4,v6,v6,v6` 的 **v4**。
+照状态表重写配置会把三条线全写成 `prefer_ipv4` —— 而 v4 出口**只由落地 colo
+决定**，三条线实测立刻挤成同一个 `104.28.205.117`（第 27 条：v4 渠道数不应超过
+colo 数）。正确的取值是 `member["family"]`，也就是 `WARP_WG_FAMILIES` 的声明；
+`write_line(family=None)` 自身也按 `line_family(i)` 算，与 `apply()` 同源。
+
+**误判过程（写下来防止再犯）**：看到状态表记 v4、配置文件记 `prefer_ipv6`，
+先入为主地认为「配置被 bug 写坏了、状态表才是真相」，于是按状态表改配置 ——
+把本来正确的 v6 改成了 v4，制造了那个「三条线撞同一出口」的现象。
+**判据应该是 `WARP_WG_FAMILIES` 本身**，不是任何派生物。
+
+**推论**：状态表的 `family` 只能当「上一次 apply 时的快照」看。任何按族做判断的
+地方（`_warp_alive_rank` 选证据列、同块轮回的跨块优先）都取声明值。
 
 ### 27. v4 线的出口数量上限 = 落地 colo 数
 
@@ -764,3 +1057,43 @@ CF 侧只认设备身份（usque 进程），一条节点上可以挂多条不�
 - 新增一条"看起来像 bug 的设计"时，加到这里，写清**看起来像什么 / 实际是什么 / 为什么**
 - 不要写"因为代码这么写的" —— 要写**实测依据**或**上游的硬约束**
 - 每条都要能回答"改了会怎样"
+
+---
+
+### 13i. 测试台账必须隔离，否则「补位线有几条」决定用例结论
+
+**看起来像**：`test_warp_wg.py` 的三个 `WARP_WG_COUNT/FAMILIES` 用例稳定通过，
+与 daemon 改了什么无关。
+
+**实际是**，它们读的是**线上** `.warp/backfill.json` 与 `.warp/h2/channels.json`：
+`config.py` 在 import 时把这两份台账并进 `members`（`_append_backfill_members`
+/ `_append_h2_members`）。补位线从 7 条涨到 10 条那天（2026-11-04），三条断言
+「members 里只能有配置声明的那几条 wg 线」的用例一起转红，代码一行没改。
+
+处置：`conftest.py` **在 `import daemon` 之前**就把两份台账指到空文件
+（`ASIP_BACKFILL_FILE_PATH` / `ASIP_H2_CHANNELS_PATH`）。必须在 import 之前：
+`config.py` 是在 import 时把台账并进 `members` 的，之后设环境变量已经晚了 ——
+唯一的补救是 reload config，而 `reload` 会**原地换掉** `config.CFG` 这个对象，
+与 `parse_subscription` 等 `from config import CFG` 的模块手里那个分家。
+`test_warp_wg.py` 本来就用 reload 测环境变量，所以还要一个
+`_restore_config_module` 在每条用例后把 config 的名字表恢复原样
+（实测不恢复会让 `test_lan_inbound_skipped_when_port_zero` 单独绿、全量红）。
+
+**同一个坑的另一条入口是 `os.environ`（2026-11-04 第二次踩）**：
+`test_channel_report.py` / `test_block_view.py` 用 `exec_module` 把
+`tools/*.py` 跑进测试进程，这些 CLI 在模块级执行 `os.environ.setdefault(...)`
+把生产 `.env` 整个灌进来 —— 手工运行时那正是它们该做的事。它不经过
+monkeypatch，用例结束不恢复，于是**之后**任何 `importlib.reload(config)`
+都读到生产的 `WARP_WG_FAMILIES`。表现：`pytest test_channel_report.py
+test_warp_wg.py` 里两条「只应有 3 条 WG 线」的用例看到 22 条而转红；
+单跑 `test_warp_wg.py` 全绿。处置：`conftest.py` 的 `_restore_environ`
+在每条用例后整表还原 `os.environ`（比逐个 delenv 稳，漏一个就是一个未来的假红）。
+
+**同一批里还有三条用例断言的是已被推翻的旧行为**，已按代码里记下的决定改正
+（改判据时这些地方要一起改，别只改代码）：
+
+| 用例 | 旧断言 | 现行行为 |
+|---|---|---|
+| `test_cached_ok_verdict_does_not_skip_probe` | TTL 内 OK 仍须实测 | **直接复用**（主人 2026-10-28 拍板「省配额优先，复用被烧地址可接受」；T-225 把 TTL 抬到 1800） |
+| `test_restart_cap_survives_state_reload` | 重启后恢复 20 条 `restart_hist` | **启动即清空**（重启是人工动作，不该继承重启前的小时预算） |
+| `test_probe_cache_never_bleeds_across_ips_in_same_segment` | 结论按线隔离 | `quota`/`flagged` **跨线复用**（判的是地址，不是隧道）；`unreachable`/`err` 仍不跨线 |

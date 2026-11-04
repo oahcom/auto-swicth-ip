@@ -174,7 +174,7 @@ def test_long_quota_hold_blocks_quota_restart(monkeypatch):
     monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == [], \
         "额度闸开着仍重启 quota 线 —— 换 IP 不能让账号级配额提前恢复"
@@ -192,7 +192,7 @@ def test_quota_hold_also_blocks_penalty_restart(monkeypatch):
     monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == [], \
         "额度闸只拦了 quota 路径，惩罚期路径仍在重启 —— 同一轮风暴从另一半漏过去"
@@ -213,7 +213,7 @@ def test_quota_hold_does_not_block_tunnel_death_restart(monkeypatch):
     monkeypatch.setattr(daemon, "_port_open", lambda port: True)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == ["W2"], \
         "额度闸把隧道半死的自愈路径也挡了 —— 那是地址没了，不是配额没了"
@@ -226,6 +226,10 @@ def test_model_probe_opens_hold_only_for_long_quota(monkeypatch):
     monkeypatch.setattr(daemon, "_warp_probe_blind", lambda now=None: False)
     monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: False)
     monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    # `quota_hold_enabled` 默认是 False（2026-10-28 主人要求关闭）。这条用例
+    # 测的是「闸一旦启用，只有长 Retry-After 的 quota 才开」这条判据本身，
+    # 所以要把开关显式打开 —— 否则断言的是配置，不是逻辑。
+    monkeypatch.setitem(daemon.CFG["warp"], "quota_hold_enabled", True)
     monkeypatch.setitem(daemon.CFG["warp"], "quota_hold_min_sec", 1800)
     import probe_warp
 
@@ -380,6 +384,6 @@ def test_tunnel_death_port_closed_defers_to_systemd(monkeypatch):
     monkeypatch.setattr(daemon, "_port_open", lambda port: False)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r: restarted.append(m["tag"]) or True)
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == [], "端口已关还重启，等于抢 systemd 的活"

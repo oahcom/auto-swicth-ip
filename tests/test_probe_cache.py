@@ -59,8 +59,11 @@ assert d._PROBE_STATS['cross_tag_reuse'] == 0, d._PROBE_STATS
 print('P7 PASS  unreachable 不跨线复用')
 
 # ---- P8 TTL 内的 OK 直接复用（主人 2026-10-28：旧 OK 被切上去可接受） ----
+# 别写死 500/700：`probe_ok_ttl_sec` 2026-11-02 从 600 提到 1800（T-225），
+# 写死的边界会随配置一起过期。这里只验「TTL 内命中、TTL 外重探」。
 reset()
 d._probe_cache_put('WARP-WG-1', ip, 'OK', now=now)
-assert d._probe_cache_lookup('WARP-WG-1', ip, now + 500)[0] == 'OK'
-assert d._probe_cache_lookup('WARP-WG-1', ip, now + 700) is None
-print('P8 PASS  TTL 内 OK 复用，过期即重探')
+_ok_ttl = d._probe_ttl('OK')
+assert d._probe_cache_lookup('WARP-WG-1', ip, now + _ok_ttl - 1)[0] == 'OK'
+assert d._probe_cache_lookup('WARP-WG-1', ip, now + _ok_ttl + 1) is None
+print(f'P8 PASS  TTL({_ok_ttl:.0f}s) 内 OK 复用，过期即重探')

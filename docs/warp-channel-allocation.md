@@ -449,6 +449,23 @@ python3 warp_diag.py --job /tmp/opencode/dead44_inputs.json \
     --out /tmp/opencode/diag44-$(date +%m%d).jsonl --rounds 2
 ```
 
+### 自动实测（2026-11-04 起，daemon 内置）
+
+订阅刷新成功后 daemon 会异步跑一轮 `_run_autodiag`，不再需要人肉重测：
+
+1. `_pending_probe_nodes` 从台账里挑「有节点、`block-map` 里没 colo」的节点，
+   **按源轮转**取前 12 个（按顺序取会让老源永远占满名额，新源轮不上）。
+2. `_ensure_spare_devices` 检查空闲设备；不足 2 台就 `warp_wg.register_line`
+   补注册，**每轮最多 3 台**（CF 一个窗口约限流 9 台，`register_line` 自带
+   30/90/240s 退避，撞上就等下一轮而不是本地硬撑）。
+3. 跑 `warp_diag.py --rounds 2 --skip-done`（15min 超时），有成功的才
+   `warp_blocks.py merge-diag` 并入实测表 —— 0 成功不入块，避免把「节点不行」
+   写死成「已测」。
+4. 两轮之间至少隔 `_AUTODIAG_MIN_GAP`=30min：一轮要几分钟且全程占用设备。
+
+新测出的 colo 由 `warp_blocks.discovered_blocks()` 自动补成块（排在静态块表
+**之后**，不挤占已验证块的优先级）。
+
 ### 端点全扫描（2026-11-01 23:05，网上案例验证）
 
 社区案例（samnet.dev 的 WARP 指南）给了另一条路：Cloudflare 在 **5 个 /24** 上

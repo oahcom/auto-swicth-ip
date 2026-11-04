@@ -223,7 +223,11 @@ def test_probe_cache_never_bleeds_across_ips_in_same_segment(monkeypatch):
     assert daemon._probe_cache_verdict("W1", ip2, 1001.0) is None, \
         "同段别的地址没被实测过，不能判死"
     assert daemon._probe_cache_verdict("W1", ip3, 1001.0) is None
-    assert daemon._probe_cache_verdict("W2", ip1, 1001.0) is None, "按线隔离"
+    # **跨线可复用**：quota/flagged 判的是地址（配额/信誉），不是 W1 这条
+    # 隧道。同一条地址换条线照样是 quota —— 重探只是把同一个结论再买一遍。
+    # 反过来 unreachable/err 不跨线（见紧邻的 `_WARP_PROBE_ADDRESS_SCOPED`）。
+    assert daemon._probe_cache_verdict("W2", ip1, 1001.0) == "quota", \
+        "地址级结论应跨线复用"
 
     daemon._probe_cache_put("W1", ip2, "OK", now=2000.0)
     assert daemon._probe_cache_verdict("W1", ip2, 2001.0) == "OK"
@@ -586,9 +590,14 @@ def test_proactive_rotation_gated_when_on_warp():
     制造日志噪音。主循环是单体 main()，这里断言门控仍在。
     """
     src = open('daemon.py', encoding='utf-8').read()
-    assert ("if (not opencode_out_on_warp()\n"
-            "                    and now - last_proactive_rotate") in src, \
-        "步骤 3 主动轮换缺少 opencode_out_on_warp 门控"
+    # 门控仍在，但多了一个**有意的**例外：池选中的节点已判死时，非 opencode
+    # 流量（9router 其它 provider）走 7890 会 100% 失败，此时无论 opencode
+    # 在哪都必须换掉它。所以判据是
+    #   if (not opencode_out_on_warp() or _pool_current_dead) and now - ...:
+    assert ("if (not opencode_out_on_warp() or _pool_current_dead)"
+            in src), "步骤 3 主动轮换缺少 opencode_out_on_warp 门控"
+    assert "and now - last_proactive_rotate" in src, \
+        "步骤 3 主动轮换的周期判据被删了"
 
 
 def test_failback_is_not_triggered_by_warp_revival_alone():

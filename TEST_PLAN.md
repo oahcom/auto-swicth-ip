@@ -2075,6 +2075,113 @@ tag 漂移按 `host:port` 兜底、沉睡池标 `okz / 旧入口快照`、重启
 2. `asip chan --json` —— 每条渠道带 `seg_v6` / `seg_addr` / `seg_v4` / `colo_fp`。
 3. `asip chan --html /tmp/chan.html` —— 表头 17 列与行内 `<td>` 数一致（曾因加列漏 `<td>` 错位）。
 
+## 16. 补位线自造（设备用完自救，T-284~T-288）
+
+**范围**：`daemon._ensure_backfill_line` / `_install_wg_unit` / `_wg_line_state`
+与 `deploy/wg-lines-install.sh --line N`。全部用例离线：设备目录、单元目录、
+members 都由 `tmp_path` 造假，不注册真设备、不碰 `/etc`。
+
+```bash
+python3 -m pytest test_daemon_backfill.py test_daemon_backfill_create.py -q   # 10 例
+```
+
+背景：补位判据是「注册过（`profile.conf`）**且** 单元已装」。`register_line`
+只写 profile，单元由安装脚本另一步生成 —— 只注册不装单元等于不存在。
+实测 2026-11-04：31 条 WG 线里 27 被 mask、31 注册了整晚没单元、其余全在
+members，补位日志每轮报「没有能起设备的空闲线」，7 条 H2 线整晚无补位。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-284 | P0 | 已注册没单元的线优先补单元 | `pytest test_daemon_backfill_create.py -k without_unit` | `_install_wg_unit` 只对 `missing` 的线调用；不注册新设备（不烧 CF 额度）；返回该线号并记 `_LAST_WG_CREATE_TS` |
+| T-285 | P0 | mask 的线永不自动恢复 | `-k masked` | 软链 `/dev/null` 的线不进 `installed`；可以另起新线（`register_line(max+1)`），但不能把 mask 的装回来 |
+| T-286 | P1 | 注册限速读磁盘 mtime，装单元不受限 | `-k "gap or without_unit or mtime"` | 限速依据是**最新 `profile.conf` 的 mtime**（进程内变量重启即归零）；600s 内不注册新设备；但「已注册没单元」的线**照样装**（不烧额度） |
+| T-287 | P1 | 判据单源 + 硬上限 | `pytest test_daemon_backfill_create.py -k hard_cap` | `_wg_line_state()` 同时被补位判据、自造、失败诊断三处调用；线号达 `_WG_MAX_LINES`=64 后停止注册并**报错**（日志含「已达上限」），不无声膨胀 |
+
+| T-288 | P1 | 测试台账隔离与 config 快照 | `pytest test_warp_wg.py test_subscription_parse.py -q`（不需要先清线上补位线） | 两份台账在 **`import daemon` 之前**就指向空文件（`config.py` 在 import 时读它们）；`_restore_config_module` 在每条用例后恢复 config 名字表，抵消 `test_warp_wg` 的 `importlib.reload` 造成的 `CFG` 对象分家 |
+
+**手工验收**：
+
+1. `sudo -n systemd-run --pipe --wait --collect --quiet` 跑 `deploy/wg-lines-install.sh --line N`
+   —— 验证 `/etc` 只读挂载那一条（daemon 的 `ProtectSystem=strict` 让直接
+   `sudo bash` 报 `Read-only file system`，必须换宿主 namespace）。
+2. 新线单元里 `User=` / `Environment=HOME=` 必须是仓库属主，不是 `root` / `/root`。
+3. 补位上线后 `journalctl -u auto-switch-ip` 应出现
+   `⇢ <原线> 渠道被封，补位渠道 WARP-WG-N 已在 <colo> 上线`。
+
+## 17. 环内轮换的承载能力排序（T-289~T-291）
+
+**范围**：`daemon._warp_alive_rank` / `_same_block_standby` /
+`_channel_rehome_target` / `_rehome_held_lines` 的锁定分支。全部离线。
+
+```bash
+python3 test_node_rotation.py                                         # 15 项自检
+python3 -m pytest test_channel_ban_hold.py -q                         # 60 例
+```
+
+背景：`rotation` 是 `warp_wg.apply()` 按**延迟**生成的，之后不重建 ——
+22 条 WG 线的 176 个 rotation 槽位里 135 个（77%）从没有过 WG 实测记录；
+NRT 块内实测可用的 14 台节点只有 1 台进过 rotation。轮换因此在赌。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-289 | P0 | 同块候选按承载能力排序 | `test_node_rotation.py` 第 13/14 项 | 块序在前但 `wg=0/4` 的节点排到实测可用的之后；没测过（rank 1）仍排在实测不通（rank 2）之前 |
+| T-290 | P0 | 全都没测过时照常按块序选 | `test_node_rotation.py` 第 15 项 | 返回块序第一个 —— 过滤会让人工刚加的节点永远上不了线 |
+| T-291 | P0 | 锁定节点实测不能时改投而不反复重启 | `pytest test_channel_ban_hold.py -k "dead_node or cannot_carry"` | `ban_hold_node` 是 rank 2 时不调用 `_warp_line_restart`，改投到新节点；`ban_hold_home`（08:00 还原目标）不动 |
+
+**手工验收**：
+
+1. `journalctl -u auto-switch-ip | grep "承载不了 WARP"` 应出现
+   `⇢ <tag> 锁定节点 <node> 实测承载不了 WARP，改投 <colo>（<node>）`。
+2. 该线在「渠道重定位」理由下的重启次数应从每分钟级降到 ≤1 次/h，
+   且 `ban_hold_ready` 随后置位（`python3 -c` 读 `.warp_line_state.json`）。
+
+## 18. 状态表体积与渠道锁的两条死路（T-292~T-296）
+
+**范围**：`daemon._channel_ban_trim` / `_channel_ban_expand` /
+`_channel_ban_hold_hit` / `_channel_ban_note` / `_channel_noaddr_note` /
+`_rehome_one` / `_LINE_DEFAULTS`；`tools/channel_report._expand_ban_probes`。全部离线。
+
+```bash
+python3 -m pytest test_channel_ban_hold.py test_channel_report.py -q   # 78 例
+```
+
+背景三条，全部来自 2026-11-04 的生产状态表：
+
+1. **`ban_probes` 无界增长**：秒级写入 × 5s 落盘节流 ⇒ 状态文件 565 KB ⇒
+   **9.4 GB/天** 磁盘写。判据只问「当天是否全部 quota」，但排查要看时序，
+   不能按条数截断（主人明确要求「ban_probes 得留多点」）。
+2. **补位渠道被锁死 57 年**：WG-23/24/25 是补位线，`_channel_noaddr_note`
+   连续 5h 无地址就锁，而它们本来就在死节点上 —— 锁住等于让被顶的线整夜没人补位。
+3. **`restart_count` 是纯垃圾**：进程终身累计，实测最高 41982，全库零读取者
+   （报表用的是 `restart_hist` 的窗口内计数）。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-292 | P0 | 同结论相邻样本合并成段，且结论不丢 | `test_trim_merges_consecutive_same_verdict` | 10 条 quota → `[起, 止, 10, "quota"]`；换结论时开新段；段内条数总和 == 原样本数 |
+| T-293 | P0 | **不按条数截断** | `test_trim_keeps_all_samples_no_cap` | 1000 条仍全在（原 `_BAN_SAMPLES_MAX` 截断已删）；这是主人「留多点」的直接回归 |
+| T-294 | P0 | 段格式与旧二元组双向兼容 | `test_expand_round_trips_runs`、`test_malformed_state_does_not_crash_loader` | `_channel_ban_expand(_channel_ban_trim(x))` 条数**与结论序列**都不变；混入 `[ts, "quota"]` 旧格式与坏条目仍能加载，结论读 `e[3]` 而非 `e[1]` |
+| T-295 | P0 | 补位渠道永不被渠道锁 | `test_backfill_line_is_never_channel_locked` | `members[tag]["backfill_for"]` 非空时，`_channel_noaddr_note` 直接返回，`ban_noaddr_since` 保持 0 |
+| T-296 | P0 | 重写配置用**声明**的族，不用状态表 | `test_rehome_uses_declared_family_not_stale_state` | 状态表记 v4（旧拓扑残留）/ 声明 v6 时，`warp_wg.write_line` 必须收到 `family="v6"` |
+
+| T-297 | P1 | 用例不得依赖真实时钟的「当天」边界 | `_noon_today()` 构造样本时刻 | 00:00~00:30 跑测试时，回溯 30 分钟的样本仍在当天内（实测 11-05 00:02 曾让 T-292/T-295 两个用例同时变红） |
+
+**变异验证**（三条都实测过，改回旧逻辑必红）：
+
+| 改动 | 结果 |
+|------|------|
+| `family=m.get("family")` → 改成读状态表 | T-296 `1 failed` |
+| 删掉 `_channel_noaddr_note` 的 `backfill_for` 跳过 | T-295 `1 failed` |
+| 恢复按条数截断（`_BAN_SAMPLES_MAX`） | T-293 `1 failed` |
+
+**手工验收**：
+
+1. 状态文件体积：`ls -l .warp_line_state.json` 应在 **100 KB 以内**
+   （迁移前 633 KB），且 `ban_probes` 每项长度是 4（段）而不是 2（点）。
+2. 补位线不被锁：`python3 -c "import json;d=json.load(open('.warp_line_state.json'));
+   print({k:(v.get('ban_hold_until') or 0)>0 for k,v in d['lines'].items() if 'WG-2' in k})"`
+   应全 False。
+3. `restart_count` 残留 0：`grep -c restart_count .warp_line_state.json` 返回 0。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
@@ -2142,3 +2249,6 @@ tag 漂移按 `host:port` 兜底、沉睡池标 `okz / 旧入口快照`、重启
 | v1.58 | 2026-11-01 | 独立审查（codex 缺 `@openai/codex-linux-x64` 二进制，改用对抗性审查代理）对 v1.56 的 4 项修复 + 1 项新增覆盖。**P0 测试时段相关**：`conftest.py` 未关 night_window，既有套件全用真实时钟 + 非白名单 tag → 20:00–08:00 跑 pytest 会有 9+ 例变红、`performed<=20`/`quota_until<=now` 两例假绿。修：autouse `_disable_night_window`；验证方式为 `TZ=Etc/GMT-14`（本地 23:51）复跑，改前改后同为 98 passed/4 failed，与白天逐例一致。**P1 校验洞**：① `_v` 允许 24 → `0→24` 恒真＝全天锁，且 `isinstance(True,int)` 让布尔值混进小时；改 `0<=v<=23` + 显式挡 bool。② `allow` 不校验元素类型，非字符串会被 `_night_allow_tags` 的 isinstance 静默滤空 → 夜里全锁；改导入期断言。③ 时区靠主机 localtime，unit 无 `TZ=`，主机改 UTC 就整体偏 8h；`deploy/install.sh` 与现网 unit 均加 `Environment=TZ=Asia/Shanghai`（备份 `auto-switch-ip.service.bak-tz-*`，已 daemon-reload）。④ `_refresh_idle_warp` 被锁后仍按通用失败重试 3 次（2+5s 退避）并写「端口未就绪」，把锁误报成故障；改为进循环前短路返回 None。**P2**：`_NIGHT_LOG_TS` 由单时间戳改 `dict[tag,ts]`（全局单值时 20 条线 30s 内只打一条，读日志会误判成只有一条被拦）；订阅刷新换绑定的 `now` 从循环外移进循环（跨 08:00 会多锁/少锁一夜）；补 `_warp_line_restart` 夜间用例（该闸删掉仍会被下层 `_restart_warp_line` 兜住，但那时已 `warming=True`、`restart_hist` +1、`fail_streak` +1 —— 一次没重启却记一次重启和一次失败）与按 tag 节流用例。`test_night_window.py` 12 例；`test_subscription_parse + test_night_window + test_asip_* + test_warp_line_worker` 共 209 passed / 1 failed（既有 log_file 用例） | 独立审查 |
 | v1.59 | 2026-11-01 | 渠道分配模型落地 + 夜锁分层（docs/warp-channel-allocation.md 七/八节）：① `config.warp.blocks`（9 个 colo 的静态属性 + `channels_per_block` + `enabled`，默认关）+ 导入期校验（colo 重复、`channels_per_block<1`）；② `warp_blocks.py` 从「只有渠道清单」补成完整模型：`order_nodes`（纯读延迟，未知排尾）、`plan_lines`（渠道→线路，后备先同块）、`night_line_tags`（块→线路，未知 colo 保留）、`build_map`（**按出口 IP 聚合**：一个 IP 常被 2 节点共用，按节点聚合会把同一份观测算两遍）；③ `warp_wg.apply` 新增选点分叉：`blocks.enabled` 时走 `plan_lines`，注册/写盘/发布共用，两条路径只在「选哪个节点」处不同；④ 夜锁策略拆到 `warp_night.py`（`window`/`active`/`restart_allowed`/`label`，纯函数），daemon 保留同名门面做 IO，白名单改由块生成（`_block_night_tags` 30s 缓存，异常退回配置 allow）；⑤ `warp_diag.py` 替代 `/tmp` 里那份自己拼配置的探针 —— 配置只从 `warp_wg.build_line_config` 生成，失败分 config/port/handshake/ok。**旧探针的教训**：它自拼配置（DoH、节点 tag 改名、缺 `domain_resolver`）且端口用「基准+偏移」与残留进程撞车，44 个节点全报「握手失败」，其中 15 个 UDP:53 是通的 —— 探针在测自己。回归：`test_warp_blocks.py` 22 例新绿；`test_daemon_unit + test_warp_refresh + test_portability + test_warp_line_worker + test_asip_*` 改前改后同为 **472 passed / 14 failed**（14 例为既有红，已在改动前的副本上逐例复现）；`test_night_window + test_warp_prober_gates` 44 passed / 1 既有红 | 主人需求 + 自对抗 |
 | v1.60 | 2026-11-04 | 新增 §15 渠道健康报表（T-281~T-283）+ 报表改版：`asip chan` 的出口段从「全部 /64 段名」逐步收敛为 `/32//48//64//128` 四级计数（`2/12/60/1035`），明细表**按声明 colo 合并**（同 colo 的线共用同一池子，逐条印是同一份）并给出口段、池（`/48/64/128` 三级去重，收全日志含已下线 tag）、指纹落点三样；原独立的 `colo ↔ 段指纹` 表并入（同维度）。新增 `_merge_segs` / `_fp_pools` / `_addr_sort`，`channel_segments()` 额外收集 `/128`。实测 2026-11-04：NRT 池 `12/12/1184`（10 条渠道共用 12 个 /64，/128 级 5 分钟重复率 36.1%）vs SIN `12/132/9731`（0.7%）—— 只看 /48 这两个机房一样宽。`test_channel_report.py` 17 例全绿（含 `bac1:7680` 共用段按 /64 拆分） | 主人需求 |
+| v1.31 | 2026-11-04 | 新增 §18 状态表体积与渠道锁的两条死路 (T-292~T-296)。**`ban_probes` 游程化**：状态表现在是整库最大的写入源（565 KB × 12 次/分 = 9.4 GB/天），改成段格式 `[起, 止, 条数, 结论]` —— 实测 19k 样本只有 484 段同结论，压缩 **39 倍**（633 KB → 61 KB，1.02 GB/天），一条样本不丢（主人明确要求「留多点」，所以不是按条数截断）。旧二元组格式仍认；结论位置是 **`e[3]`** 不是 `e[1]`（初版写错这一处，31 条 quota 记成 31 段、`_channel_ban_hold_hit` 恒 False，用例转红）。**补位线永不被渠道锁**：`_channel_noaddr_note` 漏了 quota 分支早就有的 `backfill_for` 跳过，实测 WG-23/24/25 被锁到 `ban_hold_until` 剩 **57 年**，三条 H2 线整夜无补位。**`restart_count` 删除**（终身累计最高 41982、零读取者）。**`_rehome_one` 的族改回取声明值**：初版误以为状态表是权威（那里 WG-1/2/3 记 v4），按它重写把三条线全写成 `prefer_ipv4`，实测立刻撞成同一个 `104.28.205.117` —— 状态表的 `family` 只在 `apply()` 时写一次，改过拓扑就是旧世代残留（本机 `.env` 是 `WARP_WG_FAMILIES=v6`）。现在读 `member["family"]`，与 `write_line(family=None)` 同源。**`_warp_alive_rank` 单族判据**：`family` 指定时只看那一族，不再拿 v4 的失败否决 v6 线。`test_channel_ban_hold.py` 57→61 例，`test_node_rotation.py` 15 项，全量 **869 passed**；三处变异验证全红。另修用例的零点依赖（T-297）：样本时刻改用 `_noon_today()`，否则 00:00~00:30 跑测试时回溯 30 分钟的样本落到昨天被裁掉 | 主人需求「ban_probes得留多点」 |
+| v1.30 | 2026-11-04 | 新增 §17 环内轮换的承载能力排序 (T-289~T-291)：`rotation` 按延迟生成、从没按「能不能跑 WARP」重建，176 个槽位里 77% 无实测记录 ⇒ 39 次同块轮换 5 分钟内拿到出口的只有 15 次（38%）。新增 `_warp_alive_rank()` 三档排序（只排序不淘汰），接入 `_same_block_standby` 与 `_channel_rehome_target`；渠道锁目标落在 rank 2 节点时改投而不是每分钟重启（实测 WG-1 在 `wg=0/4` 节点上 30 分钟内被重启 71 次，改投后立刻拿到出口，降到 1 次/h）。`test_node_rotation.py` 12→15 项，`test_channel_ban_hold.py` 55→57 例，全量 864 passed |
+| v1.29 | 2026-11-04 | 新增 §16 补位线自造 (T-284~T-288)：设备用完时 `_ensure_backfill_line` 先补装「已注册但没单元」的线、再注册新设备，`_WG_CREATE_GAP`=600s 限速，mask 线永不自动恢复。关键坑：`ProtectSystem=strict` 让 `/etc` 在 daemon 的 mount namespace 只读，`sudo` 不换 namespace ⇒ 装单元必须走 `systemd-run`；以 root 跑安装脚本须显式传 `ASIP_RUN_USER/GROUP/HOME_DIR`，否则单元写成 `User=root`+`HOME=/root` 读不到 administrator 的凭据 | - |

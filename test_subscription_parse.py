@@ -13,6 +13,8 @@ import subprocess
 
 import pytest
 
+import json
+
 import daemon
 import parse_subscription as ps
 
@@ -229,6 +231,68 @@ def test_long_base64_subscription_is_not_truncated(monkeypatch):
 
     nodes = ps.fetch_and_decode_sub("https://example.invalid/sub")
     assert len(nodes) == len(urls), f"节点被截断: {len(nodes)}/{len(urls)}"
+
+
+# ============= 4. 源快照：一次性订阅链接的最后一道保险 =============
+def test_source_snapshot_rescues_a_dead_link(monkeypatch, tmp_path):
+    """拉取成功写过快照后，链接失效时仍能拿回上一轮内容。
+
+    实测 2026-11-04：一次性订阅链接第二次拉就 403，旧逻辑直接 continue，
+    49 个节点从生产配置里消失。快照让「拉不到」退化成「用上一轮」。
+    """
+    monkeypatch.setenv("ASIP_SUB_CACHE_DIR", str(tmp_path))
+    url = "https://x.invalid/api/dktv?sby=SECRETTOKEN"
+    monkeypatch.setattr(ps, "_fetch_raw", lambda u: "NODE-LIST-1")
+    raw, origin = ps._fetch_or_cache(url)
+    assert (raw, origin) == ("NODE-LIST-1", "ok")
+
+    def boom(u):
+        raise RuntimeError("HTTP 403 token is error")
+    monkeypatch.setattr(ps, "_fetch_raw", boom)
+    raw, origin = ps._fetch_or_cache(url)
+    assert raw == "NODE-LIST-1"
+    assert origin.startswith("cache:")
+
+
+def test_snapshot_is_per_source_not_shared(monkeypatch, tmp_path):
+    """两个源各自快照：一个挂了不能把另一个的内容冒充成它的。"""
+    monkeypatch.setenv("ASIP_SUB_CACHE_DIR", str(tmp_path))
+    a, b = "https://a.invalid/s?t=1", "https://b.invalid/s?t=2"
+    monkeypatch.setattr(ps, "_fetch_raw",
+                        lambda u: "A" if "a.invalid" in u else "B")
+    ps._fetch_or_cache(a)
+    ps._fetch_or_cache(b)
+
+    def only_b(u):
+        if "a.invalid" in u:
+            raise RuntimeError("HTTP 403")
+        return "B2"
+    monkeypatch.setattr(ps, "_fetch_raw", only_b)
+    assert ps._fetch_or_cache(a)[0] == "A"
+    assert ps._fetch_or_cache(b)[0] == "B2"
+
+
+def test_snapshot_file_is_private_and_does_not_leak_the_token(monkeypatch, tmp_path):
+    """快照里就是节点正文，文件名不能带 URL（URL 里有 token）。"""
+    monkeypatch.setenv("ASIP_SUB_CACHE_DIR", str(tmp_path))
+    url = "https://x.invalid/api/dktv?sby=SECRETTOKEN"
+    monkeypatch.setattr(ps, "_fetch_raw", lambda u: "NODES")
+    ps._fetch_or_cache(url)
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    assert "SECRET" not in files[0].name and "x.invalid" not in files[0].name
+    assert files[0].stat().st_mode & 0o077 == 0, "快照必须 0600"
+
+
+def test_dead_source_without_snapshot_still_raises(monkeypatch, tmp_path):
+    """从没成功过、又没有快照 → 必须抛，让调用方跳过该源并报出来。"""
+    monkeypatch.setenv("ASIP_SUB_CACHE_DIR", str(tmp_path))
+
+    def boom(u):
+        raise RuntimeError("HTTP 403 token is null")
+    monkeypatch.setattr(ps, "_fetch_raw", boom)
+    with pytest.raises(RuntimeError, match="无快照"):
+        ps._fetch_or_cache("https://never.invalid/s")
 
 
 # ============= 4. refresh_subscription 检查 returncode =============
@@ -680,3 +744,98 @@ def test_get_lan_auth_rejects_malformed(tmp_path, monkeypatch):
     f2.write_text("user:pa:ss")
     monkeypatch.setattr(config, "LAN_AUTH_FILE", str(f2))
     assert config.get_lan_auth() == ("user", "pa:ss"), "口令允许含冒号，首个冒号分隔"
+
+
+# ============= 6. 一键插入订阅（sing-box 源 + 追加源台账） =============
+def test_singbox_outbounds_extracts_dialers_with_stable_tag():
+    """flag=sing 的源直接下发 sing-box JSON：出站原样收下，tag 必须稳定。
+
+    机场给的 tag 是 `剩余流量：59.98 GB` 这种**每次刷新都变**的展示名。
+    tag 是 daemon 判死表 / block-map / selector 的共用身份键，跟着流量数字
+    漂等于每轮都把整池当成新节点。这里钉住「统一成 host:port-协议」。
+    """
+    raw = json.dumps({"outbounds": [
+        {"type": "selector", "tag": "节点选择", "outbounds": ["A"]},
+        {"type": "urltest", "tag": "自动选择", "outbounds": ["A"]},
+        {"type": "direct", "tag": "direct"},
+        {"type": "trojan", "tag": "剩余流量：59.98 GB",
+         "server": "a.example.com", "server_port": 443, "password": "x"},
+        {"type": "anytls", "tag": "🇭🇰 HK 01",
+         "server": "b.example.com", "server_port": 20470, "password": "y"},
+    ]})
+    got = ps.singbox_outbounds(raw)
+    assert [o["tag"] for o in got] == ["a.example.com:443-tr",
+                                       "b.example.com:20470-any"]
+    # 非 sing-box 正文不能误判
+    assert ps.singbox_outbounds("trojan://pw@a.com:443#x") == []
+    assert ps.singbox_outbounds("not json") == []
+
+
+def test_extra_subscription_urls_reads_ledger_file(tmp_path, monkeypatch):
+    """.extra_subscriptions 是插订阅的落点：daemon 每次刷新现读，不必重启。"""
+    import config
+    ledger = tmp_path / "extra"
+    ledger.write_text("# 注释行不算\n"
+                      "https://a.example/sub?token=1\n"
+                      "https://a.example/sub?token=1\n"     # 重复项去掉
+                      "https://b.example/sub\n")
+    monkeypatch.setattr(config, "EXTRA_SUBS_FILE", str(ledger))
+    monkeypatch.delenv("ASIP_EXTRA_SUB_URLS", raising=False)
+    assert config.extra_subscription_urls() == [
+        "https://a.example/sub?token=1", "https://b.example/sub"]
+    # 环境变量优先且排在最前
+    monkeypatch.setenv("ASIP_EXTRA_SUB_URLS", "https://env.example/sub")
+    assert config.extra_subscription_urls()[0] == "https://env.example/sub"
+
+
+def test_daemon_reads_extra_sources_at_refresh_time(monkeypatch):
+    """daemon 的固定源在 import 期冻结，追加源必须每次现读 —— 否则插完
+    订阅还要重启 daemon，而重启会掐断在途 SSE。"""
+    monkeypatch.setattr(daemon, "_SUB_URLS", ["https://fixed.example/sub"])
+    monkeypatch.setenv("ASIP_EXTRA_SUB_URLS", "https://extra.example/sub")
+    assert daemon._sub_urls() == ["https://fixed.example/sub",
+                                  "https://extra.example/sub"]
+
+
+def test_merge_diag_builds_block_entry_for_new_node(tmp_path):
+    """新节点必须能被 diag 建档入块，否则永远分不到渠道。
+
+    块表原先只认 build_map 的输入文件，而新插入订阅的节点不在那些文件里；
+    merge_diag 又只写 wg_ok/wg_n 不写 colo —— 结果是「测了但入不了块」。
+    """
+    import warp_blocks as wb
+    path = tmp_path / "block-map.json"
+    path.write_text(json.dumps({"nodes": {
+        "old:443-vl": {"colo": "NRT", "category": "regular", "ok": 2, "n": 2}}}))
+    rows = [
+        # 新节点：两轮都拿到 trace，colo=SIN
+        {"tag": "new:443-any", "family": "v6", "rounds": [
+            {"ok": True, "stage": "ok", "colo": "SIN", "ip": "1.2.3.4"},
+            {"ok": True, "stage": "ok", "colo": "SIN", "ip": "1.2.3.4"}]},
+        # 已有节点：diag 不能覆盖它已入块的 colo
+        {"tag": "old:443-vl", "family": "v6", "rounds": [
+            {"ok": True, "stage": "ok", "colo": "LAX", "ip": "9.9.9.9"}]},
+        # 全失败：不入块
+        {"tag": "dead:443-tr", "family": "v6", "rounds": [
+            {"ok": False, "stage": "handshake", "colo": None}]},
+    ]
+    wb.merge_diag(path, rows)
+    nodes = json.loads(path.read_text())["nodes"]
+    assert nodes["new:443-any"]["colo"] == "SIN"
+    assert nodes["new:443-any"]["category"] == "regular"
+    assert nodes["old:443-vl"]["colo"] == "NRT", "diag 不得覆盖已入块的 colo"
+    assert "dead:443-tr" not in nodes, "0 次成功不入块"
+
+
+def test_display_name_only_drops_status_placeholders():
+    """信息节点的判据是「状态词 + 冒号」，不是前缀。
+
+    只按前缀匹配会把 `官网线路`、`订阅节点1`、`重置专用` 这些真实节点名
+    一起清空 —— 机场换命名习惯时就会静默误伤。
+    """
+    import parse_subscription as ps
+    for real in ("官网线路", "订阅节点1", "重置专用", "流量包-美国", "HK-G1"):
+        assert ps.display_name(real) == real
+    for info in ("剩余流量：59.98 GB", "套餐到期：2026-12-03",
+                 "距离下次重置剩余：29 天", "官网：etcloud.one", ""):
+        assert ps.display_name(info) == ""

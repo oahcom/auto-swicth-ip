@@ -100,9 +100,14 @@ asip — auto-switch-ip 日志与出口诊断
   asip chan            渠道健康：成功率/ban 率/机房/colo/出口段/订阅源（-h 看参数）
   asip chan --html F   同上，输出可直接打开的 HTML
   asip blk             块视图：每个 colo 块有哪些节点、延迟、谁在用
-  asip blk --colo NRT  只看一个块；加 --delay 现测延迟（慢，占用出口）
+  asip blk --blocks    块池视角：块内**全部**节点，标出哪几个排成线位、哪些是候补
+  asip blk --colo NRT  只看一个块；加 --delay 现测延迟（慢，并发会打满出口）
   asip blk --channels  渠道视角：每条渠道选中哪个节点、候选池多大、和谁撞同一台
   asip blk --pools     附带打印每块的完整候选节点池
+
+  承载口径（不再是笼统的 proxy）：
+    warp-proxy   WG over UDP，经机场节点中转     h2-warp   MASQUE over HTTP/2
+    warp-direct  直连 WARP，不经节点              proxy     纯代理，不承载 WARP
 
 WARP 控制
   asip warp start      解除屏蔽并启动全部隧道

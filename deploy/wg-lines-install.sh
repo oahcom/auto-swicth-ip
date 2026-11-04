@@ -50,18 +50,39 @@ if [ -z "${SYSTEMD_DIR:-}" ] && [ -n "$cur" ] && [ "$cur" != "$DIR" ] && [ -f "$
 fi
 
 CONFIG_ONLY=0
-[ "${1:-}" = "--config-only" ] && CONFIG_ONLY=1
+# `--line N`：只给已有设备补一条单元，不跑 apply（不重新分配、不注册）。
+# daemon 的补位自造（`_ensure_backfill_line`）走这条路 —— 它要的是「注册过的
+# lineN 变得能 systemctl start」，不是重排整个线表。
+ONE_LINE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --config-only) CONFIG_ONLY=1 ;;
+        --line) ONE_LINE="${2:-}"; shift ;;
+        --line=*) ONE_LINE="${1#*=}" ;;
+        *) echo "✗ 未知参数: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
 
-if [ -n "${WARP_WG_FAMILIES:-}" ]; then
+if [ -n "$ONE_LINE" ]; then
+    case "$ONE_LINE" in ''|*[!0-9]*)
+        echo "✗ --line 需要线号（正整数）" >&2; exit 2 ;;
+    esac
+    [ -f "$DIR/.warp/wglines/line$ONE_LINE/profile.conf" ] \
+        || { echo "✗ line$ONE_LINE 还没注册设备（先 warp_wg.py register）" >&2; exit 1; }
+    COUNT=0; LINES="$ONE_LINE"
+elif [ -n "${WARP_WG_FAMILIES:-}" ]; then
     export WARP_WG_FAMILIES
     export WARP_WG_NODES="${WARP_WG_NODES:-1}"
     PER=$(printf '%s' "$WARP_WG_FAMILIES" | tr ',' '\n' | grep -cE '^(v4|v6)$' || true)
     COUNT=$((PER * WARP_WG_NODES))
+    LINES="$(seq 1 "$COUNT")"
 else
     COUNT="${WARP_WG_COUNT:-0}"
     export WARP_WG_COUNT="$COUNT"
+    LINES="$(seq 1 "$COUNT" 2>/dev/null || true)"
 fi
-if ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [ "$COUNT" -le 0 ]; then
+if [ -z "$ONE_LINE" ] && { ! [[ "$COUNT" =~ ^[0-9]+$ ]] || [ "$COUNT" -le 0 ]; }; then
     echo "✗ 需要 WARP_WG_FAMILIES（如 v4,v6,v6,v6）或 WARP_WG_COUNT=N（N>0）。" >&2
     exit 1
 fi
@@ -71,10 +92,15 @@ fi
 # 首次部署建议开着确认节点可用性。
 APPLY_ARGS=(apply)
 [ "${WARP_WG_PROBE:-0}" = "1" ] && APPLY_ARGS+=(--probe)
+# 单线模式不 apply：apply 会重排整张线表并改写主配置出站清单，那正是
+# 「补一条单元」不该碰的东西。
+[ -n "$ONE_LINE" ] && APPLY_ARGS=(true)
 # apply 会写 .warp/wglines/lineN/{account.toml,profile.conf,singbox.json}（0600）。
 # 以 root 部署时若以 root 跑，文件属 root，而单元以 $RUN_USER 运行 —— 读不到配置，
 # 16 条线全在 permission denied 里崩溃循环（实测过一次）。从源头给对属主。
-if [ "$(id -u)" = 0 ] && [ "$RUN_USER" != root ]; then
+if [ -n "$ONE_LINE" ]; then
+    :   # 单线模式：设备已注册，只补单元
+elif [ "$(id -u)" = 0 ] && [ "$RUN_USER" != root ]; then
     runuser -u "$RUN_USER" -- env PYTHONPATH="$DIR" "$PYBIN" "$DIR/warp_wg.py" "${APPLY_ARGS[@]}"
 else
     PYTHONPATH="$DIR" "$PYBIN" "$DIR/warp_wg.py" "${APPLY_ARGS[@]}"
@@ -84,7 +110,7 @@ fi
 # 名字必须与 config.py 里生成的 member.service 一致，否则 daemon 的
 # systemctl restart 会打空。
 SERVICES=""
-for i in $(seq 1 "$COUNT"); do
+for i in $LINES; do
     svc="warp-wg-$i.service"
     SERVICES="$SERVICES $svc"
     cat > "$UNIT_DIR/$svc" <<EOF
@@ -122,7 +148,7 @@ case "$UNIT_DIR" in
     *) systemctl --user daemon-reload 2>/dev/null || true ;;
 esac
 
-if [ "$CONFIG_ONLY" = 1 ]; then
+if [ "$CONFIG_ONLY" = 1 ] || [ -n "$ONE_LINE" ]; then
     echo "已生成配置与单元（未启用/未重启）：$UNIT_DIR"
     exit 0
 fi

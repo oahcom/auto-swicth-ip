@@ -347,6 +347,27 @@ def dormant_tags() -> set[str]:
                                    or []) if n.get("tag")}
 
 
+def _expand_ban_probes(samples) -> list[tuple[float, str]]:
+    """`ban_probes` 展开成 `[(ts, verdict)]`。
+
+    daemon 侧为了压住状态文件体积改成了**游程** `[起, 止, 条数, 结论]`
+    （19k 样本 / 526 KB → 484 段 / 14 KB）。旧的两元组格式仍然认：报表是
+    只读工具，不该因为读到昨天写的文件就整张表空掉。
+    """
+    out: list[tuple[float, str]] = []
+    for e in samples or []:
+        if not isinstance(e, (list, tuple)) or len(e) < 2:
+            continue
+        if not isinstance(e[0], (int, float)) or isinstance(e[0], bool):
+            continue
+        if len(e) >= 4 and isinstance(e[2], int):
+            # 段内所有样本同一结论，时间取段尾（保守：宁可少算进窗口）。
+            out.extend([(float(e[1]), str(e[3]))] * max(0, int(e[2])))
+        else:
+            out.append((float(e[0]), str(e[1])))
+    return out
+
+
 def summarize(state: dict, chans: dict, sources: dict, hours: float,
               now: float | None = None, dormant: set[str] | None = None,
               segments: dict[str, dict] | None = None) -> list[dict]:
@@ -364,9 +385,8 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
     rows = []
     for tag, meta in chans.items():
         st = state.get(tag) or {}
-        samples = [s for s in (st.get("ban_probes") or [])
-                   if isinstance(s, (list, tuple)) and len(s) == 2
-                   and isinstance(s[0], (int, float)) and s[0] >= cutoff]
+        samples = [s for s in _expand_ban_probes(st.get("ban_probes"))
+                   if s[0] >= cutoff]
         ok = sum(1 for _, v in samples if v == "OK")
         ban = sum(1 for _, v in samples if v in BAN_VERDICTS)
         err = len(samples) - ok - ban

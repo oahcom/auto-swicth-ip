@@ -75,6 +75,14 @@
 4. 被封的那条正在服务流量时，selector 切到补位渠道
 5. 次日 08:00 解封：selector 切回原线 → 停单元 → 撤成员 → 重发配置
 
+**每分钟对账一次**（`_backfill_reconcile`），修两种半途状态：台账行没有锁线认领
+→ 停单元、删行；锁线记着 `ban_backfill_tag` 但行丢了 → 停残留单元、清字段，当轮
+重开。没有它的话，开/撤过程中一次写盘异常就能让「被封必有补位」永久失效（锁线
+以为有补位，开补位循环永远跳过它）。
+
+补位是**硬要求**，`channel_rehome_enabled` 关掉时重定位可以停，补位照开
+（`_backfill_open` 传 `ignore_enabled=True`）。补位渠道自己也被封时不再套娃开新线。
+
 成员身份必须落 `.warp/backfill.json` 而不是只在 daemon 内存里：`deploy/members.py`
 与 `parse_subscription.py` 都是独立进程，只改 `CFG["warp"]["members"]` 它们看不见，
 补位渠道起来了也没人能切过去。`config.py::_append_backfill_members` 读这个文件把

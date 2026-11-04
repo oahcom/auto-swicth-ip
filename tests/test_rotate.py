@@ -22,7 +22,9 @@ assert r['switched'] is False and r['switched_at'] > 0, r
 print('T6 PASS  800ms 内合并')
 
 # ---- T7: 限速 ----
-d._last_rotate_ts = time.time() - 2.0
+# 区间取 (合并窗 800ms, 换线闸 ~1.5s] 之内：写死 2s 已越过闸门（线多时
+# `_rotate_gap()` = rate429_guard_sec/线数 ≈ 1.54s），0.2s 又落进合并窗。
+d._last_rotate_ts = time.time() - 1.0
 r = d._rotate_once('rate429')
 assert r['reason'] == 'too_frequent' and r['ok'] is False, r
 print('T7 PASS  间隔内拒绝')

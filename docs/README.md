@@ -164,6 +164,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | `deploy/remote-deploy.sh` | **一键复刻本机拓扑到远端**（代码/状态表/设备/单元/验收） |
 | [ops-20261028-security-changes.md](ops-20261028-security-changes.md) | 安全变更操作记录 |
 | [9router-task-book-20261028.md](9router-task-book-20261028.md) | 9router 任务书 |
+| [task-20261104-channel-backfill.md](task-20261104-channel-backfill.md) | 渠道封禁补位：任务、实现、验证、踩过的坑 |
 | [9router-dev-logic-20261028.md](9router-dev-logic-20261028.md) | 9router 开发逻辑（已不存在于本项目的 proxy-global.js 那一层） |
 
 ---

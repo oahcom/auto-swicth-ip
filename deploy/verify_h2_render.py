@@ -95,21 +95,47 @@ def check_rules(cfg: dict) -> None:
 
 
 def check_nodes(ledger: list[dict]) -> None:
-    dorm = {n["tag"] for n in json.load(open(PROJECT / "dormant-outbounds.json"))}
+    """节点必须能在**生产配置或沉睡池**里找到。
+
+    只查 `dormant-outbounds.json` 是过时的判据：那份是 okz 旧入口的手工快照，
+    新订阅的节点（etcloud 的 `*.greatgameupload.org`、yyd2tett 的
+    `*.dankenet.help`）从来不在里面。实测 2026-11-04 渲染出 18 个 etcloud
+    活节点后，校验器把其中 8 条判成错误 —— 而它们在
+    `singbox-config.json` 里好好地躺着。渲染器的 `node_outbound()` 本来就是
+    「主配置优先、沉睡池兜底」，校验器必须用同一个口径。
+    """
+    known: set[str] = set()
+    for path in (PROJECT / "singbox-config.json",
+                 PROJECT / "dormant-outbounds.json"):
+        try:
+            data = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        items = data if isinstance(data, list) else data.get("outbounds") or []
+        known |= {n["tag"] for n in items if isinstance(n, dict) and n.get("tag")}
     for r in ledger:
-        if r["node"] not in dorm:
-            err(f"{r['unit']}: 节点 {r['node']} 不在 dormant-outbounds.json")
+        if r["node"] not in known:
+            err(f"{r['unit']}: 节点 {r['node']} 既不在生产配置也不在沉睡池")
 
 
 def check_devices(ledger: list[dict]) -> None:
+    """设备必须存在，且**不能被别的组占用**。
+
+    判据不能是 `free_devices()`：它按定义排除 active 单元占着的设备，而
+    重渲染后重跑 h2-install.sh 时，19 条 usque-h2-* 正占着台账里的 19 台 ——
+    于是每条线都报「已被 active 单元占用」（2026-11-05 实测 19 条全报错），
+    恰恰把要支持的幂等重装挡在门外。台账里的设备属于**本组**，只要求占用者
+    是这条线自己的单元。
+    """
     import render_h2_lines as rd
-    free = set(rd.free_devices())
+    owner = rd.device_owner()
     for r in ledger:
         cfg = PROJECT / ".warp" / r["device"] / "config.json"
         if not cfg.exists():
             err(f"{r['unit']}: 设备配置缺失 {cfg}")
-        if r["device"] not in free:
-            err(f"{r['unit']}: 设备 {r['device']} 已被 active 单元占用")
+        held = owner.get(r["device"])
+        if held and held != r["unit"]:
+            err(f"{r['unit']}: 设备 {r['device']} 已被 {held} 占用")
 
 
 def check_units(ledger: list[dict]) -> None:

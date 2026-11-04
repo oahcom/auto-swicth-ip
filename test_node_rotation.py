@@ -193,4 +193,47 @@ assert updates.get("ban_hold_node") == "b.nrt:443-any", \
 assert "ban_hold_home" not in updates, "还原目标不能动"
 assert updates.get("ban_hold_ready"), "换节点重启成功要记 ready，免得再补一次重启"
 
-print("✓ 12 项同块轮回自检通过")
+# 13) 候选排序必须把「实测承载不了 WARP」的压到最后。
+# 实测 2026-11-04：WG-1 在 HKG/NRT 两个 wg=0/4 的节点之间来回换了 12 次，
+# 每次都「节点 TCP 通但拿不到出口」；39 次同块轮回里 5 分钟内拿到出口的只有
+# 15 次（38%）。rotation 176 个槽位里 135 个从没测过，凭块序选等于赌。
+DEAD_FIRST = {k: dict(v) for k, v in NODES.items()}
+DEAD_FIRST["b.nrt:443-any"].update({"wg_ok": 0, "wg_n": 4})   # 实测不通
+DEAD_FIRST["c.nrt:443-any"].update({"wg_ok": 2, "wg_n": 2})   # 实测可用
+with patch.object(daemon, "_warp",
+                  return_value={"node_rotation_enabled": True,
+                                "restart_max_per_hour_per_line": 20,
+                                "members": []}), \
+     patch.object(daemon, "_warp_line_state",
+                  return_value={"restart_hist": [], "ip": "2a09:bac1::1"}), \
+     patch.object(daemon, "_warp_line_state_locked", return_value={}), \
+     patch.object(daemon.warp_wg, "_read_state",
+                  side_effect=lambda: copy.deepcopy(LINE)), \
+     patch.object(warp_blocks, "load_map", return_value=DEAD_FIRST), \
+     patch.object(daemon, "active_warp_tag", return_value=None), \
+     patch.object(daemon, "_node_tcp_ok", return_value=True):
+    got = daemon._same_block_standby("WARP-WG-7", 1_000_000.0)
+assert got == "c.nrt:443-any", \
+    f"应跳过块序在前但实测不通的 b，选实测可用的 c，实际 {got}"
+
+# 14) 没测过（rank 1）不能因为「块序在后」被实测不通的（rank 2）顶掉 ——
+# 未知不等于坏，把它排到实测不可用之后但仍可被选中。
+MIXED = {k: dict(v) for k, v in NODES.items()}
+MIXED["b.nrt:443-any"].update({"wg_ok": 0, "wg_n": 4})
+with patch.object(daemon.warp_wg, "_read_state",
+                  side_effect=lambda: copy.deepcopy(LINE)), \
+     patch.object(warp_blocks, "load_map", return_value=MIXED), \
+     patch.object(daemon, "_node_tcp_ok", return_value=True):
+    got = daemon._same_block_standby("WARP-WG-7", 1_000_000.0)
+assert got == "c.nrt:443-any", f"没测过的 c 应排在实测不通的 b 之前，实际 {got}"
+
+# 15) 全线都没测过时照常按块序选第一个 —— 过滤会让人工刚加的节点永远上不了线。
+UNMEASURED = {k: dict(v) for k, v in NODES.items()}
+with patch.object(daemon.warp_wg, "_read_state",
+                  side_effect=lambda: copy.deepcopy(LINE)), \
+     patch.object(warp_blocks, "load_map", return_value=UNMEASURED), \
+     patch.object(daemon, "_node_tcp_ok", return_value=True):
+    got = daemon._same_block_standby("WARP-WG-7", 1_000_000.0)
+assert got == "b.nrt:443-any", f"全未知时按块序，实际 {got}"
+
+print("✓ 15 项同块轮回自检通过")

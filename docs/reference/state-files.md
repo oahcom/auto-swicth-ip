@@ -27,6 +27,7 @@
 | `.pool_history.json` | daemon | daemon | 骤降护栏的基线样本 |
 | `.warp_proxy_fallback.json` | daemon | daemon | 落池时刻（3h 冷却） |
 | `.warp_segment.json` | daemon | daemon | 当前出口段起点 |
+| `.warp/backfill.json` | daemon（开/撤补位渠道） | `config.py::_append_backfill_members` | 补位渠道成员（锁定期才存在） |
 | `.warp/block-map.json` | 人工 / `warp_blocks.build_map` | `warp_blocks.channels()` | 块 → 节点归属 |
 | `.warp/h2/channels.json` | `deploy/render_h2_lines.py` | `h2-install.sh` / `remote-deploy.sh` | H2 渠道 ↔ 设备 ↔ 端口 |
 | `.warp/ipv6_segments.json` | 探测脚本 | `warp_blocks` | colo ↔ 地址段映射（实测数据） |
@@ -77,6 +78,17 @@ rebind_ts`。少了它，渠道锁还原会每分钟重写一次配置，而 `re
 `quota` 说明隧道完全正常、只是这个地址被封，把健康线当半死线重启还有一层
 后果：真故障被噪声埋掉（实测 WARP-WG-17 涨到 2457）。
 
+### `ban_backfill_tag` / `ban_backfill_node`
+
+补位渠道记在**被封的那条线**上：`ban_backfill_tag` 是顶上来的空闲设备线
+（`WARP-WG-N`），`ban_backfill_node` 是它落的节点。**必须落盘**：只放内存的话
+daemon 重启一次就再也撤不掉那条补位线了。
+
+成员身份另存 `.warp/backfill.json`（daemon 写，`config.py::_append_backfill_members`
+读）——`deploy/members.py` 与 `parse_subscription.py` 是独立进程，只看得到文件。
+两份记录**都要有**：文件让补位渠道进配置，字段让 08:00 找得到该撤哪条。
+详见 [../task-20261104-channel-backfill.md](../task-20261104-channel-backfill.md)。
+
 ### `ban_hold_*` 四个字段
 
 `ban_hold_home` / `ban_hold_node` / `ban_hold_until` / `ban_hold_ready`，
@@ -86,10 +98,11 @@ rebind_ts`。少了它，渠道锁还原会每分钟重写一次配置，而 `re
 
 - `_line_node(tag) == home` **且** `_line_restarted_after_write(tag)` → 已达目的
 - `_rehome_one` 返回 `gone`（原节点下架）→ 放弃还原，保留当前节点
-- 重启成功 → 清 `ban_hold_*` **并且清 `ban_window`**
+- 重启成功 → 清 `ban_hold_*` **并且清 `ban_probes`**
 
-**`ban_window` 必须一起清**：不清的话，解封前那一小时攒的 31 条样本还在，
-08:00 之后再记一条就直接重新锁到次日 —— "锁一天"退化成"永久锁定"（实测复现）。
+**`ban_probes` 必须一起清**：它是「当天最近 1000 条模型层实测结论」，不清的话
+解封前攒的 quota 样本还在，08:00 之后再记一条就直接重新锁到次日 —— "锁一天"
+退化成"永久锁定"（实测复现）。旧字段名是 `ban_window`，2026-11-04 换判据时改名。
 
 ## 四、`.warp_ip_used.json`
 
