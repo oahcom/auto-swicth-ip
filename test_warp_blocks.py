@@ -423,3 +423,32 @@ def test_discovered_block_still_respects_exclude_colos():
     # discovered_blocks 本身只负责「块表没有的 colo」；排除由 channels 管
     tags = {x["colo"] for x in wb.channels(c, nm)}
     assert "BOM" not in tags
+def test_rebind_uses_declared_family_not_stale_state(monkeypatch):
+    """rebind 写配置时必须用**当前声明**的族，不能读状态表里的旧值。
+
+    状态表的 `family` 只在 `apply()` 时写一次，改过拓扑就是旧世代残留。
+    实测远端 2026-11-05：`.env` 是 `WARP_WG_FAMILIES=v6`，状态表记
+    WG-1/2/3 为 v4 —— rebind 按状态表重写，把 line2/line3 写回
+    `prefer_ipv4`。v4 出口只由 colo 决定，三条线立刻撞成同一个
+    `104.28.205.117`（既定事实第 27 条：v4 渠道数不应超过 colo 数）。
+    """
+    import warp_wg as ww
+
+    got = {}
+    monkeypatch.setattr(ww, "_read_state", lambda: {"lines": {
+        "WARP-WG-2": {"node": "old", "family": "v4",
+                      "rotation": ["a", "b"], "port": 1111}}})
+    monkeypatch.setattr(ww, "udp_capable", lambda nodes, probe=False: list(nodes))
+    monkeypatch.setattr(ww, "load_nodes", lambda: [
+        {"tag": "a", "server": "a", "server_port": 1},
+        {"tag": "b", "server": "b", "server_port": 1}])
+    monkeypatch.setattr(ww, "write_line",
+                        lambda i, n, family=None: got.setdefault("f", family))
+    monkeypatch.setattr(ww, "write_json", lambda *a, **k: None)
+    monkeypatch.setattr(ww, "state_path", lambda: "/tmp/x.json")
+    monkeypatch.setattr(ww, "_wg", lambda: {"families": ["v6"],
+                                            "tag_prefix": "WARP-WG-",
+                                            "service_prefix": "warp-wg-",
+                                            "base_port": 1110})
+    ww.rebind(2)
+    assert got["f"] == "v6", f"应取声明的 v6，实际 {got}"

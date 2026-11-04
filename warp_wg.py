@@ -826,7 +826,14 @@ def rebind(i: int, probe: bool = False) -> str | None:
             continue
         if probe and not probe_node_tcp(pool[tag]):
             continue
-        write_line(i, pool[tag], family=line.get("family"))
+        # family 用**当前配置声明的值**，不用状态表里的 `line["family"]`：
+        # 后者是上一次 `apply()` 的快照，改过拓扑（如 `WARP_WG_FAMILIES`
+        # 从 `v4,v6,v6,v6` 变成 `v6`）之后它就是旧世代残留。实测远端
+        # 2026-11-05：状态表记 WG-1/2/3 为 v4，而 `.env` 是 `v6` —— rebind
+        # 按状态表重写，把 line2/line3 写回了 `prefer_ipv4`，v4 出口只由
+        # colo 决定 ⇒ 三条线撞成同一个 `104.28.205.117`。
+        # `line_family(i)` 与 `apply()` 的取值口径完全一致。
+        write_line(i, pool[tag], family=line_family(i))
         line["node"] = tag
         line["rebind_ts"] = int(time.time())
         st["updated"] = int(time.time())
