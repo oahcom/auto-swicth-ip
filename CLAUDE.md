@@ -19,6 +19,7 @@ Claude Code / AI Client
     │   该文件已不存在，进程环境里也没有 NODE_OPTIONS）
     ↓
 sing-box (mixed inbound :7890 环回 / :7891 局域网, Clash API :9090 Bearer auth)
+    另有 asip-h2-singbox 承载 31 条 H2 线，Clash API :9091（daemon 换 H2 节点用）
     ├── route: domain_suffix ["opencode.ai"] → selector opencode-out
     │   → 50 条 WARP 线路（5 直连 + 19 H2 + 22 WG + 4 已停用）
     │      + proxy 池兜底，共 51 个 selector 成员
