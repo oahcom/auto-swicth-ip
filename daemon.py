@@ -3273,6 +3273,21 @@ def _rehome_held_lines(now: float | None = None) -> None:
         if not isinstance(st, dict):
             continue
         until = float(st.get("ban_hold_until") or 0.0)
+        # **H2 的「取不到出口」锁可以在锁定期内直接解**。这条锁的前提是
+        # 「重启换的是同一个节点的地址，白烧」，而 selector 换节点不重启、
+        # 不断流、零成本 —— 前提不成立。实测 2026-11-05 NRT-13/14、TPE-5/6/18、
+        # SLC-11/12 被锁到次日 08:00，其中 NRT 两条当时就有 4 个 TCP 可达的
+        # 候选，整晚一次探测都没有。换成了就解锁放回探测；换不成（整池死）
+        # 保持锁定，`_h2_repair` 自带 60s 节流。
+        # 只认 `ban_noaddr_since`：quota 锁说的是「这个地址被烧」，节点本身
+        # 是好的，换掉等于白丢一条能用的链路。
+        if until > now and float(st.get("ban_noaddr_since") or 0.0):
+            _m = _warp_member(tag)
+            if _m and _m.get("kind") == "h2" and _h2_repair(_m):
+                _warp_line_update(tag, ban_hold_until=0.0, ban_hold_ready=0.0,
+                                  stop_probe=False, ban_noaddr_since=0.0)
+                log(f"  ⇢ {tag} 换到可用节点，解除「取不到出口」锁")
+                continue
         # 释放条件（三者都必须先满足 until <= now，否则会把还在锁里的线放出来）：
         #   ① 0 < until <= now —— 正常到期，也覆盖旧版本留下、没有 stop_probe
         #      字段的存量锁（不认它的话，旧锁到期后样本不清，下一条实测就重锁）；
