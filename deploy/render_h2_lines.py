@@ -268,9 +268,21 @@ def free_devices(unit_dir: str | Path = "/etc/systemd/system") -> list[str]:
     # （2026-11-04 实测：free_devices 返回的 19 台正好全是生产在用的那 19 台。）
     units = Path(unit_dir)
     used = set(device_owner(units))
-    all_dev = sorted(
-        p.name for p in (PROJECT / ".warp").glob("usque*")
-        if p.is_dir() and (p / "config.json").exists())
+    all_dev = []
+    for p in sorted((PROJECT / ".warp").glob("usque*")):
+        if not (p.is_dir() and (p / "config.json").exists()):
+            continue
+        # 设备目录必须带 `usque`（指向 `../usque/usque` 的软链，见 h2-add-devices.sh）。
+        # 只有 config.json 的半成品目录也会被当成可用设备，渲染出的单元起上去就是
+        # status=127 无限重启 —— 2026-11-05 远端 9 台 h2new 正是这样，直到扩容
+        # 10 条线时才从 journal 里发现。这里直接补链接（幂等），而不是把它们
+        # 排除掉：那等于把这批设备永久闲置，症状更隐蔽。
+        if not (p / "usque").exists() and not (p / "usque").is_symlink():
+            try:
+                (p / "usque").symlink_to("../usque/usque")
+            except OSError:
+                continue
+        all_dev.append(p.name)
     return [d for d in all_dev
             if d not in used and not d.startswith("usque-probe")]
 

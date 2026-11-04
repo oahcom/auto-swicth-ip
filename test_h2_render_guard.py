@@ -41,6 +41,24 @@ def test_probe_devices_are_never_reported_free(tmp_path, monkeypatch):
     assert free == ["usque10"], f"探测设备被当成空闲: {free}"
 
 
+def test_device_without_usque_gets_the_symlink_not_dropped(tmp_path, monkeypatch):
+    """只有 config.json 的设备目录要补上 usque 软链，不能直接发出去当空闲。
+
+    2026-11-05 远端 9 台 `usque-h2new*` 注册成功但没建链接，渲染器把它们当空闲
+    分给 10 条新线，单元起上去就是 `status=127` 无限重启（journal 里是
+    `No such file or directory`），而 daemon 只看到这些线「取不到出口」。
+    """
+    mod = _render_mod()
+    warp = tmp_path / ".warp"
+    (warp / "usque-new").mkdir(parents=True)
+    (warp / "usque-new" / "config.json").write_text("{}")
+    monkeypatch.setattr(mod, "PROJECT", tmp_path)
+
+    free = mod.free_devices(tmp_path / "units")
+    assert free == ["usque-new"], free
+    assert (warp / "usque-new" / "usque").is_symlink(), "没补链接"
+
+
 def test_active_h2_units_occupy_their_devices(tmp_path, monkeypatch):
     """在跑 usque-h2-* 的设备必须算「已占用」。
 
