@@ -91,6 +91,38 @@ def test_new_colo_gets_a_member_and_old_ones_keep_their_numbers(tmp_path,
     assert order[3] == ("WARP-H2-BOM-16", "BOM")
 
 
+def test_expansion_runs_even_when_block_map_yields_channels(tmp_path,
+                                                            monkeypatch):
+    """扩张逻辑不能只活在「块模型一条也没筛出」那个分支里。
+
+    2026-11-05 实测两台机器同一份代码：本地 31 条、远端 22 条。差的 9 条正是
+    块模型没覆盖的新 colo —— 扩张代码原文写在 `if not out:` 里面，而块模型
+    通常总能筛出几条，于是生产上从没执行过。远端 block-map 有 43 个 h2 节点、
+    8 个 colo，投产的却只有块模型那一份 22 条。
+    """
+    mod = _render_mod()
+    monkeypatch.setattr(mod.warp_blocks, "load_map", lambda: {
+        "a.nrt:443-any": {"colo": "NRT", "carrier": "h2"},
+        "b.nrt:443-any": {"colo": "NRT", "carrier": "h2"},
+        "c.bom:443-any": {"colo": "BOM", "carrier": "h2"},
+    })
+    # 块模型只筛出 NRT 那一条；BOM 不在它返回的列表里。
+    monkeypatch.setattr(mod.warp_blocks, "channels",
+                        lambda cfg, nodes: [{"tag": "WARP-H2-NRT-0",
+                                             "node": "a.nrt:443-any",
+                                             "index": 0, "family": "v4"}])
+    monkeypatch.setitem(mod.CFG["warp"].setdefault("blocks", {}),
+                        "channels_per_block", 2)
+    monkeypatch.setattr(mod, "PROJECT", tmp_path)
+    monkeypatch.setitem(mod.CFG["warp"], "blocks",
+                        {**mod.CFG["warp"]["blocks"], "table": [
+                            {"colo": "NRT"}, {"colo": "BOM"}]})
+    out = mod.h2_channels()
+    assert [c["tag"] for c in out][0] == "WARP-H2-NRT-0"
+    assert "WARP-H2-BOM-1" in [c["tag"] for c in out], \
+        f"块模型筛出 1 条时扩张逻辑没跑，实际 {[c['tag'] for c in out]}"
+
+
 def test_missing_node_skips_one_line_not_the_whole_batch(tmp_path, monkeypatch):
     """落地节点从订阅里消失时只跳过那一条线。
 
@@ -231,6 +263,44 @@ def test_h2_repair_switches_node_before_restarting(monkeypatch):
     daemon._NODE_NEXT_CHECK["WARP-H2-X-3"] = 9e18
     assert not daemon._h2_repair({"tag": "WARP-H2-X-3", "kind": "h2",
                                   "index": 3})
+
+
+def test_noaddr_lock_release_switches_node_first(monkeypatch):
+    """「连续 5h 取不到出口」的锁到期时，H2 先后换节点再解锁。
+
+    只解锁不换节点的话，下一轮探测还是同一个死节点：3 次 unknown → 换节点 →
+    整池试遍 → 又 5h 无地址被锁，一圈回到原点。实测 2026-11-05 NRT-13 /
+    SLC-11 / TPE-5 / TPE-6 各停了约 700 分钟没有任何探测。
+    """
+    import time
+    import daemon
+
+    repaired = []
+    monkeypatch.setattr(daemon, "_warp", lambda: {
+        "channel_ban_hold_enabled": True, "members": []})
+    monkeypatch.setattr(daemon, "_warp_member",
+                        lambda t: {"tag": t, "kind": "h2", "index": 3})
+    monkeypatch.setattr(daemon, "_h2_repair",
+                        lambda m: (repaired.append(m["tag"]), True)[1])
+    monkeypatch.setattr(daemon, "_backfill_close", lambda t: False)
+    monkeypatch.setattr(daemon, "_backfill_reconcile", lambda n: None)
+    monkeypatch.setattr(daemon, "_backfill_open", lambda *a, **k: None)
+    stale = time.time() - 60
+    daemon._WARP_LINE_STATE.clear()
+    daemon._WARP_LINE_STATE["WARP-H2-TPE-5"] = {
+        "ban_hold_until": stale, "stop_probe": True,
+        "ban_noaddr_since": stale - 5 * 3600, "ban_noaddr": 0.0}
+    daemon._rehome_held_lines()
+    assert repaired == ["WARP-H2-TPE-5"], "解锁前没先换节点"
+    assert daemon._WARP_LINE_STATE["WARP-H2-TPE-5"]["stop_probe"] is False
+
+    # quota 锁不换节点：地址被烧时节点本身是好的，换掉等于白丢一条链路。
+    repaired.clear()
+    daemon._WARP_LINE_STATE.clear()
+    daemon._WARP_LINE_STATE["WARP-H2-LAX-15"] = {
+        "ban_hold_until": stale, "stop_probe": True, "ban_noaddr_since": 0.0}
+    daemon._rehome_held_lines()
+    assert repaired == [], "quota 锁不该换节点"
 
 
 def test_ledger_devices_count_as_capacity(tmp_path, monkeypatch):

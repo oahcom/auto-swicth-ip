@@ -117,42 +117,54 @@ def h2_channels() -> list[dict]:
                 })
             print(f"块模型未筛出 h2 渠道，改用台账 {len(out)} 条"
                   f"（.warp/h2/channels.json）", file=sys.stderr)
-            # **台账只是起点，不是天花板**：设备够的时候（远端实测 16 台空闲 +
-            # 22 台在册）新 colo 的 h2 节点应当能开新线。否则台账既是渲染器的
-            # 输入又是它的输出，渲染器永远扩张不了 —— 自锁。这里把 block-map
-            # 里还没被台账覆盖的 h2 节点补成新渠道，编号接在既有最大 index
-            # 之后（与 `_member_order` 同一约定）。
-            have = {c["node"] for c in out}
-            cap = int((CFG["warp"].get("blocks") or {})
-                      .get("channels_per_block") or 0)
-            per_colo: dict[str, int] = {}
-            for c in out:
-                if c.get("colo"):
-                    per_colo[c["colo"]] = per_colo.get(c["colo"], 0) + 1
-            # 按 colo 分组、组内按名字排序：同一批新增在两次渲染间保持稳定。
-            cand: dict[str, list[str]] = {}
-            for node, meta in nodes_map.items():
-                if not isinstance(meta, dict) or meta.get("carrier") != "h2":
-                    continue
-                if node not in have:
-                    cand.setdefault(str(meta.get("colo") or "?"), []).append(node)
-            nxt = max([c["index"] for c in out] or [-1]) + 1
-            added = 0
-            for colo in sorted(cand):
-                for node in sorted(cand[colo]):
-                    if cap and per_colo.get(colo, 0) >= cap:
-                        break
-                    out.append({"tag": f"WARP-H2-{colo}-{nxt}",
-                                "node": node, "colo": colo,
-                                "colo_measured": colo, "carrier": "h2",
-                                "index": nxt, "family": "v4",
-                                "_saved_device": None})
-                    per_colo[colo] = per_colo.get(colo, 0) + 1
-                    nxt += 1
-                    added += 1
-            if added:
-                print(f"台账之外按 block-map 补 {added} 条 h2 渠道",
-                      file=sys.stderr)
+    # **台账/块模型都只是起点，不是天花板**：设备够的时候（远端实测 16 台空闲
+    # + 22 台在册）新 colo 的 h2 节点应当能开新线。否则台账既是渲染器的输入
+    # 又是它的输出，渲染器永远扩张不了 —— 自锁。这里把 block-map 里还没被
+    # 覆盖的 h2 节点补成新渠道，编号接在既有最大 index 之后（与 `_member_order`
+    # 同一约定）。
+    #
+    # **不能放在 `if not out:` 里面**（原样）：那样只有「块模型一条也没筛出」
+    # 时才扩张，而块模型通常总能筛出几条 —— 于是扩张逻辑在生产上从没执行过。
+    # 实测 2026-11-05 两台机器同一份代码：本地 31 条、远端 22 条，差的 9 条正是
+    # 从来没被补出来的新 colo。远端 block-map 里有 43 个 h2 节点、8 个 colo，
+    # 实际投产的只有块模型那一份。
+    have = {c["node"] for c in out}
+    cap = int((CFG["warp"].get("blocks") or {}).get("channels_per_block") or 0)
+    per_colo: dict[str, int] = {}
+    for c in out:
+        # 台账里的 `colo` 字段是 null（只有 `member_tag` 里有块名），从 tag 兜底，
+        # 否则 per_colo 恒空、上限永远不生效（同一 colo 会被补出任意多条）。
+        colo = c.get("colo") or c.get("colo_measured")
+        if not colo:
+            parts = str(c.get("tag") or "").split("-")
+            colo = parts[2] if len(parts) > 3 else None
+        if colo:
+            c["colo"] = c["colo_measured"] = colo
+            per_colo[colo] = per_colo.get(colo, 0) + 1
+    # 按 colo 分组、组内按名字排序：同一批新增在两次渲染间保持稳定。
+    cand: dict[str, list[str]] = {}
+    for node, meta in nodes_map.items():
+        if not isinstance(meta, dict) or meta.get("carrier") != "h2":
+            continue
+        if node not in have:
+            cand.setdefault(str(meta.get("colo") or "?"), []).append(node)
+    nxt = max([c["index"] for c in out] or [-1]) + 1
+    added = 0
+    for colo in sorted(cand):
+        for node in sorted(cand[colo]):
+            if cap and per_colo.get(colo, 0) >= cap:
+                break
+            out.append({"tag": f"WARP-H2-{colo}-{nxt}",
+                        "node": node, "colo": colo,
+                        "colo_measured": colo, "carrier": "h2",
+                        "index": nxt, "family": "v4",
+                        "_saved_device": None})
+            per_colo[colo] = per_colo.get(colo, 0) + 1
+            nxt += 1
+            added += 1
+    if added:
+        print(f"台账/块模型之外按 block-map 补 {added} 条 h2 渠道",
+              file=sys.stderr)
     # v4 块（colo=ALL）没有自己的节点，节点与 SIN 那三条重复，排最后。
     out.sort(key=lambda c: (c["index"], blk_pos.get(c["colo"], len(table))))
     return out
