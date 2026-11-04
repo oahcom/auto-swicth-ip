@@ -5,6 +5,7 @@
 出口探测仍要求 `warp=on`、line_worker 默认不接管旧守护。
 """
 import sys
+import time
 
 import pytest
 
@@ -240,3 +241,133 @@ def test_dead_nodes_export_shares_lock_and_keeps_foreign_entries(monkeypatch, tm
     assert seen["path"] == str(target)
     assert seen["lock"] == str(target) + ".lock"
     assert set(seen["data"]) == {"from-cron", "from-daemon"}
+
+
+# ─────────────────────────────────────────────────────────────
+# /rotate 的回复必须带上「此刻哪条线是出口」
+# ─────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def _rotate_isolated(monkeypatch):
+    """让 _rotate_once 只做自己的事：不换线、不落盘、不碰真实台账。"""
+    monkeypatch.setattr(daemon, "_last_rotate_ts", 0.0)
+    monkeypatch.setattr(daemon, "_api_stats",
+                        {"calls": 0, "switched": 0, "coalesced": 0,
+                         "too_frequent": 0, "no_standby": 0})
+    monkeypatch.setattr(daemon, "_warp_line_ip", lambda tag: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: False)
+
+
+def test_rotate_reports_active_line_when_it_declines(monkeypatch, _rotate_isolated):
+    """没换线也必须回答「现在哪条线、哪个地址是出口」。
+
+    调用方只有这个字段能看见「asip 自己换过线」（主循环、探测判死、定时轮换都
+    不经过 9router）。被限速的那次回复若什么都不说，调用方就以为没变、继续骑着
+    旧隧道 —— 那批连接会一直吐旧出口的 429。
+    """
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-7")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:6215:28::4:347")
+    # 刚换过、但没到合并窗口：走 too_frequent 而不是 coalesced。
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 3600.0)
+    monkeypatch.setattr(daemon, "_last_rotate_ts", time.time() - 2)
+
+    out = daemon._rotate_once("rate429")
+
+    assert out["reason"] == "too_frequent", "用例前提：这一轮应当被限速"
+    assert out["active_tag"] == "WG-7", (
+        "被限速的回复没带 active_tag —— 调用方看不见 asip 自己换过的那次线"
+    )
+    assert out["active_egress"] == "2a09:bac5:6215:28::4:347", (
+        "被限速的回复没带 active_egress —— 原地重连换了地址但线名不变，"
+        "调用方据此会以为没换、继续骑着断掉的连接"
+    )
+
+
+def test_rotate_reports_the_new_line_after_switching(monkeypatch, _rotate_isolated):
+    """换线成功时要报刚切上去那条，不能去读 selector 快照。
+
+    快照轮询 0.5s 才刷新一次，刚 PUT 完读回来可能还是被换下的旧线；调用方据此
+    判断「没变」就不重置连接，这批连接会一直吐旧出口的 429。
+    """
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-OLD")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "old-egress")
+    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
+                        lambda reason, interrupt=False, out=None: (
+                            out.update({"tag": "WG-NEW", "ip": "1.2.3.4",
+                                        "switched_at": 1234.0}) or True))
+
+    out = daemon._rotate_once("rate429")
+
+    assert out["switched"] is True
+    assert out["active_tag"] == "WG-NEW", (
+        "换线成功后 active_tag 不是刚切上去那条 —— 调用方会以为没换、不重置连接"
+    )
+    assert out["active_egress"] == "1.2.3.4", (
+        "换线成功后 active_egress 不是新地址 —— 调用方读到的身份可能是旧的"
+    )
+
+
+def test_rotate_sees_in_place_reconnect_that_keeps_the_same_line(monkeypatch, _rotate_isolated):
+    """原地重连：线名不变、只有地址变，也必须报出来。
+
+    这条路径重启的是当前隧道，在途连接是被杀掉的。只比线名的话调用方会以为
+    什么都没发生 —— 它手上那批连接已经死了，还继续往里发请求。
+    """
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-7")
+    # 原地重连成功时线表里的地址已被 invalidate 成 None，进程级出口是新地址。
+    monkeypatch.setattr(daemon, "_warp_line_ip", lambda tag: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:6215:28::4:347")
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 3600.0)
+    monkeypatch.setattr(daemon, "_last_rotate_ts", time.time() - 2)
+
+    out = daemon._rotate_once("rate429")
+
+    assert out["active_tag"] == "WG-7"
+    assert out["active_egress"] == "2a09:bac5:6215:28::4:347", (
+        "线表里的地址已被清成 None 时没有退回进程级出口 —— 原地重连看不见"
+    )
+
+
+def test_rotate_reports_no_warp_line_after_falling_back_to_proxy(monkeypatch, _rotate_isolated):
+    """落池后不能还报着旧 WARP 出口。
+
+    此时连接仍挂在被换下那条隧道上，而「当前出口」已经不是任何 WARP 线。
+    继续报旧线名/旧地址，调用方会以为身份没变、什么都不做。
+    """
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: None)
+    monkeypatch.setattr(daemon, "_warp_line_ip", lambda tag: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
+
+    out = daemon._with_active_line({}, time.time())
+
+    assert out["active_tag"] is None
+    assert out["active_egress"] is None, (
+        "落池后仍报着 WARP 出口地址 —— 调用方看不出出口已经换到轮换池"
+    )
+
+
+def test_fallback_to_proxy_clears_the_process_wide_egress(monkeypatch):
+    """落池必须清掉进程级出口地址。
+
+    留着它，`_with_active_line` 在 selector 指向 proxy 时会继续报旧地址，
+    而那批连接恰恰还挂在被换下那条隧道上。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
+    monkeypatch.setattr(daemon, "_load_proxy_fallback_ts", lambda: 0.0)
+    monkeypatch.setattr(daemon, "_write_json_atomic", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_switch_warp", lambda tag: True)
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
+    monkeypatch.setattr(daemon, "_begin_segment", lambda ts: None)
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "stale-egress")
+
+    ok = daemon._fallback_to_proxy({"tag": "WG-7", "port": 1087}, "stale-egress",
+                                   time.time())
+
+    assert ok is True, "用例前提：落池应当成功"
+    assert daemon._ACTIVE_WARP_IP is None, (
+        "落池后进程级出口地址仍是旧 WARP 地址 —— /rotate 会把它当成当前出口"
+    )

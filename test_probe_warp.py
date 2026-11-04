@@ -12,7 +12,9 @@ def test_env_marker_prepended_when_no_system_message():
 
     assert [m["role"] for m in body["messages"]] == ["system", "user"]
     assert body["messages"][0]["content"] == probe_warp.ENV_MARKER
-    assert "Workspace root folder: /workspace" in body["messages"][0]["content"]
+    # 只钉形状，不钉具体路径：路径是运行期值（9router 服务进程的 cwd），
+    # 上游门控的也是整块形状而非路径。
+    assert f"Workspace root folder: {probe_warp.ENV_WORKING_DIR}" in body["messages"][0]["content"]
 
 
 def test_env_marker_appended_to_existing_system_message():

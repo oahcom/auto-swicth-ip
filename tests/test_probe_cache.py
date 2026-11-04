@@ -62,5 +62,6 @@ print('P7 PASS  unreachable 不跨线复用')
 reset()
 d._probe_cache_put('WARP-WG-1', ip, 'OK', now=now)
 assert d._probe_cache_lookup('WARP-WG-1', ip, now + 500)[0] == 'OK'
-assert d._probe_cache_lookup('WARP-WG-1', ip, now + 700) is None
+# 过期点按当前 TTL 推导，不写死：OK 档从 600 调到 1800 后写死的 700 会假失败。
+assert d._probe_cache_lookup('WARP-WG-1', ip, now + d._probe_ttl('OK') + 1) is None
 print('P8 PASS  TTL 内 OK 复用，过期即重探')
