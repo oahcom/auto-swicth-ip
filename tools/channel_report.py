@@ -496,70 +496,18 @@ def _merge_segs(rs: list[dict]) -> dict:
             "seg_v4": sorted(v4)}
 
 
-def print_segments(rows: list[dict]) -> None:
-    """**按声明 colo 分组**：每个 colo 一行合计 + 一行 /32 细分 + 成员渠道。
+def _fp_pools(segments: dict[str, dict]) -> dict[str, dict[str, set]]:
+    """`{指纹 colo: {"/48": set, "/64": set, "/128": set}}`，全日志合并去重。
 
-    合并是必需的，不是省事：同一 colo 的各条线共用同一个池子，它们的
-    /32 明细本来就是同一份（实测 SIN 的 12 条线全是 `bac1(4) + bac5(8)`）。
-    按渠道逐条印，50 多行里真正不同的信息只有「哪条线在哪个 colo」。
+    这是**每个机房真正可抽的池子大小**，按 `ipv6_segments.colo_of()` 的
+    段指纹归并。三级并列是必需的：NRT 的 /48 和 SIN 一样是 12 个，但 /64
+    只有 12 个而 SIN 有 132 —— 只看 /48 会以为两边等宽，而 NRT 的 /128 级
+    5 分钟重复率是 30%，SIN 只有 0.4%。
 
-    表格列已经给了每条线自己的 /32//48//64//128 个数；这里回答的是另一个
-    问题：「这个机房的池子长什么样、里面有哪些线」。
+    收的是**全日志**（含已下线的 tag），不是当前在册的渠道：池子是机房的
+    属性，不会因为某条线退役而变小。只算在册渠道会让池子随成员表缩水，
+    读起来像「机房被削掉了一半」。
     """
-    if not rows:
-        print("（没有渠道数据）")
-        return
-    print("\n出口段明细（按 colo 合并该组全部渠道；/32 = 地址批次，"
-          "括号内是它下面的 /48、/64 与 /128 个数）")
-    print("-" * 92)
-    groups: dict[str, list[dict]] = defaultdict(list)
-    for r in rows:
-        groups[r["colo"] or "?"].append(r)
-    width = max((_w(c) for c in groups), default=0) + 2
-    for colo in sorted(groups):
-        rs = groups[colo]
-        m = _merge_segs(rs)
-        n32, n48, n64, n128 = _seg_counts(m)
-        v4 = m["seg_v4"]
-        head = (f"{len(rs)} 条 · {n32} 个 /32 · {n48} 个 /48 · "
-                f"{n64} 个 /64 · {n128} 个 /128") if n64 else f"{len(rs)} 条"
-        if v4:
-            head += f" · {len(v4)} 个 v4 地址"
-        print(f"{_pad(colo, width)} {head}")
-        if n64:
-            detail = "  ".join(f"{p}({a} 个 /48, {b} 个 /64, {c} 个 /128)"
-                               for p, a, b, c in _seg32_groups(m))
-            print(" " * (width + 1) + detail)
-        tags, line = [], " " * (width + 1)
-        for r in rs:
-            if _w(line) + _w(r["tag"]) + 1 > 92:
-                tags.append(line.rstrip())
-                line = " " * (width + 1)
-            line += r["tag"] + " "
-        tags.append(line.rstrip())
-        print("\n".join(tags))
-
-
-def print_colo_fp(rows: list[dict], segments: dict[str, dict]) -> None:
-    """`colo ↔ 段指纹` 对照：声明机房 vs 出口地址反推的落地机房。
-
-    两个 colo 不是一回事，混着看会得出相反结论：
-      - **声明的 colo** = 这条渠道的代理节点所在机房（`config.py` 的块模型）；
-      - **段指纹 colo** = `ipv6_segments.colo_of()` 按出口 /64 的第三四段反推
-        的落地机房。
-
-    WG 线经机场节点中转，节点在 NRT、出口完全可能落在 SIN —— 实测 WG-4..7
-    声明 NRT，出口 /64 有 73~93 个落在 SIN。块模型按声明 colo 分配渠道，
-    所以这不是 bug；但**按声明 colo 判断段池大小会错**（NRT 声明 7 条渠道，
-    实际只有 12 个 /64 可用，重复率 30%）。
-
-    `池` 列是**指纹属于该 colo 的 /48 · /64 · /128 三级个数**（全部渠道合并），
-    这才是该机房真正可抽的池子大小。三级并列看是必需的：NRT 的 /48 有 12 个
-    和 SIN 一样多，但 /64 只有 12 个而 SIN 有 132 —— 只看 /48 会以为两边池子
-    等大，而 NRT 的 /128 级 5 分钟重复率是 30%，SIN 只有 0.4%。
-    """
-    if not rows:
-        return
     pools: dict[str, dict[str, set]] = defaultdict(
         lambda: {"48": set(), "64": set(), "128": set()})
     for v in segments.values():
@@ -578,36 +526,73 @@ def print_colo_fp(rows: list[dict], segments: dict[str, dict]) -> None:
             except ValueError:
                 continue
             pools[colo]["128"].add(ip)
+    return pools
 
-    by_colo: dict[str, dict] = defaultdict(lambda: {"n": 0, "fp": defaultdict(int)})
+
+def print_segments(rows: list[dict], segments: dict[str, dict]) -> None:
+    """**按声明 colo 分组**，一组一行：出口段、池子、指纹落点、成员渠道。
+
+    三样东西放一起，是因为它们回答的是同一个问题、维度也相同（都是 colo）：
+      - **出口段** = 这组线落过哪些 /32 / /48 / /64 / /128；
+      - **指纹** = 出口段反推的落地机房分布（与声明 colo 是两件事：WG 线经
+        机场节点中转，声明 NRT 的线可以 72% 落在 SIN）；
+      - **池** = 指纹归到该机房的三级去重个数。
+
+    合并是必需的，不是省事：同一 colo 的各条线共用同一个池子，/32 明细本来
+    就是同一份（实测 SIN 的 12 条线全是 `bac1(4) + bac5(8)`）。按渠道逐条印，
+    50 多行里真正不同的只有「哪条线在哪个 colo」。
+    """
+    if not rows:
+        print("（没有渠道数据）")
+        return
+    print("\n出口段明细（按声明 colo 合并；池 = 指纹归到该机房的段数，"
+          "/32 行括号内是它下面的 /48、/64 与 /128）")
+    print("-" * 100)
+    groups: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
-        d = by_colo[r["colo"] or "?"]
-        d["n"] += 1
-        for c, n in r.get("colo_fp") or []:
-            d["fp"][c] += n
-
-    print("\ncolo ↔ 段指纹（声明 = 渠道所属机房；指纹 = 出口段反推的落地机房）")
-    print("-" * 92)
-    print(f"{_pad('声明', 6)} {_pad('渠道', 5, False)} {_pad('池 48/64/128', 13, False)}  "
-          f"指纹分布（按 /64 计数，前 5）")
-    for colo, d in sorted(by_colo.items()):
-        fp = sorted(d["fp"].items(), key=lambda kv: -kv[1])
-        total = sum(n for _, n in fp)
+        groups[r["colo"] or "?"].append(r)
+    pools = _fp_pools(segments)
+    head = (f"{_pad('声明', 6)} {_pad('渠道', 5, False)} "
+            f"{_pad('出口段 32/48/64/128', 20, False)} "
+            f"{_pad('池 48/64/128', 13, False)}  指纹落点（/64 去重，前 5）")
+    print(head)
+    width = max((_w(c) for c in groups), default=0) + 2
+    for colo in sorted(groups):
+        rs = groups[colo]
+        m = _merge_segs(rs)
+        n32, n48, n64, n128 = _seg_counts(m)
+        v4 = m["seg_v4"]
+        segs = (f"{n32}/{n48}/{n64}/{n128}" if n64 else "—")
+        if v4:
+            segs += f" +{len(v4)}v"
         pool = pools.get(colo) or {}
         cell = (f"{len(pool['48'])}/{len(pool['64'])}/{len(pool['128'])}"
                 if pool else "—")
+        fp = _fp_mix(m["seg_v6"])
+        total = sum(n for _, n in fp)
         if not total:
-            print(f"{_pad(colo or '?', 6)} {_pad(str(d['n']), 5, False)} "
-                  f"{_pad(cell, 13, False)}  —")
-            continue
-        dist = " · ".join(f"{c} {n * 100 // total}%" for c, n in fp[:5])
-        # 只在**主落点**与声明不同时标 ≠。多条渠道合并后必然混着几个机房，
-        # 按「是否 100% 一致」标会让几乎每行都带 ≠，标记本身就失去信息。
-        mark = "" if fp[0][0] == colo else "≠"
-        print(f"{_pad(colo or '?', 6)} {_pad(str(d['n']), 5, False)} "
-              f"{_pad(cell, 13, False)}  {mark}{dist}")
-    print("\n  池 = 指纹属于该机房的 /48 / /64 / /128 个数（全部渠道合并），越大越不容易撞段。")
-    print("  ≠  = 出口落在别的机房（WG 线经机场节点中转，节点机房≠出口机房是常态）。")
+            dist = "—"
+        else:
+            # 只在**主落点**与声明不同时标 ≠。混着几个机房是常态，
+            # 按「是否 100% 一致」标会让几乎每行都带 ≠，标记本身就没信息了。
+            mark = "" if fp[0][0] == colo else "≠"
+            dist = mark + " · ".join(f"{c} {n * 100 // total}%" for c, n in fp[:5])
+        print(f"{_pad(colo, width)} {_pad(str(len(rs)), 5, False)} "
+              f"{_pad(segs, 20, False)} {_pad(cell, 13, False)}  {dist}")
+        if n64:
+            detail = "  ".join(f"{p}({a} 个 /48, {b} 个 /64, {c} 个 /128)"
+                               for p, a, b, c in _seg32_groups(m))
+            print(" " * (width + 1) + detail)
+        tags, line = [], " " * (width + 1)
+        for r in rs:
+            if _w(line) + _w(r["tag"]) + 1 > 100:
+                tags.append(line.rstrip())
+                line = " " * (width + 1)
+            line += r["tag"] + " "
+        tags.append(line.rstrip())
+        print("\n".join(tags))
+    print("\n  池 = 指纹属于该机房的 /48 / /64 / /128 个数（全部渠道合并去重），越大越不容易撞段。")
+    print("  ≠  = 主落点不是声明的机房（WG 线经机场节点中转，节点机房≠出口机房是常态）。")
 
 
 def _seg_label(r: dict) -> str:
@@ -919,8 +904,7 @@ def main() -> int:
         render_html(rows, args.hours, Path(args.html))
     else:
         print_table(rows, args.hours)
-        print_segments(rows)
-        print_colo_fp(rows, segs)
+        print_segments(rows, segs)
     if args.by:
         print_grouped(rows, args.by)
     return 0

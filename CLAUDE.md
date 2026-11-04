@@ -782,8 +782,8 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `warp_night.py` | 80 | **夜锁策略**：`window` / `active` / `restart_allowed` / `label`。纯函数，不读配置不打日志；daemon 保留同名门面处理 IO |
 | `warp_diag.py` | 230 | **单节点 WARP 承载诊断**：配置只从 `warp_wg.build_line_config` 生成（不复刻），失败分 config/port/handshake/ok 四类。`--job` 输入 `{tag,node,egress_ip}` |
 | `test_warp_blocks.py` | — | 上面两个纯模块的单测（22 例）：块的切法、稳定性判定、夜间取舍、探针故障不计入节点履历 |
-| `tools/channel_report.py` | — | **渠道健康报表**（`asip chan`）：成功率/ban 率/成功失败数/物理落点/colo/**出口段**/段指纹落点/订阅源/脱敏订阅地址。出口段列写 `/32//48//64//128` 四级个数，明细表**按 colo 合并**（同 colo 的线共用同一池子，逐条印是同一份）后按 /32 批次分行并给出其下的 /48、/64 与 /128 个数（从 `daemon.log` 的出口行现算，不按时间窗口截断；台账里没有渠道归属）。`colo ↔ 段指纹` 表的「池」列同样给 `/48/64/128` 三级（`ipv6_segments.colo_of()` 按出口段反推落地机房，与声明的 colo 是两件事）。纯只读，`--hours` / `--html` / `--json` / `--by` |
-| `test_channel_report.py` | — | 报表纯函数单测（15 例）：verdict 口径、窗口夹零点、在册渠道、tag 漂移按 host:port 兜底、沉睡池节点标 okz 旧入口快照、出口段按 /64 去重、`/128` 单独留一份、`/32//48//64//128` 四级不会混、按 /32 分组、同 colo 合并去重、十六进制排序、`—`≠`0`、重启数取窗口内、段指纹映射、≠ 只标主落点 |
+| `tools/channel_report.py` | — | **渠道健康报表**（`asip chan`）：成功率/ban 率/成功失败数/物理落点/colo/**出口段**/段指纹落点/订阅源/脱敏订阅地址。出口段列写 `/32//48//64//128` 四级个数，明细表**按 colo 合并**（同 colo 的线共用同一池子，逐条印是同一份），每个 colo 一行给出口段、池（`/48/64/128` 三级去重，收全日志含已下线 tag）、指纹落点（`ipv6_segments.colo_of()` 反推，与声明的 colo 是两件事）、/32 细分与成员 tag。纯只读，`--hours` / `--html` / `--json` / `--by` |
+| `test_channel_report.py` | — | 报表纯函数单测（16 例）：verdict 口径、窗口夹零点、在册渠道、tag 漂移按 host:port 兜底、沉睡池节点标 okz 旧入口快照、出口段按 /64 去重、`/128` 单独留一份、`/32//48//64//128` 四级不会混、按 /32 分组、同 colo 合并去重、池按指纹归并三级去重、十六进制排序、`—`≠`0`、重启数取窗口内、段指纹映射、≠ 只标主落点 |
 | `tools/block_view.py` | — | **块视图**（`asip blk`）：每个 colo 块的节点清单、类别、实测握手、出口 IP、延迟（`--delay` 现测）、当前绑定线 / 块模型选中。`--channels` 换成渠道视角（每条渠道选中的节点、候选池大小、**与哪条渠道撞同一物理出口**），`--pools` 打印完整候选池 |
 | `test_block_view.py` | — | 块视图纯函数单测（11 例）：按 colo 分组与排序、在用优先于缺 diag（含 H2）、计划≠在用、延迟「没测」≠「不通」、host:port 多义不反查、CJK/emoji 对齐、渠道视角、同一物理出口去重 |
 | `requirements.txt` | — | 运行期依赖：requests / urllib3 / PyYAML（+ pytest 供测试） |

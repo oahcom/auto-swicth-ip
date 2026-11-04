@@ -169,6 +169,22 @@ def test_merge_segs_dedups_across_channels(mod):
     assert mod._merge_segs([]) == {"seg_v6": [], "seg_addr": [], "seg_v4": []}
 
 
+def test_fp_pools_dedup_three_levels_over_full_log(mod):
+    """池按**指纹 colo**归并，三级各自去重，且收全日志（含已下线 tag）。
+
+    池子是机房的属性，不随成员表缩水；只算在册渠道会让机房看起来被削掉一半。"""
+    segs = {"WARP-WG-1": {  # 在册
+                "v6": ["2a09:bac5:55f8:18be", "2a09:bac5:55f8:1d0f"],
+                "addr": ["2a09:bac5:55f8:18be::1", "2a09:bac5:55f8:18be::2"]},
+            "WARP-GONE": {   # 已下线，日志里还在
+                "v6": ["2a09:bac5:55f8:18be"], "addr": []}}
+    p = mod._fp_pools(segs)
+    # 两个 /64 同属 55f8 → SIN；三个 /128 只落在第一个 /64 下
+    assert len(p["SIN"]["48"]) == 1 and len(p["SIN"]["64"]) == 2
+    assert len(p["SIN"]["128"]) == 2
+    assert mod._fp_pools({}) == {}
+
+
 def test_seg_label_shows_four_prefix_levels(mod):
     """表格列写 `/32 / /48 / /64 / /128`：只给最细的 /64 看不出跨了几个批次，
     只给 /32 又看不出抽签密度，而没有 /128 就分不清「地址摊开」与「挤在一段」。"""
