@@ -125,7 +125,7 @@ rebind_ts`。少了它，渠道锁还原会每分钟重写一次配置，而 `re
 
 **全部来自 `okz`**。2026-11-04 实测：
 
-- 65 条 = **55 条 `bilibili-image-cdn.juhazf.cn:55001+`**（SNI `*.okzdns.com`）
+- 65 条 = **55 条 `bilibili-image-cdn.juhazf.cn:50001–60194`**（SNI `*.okzdns.com`）
   + **10 条 `*-aws-N.acczzz.com:443`**（SNI `*.hi2026.net`）—— 两个都是 okz 的域名
 - tag 一律 `host:port-any` / `-tr`，**无 `~N` 后缀**（`~N` 是 `dasho` 那种
   「同一 host:port 挂多个节点」的源才需要的消歧后缀）

@@ -539,7 +539,7 @@ daemon 之后每次换线都是 `status=404`（实测 30362 条），而日志�
 
 **沉睡池具体是 `okz` 这个订阅**，不是某个单独的源。判据（2026-11-04 实测）：
 
-- 65 条 = 55 条 `bilibili-image-cdn.juhazf.cn:55001+`（SNI 为 `*.okzdns.com`）
+- 65 条 = 55 条 `bilibili-image-cdn.juhazf.cn:50001–60194`（SNI 为 `*.okzdns.com`）
   + 10 条 `*-aws-N.acczzz.com:443`（SNI 为 `*.hi2026.net`），两个都是 okz 的域名
 - tag 一律是 `host:port-any` / `-tr`，**没有 `~N` 后缀** —— 那是 `dasho` 那种
   「同一 host:port 挂多个节点」的源才需要的消歧后缀
