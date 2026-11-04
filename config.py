@@ -884,6 +884,36 @@ def subscription_urls() -> list[str]:
     """Configured subscription URLs, in merge order, empty entries dropped."""
     return [url for url in (CFG.get(k, {}).get("sub_url", "") for k in SUBSCRIPTION_KEYS) if url]
 
+
+EXTRA_SUBS_FILE = _env_path("ASIP_EXTRA_SUBS_FILE",
+                            os.path.join(PROJECT_DIR, ".extra_subscriptions"))
+
+
+def extra_subscription_urls() -> list[str]:
+    """追加订阅源：环境变量 ASIP_EXTRA_SUB_URLS + `asip sub add` 写的台账文件。
+
+    为什么用文件而不是只写 .env：daemon 的 EnvironmentFile 只在启动时读一次，
+    写 .env 必须重启才生效 —— 而重启会掐断在途 SSE。台账文件在每次刷新的
+    `_sub_urls()` 里现读，插一个源不用动进程。环境变量仍优先（临时覆盖/试跑）。
+
+    顺序排在固定源之后：固定源是主力，追加源是补充。
+    """
+    raw = os.environ.get("ASIP_EXTRA_SUB_URLS") or ""
+    urls = [p for p in raw.replace(",", " ").split() if "://" in p]
+    try:
+        with open(EXTRA_SUBS_FILE, encoding="utf-8") as f:
+            urls += [ln.strip() for ln in f
+                     if "://" in ln and not ln.lstrip().startswith("#")]
+    except OSError:
+        pass
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
 # ============= 启动校验 =============
 # requests 模式整个判据就是「数哪个模型的成功调用」。键写错时 daemon 不该
 # 带着一条永不触发的判据上线 —— 导入即炸，比线上静默不换线好查得多。

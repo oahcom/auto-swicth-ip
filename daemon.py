@@ -7854,6 +7854,12 @@ _SUB_URLS = [
     CFG.get("dasho", {}).get("sub_url", ""),
     CFG.get("dasho_alt", {}).get("sub_url", ""),
 ]
+# 追加源在**每次刷新时**现读环境：`asip sub add` 写进 .env 后不必重启 daemon
+# （重启会掐断在途 SSE，代价远大于一次 list 拼接）。固定源仍冻结在 import 期，
+# 它们来自 config.py，改它们本来就要重启。
+def _sub_urls() -> list[str]:
+    from config import extra_subscription_urls
+    return [u for u in _SUB_URLS + extra_subscription_urls() if u]
 
 _REFRESH_LOCK = threading.Lock()   # 串行化订阅刷新：启动路径与主循环会撞在一起
 
@@ -7916,7 +7922,7 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
     try:
         parse_script = os.path.join(os.path.dirname(__file__), "parse_subscription.py")
         config_file = CFG["singbox"]["config_file"]
-        urls = [u for u in _SUB_URLS if u]
+        urls = _sub_urls()
         if not urls:
             log("✗ 无可用订阅源")
             return False
@@ -8734,6 +8740,20 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         self._send(200, _api_debug_state())
 
     def do_POST(self):
+        if self.path == "/refresh-sub":
+            # 订阅源刚被改过（`asip sub add`）时用它立刻生效。后台线程跑：
+            # 刷新要拉 4~5 个源 + 重启 sing-box，十几秒起步，阻塞在 HTTP
+            # 响应里会让调用方超时，看起来像失败。
+            if not self._authed():
+                self._send(401, {"ok": False, "reason": "unauthorized"})
+                return
+            # 不在这里判「是否已在刷新」：refresh_subscription 自己拿非阻塞锁，
+            # 重复调用只会打一行「已有订阅刷新在进行」。预判一次反而多一个竞态。
+            threading.Thread(target=refresh_subscription,
+                             args=("手动插入订阅",), daemon=True,
+                             name="manual-sub-refresh").start()
+            self._send(200, {"ok": True, "started": True})
+            return
         if self.path != "/rotate":
             self._send(404, {"ok": False, "reason": "not_found"})
             return

@@ -33,17 +33,39 @@ AIRPORT_DNS_TAG = config.AIRPORT_DNS_TAG
 
 
 # ============= 解析订阅 =============
-def fetch_and_decode_sub(url: str) -> list[str]:
-    """拉订阅，base64 解码，返回原始 URL 列表
-    支持：标准 base64 订阅、明文 URL 列表、Clash YAML 配置（提取 proxy 节点）
+def _raw_body(result) -> str:
+    """JSON 响应走 data；非 JSON（base64/Clash YAML/明文列表）走全文 text。
+
+    request_json 显式传 text_limit=None，不能截断；结构化 data 重新序列化，
+    后面的 base64/YAML/splitlines 解析都针对字符串。
     """
-    import yaml
-    # 仅对 dasho 等需要 UA 的源添加 headers
+    if result.data is not None:
+        return (result.data if isinstance(result.data, str)
+                else json.dumps(result.data, ensure_ascii=False))
+    return result.text or ""
+
+
+def _fetch_raw(url: str) -> str:
+    """抓订阅正文。默认 UA 被拒时用 clash-verge UA 重试一次。
+
+    WHY 重试而不是继续按域名特判：2026-11-04 实测 etcloud 系订阅源默认 UA
+    直接 503，带 `clash-verge/1.0` 才返回内容。按域名加 UA 的旧写法只能覆盖
+    已知机场，新源要么改代码要么插不进来 —— 而 503/403 恰恰是"这个源按 UA
+    决定给不给"的典型症状，重试一次的成本远低于让人回来改代码。
+    okz 这类默认 UA 正常的源不会走到重试，行为不变。
+    """
     headers = {"User-Agent": "clash-verge/1.0"} if "dasho" in url else {}
-    # text_limit=None：非 JSON 订阅是整段 base64/明文，截断到 2000 字符
-    # 会静默丢掉后面的节点（多源合并后按截断内容生成配置）。
     result = request_json("GET", url, timeout=30, headers=headers,
                           text_limit=None)
+    # 只在**服务器答了**时才换 UA 重试：status=None 是连不上/DNS 超时，换个 UA
+    # 不会让死源复活，重试只会把单源失败耗时从 30s 翻到 60s（实测该用例因此
+    # 撞上 60s 超时）。
+    if not result.ok and not headers and result.status is not None:
+        retry = request_json("GET", url, timeout=30,
+                             headers={"User-Agent": "clash-verge/1.0"},
+                             text_limit=None)
+        if retry.ok:
+            return _raw_body(retry)
     if not result.ok:
         # 与 raise_for_status 等价：传输失败单独说明，非 2xx 带上状态码。
         if result.status is None:
@@ -51,14 +73,51 @@ def fetch_and_decode_sub(url: str) -> list[str]:
         else:
             detail = f"HTTP {result.status}"
         raise RuntimeError(f"订阅拉取失败: {detail}")
-    # JSON 响应走 data；非 JSON（base64/Clash YAML/明文列表）走全文 text
-    # （request_json 显式传 text_limit=None，不能截断）。
-    # 结构化 data 重新序列化，后面的 base64/YAML/splitlines 解析都针对字符串。
-    if result.data is not None:
-        raw = (result.data if isinstance(result.data, str)
-               else json.dumps(result.data, ensure_ascii=False))
-    else:
-        raw = result.text or ""
+    return _raw_body(result)
+
+
+def singbox_outbounds(raw: str) -> list[dict]:
+    """sing-box 配置里的节点出站，原样返回（已经是 make_config 要的形状）。
+
+    `flag=sing` 这类源直接下发 sing-box JSON，不是 base64/Clash/明文 URI。
+    **不转成 URL 再解析回来**：往返会丢字段（tls / transport / alpn），而
+    parse_* 的产物与这份 dict 本来就是同构的 —— 转一趟只是给自己造坑。
+    """
+    try:
+        cfg = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(cfg, dict):
+        return []
+    obs = cfg.get("outbounds")
+    if not isinstance(obs, list):
+        return []
+    # 逻辑出站（selector/urltest）与内建类型不是可拨号节点；wireguard 是
+    # endpoint 而不是 outbound，混进池子会让 sing-box check FATAL。
+    skip = {"selector", "urltest", "direct", "block", "dns", "wireguard"}
+    out = [o for o in obs
+           if isinstance(o, dict) and o.get("type") not in skip
+           and o.get("server") and o.get("server_port") and o.get("tag")]
+    for o in out:
+        # tag 一律重算成 `host:port-<协议>`，与 URI 源同一个规则。
+        # WHY：机场的 sing-box tag 是给人看的中文名，而且**每次刷新都变**
+        # （`剩余流量：59.98 GB` → `59.99 GB`）。tag 是 daemon 判死表、
+        # block-map、selector 成员共同的身份键 —— 让它跟着流量数字漂，
+        # 等于每轮刷新都把整池节点当成新节点重来一遍。
+        o["tag"] = f"{o['server']}:{o['server_port']}-{_SCHEME_ABBR.get(o['type'], o['type'])}"
+    return out
+
+
+def fetch_and_decode_sub(url: str) -> list[str]:
+    """拉订阅，base64 解码，返回原始 URL 列表
+    支持：标准 base64 订阅、明文 URL 列表、Clash YAML 配置（提取 proxy 节点）
+    """
+    return _decode_sub(_fetch_raw(url))
+
+
+def _decode_sub(raw: str) -> list[str]:
+    """把一份订阅正文解码成 URI 列表（base64 / Clash YAML / 明文）。"""
+    import yaml
 
     all_lines = []
 
@@ -218,6 +277,11 @@ def _clash_proxy_to_url(proxy: dict) -> str | None:
 def _tag_for(u, scheme: str) -> str:
     """tag 用 host:port-scheme 防止重复（订阅里多个不同名字同节点）"""
     return f"{u.hostname}:{u.port}-{scheme}"
+
+# 解析器用的两字母缩写。sing-box 源要生成**同一套** tag，否则同一个节点从
+# 两种源进来会得到两个 tag（同一台机器被当成两条线）。
+_SCHEME_ABBR = {"vless": "vl", "vmess": "vm", "trojan": "tr",
+                "shadowsocks": "ss", "hysteria2": "h2", "anytls": "any"}
 
 def parse_hysteria2(url: str) -> dict:
     u = urllib.parse.urlparse(url)
@@ -956,20 +1020,33 @@ if __name__ == "__main__":
             sys.exit(1)
     sub_urls = (args.urls or file_urls
                 or ([args.url] if args.url else [])
-                or config.subscription_urls())
+                or config.subscription_urls() + config.extra_subscription_urls())
     if not sub_urls:
         print("ERROR: no subscription URLs provided (use --urls or --url)", file=sys.stderr)
         sys.exit(1)
 
     all_urls = []
+    all_nodes: list[dict] = []
     for url in sub_urls:
         safe_url = url.split("@")[-1] if "@" in url else url[:60]
         print(f"fetching subscription from {safe_url}...")
         try:
-            urls = fetch_and_decode_sub(url)
+            raw = _fetch_raw(url)
         except Exception as e:
             # 异常串可能带完整 URL（含 token），stderr 会进 daemon.log。
             print(f"  ✗ 源失败，跳过: {type(e).__name__}: "
+                  f"{redact_secrets(str(e))[:120]}", file=sys.stderr)
+            continue
+        # sing-box JSON 源（flag=sing）：出站已经可直接入池，不经过 URL 往返。
+        direct = singbox_outbounds(raw)
+        if direct:
+            print(f"  got {len(direct)} sing-box outbounds")
+            all_nodes.extend(direct)
+            continue
+        try:
+            urls = _decode_sub(raw)
+        except Exception as e:
+            print(f"  ✗ 源解析失败，跳过: {type(e).__name__}: "
                   f"{redact_secrets(str(e))[:120]}", file=sys.stderr)
             continue
         print(f"  got {len(urls)} raw URLs")
@@ -998,6 +1075,26 @@ if __name__ == "__main__":
         # 只剩 41 个 tag，24 个真节点白丢），节点数连骤降护栏都过不了。
         if n["tag"] in seen_tags:
             scheme = n["tag"].rsplit("-", 1)[-1]
+            stem = f"{n['server']}:{n['server_port']}"
+            i = 2
+            while f"{stem}~{i}-{scheme}" in seen_tags:
+                i += 1
+            n["tag"] = f"{stem}~{i}-{scheme}"
+        seen_urls.add(ident)
+        seen_tags.add(n["tag"])
+        nodes.append(n)
+
+    # sing-box 源直接给的出站：身份去重与 tag 撞名规则与上面一致（tag 撞名
+    # 不能整条丢 —— 那台机器上可能只有 path/入口不同）。指纹用 _node_fp：
+    # 它由 server/port/type/transport/sni 组成，与订阅到达顺序无关，正好当身份。
+    for n in all_nodes:
+        if filter_sub and filter_sub not in str(n["tag"]).lower():
+            continue
+        ident = _node_fp(n)
+        if ident in seen_urls:
+            continue
+        if n["tag"] in seen_tags:
+            scheme = str(n["tag"]).rsplit("-", 1)[-1]
             stem = f"{n['server']}:{n['server_port']}"
             i = 2
             while f"{stem}~{i}-{scheme}" in seen_tags:

@@ -110,6 +110,12 @@ WARP 控制
   asip vercel status   Vercel 中继：台账 + 9router 池/策略 + 开关
   asip vercel probe    经每条中继探出口 IP（-h 看全部子命令）
 
+订阅
+  asip sub             列已配置的订阅源（固定 + 追加）
+  asip sub add <url>   插入一个订阅源并立即刷新（不必重启 daemon）
+  asip sub rm <url|N>  移除一个追加源（按 URL 或上表序号）并立即刷新
+  asip sub refresh     只触发一次刷新（源没变、想立刻重拉时用）
+
 收件箱（Sister Bus，各角色报给本项目的消息）
   asip inbox           本项目相关的未读消息（关键词过滤，约 4%）
   asip inbox all       不过滤，看全部未读
@@ -525,9 +531,105 @@ PY
   esac
 }
 
+cmd_sub() {
+  # 订阅源清单不在这里解析：config.py 是唯一事实源（固定源 + 环境变量 +
+  # 台账文件），CLI 只负责写台账、打一行、叫 daemon 刷新。
+  local sub=${1:-ls}; shift || true
+  local out
+  out=$("$ASIP_PY" - "$ASIP_DIR" "$sub" "$@" <<'PY'
+import sys
+repo, cmd, *rest = sys.argv[1:]
+sys.path.insert(0, repo)
+import config
+
+urls = list(config.subscription_urls())
+extra = list(config.extra_subscription_urls())
+
+def show():
+    print(f"固定源 {len(urls)} 个（config.py / .env，改后需重启 daemon）")
+    for i, u in enumerate(urls, 1):
+        print(f"  {i:2d}. {u.split('?')[0].rsplit('/', 1)[0]}/…")
+    print(f"追加源 {len(extra)} 个（{config.EXTRA_SUBS_FILE}，改后无需重启）")
+    for i, u in enumerate(extra, 1):
+        print(f"  {i:2d}. {u.split('?')[0].rsplit('/', 1)[0]}/…")
+
+if cmd in ("", "ls", "list"):
+    show()
+elif cmd == "add":
+    if not rest:
+        sys.exit("用法: asip sub add <url>")
+    url = rest[0]
+    if "://" not in url:
+        sys.exit(f"✗ 不是合法 URL: {url[:40]}")
+    if url in urls or url in extra:
+        sys.exit("已存在，不重复添加")
+    with open(config.EXTRA_SUBS_FILE, "a", encoding="utf-8") as f:
+        f.write(url + "\n")
+    import os
+    os.chmod(config.EXTRA_SUBS_FILE, 0o600)
+    print("✓ 已加入追加源")
+elif cmd == "rm":
+    if not rest:
+        sys.exit("用法: asip sub rm <url|序号>")
+    key = rest[0]
+    target = None
+    if key.isdigit():
+        k = int(key) - 1
+        target = extra[k] if 0 <= k < len(extra) else None
+        if target is None:
+            sys.exit(f"✗ 序号超出追加源范围（1~{len(extra)}）")
+    else:
+        target = key if key in extra else None
+        if target is None:
+            sys.exit("✗ 只删追加源；固定源请改 .env 后重启 daemon")
+    keep = [u for u in extra if u != target]
+    from asip.atomic_io import write_text
+    write_text(config.EXTRA_SUBS_FILE,
+               "".join(u + "\n" for u in keep), mode=0o600)
+    print("✓ 已移除")
+else:
+    sys.exit(f"✗ 未知子命令: {cmd}")
+PY
+)
+  local rc=$?
+  printf '%s\n' "$out"
+  # add/rm 才需要刷新；ls 只读。刷新失败不该吞掉原来的成功状态码 ——
+  # 台账已经写进去了，那是用户要的结果。
+  case "$sub" in
+    add|rm|refresh)
+      [ $rc -eq 0 ] || return $rc
+      local tok req
+      tok=$(cat "$ASIP_DIR/run/api-token" 2>/dev/null) || {
+        echo "⚠ 读不到 $ASIP_DIR/run/api-token，未触发刷新（daemon 未启用 rotate 接口？）" >&2
+        return 0; }
+      req=$("$ASIP_PY" - "$ASIP_DIR" "$tok" <<'PY'
+import http.client, json, socket, sys
+repo, tok = sys.argv[1], sys.argv[2]
+class C(http.client.HTTPConnection):
+    def __init__(self):
+        super().__init__("localhost", timeout=10)
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(10)
+        self.sock.connect(f"{repo}/run/rotate.sock")
+c = C()
+body = b"{}"
+c.request("POST", "/refresh-sub", body,
+          {"X-Asip-Token": tok, "Content-Length": str(len(body))})
+r = c.getresponse()
+print(r.status, r.read().decode()[:120])
+PY
+)
+      echo "→ $req"
+      echo "  （刷新在后台跑：asip s 看换线与池子成员变化，约 10~30s）"
+      ;;
+  esac
+}
+
 case "${1:-}" in
   -h|--help|help) _usage ;;
   warp) shift; cmd_warp "$@" ;;
+  sub) shift; cmd_sub "$@" ;;
   inbox|inb) shift; cmd_inbox "$@" ;;
   # Vercel 中继：子命令全在 python 里（argparse 管，别在 bash 里再抄一份参数表）。
   # 用 exec 而不是调用后返回：退出码要原样透出去（2 = 有 relay 不可用）。

@@ -36,16 +36,15 @@ done
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p "$PORT")
 
-# 部署走 `git archive HEAD` + scp，**不经过 origin** —— 所以「部署成功」和
-# 「代码已进仓库」是两件独立的事，漏 push 不会有任何报错。2026-11-03 实测：
-# 一整批提交只在本地，远端靠 scp 覆盖，GitHub 上什么都没有。
+# 部署前必须已推送：远端是从 origin 拉代码的，本地没 push 就等于部署了
+# 一份仓库里不存在的东西。2026-11-03 实测过这个坑。
 if [ "$DRY" != 1 ]; then
     UP=$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo "")
     if [ -z "$UP" ]; then
         echo "  ⚠ 没有 upstream 或无 origin，跳过「未推送提交」检查" >&2
     elif [ "$UP" != "0" ]; then
         echo "✗ 本地有 $UP 个提交未推送 —— 先 git push。" >&2
-        echo "  部署只从本地 HEAD 打包，不 push 意味着线上跑的代码不在仓库里。" >&2
+        echo "  远端从 origin 拉代码，不 push 意味着部署出去的代码不在仓库里。" >&2
         exit 1
     fi
 fi
@@ -81,24 +80,30 @@ run 'command -v python3 >/dev/null || { echo "✗ 远端缺 python3"; exit 1; }
      echo "  python3 $(python3 -V 2>&1 | cut -d" " -f2) / sudo 免密 OK"'
 
 # ---------------------------------------------------------------- 1. 代码
-say "1/7 同步代码（git archive，不含 gitignored 文件）"
+say "1/7 同步代码（远端 git pull，与 origin 同源）"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-git archive --format=tar.gz -o "$TMP/src.tgz" HEAD
-put "$TMP/src.tgz" /tmp/asip-src.tgz
-# 先在远端建 baseline：远端可能根本不是 git 仓库（旧部署是直接拷过去的）。
-# 有 baseline 才能一眼看出「本次部署改了什么」，也才能在出问题时回滚。
+# **不再用 scp 覆盖。** 旧的 `git archive + tar xzf` 有两处硬伤：
+#   · 远端仓库是独立历史，和 GitHub 毫无关系，出问题回不到任何一次真提交；
+#   · 覆盖时静默吞掉远端的工作区改动，且「部署成功」不代表「代码进了仓库」。
+# 现在远端有 origin，部署就是一次 pull。前提（2026-11-03 已配好）：
+# 远端的 ~/.ssh/id_ed25519 能访问 github.com:oahcom/auto-swicth-ip。
 run "set -e
-cd $REMOTE_DIR 2>/dev/null || { mkdir -p $REMOTE_DIR; cd $REMOTE_DIR; }
-if [ ! -d .git ]; then
-    git init -q && git config user.email deploy@asip.local && git config user.name 'asip deploy'
-    git add -A 2>/dev/null || true
-    git commit -q -m 'baseline: 部署前远端状态' 2>/dev/null || true
-    echo '  (远端原本不是 git 仓库，已 init + baseline)'
+cd $REMOTE_DIR 2>/dev/null || { echo '✗ 远端没有 $REMOTE_DIR'; exit 1; }
+if ! git remote get-url origin >/dev/null 2>&1; then
+    echo '✗ 远端仓库没有 origin —— 先接上 GitHub（见 docs/runbook/troubleshoot.md）' >&2
+    exit 1
 fi
-tar xzf /tmp/asip-src.tgz
+if [ -n \"\$(git status --porcelain)\" ]; then
+    echo '  ⚠ 远端工作区有未提交改动，先备份再 pull：' >&2
+    git status --short | sed 's/^/    /' >&2
+    git stash push -u -m \"deploy-autostash-\$(date +%s)\" >/dev/null
+    echo '  （已 stash；git stash list 可查）' >&2
+fi
+git fetch --depth=1 origin main
+git reset --hard origin/main
 chmod +x deploy/*.sh tools/*.sh 2>/dev/null || true
 python3 -m py_compile config.py daemon.py warp_wg.py warp_blocks.py
-echo '  代码已解包，py_compile OK'"
+echo \"  已同步到 \$(git rev-parse --short HEAD) \$(git log -1 --format=%s)\""
 
 # ---------------------------------------------------------------- 2. 拓扑参数
 say "2/7 对齐 .env 拓扑参数（以本机为准）"

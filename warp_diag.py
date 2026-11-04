@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 import warp_wg
+from config import CFG as _CFG
 from config import PROJECT_DIR
 
 PROJECT = Path(PROJECT_DIR)
@@ -410,6 +411,10 @@ def summarize(path: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="单节点 WARP 承载能力诊断")
     ap.add_argument("--job", help="{tag, node, egress_ip} 列表 JSON")
+    ap.add_argument("--from-config", action="store_true",
+                    help="从当前 singbox-config.json 取节点（新订阅节点走这条）")
+    ap.add_argument("--new-only", action="store_true",
+                    help="只测 .warp/block-map.json 里还没有 colo 的节点")
     ap.add_argument("--out", help="结果 JSONL（逐条追加，可中断续跑）")
     ap.add_argument("--rounds", type=int, default=3, help="每节点最多几轮（默认 3）")
     ap.add_argument("--family", default="v6", choices=("v6", "v4"))
@@ -434,8 +439,25 @@ def main() -> None:
         out = explain(item, spare_slots()[0])
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
+    if args.from_config and not args.job:
+        # 新插入的订阅源默认走这条：节点刚从配置里生出来，还没有 job 文件。
+        # tag 用 config 里那个（channels/plan_lines 按 tag 认节点）。
+        cfg = json.loads(Path(_CFG["singbox"]["config_file"]).read_text())
+        skip = {"selector", "urltest", "direct", "block", "dns", "socks"}
+        args.job = str(Path(args.out or "/tmp/asip-sub-job.json").with_suffix(".job.json"))
+        items = [{"tag": o["tag"], "node": o}
+                 for o in cfg.get("outbounds", [])
+                 if o.get("type") not in skip and o.get("server")
+                 and o.get("server_port")]
+        if args.new_only:
+            import warp_blocks
+            mapped = warp_blocks.load_map()
+            items = [i for i in items
+                     if not (mapped.get(i["tag"]) or {}).get("colo")]
+        Path(args.job).write_text(json.dumps(items, ensure_ascii=False))
+        print(f"从配置取 {len(items)} 个节点 → {args.job}", file=sys.stderr)
     if not args.job or not args.out:
-        raise SystemExit("需要 --job 与 --out（或 --summarize）")
+        raise SystemExit("需要 --job/--from-config 与 --out（或 --summarize）")
     slots = ([int(s) for s in args.slots.split(",") if s.strip()]
              if args.slots else spare_slots())
     print(f"设备槽位 {slots}（active 线路 {sorted(active_slots())} 已排除）",

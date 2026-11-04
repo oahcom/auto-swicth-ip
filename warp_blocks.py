@@ -337,8 +337,11 @@ def merge_diag(path: Path, rows: list[dict]) -> dict[str, int]:
 
     返回 `{"v6": n, "v4": m}`：各更新了几个节点。
 
-    这是**合并**不是重建：diag 只回答「这台机器能不能承载 WARP」，回答不了
-    colo / 类别（那是出口 trace 的产物）。整表重建会把没跑 diag 的节点一起丢掉。
+    这是**合并**不是重建：已入块的节点只补 wg_ok/wg_n，不覆盖它的 colo ——
+    那份 colo 是按出口 IP 聚合多轮 trace 得出的，一条 diag 推翻不了它。
+    新节点（块表里没有的）则**建档**：diag 的成功轮次本身就带 trace 的
+    colo/ip，够格落一条 {colo, category}。没有这条，新插入的订阅节点永远
+    分不到渠道 —— 块表只认 build_map 的输入文件，而新源不在那些文件里。
 
     v6 与 v4 分开存：实测 `cn.bing.com:443` 的 v6 两轮全通，v4 两轮全
     handshake —— 合并成一份会把「能跑 v6」当成「能跑 v4」。
@@ -346,6 +349,8 @@ def merge_diag(path: Path, rows: list[dict]) -> dict[str, int]:
     data = json.loads(path.read_text())
     nodes = data.setdefault("nodes", {})
     seen: dict[str, dict[str, list[int]]] = {"v6": {}, "v4": {}}
+    colo_votes: dict[str, Counter] = {}
+    ok_ips: dict[str, str] = {}
     for x in rows:
         rounds = [r for r in (x.get("rounds") or [])
                   if r.get("stage") in ("ok", "handshake")]
@@ -355,12 +360,27 @@ def merge_diag(path: Path, rows: list[dict]) -> dict[str, int]:
         hit = seen[fam].setdefault(x["tag"], [0, 0])
         hit[0] += sum(1 for r in rounds if r.get("ok"))
         hit[1] += len(rounds)
+        for r in rounds:
+            if r.get("ok") and r.get("colo"):
+                colo_votes.setdefault(x["tag"], Counter())[r["colo"]] += 1
+                ok_ips.setdefault(x["tag"], r.get("ip") or "")
     for fam, tbl in seen.items():
         pre = "wg_" if fam == "v6" else "v4_"
         for tag, (ok, n) in tbl.items():
             e = nodes.setdefault(tag, {})
             e[pre + "ok"] = ok
             e[pre + "n"] = n
+            # 新节点建档。已有节点一律不动 colo/category：那两份证据来自
+            # build_map 的多轮聚合，diag 的 1~2 轮不该覆盖它。
+            if e.get("colo") or not ok or not colo_votes.get(tag):
+                continue
+            colo = colo_votes[tag].most_common(1)[0][0]
+            cat = category_for(ok, n)
+            if cat is None:
+                continue
+            e.update({"colo": colo, "category": cat, "ok": ok, "n": n,
+                      "egress_ip": ok_ips.get(tag) or None,
+                      "colo_mix": dict(colo_votes[tag]), "drift": []})
     from asip.atomic_io import write_json
     data["updated"] = int(time.time())
     write_json(str(path), data, mode=0o600, indent=2)
