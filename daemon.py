@@ -4118,6 +4118,8 @@ def _line_node_cannot_carry(tag: str) -> bool:
             # `ever_ip` 始终 False，仍每 ~2 分钟重启一次 usque-h2-N。
             # 判据只用 `_h2_repair` 已经算过的结论（它每 60s 亲自巡一遍池子），
             # 这里不额外打 Clash API —— 本函数在探测热路径上。
+            # 池子重渲染后会自动失效：新候选不在 `_H2_TRIED` 里，下一次
+            # `_h2_repair` 能换出去，换成功即清空本集合。
             return tag in _H2_POOL_DEAD
         line = (warp_wg._read_state().get("lines") or {}).get(tag) or {}
         node = line.get("node")

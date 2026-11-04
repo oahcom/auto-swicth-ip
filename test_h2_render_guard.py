@@ -299,8 +299,11 @@ def test_h2_exhausted_pool_stops_the_restart_loop(monkeypatch):
     daemon._NODE_NEXT_CHECK.clear()
     assert not daemon._h2_repair(m), "整池试遍后不该再换"
     assert daemon._line_node_cannot_carry(m["tag"]) is True
-    # 拿到出口即解除（下一轮探测成功时清空）。
-    daemon._H2_POOL_DEAD.discard(m["tag"])
+    # 池子重渲染多出一个新节点 → 换得出去、判死随之解除（自愈，无需重启）。
+    names.append("h2-c")
+    cur["now"] = "h2-a"
+    daemon._NODE_NEXT_CHECK.clear()
+    assert daemon._h2_repair(m)
     assert daemon._line_node_cannot_carry(m["tag"]) is False
 
 
