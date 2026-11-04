@@ -3562,10 +3562,11 @@ def _h2_select(member: dict | None, node: str) -> str:
 # 没有它，整池失效的线（实测 ORD 池只有 1 个、SLC/LAX 池全是 bilibili）会每
 # 60s 在死节点之间空转：PUT 本身无害，但每次都会清掉 `ip` 并触发一整轮探测。
 _H2_TRIED: dict[str, set[str]] = {}
-# 整池试遍仍拿不到出口的 H2 线（`_h2_repair` 最后一次的结果）。重启 usque 换的是
-# 同一个死节点上的新会话，重启没有意义 —— 判据见 `_line_node_cannot_carry`。
-# 拿到出口时清空（与 `_H2_TRIED` 同一处），换节点成功后也清空。
-_H2_POOL_DEAD: set[str] = set()
+# 整池试遍仍拿不到出口的 H2 线 → 判死时刻。重启 usque 换的是同一个死节点上的
+# 新会话，重启没有意义（见 `_line_node_cannot_carry`）。拿到出口或换节点成功
+# 即清空；`_H2_POOL_DEAD_RETRY_SEC` 后再重走一遍池子，免得节点恢复后永久停产。
+_H2_POOL_DEAD: dict[str, float] = {}
+_H2_POOL_DEAD_RETRY_SEC = 1800.0
 
 
 def _h2_next_node(member: dict | None) -> str | None:
@@ -3602,15 +3603,25 @@ def _h2_repair(member: dict | None) -> bool:
     now = time.time()
     if now < _NODE_NEXT_CHECK.get(tag, 0.0):
         return False
+    # 判死是暂时的：整池不通可能只是机场抖动。过了重试窗口把整池重新走一遍
+    # （否则节点恢复后这条线永远停产 —— `_h2_next_node` 只认 `_H2_TRIED`）。
+    dead = _H2_POOL_DEAD.get(tag)
+    if dead and now - dead >= _H2_POOL_DEAD_RETRY_SEC:
+        _H2_POOL_DEAD.pop(tag, None)
+        _H2_TRIED.pop(tag, None)
     nxt = _h2_next_node(member)
     _NODE_NEXT_CHECK[tag] = now + float(
         _warp().get("node_rotation_interval_sec", 60))
     if not nxt:
-        _H2_POOL_DEAD.add(tag)           # 整池都试过了，等重渲染/地址恢复
+        # 只有**试过候选**才判死：`_h2_next_node` 在 Clash API 读不到池子时
+        # 同样返回 None（共享 sing-box 重启中），那不是节点的结论。
+        if _H2_TRIED.get(tag):
+            # `setdefault`：这里每 60s 被调一次，重写时间戳会让重试窗口永远不到点。
+            _H2_POOL_DEAD.setdefault(tag, now)   # 整池试遍，等重渲染/重试窗口
         return False
     if _rehome_one(tag, nxt) != "ok":
         return False
-    _H2_POOL_DEAD.discard(tag)
+    _H2_POOL_DEAD.pop(tag, None)
     _H2_TRIED.setdefault(tag, set()).add(nxt)
     # 新落地节点的出口地址必然不同：清掉旧地址，让探测器按新链路重新判。
     _invalidate_warp_line_ip(tag)
@@ -4118,9 +4129,12 @@ def _line_node_cannot_carry(tag: str) -> bool:
             # `ever_ip` 始终 False，仍每 ~2 分钟重启一次 usque-h2-N。
             # 判据只用 `_h2_repair` 已经算过的结论（它每 60s 亲自巡一遍池子），
             # 这里不额外打 Clash API —— 本函数在探测热路径上。
-            # 池子重渲染后会自动失效：新候选不在 `_H2_TRIED` 里，下一次
-            # `_h2_repair` 能换出去，换成功即清空本集合。
-            return tag in _H2_POOL_DEAD
+            # 判死只维持一个重试窗口（`_H2_POOL_DEAD_RETRY_SEC`），到点由
+            # `_h2_repair` 自动重走整池；换节点成功或拿到出口也会立即清空。
+            # 与 WG 分支同一口径：**出过口**的线不判死 —— 那时更可能是本机
+            # usque 会话僵死，重启正是唯一能修的动作（见 `tunnel_dead`）。
+            return (tag in _H2_POOL_DEAD
+                    and not bool(_warp_line_state(tag).get("ever_ip")))
         line = (warp_wg._read_state().get("lines") or {}).get(tag) or {}
         node = line.get("node")
         if not node:
@@ -5126,7 +5140,7 @@ def _probe_one_line(member: dict) -> None:
     # 这条链路能出地址了：H2 的候选池从头开始记（见 `_h2_next_node`）。
     if member.get("kind") == "h2":
         _H2_TRIED.pop(tag, None)
-        _H2_POOL_DEAD.discard(tag)
+        _H2_POOL_DEAD.pop(tag, None)
     cur = _warp_line_state(tag)
     if tag != active and _warp_line_ok_fresh(tag, now) and cur.get("ip") == ip:
         return

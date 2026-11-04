@@ -305,6 +305,12 @@ def test_h2_exhausted_pool_stops_the_restart_loop(monkeypatch):
     daemon._NODE_NEXT_CHECK.clear()
     assert daemon._h2_repair(m)
     assert daemon._line_node_cannot_carry(m["tag"]) is False
+    # 重试窗口到点后自动重走整池（否则节点恢复后这条线永久停产）。
+    import time as _t
+    daemon._H2_POOL_DEAD[m["tag"]] = _t.time() - daemon._H2_POOL_DEAD_RETRY_SEC - 1
+    daemon._NODE_NEXT_CHECK.clear()
+    assert daemon._h2_repair(m)
+    assert daemon._line_node_cannot_carry(m["tag"]) is False
 
 
 def test_noaddr_lock_release_switches_node_first(monkeypatch):
