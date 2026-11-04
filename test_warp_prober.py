@@ -387,3 +387,33 @@ def test_tunnel_death_port_closed_defers_to_systemd(monkeypatch):
                         lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == [], "端口已关还重启，等于抢 systemd 的活"
+
+
+def test_successful_probe_records_node_colo(monkeypatch, tmp_path):
+    """探测成功时顺手把「落地节点 → colo」写进台账。
+
+    `.warp/wg_colo_map.json` 原来只由 `warp_wg.survey()` 写，而 survey 要给
+    每个节点起一个 sing-box（几十秒/节点），没人会定期跑。结果新节点永远
+    不在块表里 —— `_same_block_standby` 判不出同块就放弃选点（实测
+    WG-3/WG-4 fail_streak 到 197 / 88 仍在同一个死节点上打转）。
+    """
+    import json
+    ledger = tmp_path / "wg_colo_map.json"
+    monkeypatch.setattr(daemon.warp_wg, "colo_map_path", lambda: ledger)
+    monkeypatch.setattr(daemon, "_line_node", lambda t: "n.nrt:443-any")
+    monkeypatch.setattr(daemon, "_warp_probe_blind", lambda now=None: False)
+    monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
+
+    def fake_egress(port):
+        # 模拟 `warp_egress_ip`：产出口 IP 的同时把完整 trace 留在模块变量里。
+        daemon._LAST_EGRESS_TRACE = {"port": int(port), "ip": "203.0.113.7",
+                                     "colo": "NRT", "loc": "JP"}
+        return "203.0.113.7"
+
+    monkeypatch.setattr(daemon, "warp_egress_ip", fake_egress)
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r, **kw: True)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda *a, **kw: False)
+    daemon._probe_one_line(_member())
+    got = json.loads(ledger.read_text())["nodes"]["n.nrt:443-any"]
+    assert got["colo"] == "NRT" and got["ok"] is True, got

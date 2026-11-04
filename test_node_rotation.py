@@ -236,4 +236,28 @@ with patch.object(daemon.warp_wg, "_read_state",
     got = daemon._same_block_standby("WARP-WG-7", 1_000_000.0)
 assert got == "b.nrt:443-any", f"全未知时按块序，实际 {got}"
 
-print("✓ 15 项同块轮回自检通过")
+# 16) 当前节点**不在块表里**时不能直接放弃选点。
+# 实测 2026-11-05：WG-3/WG-4 的节点 `downloadcfpro…~9-vl` / `~10-vl` 从没跑过
+# diag，块表里没有它们 ⇒ `home_colo is None` 分支原来直接 return None，两条线
+# 永远换不了节点，只在同一个「收 TCP 不转发 UDP:2408」的节点上无限重启
+# （fail_streak 197 / 88，日志每分钟一条「连续 N 次取不到出口地址」）。
+# 块信息缺席不等于没有候选：退化为按承载能力排序，rank 0 照样排到前面。
+NO_HOME = {"a.nrt:443-any": {"colo": "NRT", "category": "regular"},
+           "b.nrt:443-any": {"wg_ok": 2, "wg_n": 2},      # 块表里没 colo
+           "c.nrt:443-any": {"wg_ok": 0, "wg_n": 4},
+           "d.hkg:443-any": {}}
+LINE_GHOST = {"lines": {"WARP-WG-7": {
+    "node": "zz.ghost:443-any",          # 块表里根本没有当前节点
+    "home": "zz.ghost:443-any", "family": "v6",
+    "rotation": ["zz.ghost:443-any", "c.nrt:443-any",
+                 "d.hkg:443-any", "b.nrt:443-any"],
+}}}
+with patch.object(daemon.warp_wg, "_read_state",
+                  side_effect=lambda: copy.deepcopy(LINE_GHOST)), \
+     patch.object(warp_blocks, "load_map", return_value=NO_HOME), \
+     patch.object(daemon, "_node_tcp_ok", return_value=True):
+    got = daemon._same_block_standby("WARP-WG-7", 1_000_000.0)
+assert got == "b.nrt:443-any", \
+    f"当前节点不在块表时仍应按承载能力选点，实际 {got}"
+
+print("✓ 16 项同块轮回自检通过")

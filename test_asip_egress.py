@@ -168,3 +168,27 @@ def test_proc_run_is_the_single_execution_seam(monkeypatch):
     monkeypatch.setattr(egress, "proc_run", fake)
     assert probe_egress().ip == "203.0.113.7"
     assert len(seen) == 1
+
+
+def test_trace_carries_colo_and_loc(monkeypatch):
+    """trace 里的 `colo=` / `loc=` 必须带出来。
+
+    WHY：节点→colo 台账（`.warp/wg_colo_map.json`）此前只能靠
+    `warp_wg.survey()` 逐节点起 sing-box 测出来。而生产探测**本来每次都
+    拿到了完整 trace**，只是 `EgressResult` 把它丢了。实测 2026-11-05：
+    WG-3/WG-4 的落地节点从没跑过 survey，块表里没有它们 ⇒ 同块轮回判不出
+    「同块」直接放弃，两条线在死节点上无限重启（fail_streak 197 / 88）。
+    """
+    _install(monkeypatch,
+             stdout="ip=203.0.113.7\nwarp=on\ncolo=NRT\nloc=JP\n")
+    r = probe_egress()
+    assert r.ip == "203.0.113.7"
+    assert r.colo == "NRT", f"colo 被丢掉了: {r}"
+    assert r.loc == "JP", f"loc 被丢掉了: {r}"
+
+
+def test_missing_colo_stays_none(monkeypatch):
+    """trace 里没有 colo 时给 None，不能编一个空串 —— 调用方用 `if colo` 判。"""
+    _install(monkeypatch, stdout="ip=203.0.113.7\nwarp=on\n")
+    r = probe_egress()
+    assert r.colo is None and r.loc is None

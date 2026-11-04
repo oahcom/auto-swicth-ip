@@ -962,6 +962,10 @@ def _release_refresh_slot(tag: str) -> None:
 # 脏线守护的探测中集合。探测不占用 _WARP_REFRESHING —— 那条集合会被换线路径
 # 当作「不可选」，探测中的干净线若也算进去，换线会看到「备线 0 条」直接落池。
 _WARP_PROBING: set[str] = set()
+# 最近一次 `warp_egress_ip` 拿到的完整 trace（port/ip/colo/loc）。
+# 只用来把落点顺手记进 `wg_colo_map.json`；带上 port 是为了让调用方确认
+# 「这条结果确实是我这次探测的」，并发探测时不会记到别人的 colo。
+_LAST_EGRESS_TRACE: dict = {}
 # 本轮因「仍在传数据」让出的线 → 冷却截止时刻。没有它守护每 5s 就会重派一次
 # 探测线程（每次 2 次出口探测 ≈ 2~14s），把活线当靶子反复打；冷却让节奏回到
 # 一条线最多每 refresh_delay_sec 被探一次。
@@ -2662,13 +2666,26 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
     起来，多等 18s 不会变好，只把换线线程钉在原处。所以刷新路径传短超时
     （见 `_refresh_idle_warp`），把单次尝试的最坏耗时从 32s 压到 19s。
     """
-    return probe_egress(
+    res = probe_egress(
         socks_port=port,
         socks_host=_warp()["socks_host"],
         urls=(TRACE_URL,),
         timeout=timeout_sec,
         require_warp=True,
-    ).ip
+    )
+    # Cloudflare trace 里本来就带 `colo=` / `loc=`，此前被直接丢掉。留住它，
+    # 节点→colo 的台账就能跟着生产探测自我更新，不必单独跑
+    # `warp_wg.survey()`（逐节点起 sing-box，一次几十秒）。
+    # 存进模块变量而不是改返回值：`warp_egress_ip` 有十几处调用方与测试桩，
+    # 改签名等于把它们全部打断，而这个信息只有探测器要用。
+    global _LAST_EGRESS_TRACE
+    # `getattr` 而不是直接取属性：测试里 `probe_egress` 常被换成只带 `ip`
+    # 的替身对象（`namedtuple`/`SimpleNamespace`），硬取会让整条探测路径
+    # 在测试里抛出 AttributeError 而不是走正常逻辑。
+    _LAST_EGRESS_TRACE = {"port": int(port), "ip": res.ip,
+                          "colo": getattr(res, "colo", None),
+                          "loc": getattr(res, "loc", None)}
+    return res.ip
 
 
 def _probe_refresh_egress(port: int) -> str | None:
@@ -3425,6 +3442,42 @@ def _line_restarted_after_write(tag: str) -> bool:
     return ts > 0 and float(_warp_line_state(tag).get("restart_ts") or 0) >= ts
 
 
+def _record_line_colo(tag: str, colo: str | None, loc: str | None,
+                      ip: str | None) -> None:
+    """把一次成功探测里的落点写进 `wg_colo_map.json`（节点→colo 台账）。
+
+    WHY 在探测器里顺手做，而不是定期跑 `warp_wg.survey()`：
+    `survey()` 要给每个节点单独起一个 sing-box、等它握手（一次几十秒），
+    而生产探测**本来就已经拿到了整条 Cloudflare trace**（`colo=` / `loc=`
+    就在响应里），此前被 `probe_egress` 直接丢掉。实测 2026-11-05：
+    WG-3/WG-4 的落地节点 `downloadcfpro…~9-vl` / `~10-vl` 从没跑过 survey，
+    块表里没有它们 ⇒ `_same_block_standby` 判不出「同块」直接放弃，
+    两条线在死节点上无限重启。
+
+    只写 `ok: true` 的条目：一次失败的探测说明不了落点在哪，写进去反而
+    会把已知的良好记录冲成 `colo=None`（`survey(merge=True)` 同样只在
+    成功时更新，这里保持一致）。
+    """
+    if not (colo and ip):
+        return
+    try:
+        path = warp_wg.colo_map_path()
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {"nodes": {}}
+        nodes = data.setdefault("nodes", {})
+        cur = nodes.get(tag) or {}
+        if cur.get("colo") == colo and cur.get("ok"):
+            return                      # 没变化，不刷盘
+        nodes[tag] = {"colo": colo, "loc": loc, "v4": ip if ":" not in ip else None,
+                      "ok": True}
+        data["updated"] = int(time.time())
+        warp_wg.write_json(str(path), data, mode=0o600, indent=2)
+    except Exception as e:
+        log(f"  · {tag} 记录 colo 失败: {e}")
+
+
 def _rehome_one(tag: str, node: str | None) -> str:
     """把一条线写到指定落地节点。
 
@@ -3937,15 +3990,21 @@ def _same_block_standby(tag: str, now: float) -> str | None:
     if home_colo is None:
         # 块表里没有当前节点（`_channel_rehome_target` 挑目标用的是
         # `load_colo_map()`，两张表不同源；实测 LAX 4 个池内节点只有 1 个在块表）。
-        # 此时 `None == None` 会把**所有块表里同样缺席的节点**都算成「同块」，
-        # v6 线就会被换到另一个 colo —— 而既定事实里 v6 同 colo 换节点就够。
-        # 拿不到当前 colo 就没有「同块」可言：只走别的 colo 会白烧一个池子，
-        # 干脆不动（返回 None 让调用方下轮再看）。
-        return None
-    same = [t for t in rot if (nodes_map.get(t) or {}).get("colo") == home_colo]
-    others = [t for t in rot if t not in same]
-    # v4：跨块优先。同 colo 换节点拿回同一 /24，等于没换地址池。
-    order = (others + same) if line.get("family") == "v4" else (same + others)
+        # **不能直接放弃**：实测 WG-3/WG-4 的当前节点
+        # `downloadcfpro…~9-vl` / `~10-vl` 从没跑过 diag，块表里根本没有它们，
+        # 于是这里恒返 None —— 两条线永远换不了节点，只能在同一个
+        # 「收 TCP 不转发 UDP:2408」的节点上无限重启（实测 fail_streak 197 / 88）。
+        #
+        # 退化为**不按块分组**，只按承载能力排序：块信息缺席时「同块」无从判断，
+        # 但那不等于没有候选 —— 把整条 rotation 交给下面的 rank 排序，
+        # rank 0（实测能承载）自然会排到前面。v4 线仍然吃亏（它靠换 colo 换
+        # 地址池，没 colo 判定不了），但总好过钉死在死节点上。
+        order = list(rot)
+    else:
+        same = [t for t in rot if (nodes_map.get(t) or {}).get("colo") == home_colo]
+        others = [t for t in rot if t not in same]
+        # v4：跨块优先。同 colo 换节点拿回同一 /24，等于没换地址池。
+        order = (others + same) if line.get("family") == "v4" else (same + others)
     # 块内顺序定了之后，同档内把**实测不能承载**的压到最后（稳定排序，块序不动）。
     # 不加这条时轮换是在赌：实测 WG-1 在 HKG/NRT 两个 wg=0/4 的节点之间来回
     # 换了 12 次，每次都是「节点 TCP 通但拿不到出口」；39 次同块轮回里 5 分钟内
@@ -4816,6 +4875,17 @@ def _probe_one_line(member: dict) -> None:
         return
     started_at = time.time()
     ip = warp_egress_ip(member["port"])
+    if ip:
+        # 落点台账跟着生产流量自更新：这条线绑的是哪个落地节点、它实际出口
+        # 在哪个 colo —— 一次成功探测就够了，不需要单独的 survey。
+        # 台账的键是**落地节点**（`wg_colo_map.json` 的 nodes 表按节点 tag
+        # 索引，与 `survey()` / `load_colo_map()` 同一口径），不是线路 tag。
+        # trace 由 `warp_egress_ip` 顺手存在 `_LAST_EGRESS_TRACE` 里；
+        # 端口对不上说明那次结果不是本次探测的，宁可不记。
+        tr = _LAST_EGRESS_TRACE or {}
+        node = _line_node(tag) if tr.get("port") == int(member["port"]) else None
+        if node:
+            _record_line_colo(str(node), tr.get("colo"), tr.get("loc"), ip)
     if not ip:
         _channel_noaddr_note(tag, False, time.time())
         _warp_line_record_observation(tag, None, "unknown", time.time(), started_at)

@@ -478,7 +478,6 @@ def render(print_only: bool = False) -> int:
                   file=sys.stderr)
             continue
         ob["tag"] = f"h2-{i}-{tag}"[:120]
-        ob["tag"] = f"h2-{i}-{tag}"[:120]
         outbounds.append(ob)
         inbounds.append({"type": "direct", "tag": f"h2in-{i}",
                          "listen": "127.0.0.1", "listen_port": inbound_port})
