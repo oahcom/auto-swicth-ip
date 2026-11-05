@@ -324,6 +324,36 @@ opencode 限流"，不是"隧道不通"。结果 22 条线全被判死，包括�
 `patch-wg-outbounds.py` → 重启主 sing-box。渲染必须在提权**之前**以本用户
 完成：root 跑会把 `.warp/h2/*` 属主改成 root，daemon 之后读不回来。
 
+**手动跑 `h2-install.sh` 只做一半，不要以为装完就到位了（2026-11-05 实测）**：
+它只装 H2 子 sing-box + usque 单元，**不写** `warp-outbound.json`、**不跑**
+`patch-wg-outbounds.py`。于是 5 条新线（SJC-35/BOM-36/DUB-37/IAD-38/JNB-39）
+单元全 active、`h2-sel-N` 全在 9091 上、单条 SOCKS 直连也能出 `warp=on`，
+但主 `opencode-out` 的成员表里**一条都没有** —— 69 项里查不到，daemon 永远
+切不过去。而 `patch-wg-outbounds.py --check` 这时还报 `UNCHANGED`：它读的
+`warp-outbound.json` 本身就没这 5 条（该文件由 `members.py` 从 `config.py`
+的 `warp.members` 生成，而 H2 成员是 `config.py` 在 import 期从
+`channels.json` 追加的 —— 必须重新跑一次 `members.py --write-warp-outbound`
+才会看到）。
+
+手动排障时的完整顺序（缺一步就是上面那个症状）：
+
+```bash
+python3 deploy/render_h2_lines.py          # 写 .warp/h2/
+python3 deploy/members.py --write-warp-outbound   # ← h2-install.sh 不会做
+./deploy/h2-install.sh
+python3 deploy/patch-wg-outbounds.py       # ← h2-install.sh 不会做
+# 主 sing-box 必须重载：它由 daemon Popen 拉起、无独立单元。
+# 杀掉主进程，watchdog（30s 一轮）会按新配置重新拉起。
+kill $(pgrep -f "sing-box run -c $PWD/singbox-config.json")
+```
+
+验证要看**运行中**的 selector，不是配置文件的：
+
+```bash
+curl -s -H "Authorization: Bearer $SEC" http://127.0.0.1:9090/proxies/opencode-out \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["all"]), d["now"])'
+```
+
 ---
 
 ### 13d. H2 线与 WG 线的「换节点」机制不同（不能互相套用）
@@ -524,6 +554,25 @@ WARP 出口，它只是把流量转给机场。把它们都显示成 `proxy`，�
 全新地址，而单条地址仍然一格配额就 429（LHR-33 与 SYD-34 各自的新地址都在
 2 分钟内被标 `rate429`）。所以扩容抬高的是**单位时间的可用地址产出**，不是
 单地址寿命 —— 它救急，不改变「必须持续换」这件事。
+
+**2026-11-05 下午第二波 + 补源：BOM / JNB / DUB / IAD 到手。** 远端此前
+一条 greatgame 节点都没有，根因不在探测而在**订阅源缺失**：远端的
+`.extra_subscriptions` 只有 yyd2tett 与 jiashule，本地多一条 etcloud
+（`3e136476…`，29 个 greatgame）。补上后远端 H2 实测 **22/28 可承载**，
+块数 15 → **19**，新增 SJC/BOM/DUB/IAD/JNB 五个块、5 条线（35–39）。
+端到端实测全部 `warp=on`：BOM `2a09:bac5:3afa:11c3::1c5:12e` / DUB
+`2a09:bac5:3a67:2400::396:68` / IAD `2a09:bac1:76a0:11c0::400:5d` /
+JNB `2a09:bac5:d4b4:1b9b::2c0:2e` / SJC `2a09:bac5:661b:28::4:361`。
+
+**这条源的成功率远高于早先那 1/6**：同一批 greatgame 节点在本地当时只用 6 个
+样本、仅 1 个通过（`normal:2155` → HKG），而远端 28 个里 22 个通过。差异来自
+**当时 okz 节点整体超时**，不是 greatgame 不行 —— 那次结论（13h 开头
+「etcloud 只覆盖 6 个 colo」）是特定时段的测量，不是节点属性。
+
+**补源时必然踩到的一个坑**：一次性订阅链接在本地拉过之后已失效，远端刷新会
+走 `_fetch_or_cache` 回退上一轮快照（日志 `本轮用快照（0.2h）`）。所以补源的
+正确顺序是**先传 `.sub_cache/<key>.json` 再改 `.extra_subscriptions`** ——
+否则远端第一轮刷新拿不到任何节点，还会被后续刷新反复覆盖成空。
 
 另一个必须同时做的：**设备目录缺 `usque` 软链时渲染器会把它当空闲发出去**，
 单元起上去是 `status=127` 无限重启，daemon 侧只表现为「一直取不到出口」。

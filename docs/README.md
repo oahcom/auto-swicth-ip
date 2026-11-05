@@ -105,8 +105,13 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
   `ever_ip` 为假的线重启没有意义，得换节点。H2 线的承载闸查的是另一个集合
   `_H2_POOL_DEAD`（它们的落地节点不在 `warp_wg` 台账里）。
 - **第 13h 条** 部分 H2 线绑在死节点上是**预期状态**；2026-11-05 扩容后多出
-  FRA/GIG/IST/LHR/SYD 五个 colo，但**新 colo 抬的是单位时间地址产出，不是单
-  地址寿命** —— 看到「新 colo 也很快 429」不是扩容失效。
+  FRA/GIG/IST/LHR/SYD 五个 colo，当天下午补 greatgame 源后又多出
+  BOM/JNB/DUB/IAD 四个（28 个节点实测 22 个可承载 H2）。但**新 colo 抬的是
+  单位时间地址产出，不是单地址寿命** —— 看到「新 colo 也很快 429」不是扩容失效。
+- **第 13c 条** 手动跑 `h2-install.sh` **只装了一半**：它不写
+  `warp-outbound.json`、不跑 `patch-wg-outbounds.py`，于是新线单元全 active、
+  单条 SOCKS 直连能出 `warp=on`，但主 `opencode-out` 里一条都没有。完整顺序
+  见 TEST_PLAN §20b。
 
 **架构层**（看代码看不出来的设计）
 
