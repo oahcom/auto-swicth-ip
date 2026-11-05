@@ -241,6 +241,15 @@ def format_node_display(node: str | None) -> str:
     return node
 
 # ============= 全局状态 =============
+# ===== 轮换池（订阅节点） vs WARP 渠道（隧道）的状态边界 =====
+#
+# 渠道 = 隧道线（WG/H2）、它的出口 IP、落地的 colo/块 —— 状态前缀 `_WARP_*`。
+# 池  = 机场订阅节点 + selector `proxy` —— 状态是下面这几个。
+#
+# 两边**不共享**变量：池的 dead/cooldown/delay 只描述订阅节点能不能连，
+# 渠道的探测/换线/块归属全走 `_WARP_*` 与 warp_wg。唯一的历史耦合是
+# `_export_dead_nodes_locked` 把池的死节点写进 `.bad_nodes.json`（原本给
+# 已删除的 proxy-global.js 读），见那边的注释。
 _DEAD_NODES: set[str] = set()
 _DEAD_NODES_RELEASE_TS: dict[str, float] = {}
 # 死节点指数退避参数
@@ -1007,8 +1016,8 @@ def _warp_ip_refresh_reason(ip: str | None, now: float,
         return f"{entry.get('blocked_kind') or 'blocked'} 惩罚期"
     if _ip_history_is_truth():
         return "复用窗口内" if _warp_ip_recently_used(ip, now) else ""
-    # 档 3 才是「出现过却一次 OK 都没拿到」。档 2 是探针验过但还没轮到它服务，
-    # 那种地址此刻能服务，只是没撑过真实流量 —— 不当作低质原因报。
+    # 档 3 才是「出现过却一次 OK 都没拿到」。档 1/2 都不是低质：档 1 是探针
+    # 刚验过、此刻确实能服务，档 2 是撑过生产流量（只是没有新鲜探针结论）。
     return ("从无成功流量"
             if _warp_ip_rank(ip, now, _warp()["ip_reuse_guard_sec"])[0] == 3
             else "")
@@ -1060,6 +1069,16 @@ _proxy_fallback_ts_loaded = False   # 惰性读取只做一次
 _PROXY_FALLBACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".warp_proxy_fallback.json")
 _proxy_fail_streak: int = 0     # 池健康探测连续失败次数（回切判据之一）
 _NODE_DELAYS: dict[str, int] = {}  # 节点延迟缓存 (ms)
+# 延迟样本的落账时刻。没有它，_NODE_DELAYS 只能「有/无」二值：一次成功的
+# 快速预检就把节点钉成快节点，之后永远不再更新 —— 实测池子 142 个节点里
+# 只有 3 个有延迟数据，P2C 的「延迟优先」退化成随机（49 个活节点里只有
+# 26.5% 的选中落在活的上面）。超过 _DELAY_TTL 的样本按「未知」处理。
+_NODE_DELAY_TS: dict[str, float] = {}
+_NODE_DELAY_TTL = 900.0
+# 有这以内的成功样本就不再做切换前预检。与 TTL 分开：TTL 决定「还能不能拿它
+# 排序」，这个决定「还需不需要花 1.5s 验一次连通」。3 分钟足够短，坏掉的节点
+# 会被健康检查按自己的节奏抓出来。
+_PROBE_SKIP_FRESH_SEC = 180.0
 _NODE_CALL_COUNTS: dict[str, int] = {}  # 节点调用计数（仅成功调用）
 _NODE_CALL_RESET_TS: float = 0  # 上次重置时间
 _strategy_mode: str = "normal"  # "normal"=延迟优先, "pressure"=均匀分散
@@ -5751,8 +5770,8 @@ def _warp_ip_recently_used(ip: str | None, now: float,
     窗口取该 IP 记过的各类惩罚期中最长的一档：先被 403 烧过（6h）、没过多久
     又被 429 烧过（默认 60s；解析到精确值时更长，上限 24h）的地址取更晚的
     那条 —— 规则是「按多的来」。过了惩罚期的
-    地址降级为**次级优质**，可以复用而不是永久排除 —— 这正是它重新进入候选池
-    的路径。未被标记的地址沿用调用方给的 window。
+    地址降级为**档 2（次级优质）**，可以复用而不是永久排除 —— 这正是它重新
+    进入候选池的路径。未被标记的地址沿用调用方给的 window。
     """
     if not ip:
         return False
@@ -5768,6 +5787,7 @@ def _warp_ip_recently_used(ip: str | None, now: float,
     # 本函数只回答「窗口内有没有成功流量」，没有成功记录答 False。这与
     # 「该不该用」不是一回事 —— 没成功过也没被标记的地址（实测 97/350 条）
     # 由 _warp_ip_rank 排到第 2 档，不当新鲜地址直接切，但仍可作兜底。
+    # 档 1（探针刚 OK）与档 2（撑过生产）在此函数里不做区分，它只看 last_ok_ts。
     return bool(ok) and now - float(ok) < window
 
 
@@ -5896,10 +5916,10 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
         return True
     if _ip_history_is_truth():
         return _warp_ip_recently_used(ip, now)
-    # 只有档 3（出现过却连一次 OK 都没拿到）该刷。档 2 是「探针验过、只是还没轮到
-    # 它服务」—— 那正是机制一要保住的资产，刷它等于把好不容易验出的好地址丢掉。
-    # WHY 写 == 3 而不是 == 2：加上探针档后档位从三档变四档，沿用 == 2 会把
-    # 「验过未用」当成脏线反复重启，正好把机制一变成反向优化。
+    # 只有档 3（出现过却连一次 OK 都没拿到）该刷。档 1（探针刚 OK）与档 2
+    # （撑过生产流量）都不是低质 —— 刷它们等于把好不容易验出/服务过的地址丢掉。
+    # WHY 写 == 3：加上探针档后档位从三档变四档，写 == 2 会把「验过未用」
+    # 当成脏线反复重启，正好把机制一变成反向优化。
     return _warp_ip_rank(ip, now, _warp()["ip_reuse_guard_sec"])[0] == 3
 
 
@@ -6152,14 +6172,15 @@ def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, int, 
 
     四档（对应「按使用来区分」）：
       0. 从未出现过 —— 最优，必然没被 opencode 见过；
-      1. 次级优质 —— **真的撑过生产流量**，且已过对应的惩罚期（403 六小时 /
+      1. **探针刚验过 OK** —— 空跑实测此刻确实能服务。排在「撑过生产流量」
+         之前：探测器每条线都在跑，这个结论是**此刻**的；而 `last_ok_ts` 只由
+         当前出口挣得、且每次重启清零，它奖励的是「一直没被换下」而不是
+         「现在还能用」。档内按「距上次探针 OK 的时长」排，**越新越优先** ——
+         刚刷出来的 OK 说明这个地址这一刻还没被烧，压着它是等它过期；
+      2. 次级优质 —— **真的撑过生产流量**，且已过对应的惩罚期（403 六小时 /
          429 默认六十秒；解析到精确 Retry-After/body/message 时以 ban_until
-         为准，上限 24h）。过了惩罚期的 IP 可以复用，不是废址；档内按「距
-         上次成功的时长」排序，越久越靠前，这只是次级优质内部的先后，与恢复
-         进度无关。已验证能服务，优先于没成功过的地址；
-      2. 探针验过但从未服务生产 —— 空跑里拿到过 OK，但一次真实流量都没撑过。
-         配额可能在下一格就被烧，也可能永远轮不到它上场；比「从未验过」差
-         （后者至少可能是个新鲜好地址），但比「验过且失败」强；
+         为准，上限 24h）。过了惩罚期的 IP 可以复用，不是废址；档内同样越新
+         越优先。没有新鲜的探针结论时，它仍是有过真实成功的那一批；
       3. 出现过但**没有任何成功记录** —— 切上去就报错、或从没真正服务过。
          排在最后，仅作兜底。
     仍处于惩罚期内的地址由调用方先筛掉，不进本函数比较。
@@ -6173,15 +6194,14 @@ def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, int, 
                 and rest < _warp().get("prefix_rest_sec", 300)) else 0
     if entry is None:
         return (0, hot, 0.0)
-    ok = entry.get("last_ok_ts") if isinstance(entry, dict) else None
-    if ok:
-        # 取负：调用方用 min()，而「越久没成功越该优先」意味着间隔越大排序值要越小。
-        return (1, hot, -(now - float(ok)))
     probe_ok = entry.get("probe_ok_ts") if isinstance(entry, dict) else None
     if probe_ok:
-        # 同样取负：验得越久（越接近该结果过期）越该先用一次，否则等到 TTL
-        # 过期就白验了。
-        return (2, hot, -(now - float(probe_ok)))
+        # 越新越优先：取正，调用方用 min()，刚验出来的 OK 排序值最小。
+        return (1, hot, now - float(probe_ok))
+    ok = entry.get("last_ok_ts") if isinstance(entry, dict) else None
+    if ok:
+        # 同样越新越优先。
+        return (2, hot, now - float(ok))
     return (3, hot, 0.0)
 
 
@@ -6435,8 +6455,10 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}{hint}"
         f"{_warp_refresh_count_note(tag)}")
     if ok:
-        # 实测通过 = 这条地址此刻确实能服务，记进 `probe_ok_ts`。否则同址仍停在
-        # 档位 3（一次 OK 都没拿到），后台会把刚验过的线当低质反复重启，白烧配额。
+        # 实测通过 = 这条地址此刻确实能服务，记进 `probe_ok_ts`。这是选线的
+        # **档 1**（见 `_warp_ip_rank`）—— 探测器每条线都在跑，所以它是唯一
+        # 「此刻」级别的正面证据；不记则同址停在档 3，后台把刚验过的线当低质
+        # 反复重启，白烧配额。
         now = time.time()
         # 字典改动与落盘必须在同一把锁内：`_warp_model_test_many` 会并发调
         # 本函数，放锁后再写会让较旧的快照覆盖较新的台账。
@@ -6904,6 +6926,18 @@ def _schedule_idle_refresh(member: dict) -> None:
                      name=f"warp-refresh-{member['tag']}").start()
 
 
+def _is_pool_node(tag: str | None) -> bool:
+    """这个 tag 属不属于代理池（订阅节点）。
+
+    池与 WARP 渠道的唯一边界判据，所有「这段逻辑该不该处理它」的问题都问这里，
+    不要散落成 startswith("WARP-") 或 `_warp_member(x) is None`。两条都只描述了
+    当前命名习惯，不是契约：WARP 成员可能是任意 tag，池节点理论上也可能改名。
+    """
+    if not tag or tag == "direct":
+        return False
+    return not tag.startswith("WARP-") and _warp_member(tag) is None
+
+
 def _pool_nodes() -> list[str] | None:
     """轮换池节点列表（排除 WARP 成员与 direct）；查询失败返回 None。"""
     try:
@@ -6912,8 +6946,7 @@ def _pool_nodes() -> list[str] | None:
         return None
     if not data:
         return None
-    return [x for x in (data.get("all") or [])
-            if x != "direct" and not x.startswith("WARP-")]
+    return [x for x in (data.get("all") or []) if _is_pool_node(x)]
 
 
 def _proxy_pool_healthy(sample: int = 3, nodes: list[str] | None = None) -> bool | None:
@@ -7463,10 +7496,10 @@ def reconnect_warp(reason: str, interrupt: bool = True) -> bool:
     usable = [p for p in usable if p[1] != old_ip]
     if _ip_history_is_truth():
         n_new = sum(1 for p in probes if _warp_ip_never_used(p[1]))
-        n_ok = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 1)
-        n_probe = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 2)
-        log(f"  ↻ 选线: 从没用过 {n_new} 条, 次级优质 {n_ok} 条, "
-            f"验过未用 {n_probe} 条, "
+        n_probe = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 1)
+        n_ok = sum(1 for p in probes if _warp_ip_rank(p[1], now, guard)[0] == 2)
+        log(f"  ↻ 选线: 从没用过 {n_new} 条, 探针 OK {n_probe} 条, "
+            f"次级优质 {n_ok} 条, "
             f"{guard/3600:.0f}h 内无成功流量合计 {len(usable)} 条 / 备线 {len(probes)} 条")
     else:
         log(f"  ↻ 选线: 模型层实测可用 {len(probes)} 条")
@@ -8143,11 +8176,11 @@ def _collect_test_nodes(nodes: list[str], current: str) -> list[str]:
     cleanup_dead_ttl()
 
     to_test = [n for n in nodes
-               if n != "direct" and n != current and n not in _DEAD_NODES]
+               if _is_pool_node(n) and n != current and n not in _DEAD_NODES]
     # 仅测试 TTL 已到的死节点（允许恢复），保持指数退避语义
     now = time.time()
     for n in list(_DEAD_NODES):
-        if n != "direct" and n != current and _DEAD_NODES_RELEASE_TS.get(n, 0) <= now:
+        if _is_pool_node(n) and n != current and _DEAD_NODES_RELEASE_TS.get(n, 0) <= now:
             to_test.append(n)
             _DEAD_NODES.discard(n)
             _DEAD_NODES_RELEASE_TS.pop(n, None)
@@ -8182,10 +8215,12 @@ def _apply_test_results(nodes: list[str], results: dict[str, int | None], now: f
         if delay is not None and delay < CFG["thresholds"]["node_test_timeout_ms"]:
             alive.add(node)
             _NODE_DELAYS[node] = delay
+            _NODE_DELAY_TS[node] = now
             _dead_fail_count.pop(node, None)
         else:
             dead.add(node)
             _NODE_DELAYS.pop(node, None)
+            _NODE_DELAY_TS.pop(node, None)
             _dead_fail_count[node] = _dead_fail_count.get(node, 0) + 1
             fail_count = _dead_fail_count[node]
             if fail_count > len(_DEAD_TTL_STAGES):
@@ -8228,8 +8263,84 @@ def batch_test_nodes(nodes: list[str], current: str) -> tuple[set[str], set[str]
     return dead, alive
 
 def _run_health_check_async(nodes: list[str], current: str) -> tuple[set[str], set[str]]:
-    """后台异步运行健康检查，供主循环非阻塞调用"""
+    """后台异步运行健康检查，供主循环非阻塞调用。
+
+    只测池节点、只写池状态：`nodes` 是 selector `proxy` 的成员，WARP 隧道的
+    健康另有探测器（`_warp_prober_loop`，按线状态表驱动），两条路径不共享结论。
+    """
     return batch_test_nodes(nodes, current)
+
+
+_POOL_DELAY_CURSOR = 0
+_pool_delay_last = 0.0
+
+
+def _pool_delay_bootstrapping(nodes: list[str] | None) -> bool:
+    """池里还有没有「缺样本或样本过期」的节点 —— 冷启动/样本失效后为真。
+
+    为真时补刷按秒级节奏连续排空，而不是等 300s 的健康检查周期。压测实测
+    单轮 40 个要 15s：142 个池子按 300s 节奏要 20 分钟才铺满，而这 20 分钟里
+    选点没有延迟可用，每次轮换都可能切到死节点。
+
+    注意这里问的是「有没有**测过**」，不是「有没有成功的样本」：探测失败的
+    节点也会写时间戳（见 `_refresh_pool_delays`），否则它会永远留在 stale 里，
+    让排空循环停不下来。
+    """
+    if not nodes:
+        return False
+    now = time.time()
+    with _state_lock:
+        return any(_is_pool_node(n) and n not in _DEAD_NODES
+                   and now - _NODE_DELAY_TS.get(n, 0.0) > _NODE_DELAY_TTL
+                   for n in nodes)
+
+
+def _refresh_pool_delays(nodes: list[str], current: str | None) -> int:
+    """补池成员的延迟样本：每轮健康检查抽 `pool_delay_refresh` 个缺样本的节点。
+
+    WHY 不是每轮全测：142 个节点串行测一轮 93s（实测 1.55s/节点），而池的
+    主动轮换是 60s 一次。全量刷新会把 _health_pool 占满，并把 sing-box 的
+    延迟探测接口打成持续负载。游标轮转保证每个节点在几轮内都会拿到样本。
+
+    只补「缺样本或样本过期」的，已经在 TTL 内的不重测 —— 机场节点延迟的
+    有效窗口是分钟级，重复测只是烧配额。
+    """
+    global _POOL_DELAY_CURSOR
+    limit = int(CFG["intervals"].get("pool_delay_refresh") or 40)
+    if limit <= 0 or not nodes:
+        return 0
+    now = time.time()
+    with _state_lock:
+        stale = [n for n in nodes
+                 if _is_pool_node(n) and n not in _DEAD_NODES
+                 and n != current
+                 and now - _NODE_DELAY_TS.get(n, 0.0) > _NODE_DELAY_TTL]
+    if not stale:
+        return 0
+    # 游标取模：stale 列表每轮都在变长变短，用绝对游标保证不会永远只测前 40 个。
+    start = _POOL_DELAY_CURSOR % len(stale)
+    batch = (stale[start:] + stale[:start])[:limit]
+    _POOL_DELAY_CURSOR = start + len(batch)
+    results = _concurrent_test_delays(batch)
+    got = 0
+    failed_after_probe = 0
+    with _state_lock:
+        for node, delay in results.items():
+            # 测过就给时间戳，包括失败：失败的样本同样是「刚测过」的证据。
+            # 不给的话，探不通的节点永远留在 stale 里，冷启动排空判据永远为真
+            # → 每秒派发一轮 40 个节点的探测，把 _health_pool 打满（实测会连续
+            # 跑 10 轮 / 112s 才收敛）。
+            _NODE_DELAY_TS[node] = now
+            if delay is None:
+                _NODE_DELAYS.pop(node, None)
+                failed_after_probe += 1
+                continue
+            _NODE_DELAYS[node] = delay
+            got += 1
+    log(f"  池延迟样本: {got}/{len(batch)} 刷新成功"
+        f"{f'，{failed_after_probe} 个探测失败' if failed_after_probe else ''}"
+        f"（池内有效样本 {sum(1 for n in nodes if now - _NODE_DELAY_TS.get(n, 0.0) <= _NODE_DELAY_TTL)}/{len(nodes)}）")
+    return got
 
 def cleanup_dead_ttl():
     """清理过期的死节点 TTL，重置连续失败计数（给节点公平重试机会）
@@ -8359,7 +8470,10 @@ def _delay_score(node: str, delays: dict[str, int], median: int, min_d: int, max
     """
     d = delays.get(node)
     if d is None:
-        return 0.1
+        # 未知延迟给 0.4：比中位数以下的所有已知节点（0.5~1.0）差，但不该像
+        # 0.1 那样被系统性打死 —— 新上架的节点还没有样本，0.1 意味着它只会
+        # 在「两个都未知」时被抽到，于是永远拿不到样本，形成冷启动死锁。
+        return 0.4
 
     # 防除零：median=0 时所有延迟都为 0，直接返回 1.0
     if median == 0:
@@ -8414,7 +8528,7 @@ def _filter_candidates(current: str, all_nodes: list, fail_set: set) -> list[str
     _prune_cooldown()
 
     def usable(n):
-        if n == "direct" or n == current:
+        if not _is_pool_node(n) or n == current:
             return False
         if n in fail_set or n in _DEAD_NODES or n in _recent_nodes:
             return False
@@ -8510,7 +8624,11 @@ def _p2c_select(candidates: list[str], dedup_skip: set[str], call_map: dict[str,
     pool = [n for n in candidates if n not in dedup_skip] or candidates
     with _state_lock:
         usage_counts = {n: call_map.get(n, 0) + _NODE_CALL_COUNTS.get(n, 0) for n in candidates}
-        delays = dict(_NODE_DELAYS)
+        # 过期样本按「未知」处理：留着它等于用一个 15 分钟前的延迟决定此刻的
+        # 出口，而机场节点的延迟按分钟级抖动。
+        now = time.time()
+        delays = {n: d for n, d in _NODE_DELAYS.items()
+                  if now - _NODE_DELAY_TS.get(n, 0.0) <= _NODE_DELAY_TTL}
         mode = _strategy_mode
     all_delays = [d for d in delays.values() if d is not None]
     median, dmin, dmax = _precompute_delay_stats(all_delays)
@@ -8548,13 +8666,24 @@ def pick_next_node(current: str, all_nodes: list, fail_set: set, count_call: boo
     dedup_skip = _dedup_by_ip(candidates, call_map, ip_map)
     dedup_skip |= _skip_recent_node_ips(candidates, ip_map)
 
-    # 最多尝试 3 个候选，避免死循环
+    # 抽查上限 3 个。压测实测：单次 strict 预检 p50 ~1.5s，3 次全失败 =
+    # 4.5s 常速、30s 走满超时；而同一个 3 次预算拿去换 3 个不同候选，比
+    # 反复重抽同一批更可能选到一个活的（池里 11/60 是死的）。
     for attempt in range(3):
         chosen = _p2c_select(candidates, dedup_skip, call_map)
-        # 快速可用性探测（10s 超时），不更新 _NODE_DELAYS
-        if test_node_quick(chosen, timeout_ms=10000):
+        # 预检只在「没有新鲜延迟样本」时做。压测实测：单次 strict 预检 p50
+        # 1.5s / p95 4.5s / 最坏 10s，而每次轮换都要付这笔；可延迟样本本来就
+        # 已经回答「它此刻连不连得上」（3 分钟内测到的成功即证据）。有样本
+        # 就直接切，把那 1.5s 从换线关键路径上拿掉。
+        fresh = time.time() - _NODE_DELAY_TS.get(chosen, 0.0) <= _PROBE_SKIP_FRESH_SEC
+        probe = _probe_node(chosen, 10000, strict=True) if not fresh else _NODE_DELAYS.get(chosen)
+        # 注释与实现不符的老坑：原来这里调 test_node_quick()，它内部就是
+        # _probe_node()，返回值被丢掉了，于是 precheck 拿到的延迟白测一次。
+        if probe is not None:
             with _state_lock:
                 _recent_nodes.append(chosen)
+                _NODE_DELAYS[chosen] = probe
+                _NODE_DELAY_TS[chosen] = time.time()
                 if count_call:
                     _NODE_CALL_COUNTS[chosen] = _NODE_CALL_COUNTS.get(chosen, 0) + 1
             return chosen
@@ -9742,6 +9871,22 @@ def _rd_watermark() -> int:
     return _rd_seq
 
 
+def _pool_should_rotate(on_warp: bool, pool_current_dead: bool) -> bool:
+    """池该不该做主动轮换。**只表达池自己的需要**，WARP 状态只作为一个事实入参。
+
+    三种情况：
+      1. opencode 不在 WARP 上 → 它就是池的流量，必须按时换（保持原行为）
+      2. 池当前节点已死 → 非 opencode 的流量（9router 其它 provider）走
+         :7890 也是 100% 失败，必须换
+      3. 其余情况（opencode 在 WARP、池节点健康）→ 不换：池是兜底资源，
+         轮换只是白消耗节点配额
+
+    单独成函数是为了让「池的节奏」与「WARP 的状态」在代码上分开：调用点只
+    负责把 WARP 的状态喂进来，判据的演进不会牵动 WARP 换线逻辑。
+    """
+    return (not on_warp) or pool_current_dead
+
+
 def _rotate_pool_proactive(current: str | None, nodes: list[str], now: float) -> None:
     """轮换池内的主动切节点（opencode 落在池上时才用）。"""
     next_node = pick_next_node(current or "", nodes, set())
@@ -10092,7 +10237,7 @@ def _log_startup_banner(all_nodes: list[str]) -> None:
 _API_LOCK = threading.Lock()
 _API_TOKEN = ""
 _last_rotate_ts: float = 0.0
-_api_stats = {"calls": 0, "switched": 0, "coalesced": 0,
+_api_stats = {"calls": 0, "switched": 0, "coalesced": 0, "retired": 0,
               "too_frequent": 0, "no_standby": 0, "failed": 0}
 
 _REASON_WHITELIST = {"rate429": "rate429", "abuse403": "abuse403",
@@ -10154,6 +10299,31 @@ def _rotate_gap() -> float:
     return max(floor, sustain)
 
 
+def _rotate_ip_is_retired(ip: str | None, current_ip: str | None) -> bool:
+    """调用方吃到 429 的这个地址，是否**已经不是**当前出口。
+
+    True  = 已经换走了 —— 调用方重连一次就能绕开，本次不必再烧一条新线。
+    False = 它仍是当前出口（或判不出来）—— 重连无用，必须真换线。
+
+    判据只有「等不等于当前出口」，不查线名、不查历史：调用方手里的地址就是
+    它刚才打通的隧道，只要当前出口已经不是它，那条隧道就换掉了，重连必然
+    落到新出口上。反过来只要还是它，换线才是唯一出路。
+
+    地址从哪来（关键）：9router 在 proxy 模式下自己不知道出口 IP ——
+    `identifyFixedEgress` 对 proxy/relay 一律返回 `ip: null`，只有 direct 才
+    会探测。所以这个值不靠客户端探测，而是 asip 自己在每次 /rotate 响应里给的
+    `active_egress`（selector 在 asip 手里，地址本来就知道）。调用方缓存它、
+    下次 429 带回来，闭环里没有第三方推断。
+
+    判不出来时一律当 False（正常换线）：当前出口未知（停在轮换池）时没有可比
+    的对象，多换一次线只是浪费一格配额，而漏判「已换走」会让调用方拿着死隧道
+    反复重试 —— 两种错误的代价不对称。
+    """
+    if not ip or not current_ip:
+        return False
+    return ip != current_ip
+
+
 def _with_active_line(payload: dict, t0: float, tag: str | None = None,
                       egress: str | None = None) -> dict:
     """给 /rotate 的每个分支补上「此刻哪条线、哪个地址是出口」。
@@ -10190,17 +10360,21 @@ def _with_active_line(payload: dict, t0: float, tag: str | None = None,
     return payload
 
 
-def _rotate_once(reason: str, request_started_at: float | None = None) -> dict:
+def _rotate_once(reason: str, request_started_at: float | None = None,
+                 egress_ip: str | None = None) -> dict:
     """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
 
     换线本体复用 _reconnect_warp_by_table：只读状态表、不现场探测、不重启、
     不落池。那条路径本来就是为「主循环要换线」写的，语义与这里完全一致。
 
-    `request_started_at` 是调用方**发出那条 429 请求**的时刻。有它时按它回溯标脏
-    对象，而不是取此刻的活动线：429 可能迟到几十秒（实测 p99=26s / max=37s），
-    期间线已经换过，此刻这条根本没承载过那条请求 —— 实测 44/44 条迟到的 429
-    全部落在「活动线已经不是发出时那条」的情形里，把它们记到当前线上等于拿旧
-    证据给新线定罪。
+    `egress_ip` 是调用方**吃到 429 的那个出口地址**（由上一次 /rotate 的
+    `active_egress` 缓存而来，不是客户端自己探测的 —— 它探测的只会是直连地址，
+    与代理链路无关）。有它时先判「这个地址是不是已经被换走了」：是的话这次
+    429 对当前隧道无效，不该再烧一条新线，直接回 `switched=False, reason=
+    already_retired`，让调用方重连一次即可。比时刻回溯更硬：时刻是推断，
+    地址是事实。
+
+    `request_started_at` 是旧的推断路径，两者都给时以 `egress_ip` 为准。
 
     已知局限：与主循环自己的换线调用没有共用一把锁。两条同时发生时结果为
     最后写入者胜，记账各自完整但可能指向不同的线。两者都罕见，代价是一次
@@ -10213,6 +10387,17 @@ def _rotate_once(reason: str, request_started_at: float | None = None) -> dict:
         _api_stats["calls"] += 1
         current_tag = active_warp_tag()
         old_ip = _warp_line_ip(current_tag) or _ACTIVE_WARP_IP
+        # 最硬的一条判据：调用方手里的地址已经不是当前出口。此时这条 429 说的
+        # 是一条不再承载流量的隧道，重连就能绕开 —— 再换一次线等于用旧证据烧掉
+        # 一条干净的新线（实测 19:24~19:27 连续 8 次轮换里，多数是同一批迟到
+        # 429 在追已经换掉的地址）。放到最前面：下面的回溯与记账都不该执行。
+        if egress_ip and _rotate_ip_is_retired(egress_ip, old_ip):
+            _api_stats["retired"] += 1
+            log(f"· /rotate: 429 地址 {egress_ip} 已不是当前出口"
+                f"（当前 {current_tag or '轮换池'} / {old_ip or '地址未知'}），不换线")
+            return _with_active_line(
+                {"ok": True, "switched": False, "reason": "already_retired",
+                 "switched_at": _last_rotate_ts}, t0)
         # 当前出口本身，回溯**不会**改它。下面两个判据口径不同，必须分开：
         # `was_blocked` 问的是「此刻这条出口还脏不脏」—— 脏就别再等 gap，接着
         # 换下一跳；而 `old_ip` 是「这条 429 该记到谁头上」，迟到时可以指向另
@@ -10425,9 +10610,11 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             req = {}
         try:
+            ip = req.get("egress_ip")
             self._send(200, _rotate_once(
                 _normalize_rotate_reason(req.get("reason")),
-                _as_ts(req.get("request_started_at"))))
+                _as_ts(req.get("request_started_at")),
+                str(ip).strip() if isinstance(ip, str) and ip.strip() else None))
         except Exception as e:
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})
@@ -10535,6 +10722,7 @@ def main():
     last_proactive_rotate = 0
 
     global _RESTART_COUNT, _NODE_CALL_RESET_TS, _last_wal_checkpoint, _strategy_mode
+    global _pool_delay_last
     global _health_check_future, _health_check_nodes, _health_check_current
     global _last_warp_reconnect_ts, _proactive_progress, _POOL_PROACTIVE_LABEL
     with _RESTART_LOCK:
@@ -10741,8 +10929,13 @@ def main():
             # 池轮换原本只在 opencode 落池时跑。但如果池选中的节点已经死了，
             # 非 opencode 流量（9router 的其它 provider）走 7890 就是 100% 失败 ——
             # 此时无论 opencode 在哪都必须换掉它。
+            #
+            # 注意这里的 `opencode_out_on_warp()` 是**外部依赖**，不是池自己的
+            # 状态：它只回答「WARP 渠道此刻是否在承载 opencode」。池该不该轮换
+            # 仍取决于池自己 —— 见 `_pool_should_rotate()`，两者的判据分开写，
+            # 这样 WARP 侧的改变不会静默改变池的节奏。
             _pool_current_dead = bool(cached_current_proxy) and cached_current_proxy in _DEAD_NODES
-            if (not opencode_out_on_warp() or _pool_current_dead) \
+            if _pool_should_rotate(opencode_out_on_warp(), _pool_current_dead) \
                     and now - last_proactive_rotate > CFG["intervals"]["proactive_rotate_sec"]:
                 last_proactive_rotate = now
                 if cached_all_nodes:
@@ -10764,7 +10957,23 @@ def main():
             if not prober_enabled and not _line_worker_owns_scheduling():
                 _prewarm_standby_warp(now)
 
-            # ---- 5. 节点健康检查 (每 300s) ----
+            # ---- 5. 池节点健康检查 (每 300s) + 延迟样本补刷 ----
+            # 这一整块只服务代理池，与 WARP 渠道的线探测无关：
+            #   `_collect_test_nodes` / `_apply_test_results` 读写的都是池状态
+            #   （_DEAD_NODES 等），入参 `cached_all_nodes` 是 selector `proxy`
+            #   的成员快照。渠道侧的健康由 `_warp_prober_loop` 各自维护。
+            # 延迟补刷有自己的节奏：健康检查在「首轮完成 && 有快照」之前一直不跑，
+            # 而池的选点完全依赖这份延迟表。独立之后哪怕 WARP 还没起来，池也有数据。
+            # 冷启动/样本集体过期时按 1s 一拍连续排空；铺满后回到 300s 节奏。
+            if _pool_delay_bootstrapping(cached_all_nodes):
+                _pool_delay_interval = 1.0
+            else:
+                _pool_delay_interval = CFG["intervals"]["node_health_sec"]
+            if now - _pool_delay_last > _pool_delay_interval and \
+                    cached_all_nodes and cached_current_proxy:
+                _pool_delay_last = now
+                _submit_once("pool-delay-refresh", _refresh_pool_delays,
+                             cached_all_nodes, cached_current_proxy)
             if now - last_health_check > CFG["intervals"]["node_health_sec"]:
                 if _initial_health_done.is_set() and cached_all_nodes and cached_current_proxy:
                     with _state_lock:

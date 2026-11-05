@@ -134,7 +134,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | 文档 | 内容 |
 |---|---|
 | [subsystems/prober.md](subsystems/prober.md) | 探测器：五档结论、按 /128 记账、失明保护 |
-| [subsystems/switching.md](subsystems/switching.md) | 换线：选线四档、/64 静置、冷却 |
+| [subsystems/switching.md](subsystems/switching.md) | 换线：选线四档、/64 静置、冷却（含已知的 H2 档位偏置） |
 | [subsystems/locks.md](subsystems/locks.md) | 四把锁：各防什么、什么时候必须让路 |
 | [subsystems/refresh.md](subsystems/refresh.md) | 补刷 / 预热 / 脏线守护：被换下的线谁来修 |
 | [warp-node-rotation.md](warp-node-rotation.md) | 同块轮回：节点坏了怎么换 |
@@ -155,6 +155,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | [colo-segment-map-20261101.md](colo-segment-map-20261101.md) | colo ↔ 地址段映射 |
 | [warp-colo-survey-20261101.md](warp-colo-survey-20261101.md) | 节点 ↔ colo 普查 |
 | [ban-survey-20261103.md](ban-survey-20261103.md) | 18:00 后各渠道/colo ban 率与报错指标 |
+| [analysis-20261105-h2-selection-bias.md](analysis-20261105-h2-selection-bias.md) | **H2 为何几乎不被选**：档 1 无时效 + 档内「验得久优先」；含供给侧的 /64 与低产线测量 |
 | [review-5d-20261027.md](review-5d-20261027.md) / [review-5d-20261028-audit.md](review-5d-20261028-audit.md) | 五日实测复盘与审计 |
 
 ### 出了事要查

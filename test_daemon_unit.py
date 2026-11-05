@@ -330,12 +330,17 @@ def test_delay_score_分水岭形状():
     assert slow < 0.5, f"慢节点应被陡降，实际 {slow}"
     # median=0 → 全部 1.0（防除零）
     assert daemon._delay_score("a", delays, 0, 0, 0) == 1.0
-    # 缺失延迟 → 0.1（保守惩罚）
-    assert daemon._delay_score("missing", delays, median, dmin, dmax) == 0.1
+    # 缺失延迟 → 0.4：比已知的慢节点差，但不再低到 0.1 —— 0.1 会让新节点
+    # 永远只在「两个都未知」时被抽到，拿不到第一个样本（冷启动死锁）。
+    assert daemon._delay_score("missing", delays, median, dmin, dmax) == 0.4
+    assert daemon._delay_score("missing", delays, median, dmin, dmax) > slow
 
 
 def test_p2c_select_normal_picks_lowest_delay():
     daemon._NODE_DELAYS = {"fast": 50, "slow": 500, "mid": 200}
+    # 延迟样本必须带落账时刻：没有时间戳会被当成过期样本（TTL 15min），
+    # 三条全是未知 → 选点退化为随机，这个用例就测不到「延迟优先」。
+    daemon._NODE_DELAY_TS = {n: time.time() for n in daemon._NODE_DELAYS}
     daemon._NODE_CALL_COUNTS = {}
     daemon._strategy_mode = "normal"
     candidates = ["fast", "slow", "mid"]
@@ -3488,9 +3493,9 @@ def test_ban_until_does_not_shorten_parallel_403(monkeypatch):
 
 
 def test_expired_block_becomes_secondary_tier(monkeypatch):
-    """过了惩罚期的 IP 降级为「次级优质」，重新进入候选；未过期的仍被排除。
+    """过了惩罚期的 IP 降级为「次级优质」（档 2），重新进入候选；未过期的仍被排除。
 
-    403 标记、7 小时前成功过 → 惩罚期已过，档位 1（次级优质），
+    403 标记、7 小时前成功过 → 惩罚期已过，档位 2（次级优质），
     _warp_ip_recently_used 不再按 blocked 窗口排除它。
     同样条件下 429 标记仍在 24h 惩罚期内 → 被排除。
     """
@@ -3505,9 +3510,9 @@ def test_expired_block_becomes_secondary_tier(monkeypatch):
         "ip-429": {"ts": now - 7 * h, "blocked": True, "blocked_kind": "rate429",
                    "blocked_ts": now - 7 * h, "last_ok_ts": now - 7 * h},
     })
-    # 403：惩罚期已过 → 档 1 次级优质，且不算「窗口内用过」
+    # 403：惩罚期已过 → 档 2 次级优质，且不算「窗口内用过」
     assert daemon._warp_ip_is_blocked("ip-403", now) is False
-    assert daemon._warp_ip_rank("ip-403", now, 24 * h)[0] == 1, "应为次级优质（档 1）"
+    assert daemon._warp_ip_rank("ip-403", now, 24 * h)[0] == 2, "应为次级优质（档 2）"
     assert daemon._warp_ip_recently_used("ip-403", now) is False, "已过 6h 窗口，应可复用"
     # 429：24h 惩罚期内 → 仍被排除
     assert daemon._warp_ip_is_blocked("ip-429", now) is True
@@ -3646,13 +3651,14 @@ def test_record_active_ip_success_uses_request_timestamps(monkeypatch):
     assert e["last_ok_ts"] - e["first_ok_ts"] == 4.0, "同批落库也要能算出真实跨度"
 
 
-def test_warp_ip_rank_orders_unseen_before_ok_before_no_success(monkeypatch):
-    """选线四档：从没用过 > 撑过生产 > 探针验过 > 一次 OK 都没拿到。
+def test_warp_ip_rank_orders_unseen_then_fresh_probe_then_served(monkeypatch):
+    """选线四档：从没用过 > 探针刚验过 OK > 撑过生产 > 一次 OK 都没拿到。
 
-    第 1 档必须排在第 2 档前面：有生产成功记录的地址已验证能服务，优于「切上去
-    就 403、从没服务成功过」的地址。第 2 档（探针验过、没撑过生产）排第 3 档之
-    前：它此刻确实能服务，只是还没轮到上场，比「验过且失败」强 —— 而「从未出现
-    过」仍排最前，因为它至少可能是个新鲜好地址。
+    **档 1 与档 2 的先后是 2026-11-05 按主人要求对调的**：探针 OK 是**此刻**
+    的结论（探测器每条线都在跑），而 `last_ok_ts` 只由当前出口挣得、且每次重启
+    清零 —— 它奖励的是「一直没被换下」，不是「现在还能用」。原先把它排在前面，
+    导致 H2 这类反复重启的线永远进不了档 1，13:00 一小时 34 次换线零选中。
+    档 3 仍是「出现过却一次 OK 都没拿到」的兜底。
     """
     now = 100000.0
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {
@@ -3672,17 +3678,18 @@ def test_warp_ip_rank_orders_unseen_before_ok_before_no_success(monkeypatch):
         "brand-new", "burned-no-ok", "probe-only-old", "probe-only-new",
         "old-ok", "recent-ok")}
     assert ranks["brand-new"][0] == 0, "没见过的地址应第 0 档"
-    assert ranks["old-ok"][0] == 1 and ranks["recent-ok"][0] == 1
-    assert (ranks["probe-only-old"][0] == 2
-            and ranks["probe-only-new"][0] == 2), "探针验过但没服务过应第 2 档"
+    assert (ranks["probe-only-old"][0] == 1
+            and ranks["probe-only-new"][0] == 1), "探针验过应第 1 档"
+    assert ranks["old-ok"][0] == 2 and ranks["recent-ok"][0] == 2, \
+        "撑过生产流量应第 2 档"
     assert ranks["burned-no-ok"][0] == 3, "一次 OK 都没拿到的地址应第 3 档"
-    # 第 1 档内部：越久没成功越优先（排序值越小，因为调用方用 min()）
-    assert ranks["old-ok"][2] < ranks["recent-ok"][2]
-    # 整体排序：brand-new < old-ok < recent-ok < 验过未用 < burned-no-ok
+    # 档内一律「越新越优先」（排序值越小，因为调用方用 min()）
+    assert ranks["probe-only-new"][2] < ranks["probe-only-old"][2]
+    assert ranks["recent-ok"][2] < ranks["old-ok"][2]
+    # 整体排序：brand-new < 新鲜探针 < 旧探针 < 新生产 < 旧生产 < burned-no-ok
     ordered = sorted(ranks, key=lambda ip: ranks[ip])
-    assert ordered == ["brand-new", "old-ok", "recent-ok",
-                       "probe-only-old", "probe-only-new",
-                       "burned-no-ok"], ordered
+    assert ordered == ["brand-new", "probe-only-new", "probe-only-old",
+                       "recent-ok", "old-ok", "burned-no-ok"], ordered
 
 
 def test_warp_ip_rank_prefers_unseen_ip_from_rested_prefix(monkeypatch):
@@ -4250,7 +4257,9 @@ def test_pick_next_node_respects_dirty_ip_skip(monkeypatch):
                         lambda cur, all_nodes, fail: ["n1", "n2"])
     monkeypatch.setattr(daemon, "_load_candidate_stats",
                         lambda cands: ({}, {"n1": "dirty-ip", "n2": "clean-ip"}))
-    monkeypatch.setattr(daemon, "test_node_quick", lambda n, timeout_ms: True)
+    # pick_next_node 的预检直接调 _probe_node（它才会把延迟写回表）；
+    # 打桩 test_node_quick 已无效。
+    monkeypatch.setattr(daemon, "_probe_node", lambda n, timeout_ms, strict=True: 100)
     monkeypatch.setattr(daemon, "_recent_nodes", deque())
     chosen = daemon.pick_next_node("", [], set(), count_call=False)
     assert chosen == "n2", f"脏 IP 节点 n1 应被避让选 n2，实际 {chosen}"
@@ -4929,3 +4938,116 @@ def test_lane_probe_uses_mixed_port(monkeypatch):
     assert daemon._opencode_lane_alive(daemon.MIXED_PORT) is True
     cmd = seen["cmd"]
     assert f"socks5h://" in " ".join(cmd) and str(daemon.MIXED_PORT) in cmd[cmd.index("--proxy") + 1]
+
+# ============= 轮换池主动轮换：动作层（_rotate_pool_proactive） =============
+# 既有用例覆盖打分/健康/回切，但没有一条验证「真的切了、切到哪、失败怎么办」。
+# 下面三条锁住动作语义；真实切换路径另由 /tmp 影子实例实测（不进 CI）。
+
+def _pool_rotate_env(monkeypatch, pick="node-b"):
+    """隔离 _rotate_pool_proactive 的全部副作用，只留可观测的切换调用。"""
+    calls = {"switch": [], "info": [], "cooldown": []}
+    monkeypatch.setattr(daemon, "pick_next_node", lambda cur, nodes, fail: pick)
+    monkeypatch.setattr(daemon, "switch_proxy", lambda n: calls["switch"].append(n) or True)
+    monkeypatch.setattr(daemon, "update_node_info_async", lambda n: calls["info"].append(n))
+    monkeypatch.setattr(daemon, "_set_pool_cooldown", lambda ts: calls["cooldown"].append(ts))
+    monkeypatch.setattr(daemon, "_NODE_DELAYS", {pick: 120})
+    return calls
+
+
+def test_rotate_pool_proactive_switches_and_arms_cooldown(monkeypatch):
+    calls = _pool_rotate_env(monkeypatch, pick="node-b")
+    daemon._rotate_pool_proactive("node-a", ["node-a", "node-b"], 1000.0)
+    assert calls["switch"] == ["node-b"], "必须切到选中的节点"
+    assert calls["info"] == ["node-b"], "切换成功后要回填 IP/归属"
+    assert calls["cooldown"] == [1000.0 + daemon.CFG["intervals"]["cooldown_after_switch_sec"]], \
+        "冷却起点必须是 'now + cooldown_after_switch_sec'，否则切完立刻又被错误路径再切一次"
+
+
+def test_rotate_pool_proactive_failed_switch_does_not_arm_cooldown(monkeypatch):
+    calls = _pool_rotate_env(monkeypatch, pick="node-b")
+    monkeypatch.setattr(daemon, "switch_proxy", lambda n: False)
+    daemon._rotate_pool_proactive("node-a", ["node-a", "node-b"], 1000.0)
+    assert calls["cooldown"] == [], "切换失败不得占用冷却窗口"
+    assert calls["info"] == [], "没切成功就不该去查新节点归属"
+
+
+def test_rotate_pool_proactive_no_candidate_and_same_node_are_noops(monkeypatch):
+    calls = _pool_rotate_env(monkeypatch, pick=None)
+    daemon._rotate_pool_proactive("node-a", ["node-a"], 1000.0)
+    assert calls["switch"] == [], "选不出节点时不得硬切"
+    monkeypatch.setattr(daemon, "pick_next_node", lambda cur, nodes, fail: "node-a")
+    daemon._rotate_pool_proactive("node-a", ["node-a", "node-b"], 1000.0)
+    assert calls["switch"] == [], "选回当前节点不得产生一次无意义的 PUT"
+
+# ============= 池：延迟样本老化 / 冷启动 =============
+
+def test_p2c_ignores_stale_delay_samples():
+    """过期延迟必须按「未知」处理，不能拿 15 分钟前的数据决定此刻的出口。"""
+    daemon._NODE_DELAYS = {"fast": 50, "slow": 900}
+    daemon._NODE_DELAY_TS = {"fast": time.time() - daemon._NODE_DELAY_TTL - 60,
+                             "slow": time.time()}
+    daemon._NODE_CALL_COUNTS = {}
+    daemon._strategy_mode = "normal"
+    picks = [daemon._p2c_select(["fast", "slow"], set(), {}) for _ in range(1000)]
+    # fast 是过期样本 → 视为未知(0.4)；slow 是新鲜样本 900ms。两者都非空，
+    # 不能断言 fast 一定输（未知 0.4 vs 慢节点分数仍可能更高），但必须证明
+    # 过期样本没有被当成 50ms 使用：否则 fast 会占压倒多数。
+    assert picks.count("fast") / len(picks) < 0.75, \
+        f"过期样本不应再被当作 50ms 使用，实际占比 {picks.count('fast')/len(picks):.0%}"
+
+def test_p2c_cold_start_does_not_starve_unknown_nodes():
+    """无延迟数据时不得系统性排除节点：0.1 的惩罚会让新节点永远拿不到样本。"""
+    daemon._NODE_DELAYS = {"known": 200}
+    daemon._NODE_DELAY_TS = {"known": time.time()}
+    daemon._NODE_CALL_COUNTS = {}
+    daemon._strategy_mode = "normal"
+    cands = ["known"] + [f"new{i}" for i in range(9)]
+    picks = [daemon._p2c_select(cands, set(), {}) for _ in range(2000)]
+    unknown_share = sum(1 for p in picks if p != "known") / len(picks)
+    assert unknown_share > 0.5, \
+        f"9/10 是未知节点，选中占比应过半（0.1 惩罚下会低于 50%），实际 {unknown_share:.0%}"
+
+
+def test_refresh_pool_delays_skips_fresh_and_dead(monkeypatch):
+    """补刷只测缺样本/过期的节点；新鲜样本和已判死的节点都不该再花探测成本。"""
+    now = time.time()
+    daemon._DEAD_NODES = {"dead1"}
+    daemon._NODE_DELAYS = {"fresh": 100}
+    daemon._NODE_DELAY_TS = {"fresh": now}
+    daemon._NODE_DELAY_TS.pop("stale", None)
+    tested = []
+
+    def fake(nodes):
+        tested.extend(nodes)
+        return {n: 200 for n in nodes}
+
+    monkeypatch.setattr(daemon, "_concurrent_test_delays", fake)
+    monkeypatch.setattr(daemon, "_POOL_DELAY_CURSOR", 0)
+    monkeypatch.setitem(daemon.CFG["intervals"], "pool_delay_refresh", 40)
+    got = daemon._refresh_pool_delays(["fresh", "stale", "dead1", "direct"], None)
+    assert set(tested) == {"stale"}, f"只该补测 stale，实际测了 {tested}"
+    assert got == 1
+    assert daemon._NODE_DELAYS["stale"] == 200
+    assert "stale" in daemon._NODE_DELAY_TS
+
+
+def test_is_pool_node_separates_pool_from_warp_channels(monkeypatch):
+    """池节点与 WARP 渠道成员的判据必须只有一个来源，不能靠命名习惯散落各处。"""
+    monkeypatch.setattr(daemon, "_warp_member",
+                        lambda tag: {"tag": tag} if tag.startswith("WARP-") else None)
+    assert daemon._is_pool_node("pq.aws48.yydjc.top:443-vl")
+    assert not daemon._is_pool_node("WARP-WG-3")
+    assert not daemon._is_pool_node("WARP-H2-SJC-20")
+    assert not daemon._is_pool_node("direct")
+    assert not daemon._is_pool_node(None)
+    assert not daemon._is_pool_node("")
+
+
+def test_pool_should_rotate_only_when_pool_is_carrying_live_traffic():
+    """池的轮换判据独立于 WARP 换线：只有「它在服务流量」或「它自己坏了」才换。"""
+    assert daemon._pool_should_rotate(on_warp=False, pool_current_dead=False), \
+        "opencode 落在池上时必须按时轮换"
+    assert daemon._pool_should_rotate(on_warp=True, pool_current_dead=True), \
+        "池当前节点死了必须换（否则 :7890 的其它 provider 全失败）"
+    assert not daemon._pool_should_rotate(on_warp=True, pool_current_dead=False), \
+        "opencode 在 WARP、池健康时不该换：池是兜底资源，轮换只是烧配额"

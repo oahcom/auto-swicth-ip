@@ -593,10 +593,14 @@ def test_proactive_rotation_gated_when_on_warp():
     src = open('daemon.py', encoding='utf-8').read()
     # 门控仍在，但多了一个**有意的**例外：池选中的节点已判死时，非 opencode
     # 流量（9router 其它 provider）走 7890 会 100% 失败，此时无论 opencode
-    # 在哪都必须换掉它。所以判据是
-    #   if (not opencode_out_on_warp() or _pool_current_dead) and now - ...:
-    assert ("if (not opencode_out_on_warp() or _pool_current_dead)"
-            in src), "步骤 3 主动轮换缺少 opencode_out_on_warp 门控"
+    # 在哪都必须换掉它。判据已抽成 `_pool_should_rotate()`（池与 WARP 渠道
+    # 拆分的一部分），语义等价： (not on_warp) or pool_current_dead。
+    assert "def _pool_should_rotate(on_warp: bool, pool_current_dead: bool)" in src, \
+        "池轮换判据函数缺失"
+    assert "return (not on_warp) or pool_current_dead" in src, \
+        "池轮换缺少 opencode_out_on_warp 门控（或池节点已死例外）"
+    assert "_pool_should_rotate(opencode_out_on_warp(), _pool_current_dead)" in src, \
+        "主循环必须把 WARP 渠道状态作为事实喂给池的判据"
     assert "and now - last_proactive_rotate" in src, \
         "步骤 3 主动轮换的周期判据被删了"
 
@@ -966,9 +970,10 @@ def test_model_probe_ok_records_probe_ok_not_served(monkeypatch):
     """实测通过记 `probe_ok_ts`，不得冒充 `last_ok_ts`。
 
     `last_ok_ts` 的语义是「该地址真的撑过生产流量」，由 `_record_active_ip_success`
-    独占；探针 OK 只说明此刻配额还没耗尽。混写会让选线把「只在空跑里验过」的地址
-    排进次级优质档，与真的撑过流量的地址同权 —— 实测台账 2945 条里 738 条属于这种
-    「验过没用过」。
+    独占；探针 OK 只说明此刻配额还没耗尽。混写会抹掉这个区分 —— 而选线正靠它
+    把「此刻验过」与「曾经撑过」分成两档：探针记档 1、生产成功记档 2
+    （2026-11-05 对调，见 `_warp_ip_rank`）。实测台账 2945 条里 738 条属于
+    「验过没用过」，两类混成一档会让这个区分失效。
     """
     import probe_warp
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
@@ -982,8 +987,8 @@ def test_model_probe_ok_records_probe_ok_not_served(monkeypatch):
         "探针 OK 不是生产成功，不得写 last_ok_ts"
     assert daemon._warp_ip_needs_refresh("ip-a", 2000.0) is False, \
         "刚验过的地址不得再被判低质"
-    assert daemon._warp_ip_rank("ip-a", 2000.0, 86400)[0] == 2, \
-        "验过但没服务过的地址应落第 2 档"
+    assert daemon._warp_ip_rank("ip-a", 2000.0, 86400)[0] == 1, \
+        "验过但没服务过的地址应落第 1 档"
 
 
 def test_model_mode_selection_trusts_probe_not_history(monkeypatch):
