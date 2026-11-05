@@ -597,6 +597,33 @@ def _exit_ledger_since(ip: str, before_ts: float) -> float | None:
     return at if at > before_ts else None
 
 
+def _exit_ledger_since_install(ip: str | None) -> float | None:
+    """这个地址是**什么时候**成为出口的；查不到返回 None。
+
+    与 `_exit_ledger_since` 互补：那个回答「什么时候被换走」，这个回答「什么时候
+    接上的」。调用方要判断「我缓存的那个地址此刻还作不作数」，两个都需要 ——
+    只知道它没被换走，不等于知道它已经在这一位待了多久。
+
+    来源按可信度排：
+      1. 换线表里 `new == ip` 的最新一条 —— 那次切换就是它的起点；
+      2. `_WARP_SWITCH_HISTORY` 里该地址的最新一条 —— 原地重连（selector 不动、
+         只有地址变）只写这里，换线表也会写，但它是过程记录更全的一份。
+    都没有说明这个地址早于本进程的记录窗口，返回 None —— 调用方退回「不知道」。
+    """
+    if not ip:
+        return None
+    with _EXIT_LEDGER_LOCK:
+        hits = [e["at"] for e in _EXIT_LEDGER if e.get("new") == ip]
+    if hits:
+        return max(hits)
+    # 换线表只留 64 条，长时间没换线时会把起点挤出去；过程历史留 128 条兜底。
+    try:
+        hist = [h[0] for h in list(_WARP_SWITCH_HISTORY) if h[2] == ip]
+    except Exception:
+        return None
+    return max(hist) if hist else None
+
+
 def _warp_line_at(ts: float) -> tuple[str | None, str | None] | None:
     """`ts` 那一刻的 (出口线, 该线的出口地址)。三态，调用方必须分开处理：
 
@@ -10410,7 +10437,8 @@ def _rotate_gap() -> float:
 
 
 def _rotate_ip_is_retired(ip: str | None,
-                          request_started_at: float | None) -> bool:
+                          request_started_at: float | None,
+                          client_since: float | None = None) -> bool:
     """调用方吃到 429 的这个地址，在**这次请求发出之后**是否已经被换走。
 
     True  = 已换走 —— 重连一次就能绕开，本次不必再烧一条新线。
@@ -10426,10 +10454,20 @@ def _rotate_ip_is_retired(ip: str | None,
     从不换线，彻底卡死。反过来，一份过期的缓存也永远追不上当前出口。这个判据
     只用来**否定**「已换走」，从不用来肯定它。
 
+    `client_since` 是调用方缓存里那个地址的**接入时刻**（asip 上次回的
+    `active_egress_since`）。它决定这个缓存值可不可信：
+      - 缓存里的接入时刻晚于本次请求发出时刻 → 调用方手里是个「未来」的地址，
+        它不可能承载过这条请求，说明缓存本身就是错的。此时**不能**据此跳过
+        换线 —— 那会让一条真实的 429 得不到处理。
+      - 接入时刻早于请求发出 → 缓存可信，正常查表。
+
     判不出来（调用方没给请求时刻、或表里查不到这个地址）一律 False：多换一次
     只浪费一格配额，而误判「已换走」会让它拿着死隧道反复重试直到超时。
     """
     if not ip or not request_started_at or request_started_at <= 0:
+        return False
+    if client_since and client_since > request_started_at:
+        # 缓存比请求还新，这个地址根本没承载过这条请求。当「判不出」处理。
         return False
     return _exit_ledger_since(ip, request_started_at) is not None
 
@@ -10466,12 +10504,18 @@ def _with_active_line(payload: dict, t0: float, tag: str | None = None,
             egress = _ACTIVE_WARP_IP if tag else None
     payload["active_tag"] = tag
     payload["active_egress"] = egress
+    # 这个地址是什么时候接上的。调用方缓存的地址只有配上这个时刻才有意义：
+    # 只知道「asip 此刻的出口是 X」不够 —— 等到它下次发 429 时，X 可能已经
+    # 挂了很久，而它自己无从分辨「刚切过来的新地址」和「缓存里躺了十分钟的旧值」。
+    # 有 None 时调用方按「不知道」处理，不会据此做任何跳过决策。
+    payload["active_egress_since"] = _exit_ledger_since_install(egress)
     payload["ms"] = int((time.time() - t0) * 1000)
     return payload
 
 
 def _rotate_once(reason: str, request_started_at: float | None = None,
-                 egress_ip: str | None = None) -> dict:
+                 egress_ip: str | None = None,
+                 egress_since: float | None = None) -> dict:
     """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
 
     换线本体复用 _reconnect_warp_by_table：只读状态表、不现场探测、不重启、
@@ -10502,7 +10546,7 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         # 证据烧掉一条干净的新线（实测 19:24~19:27 连续 8 次轮换里，多数是同一批
         # 迟到 429 在追已经换掉的地址）。放到最前面：下面的回溯与记账都不该执行。
         if egress_ip and _rotate_ip_is_retired(
-                egress_ip, request_started_at):
+                egress_ip, request_started_at, egress_since):
             _api_stats["retired"] += 1
             log(f"· /rotate: 429 地址 {egress_ip} 在请求发出后被换走"
                 f"（当前 {current_tag or '轮换池'} / {old_ip or '地址未知'}），不换线")
@@ -10734,7 +10778,8 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, _rotate_once(
                 _normalize_rotate_reason(req.get("reason")),
                 _as_ts(req.get("request_started_at")),
-                str(ip).strip() if isinstance(ip, str) and ip.strip() else None))
+                str(ip).strip() if isinstance(ip, str) and ip.strip() else None,
+                _as_ts(req.get("egress_since"))))
         except Exception as e:
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})

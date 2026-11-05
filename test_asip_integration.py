@@ -477,3 +477,63 @@ def test_exit_ledger_drops_the_oldest_entries():
         assert daemon._EXIT_LEDGER[-1]["old"] == f"old{daemon._EXIT_LEDGER_MAX + 9}"
     finally:
         daemon._EXIT_LEDGER[:] = original
+
+
+def test_rotate_ignores_a_cache_that_postdates_the_request(monkeypatch, _rotate_isolated):
+    """调用方缓存的接入时刻晚于请求发出 → 这个地址不可能承载过这条请求。
+
+    9router 的缓存只在 /rotate 的回复里更新，而回复说「此刻出口是 X」不代表
+    这条请求走的是 X。若缓存的接入时刻比请求还新，它就是一条错配的证据，
+    据此判 already_retired 会让一真实的 429 无人处理。判不出就正常换线。
+    """
+    monkeypatch.setattr(daemon, "_EXIT_LEDGER", [])
+    now = time.time()
+    daemon._exit_ledger_note("2a09:bac5:DEAD::1", "2a09:bac5:NEW::9", now)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-NEW")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:NEW::9")
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
+    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
+                        lambda reason, interrupt=False, out=None: (
+                            out.update({"tag": "WG-X", "ip": "1.2.3.4",
+                                        "switched_at": 1234.0}) or True))
+
+    # 请求发出于 now-10，但客户端缓存说这个地址是 now-2 才接上的 —— 晚于请求。
+    out = daemon._rotate_once("rate429", now - 10, "2a09:bac5:DEAD::1", now - 2)
+
+    assert out.get("reason") != "already_retired", (
+        "缓存的接入时刻晚于请求发出，却据此判已换走 —— 这条 429 会被漏处理"
+    )
+    assert out["switched"] is True
+
+
+def test_rotate_trusts_a_cache_that_predates_the_request(monkeypatch, _rotate_isolated):
+    """缓存接入时刻早于请求 → 缓存可信，正常查换线表。"""
+    monkeypatch.setattr(daemon, "_EXIT_LEDGER", [])
+    now = time.time()
+    daemon._exit_ledger_note("2a09:bac5:OLD::1", "2a09:bac5:NEW::9", now - 5)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-NEW")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:NEW::9")
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
+
+    out = daemon._rotate_once("rate429", now - 10, "2a09:bac5:OLD::1", now - 60)
+
+    assert out["reason"] == "already_retired"
+
+
+def test_rotate_reports_when_the_active_egress_was_installed(monkeypatch, _rotate_isolated):
+    """回复要带 active_egress_since：调用方靠它判断自己的缓存可不可信。"""
+    monkeypatch.setattr(daemon, "_EXIT_LEDGER", [])
+    monkeypatch.setattr(daemon, "_WARP_SWITCH_HISTORY", [])
+    now = time.time()
+    daemon._exit_ledger_note("prev-ip", "2a09:bac5:CUR::1", now - 30)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-1")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:CUR::1")
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 3600.0)
+    monkeypatch.setattr(daemon, "_last_rotate_ts", time.time() - 2)
+
+    out = daemon._rotate_once("rate429")
+
+    assert out["active_egress"] == "2a09:bac5:CUR::1"
+    assert out["active_egress_since"] == pytest.approx(now - 30, abs=2), (
+        "回复没带这个地址的接入时刻 —— 调用方无从分辨新地址和躺了很久的旧值"
+    )
