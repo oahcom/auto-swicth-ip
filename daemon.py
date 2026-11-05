@@ -499,6 +499,64 @@ def _record_warp_switch_history(tag: str | None, at: float,
         del _WARP_SWITCH_HISTORY[:-_WARP_SWITCH_HISTORY_MAX]
 
 
+# ===== 换线表（exit ledger）=====
+#
+# `_WARP_SWITCH_HISTORY` 记的是「某时刻哪条线是出口」，用来把迟到的 429 回溯到
+# 发出时的线。它记不住**旧地址去哪了** —— 而调用方（9router）手里只有地址，
+# 而且可能是几分钟前缓存的地址。要回答「这条 429 追的地址还在不在承载流量」，
+# 需要的是一张 (旧地址 → 新地址, 切换时刻) 的表。
+#
+# 为什么必须带时刻：只比 IP 是否相等，遇到**主动换线**（主循环、探测判死、
+# 定时轮换，全都不经过 9router）就会误判 —— 客户端缓存停在旧地址上，永远
+# 判成「已换走」，于是每次都回 already_retired、从不换线，彻底卡死。
+# 带上切换时刻才能分辨：
+#   - 429 的请求时刻 **早于** 那次切换 → 它打在旧出口上，隧道已经换掉了，
+#     重连即可；
+#   - 请求时刻 **晚于** 切换 → 它打在新出口上，客户端缓存过期，必须再换线。
+#
+# 只留最近 N 条：这是一张旁路证据表，不是永久审计日志。地址在表里查不到
+# 就等于「无从判断」，退回正常换线（多烧一格配额，不会卡死）。
+_EXIT_LEDGER: list[dict] = []
+_EXIT_LEDGER_MAX = 64
+_EXIT_LEDGER_LOCK = threading.Lock()
+
+
+def _exit_ledger_note(old_ip: str | None, new_ip: str | None,
+                      at: float, tag: str | None = None) -> None:
+    """记一次出口地址变更：old_ip 从此刻起不再是出口，new_ip 接替。"""
+    with _EXIT_LEDGER_LOCK:
+        _EXIT_LEDGER.append({
+            "old": old_ip or None,
+            "new": new_ip or None,
+            "at": float(at),
+            "tag": tag,
+        })
+        if len(_EXIT_LEDGER) > _EXIT_LEDGER_MAX:
+            del _EXIT_LEDGER[:-_EXIT_LEDGER_MAX]
+
+
+def _exit_ledger_since(ip: str, before_ts: float) -> float | None:
+    """`ip` 是在哪个时刻之后不再是出口的；查不到返回 None。
+
+    `before_ts` 是调用方发出那条 429 请求的时刻 —— 只在「这次请求发出之后」
+    发生的切换才算数。一次请求可能在同一个地址上跑了几十秒，期间出口换了两次；
+    取最后一次「旧地址是这个 ip」的记录即可，那才是它失效的时刻。
+
+    查不到分两种情况，都返回 None（调用方退回正常换线）：
+      - 这个地址从没进过表（客户端缓存早于表容量，或根本不是 WARP 地址）；
+      - 它进过表，但失效时刻早于这次请求 —— 说明请求发出时它还是出口。这时
+        「已换走」不成立：请求打的是一个当时有效的出口。
+    """
+    if not ip:
+        return None
+    with _EXIT_LEDGER_LOCK:
+        hits = [e["at"] for e in _EXIT_LEDGER if e["old"] == ip]
+    if not hits:
+        return None
+    at = max(hits)
+    return at if at > before_ts else None
+
+
 def _warp_line_at(ts: float) -> tuple[str | None, str | None] | None:
     """`ts` 那一刻的 (出口线, 该线的出口地址)。三态，调用方必须分开处理：
 
@@ -2460,6 +2518,10 @@ def _switch_warp(tag: str, *, ip: str | None = None) -> bool:
     # 「知道那条线、但不知道地址」→ 不标脏任何 IP，比记错地址安全。
     _record_warp_switch_history(tag if after[0] == "warp" else None,
                                 time.time(), ip)
+    # 换线表同时记一笔「旧地址 → 新地址」。旧地址取进程级的那个（selector 刚翻
+    # 完，线表里各线的 ip 还是切换前的值，不能当作「旧出口」—— 旧出口是**此刻
+    # 之前承载流量的那一个**，只有 `_ACTIVE_WARP_IP` 知道）。
+    _exit_ledger_note(_ACTIVE_WARP_IP, ip, time.time(), tag)
     if after[0] != before[0]:
         bl = before[1] or ("轮换池" if before[0] == "proxy" else "未知")
         log(f"⇄ 出口模式切换: {before[0]} -> {after[0]}"
@@ -7167,6 +7229,10 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
     # 清进程级出口地址：此时「当前出口」已经不是任何 WARP 线，留着旧地址会让
     # /rotate 把「还挂在被换下那条隧道上的连接」当成新出口的连接（见 _with_active_line）。
     _ACTIVE_WARP_IP = None
+    # 落池对外部调用方同样是一次「旧地址不再承载流量」：拿着旧地址的 429 应该
+    # 得到 already_retired 然后重连，而不是再触发一次换线（池上根本没有 WARP
+    # 可换，只会浪费一次 no_warm_standby）。
+    _exit_ledger_note(old_ip, None, landed)
     log("✓ 已切到轮换池 proxy（WARP 隧道全部不可用）")
     return True
 
@@ -7199,6 +7265,10 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
                 # 换线历史也要跟着换址：否则迟到的 429 回溯到这条线时会拿到
                 # 换址前的旧地址，把已经不再承载流量的地址记成新的坏账。
                 _record_warp_switch_history(member["tag"], now, new_ip)
+                # 换线表：selector 没动，但出口地址换了 —— 对调用方来说同样是
+                # 「旧地址不再承载流量」。漏记这一笔，拿着旧地址的 429 会被判成
+                # 「还没换走」，于是为了一个已经不是出口的地址再烧一条新线。
+                _exit_ledger_note(old_ip, new_ip, now, member["tag"])
                 _begin_segment(now)  # 本段结束：主动轮换计时重新开始
                 return True
             log(f"  ✗ {member['tag']} 出口不新鲜: {new_ip or '探测失败'}")
@@ -10299,29 +10369,29 @@ def _rotate_gap() -> float:
     return max(floor, sustain)
 
 
-def _rotate_ip_is_retired(ip: str | None, current_ip: str | None) -> bool:
-    """调用方吃到 429 的这个地址，是否**已经不是**当前出口。
+def _rotate_ip_is_retired(ip: str | None,
+                          request_started_at: float | None) -> bool:
+    """调用方吃到 429 的这个地址，在**这次请求发出之后**是否已经被换走。
 
-    True  = 已经换走了 —— 调用方重连一次就能绕开，本次不必再烧一条新线。
-    False = 它仍是当前出口（或判不出来）—— 重连无用，必须真换线。
+    True  = 已换走 —— 重连一次就能绕开，本次不必再烧一条新线。
+    False = 仍是出口（或判不出来）—— 重连无用，必须真换线。
 
-    判据只有「等不等于当前出口」，不查线名、不查历史：调用方手里的地址就是
-    它刚才打通的隧道，只要当前出口已经不是它，那条隧道就换掉了，重连必然
-    落到新出口上。反过来只要还是它，换线才是唯一出路。
+    判据只有一条：换线表里存在「旧地址就是这个 ip、切换时刻 > 请求发出时刻」
+    的记录。它说明这次切换发生在这条请求**之后**，请求打通的是一条已经下线的
+    隧道，重连必然落到新出口上。
 
-    地址从哪来（关键）：9router 在 proxy 模式下自己不知道出口 IP ——
-    `identifyFixedEgress` 对 proxy/relay 一律返回 `ip: null`，只有 direct 才
-    会探测。所以这个值不靠客户端探测，而是 asip 自己在每次 /rotate 响应里给的
-    `active_egress`（selector 在 asip 手里，地址本来就知道）。调用方缓存它、
-    下次 429 带回来，闭环里没有第三方推断。
+    **不能**只比「ip 是否等于当前出口」。asip 自己会主动换线（主循环、探测判死、
+    定时轮换，全都不经过 9router），这时客户端缓存的地址必然与当前出口不同，
+    而请求实际走的是新出口 —— 比出来就是「已换走」，于是每次都回 already_retired、
+    从不换线，彻底卡死。反过来，一份过期的缓存也永远追不上当前出口。这个判据
+    只用来**否定**「已换走」，从不用来肯定它。
 
-    判不出来时一律当 False（正常换线）：当前出口未知（停在轮换池）时没有可比
-    的对象，多换一次线只是浪费一格配额，而漏判「已换走」会让调用方拿着死隧道
-    反复重试 —— 两种错误的代价不对称。
+    判不出来（调用方没给请求时刻、或表里查不到这个地址）一律 False：多换一次
+    只浪费一格配额，而误判「已换走」会让它拿着死隧道反复重试直到超时。
     """
-    if not ip or not current_ip:
+    if not ip or not request_started_at or request_started_at <= 0:
         return False
-    return ip != current_ip
+    return _exit_ledger_since(ip, request_started_at) is not None
 
 
 def _with_active_line(payload: dict, t0: float, tag: str | None = None,
@@ -10387,13 +10457,14 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         _api_stats["calls"] += 1
         current_tag = active_warp_tag()
         old_ip = _warp_line_ip(current_tag) or _ACTIVE_WARP_IP
-        # 最硬的一条判据：调用方手里的地址已经不是当前出口。此时这条 429 说的
-        # 是一条不再承载流量的隧道，重连就能绕开 —— 再换一次线等于用旧证据烧掉
-        # 一条干净的新线（实测 19:24~19:27 连续 8 次轮换里，多数是同一批迟到
-        # 429 在追已经换掉的地址）。放到最前面：下面的回溯与记账都不该执行。
-        if egress_ip and _rotate_ip_is_retired(egress_ip, old_ip):
+        # 最硬的一条判据：换线表里显示这个地址在**这条请求发出之后**被换掉了。
+        # 那它打通的是一条已经下线的隧道，重连就能绕开 —— 再换一次线等于用旧
+        # 证据烧掉一条干净的新线（实测 19:24~19:27 连续 8 次轮换里，多数是同一批
+        # 迟到 429 在追已经换掉的地址）。放到最前面：下面的回溯与记账都不该执行。
+        if egress_ip and _rotate_ip_is_retired(
+                egress_ip, request_started_at):
             _api_stats["retired"] += 1
-            log(f"· /rotate: 429 地址 {egress_ip} 已不是当前出口"
+            log(f"· /rotate: 429 地址 {egress_ip} 在请求发出后被换走"
                 f"（当前 {current_tag or '轮换池'} / {old_ip or '地址未知'}），不换线")
             return _with_active_line(
                 {"ok": True, "switched": False, "reason": "already_retired",

@@ -373,37 +373,69 @@ def test_fallback_to_proxy_clears_the_process_wide_egress(monkeypatch):
     )
 
 
-def test_rotate_skips_switching_when_the_429_egress_is_already_retired(
+def test_rotate_skips_switching_when_the_exit_ledger_shows_the_ip_was_replaced(
         monkeypatch, _rotate_isolated):
-    """429 追的地址已经不是当前出口 → 重连即可，不该再烧一条新线。
+    """换线表显示这个地址在这条请求发出**之后**被换掉 → 重连即可。
 
-    这是唯一不靠推断的判据：调用方手里的地址就是它刚打通的隧道，只要当前出口
-    不是它，那条隧道就已经换掉了。拿时刻回溯去猜「当时哪条线」会隔三层推断，
-    而这里是一次字符串比较。
+    这是唯一不靠推断的判据：表里那条「旧地址 → 新地址 @ 时刻」是切换真的发生后
+    写下的，请求时刻早于它意味着这条请求打通的隧道已经下线。
     """
+    monkeypatch.setattr(daemon, "_EXIT_LEDGER", [])
+    now = time.time()
+    daemon._exit_ledger_note("2a09:bac5:DEAD::1", "2a09:bac5:NEW::9", now)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-NEW")
-    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:6215:28::4:347")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:NEW::9")
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
     switched = []
     monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
                         lambda *a, **k: switched.append(1) or True)
 
-    out = daemon._rotate_once("rate429", None, "2a09:bac5:DEAD::1")
+    # 请求发出于切换之前 2 秒。
+    out = daemon._rotate_once("rate429", now - 2, "2a09:bac5:DEAD::1")
 
     assert out["reason"] == "already_retired", (
-        "调用方报的地址已不是当前出口，却仍去换线 —— 用旧证据烧掉了一条好线"
+        "换线表显示地址在请求后被换走，却仍去换线 —— 用旧证据烧掉了一条好线"
     )
     assert out["switched"] is False
     assert not switched, "already_retired 分支不该调用换线"
-    assert out["active_egress"] == "2a09:bac5:6215:28::4:347", (
-        "already_retired 的回复没带当前出口 —— 调用方缓存的还是那个作废地址，"
-        "下一条 429 会被反复判成 already_retired"
+    assert out["active_egress"] == "2a09:bac5:NEW::9", (
+        "already_retired 的回复没带当前出口 —— 调用方缓存的还是那个作废地址"
     )
+
+
+def test_rotate_switches_when_the_switch_happened_before_the_request(
+        monkeypatch, _rotate_isolated):
+    """主动换线发生在请求**之前** → 必须真换线。
+
+    这是「只比 IP 是否等于当前出口」会踩的坑：asip 自己主动换线（主循环、探测
+    判死、定时轮换，都不经过 9router），客户端缓存必然与当前出口不符。若据此
+    判 already_retired，就从不换线，服务彻底卡死。请求打的是新出口，429 真实，
+    必须换。
+    """
+    monkeypatch.setattr(daemon, "_EXIT_LEDGER", [])
+    now = time.time()
+    daemon._exit_ledger_note("2a09:bac5:OLD::1", "2a09:bac5:NEW::9", now - 60)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-NEW")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:NEW::9")
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
+    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
+                        lambda reason, interrupt=False, out=None: (
+                            out.update({"tag": "WG-X", "ip": "1.2.3.4",
+                                        "switched_at": 1234.0}) or True))
+
+    # 缓存里还是换线前的旧地址，但这次请求是在切换之后发出的。
+    out = daemon._rotate_once("rate429", now, "2a09:bac5:OLD::1")
+
+    assert out["switched"] is True, (
+        "主动换线早于请求发出，却判成 already_retired —— 服务会从此永不换线"
+    )
+    assert out["active_egress"] == "1.2.3.4"
 
 
 def test_rotate_switches_when_the_429_egress_is_still_current(
         monkeypatch, _rotate_isolated):
     """429 追的地址仍是当前出口 → 必须真换线，重连没有意义。"""
+    monkeypatch.setattr(daemon, "_EXIT_LEDGER", [])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-OLD")
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:AAAA::1")
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
@@ -412,19 +444,15 @@ def test_rotate_switches_when_the_429_egress_is_still_current(
                             out.update({"tag": "WG-NEW", "ip": "1.2.3.4",
                                         "switched_at": 1234.0}) or True))
 
-    out = daemon._rotate_once("rate429", None, "2a09:bac5:AAAA::1")
+    out = daemon._rotate_once("rate429", time.time(), "2a09:bac5:AAAA::1")
 
     assert out["switched"] is True, "地址仍是出口却没换线 —— 调用方重试必然再 429"
     assert out["active_egress"] == "1.2.3.4"
 
 
 def test_rotate_switches_when_the_egress_is_unknown(monkeypatch, _rotate_isolated):
-    """判不出来时按正常换线走：漏判比多换一次的代价大得多。
-
-    调用方首轮没有缓存地址（还没见过任何 /rotate 回复），或停在轮换池时当前
-    出口为 None。两种都判不出「已换走」，这时宁可多烧一格配额，也不能让调用方
-    拿着一条可能已经死掉的隧道反复重试。
-    """
+    """判不出来时按正常换线走：漏判比多换一次的代价大得多。"""
+    monkeypatch.setattr(daemon, "_EXIT_LEDGER", [])
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: None)
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
@@ -436,3 +464,16 @@ def test_rotate_switches_when_the_egress_is_unknown(monkeypatch, _rotate_isolate
     out = daemon._rotate_once("rate429", None, "2a09:bac5:DEAD::1")
 
     assert out["switched"] is True, "当前出口未知时不该判 already_retired"
+
+
+def test_exit_ledger_drops_the_oldest_entries():
+    """表只保留最近 N 条：它是旁路证据，不是审计日志。"""
+    original = list(daemon._EXIT_LEDGER)
+    try:
+        daemon._EXIT_LEDGER.clear()
+        for i in range(daemon._EXIT_LEDGER_MAX + 10):
+            daemon._exit_ledger_note(f"old{i}", f"new{i}", float(i))
+        assert len(daemon._EXIT_LEDGER) == daemon._EXIT_LEDGER_MAX
+        assert daemon._EXIT_LEDGER[-1]["old"] == f"old{daemon._EXIT_LEDGER_MAX + 9}"
+    finally:
+        daemon._EXIT_LEDGER[:] = original
