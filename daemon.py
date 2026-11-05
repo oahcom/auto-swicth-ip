@@ -13,6 +13,7 @@ auto-switch-ip daemon v2 - 加固版
   8. node|IP|地区 映射存储与展示
 """
 import fcntl
+import bisect
 import json
 import os
 import sys
@@ -294,6 +295,13 @@ _last_warp_reconnect_ts: float = 0  # 上次发起重连的 epoch 秒，用于�
 # 上次换线**生效**的时刻。主动轮换按此切窗口：发起时刻早于生效时刻数秒，
 # 换线期间旧出口仍在服务流量，用发起时刻会把旧线消耗算进新线配额。
 _last_warp_switch_ok_ts: float = 0
+# 换线历史：[(生效时刻, tag), ...]。只用来回答「某个时刻哪条线是出口」——
+# `_last_warp_switch_ok_ts` 只有最近一次，把两次换线之间的空档也会算成后一条
+# 线的存活，回答不了「这条 429 在途时走的是谁」。
+# cap 128：客户端的换线请求最多迟到几十秒（实测请求耗时 p90=26s / max=37s），
+# 一分钟内的换线次数远到不了这个深度。
+_WARP_SWITCH_HISTORY: list[tuple[float, str, str | None]] = []
+_WARP_SWITCH_HISTORY_MAX = 128
 _warp_cooldown_until: float = 0     # 冷却截止，防重连风暴
 # WARP 出口 IP 使用记录：ip -> {ts: 最后使用时刻, blocked: 是否被 403/429 标记过}。
 # 换线前校验目标线的当前出口 IP，窗口内用过就先刷新会话再切 ——
@@ -452,6 +460,77 @@ def _begin_segment(ts: float) -> None:
     global _last_warp_switch_ok_ts
     _last_warp_switch_ok_ts = float(ts)
     _save_segment_start(ts)
+
+
+def _record_warp_switch_history(tag: str | None, at: float,
+                                ip: str | None = None) -> None:
+    """记一次换线生效，供 `_warp_line_at` 回溯。
+
+    写入点必须在 selector 真的翻过去之后 —— 记在发起时会把「没翻成的换线」
+    也算进去，回溯时给出错误的线。`tag` 为 None 表示出口切到了轮换池：必须
+    落一条记录，否则落池期间回溯会停在落池前最后一条隧道上，把一条早已不
+    承载流量的线判成「这条 429 的发出者」。
+
+    `ip` 必须**当时**取，不能在回溯时再问 `_warp_line_ip(tag)`：那条线在 429
+    迟到的几十秒里很可能已被重启换了会话地址（实测同 tag 相邻判定间隔
+    10~30s 时 99.4% 换了地址），事后取到的是新地址，会把干净的记成脏。
+
+    刻意不取 `_WARP_LOCK`：调用方 `_switch_warp` 常运行在已持有该锁的换线
+    线程里（锁跨线程持有到 worker 的 finally），再取一次就是死锁。
+    `list.append` / 切片在 CPython 下是原子的，多线程同时追加只会让相邻两条
+    记录的时刻先后微调，不会损坏结构。
+    """
+    if tag is None:
+        # 落池：必须落一条「当时不在任何隧道上」的记录。漏了它，回溯会停在前
+        # 一条隧道上，把一条早已不承载流量的线判成这条 429 的发出者。
+        _WARP_SWITCH_HISTORY.append((float(at), None, None))
+    else:
+        _WARP_SWITCH_HISTORY.append((float(at), str(tag), ip or None))
+    if len(_WARP_SWITCH_HISTORY) > _WARP_SWITCH_HISTORY_MAX:
+        del _WARP_SWITCH_HISTORY[:-_WARP_SWITCH_HISTORY_MAX]
+
+
+def _warp_line_at(ts: float) -> tuple[str | None, str | None] | None:
+    """`ts` 那一刻的 (出口线, 该线的出口地址)。三态，调用方必须分开处理：
+
+    - `None` —— **不知道**（历史是空的、或 ts 早于现存首条）。历史被截断过，
+      首条之前那段无从得知，这时只能按旧行为用当前线。
+    - `(None, None)` —— **知道，且那一刻不是任何隧道**（停在轮换池）。那条 429
+      属于池节点，不归任何隧道，不许标脏。
+    - `(tag, ip)` —— 那一刻出口是 tag，ip 是它当时的地址（可能为 None）。
+
+    地址必须随记录一起给，不能在调用处再问 `_warp_line_ip(tag)`：那条线在 429
+    迟到的几十秒里很可能已被重启换了会话地址（实测同 tag 相邻判定间隔 10~30s
+    时 99.4% 换了地址），事后取到的是新地址，会把干净的记成脏。
+
+    用二分而不是从尾部扫：历史按时间单调递增，尾部扫描在「429 迟到 37 秒、
+    其间换了十几次线」时要走十几步，而二分恒定。
+
+    键和记录必须**从同一份快照**里取。先 `[h[0] for h in hist]` 算索引、再
+    `hist[i]` 取值是错的：写线程的 `del hist[:-MAX]` 会让列表整体前移，同一个
+    索引就指向另一条记录 —— 实测并发压测 20 万次读给出 21 次**错误的线**
+    （真值 L100，返回 L101），尾部还会 IndexError。这里先切片复制，之后所有
+    下标都只在副本上算。
+
+    不取 `_WARP_LOCK`：换线 worker 会跨线程持锁数秒（`_reconnect_warp_now`
+    抢锁、worker 的 finally 才释放），这里取锁会把 /rotate 一起卡住、超过调用方
+    2s 超时。
+
+    **排序不能省**：写入点记的是「这条路什么时候知道地址变了」，不是「地址什么
+    时候生效」。`_restart_warp_inplace` 在模型实测**之前**取 `now`，实测要 1.4~8.7s
+    （实测区间），期间主循环可能又换了一次线 —— 于是列表里出现 `[(t+3, C), (t, B)]`。
+    对非单调序列二分不是「差一格」，是返回**另一条线**：实测 `ts=t+4` 真实出口是
+    C，返回 B。`sorted` 是稳定排序，时刻相同的两条保持追加先后，与无排序时的
+    「后追加者胜」一致。
+    """
+    hist = list(_WARP_SWITCH_HISTORY)
+    if not hist:
+        return None
+    hist.sort(key=lambda h: h[0])
+    i = bisect.bisect_right([h[0] for h in hist], ts) - 1
+    if i < 0:
+        return None
+    return hist[i][1], hist[i][2]
 
 
 def _warp_ip_history_path() -> str:
@@ -683,7 +762,7 @@ def _probe_ttl(verdict: str) -> float:
     if verdict in _WARP_PROBE_PERSISTENT:
         return float(w.get("probe_persistent_ttl_sec", 21600))
     if verdict in _WARP_PROBE_OK:
-        return float(w.get("probe_ok_ttl_sec", 600))
+        return float(w.get("probe_ok_ttl_sec", 1800))
     return float(w.get("probe_transient_ttl_sec", 120))
 
 
@@ -2313,7 +2392,7 @@ def _current_mode() -> tuple[str, str | None]:
     return ("warp", now) if _warp_member(now) else ("proxy", None)
 
 
-def _switch_warp(tag: str) -> bool:
+def _switch_warp(tag: str, *, ip: str | None = None) -> bool:
     """翻转 opencode-out selector。在途请求不会因换线而断。
 
     只改 selector 不会迁移已建立的连接：9router / opencode 用 HTTP/2 长连接，
@@ -2333,6 +2412,12 @@ def _switch_warp(tag: str) -> bool:
     模式切换（warp <-> proxy）在这里打日志：所有出口变更都经过这个函数，
     在调用方各打一条会漏掉 sing-box 重启后的线路恢复那条路径。
 
+    `ip` 是**切过去那条线的新出口地址**，由调用方在选线时就已知道（`probes`
+    里带着）。历史记录必须用调用方传入的这个值：本函数内部读线状态表只能读到
+    这条线切换**之前**的地址 —— 两个调用方都是「先切 selector、后写线地址表」，
+    在这里读表必然读到陈旧值，而迟到的 429 回溯时正好拿它去定罪。缺省 None
+    表示调用方也不知道，此时不记录地址，回溯会退化成「不定罪」。
+
     before 由 `_current_mode()` 直查 sing-box（只在查不到时才退回快照）：快照固定
     滞后 0.5s，连切两次时会漏打一次模式日志。
     """
@@ -2343,6 +2428,19 @@ def _switch_warp(tag: str) -> bool:
         return False
     _publish_clash_snapshot(_warp()["selector"], {"now": tag})
     after = ("warp", tag) if _warp_member(tag) else ("proxy", None)
+    # 只无条件写历史，不取 `_WARP_LOCK`：这条路径常在 `_reconnect_warp_now`
+    # 已经持有该锁的换线线程里执行（锁跨线程持有到 worker 的 finally），
+    # 再取一次会让换线线程永久阻塞、锁永不释放。
+    # 不加锁的代价只是「一次换线的记录时刻晚于另一次」时二分可能取错一格，
+    # 而记录本身不可丢 —— 丢了会把一条线整个时期的请求判成无主。
+    #
+    # ip 传 None 是刻意的：本函数只翻 selector，**取不到新出口地址**。线状态表
+    # 里此刻仍是这条线切换前的旧地址 —— 两个调用方都是「先 _switch_warp，后
+    # `_set_warp_line_ip` / `_warp_line_selected`」，在这里读表必然读到陈旧值，
+    # 而迟到的 429 回溯时正好用这个地址去定罪。记 None 会让回溯退化成
+    # 「知道那条线、但不知道地址」→ 不标脏任何 IP，比记错地址安全。
+    _record_warp_switch_history(tag if after[0] == "warp" else None,
+                                time.time(), ip)
     if after[0] != before[0]:
         bl = before[1] or ("轮换池" if before[0] == "proxy" else "未知")
         log(f"⇄ 出口模式切换: {before[0]} -> {after[0]}"
@@ -2401,7 +2499,16 @@ def _reclaim_foreign_pool(now: float | None = None) -> bool:
         return False
     target = _LAST_WARP_TAG if _warp_member(_LAST_WARP_TAG) else _warp()["members"][0]["tag"]
     _LAST_POOL_RECLAIM_TS = now
+    # 外部翻转不经过 `_switch_warp`，所以历史里没有「这一刻在池上」的记录。
+    # 不补的话，落池期间发出的 429 回溯会停在池之前最后一条隧道上，把一条
+    # 早已不承载流量的线判成发出者。落池已禁用时 `_fallback_to_proxy` 走
+    # `_restart_warp_inplace`，同样不落记录 —— 这里是唯一能补的地方。
+    _record_warp_switch_history(None, now)
     log(f"⚠ 检测到外部落池（opencode-out=proxy），回收至 {target}")
+    # 不传 ip：`_ACTIVE_WARP_IP` 是**被换下**那条 WARP 线的地址，而 target 是
+    # 另一条线（`_LAST_WARP_TAG` 或 members[0]），两者通常不是同一条。传它等于
+    # 在 target 名下记一个不属于它的地址，迟到 429 回溯时会拿这个地址定罪。
+    # 不知道地址时记 None，回溯退化成「知道这条线、不知道地址」→ 不标脏。
     return _switch_warp(target)
 
 
@@ -2715,11 +2822,38 @@ def _probe_refresh_egress(port: int) -> str | None:
         time.sleep(1)
 
 
+def _record_line_ip_drift(tag: str, old_ip: str | None, new_ip: str) -> None:
+    """线内换了会话地址时补一条历史 —— 地址漂移不只有换线一种。
+
+    实测 `.warp_line_state.json` 36 条线里 **17 条 `ip_ts` 晚于 `sel`**，即
+    「选这条线之后它的出口地址又变了」是常态而非边角。历史只记换线的话，
+    这段时间里发出的 429 回溯拿到的是这条线**上一次**的地址，把早已不承载
+    流量的地址记成新坏账（实测：请求经 B 发出，回溯给 A）。
+
+    只记**当前出口**那条线。全池都记的话，20 条线每分钟一轮探测就能往
+    128 条的历史里灌满无关漂移，把真正的换线记录挤掉 —— 而迟到 429 只可能
+    来自正在承载流量的那条。
+
+    `active_warp_tag()` 在 `_WARP_LINE_LOCK` 与 `_WARP_LOCK` 之外（快照读），
+    本函数可能在持 `_WARP_LINE_LOCK` / `_WARP_LINE_CV` 时被调用。
+    """
+    if not new_ip or new_ip == old_ip:
+        return
+    try:
+        if active_warp_tag() != tag:
+            return
+    except Exception:
+        return
+    _record_warp_switch_history(tag, time.time(), new_ip)
+
+
 def _set_warp_line_ip(tag: str, ip: str) -> None:
     with _WARP_LINE_LOCK:
         st = _WARP_LINE_STATE.setdefault(tag, {})
+        old_ip = st.get("ip")
         st["ip"] = ip
         st["ip_ts"] = time.time()
+    _record_line_ip_drift(tag, old_ip, ip)
 
 
 def _warp_line_ip(tag: str) -> str | None:
@@ -4662,6 +4796,7 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             else:
                 st["next_probe_ts"] = ts + _line_probe_cadence()
         _WARP_LINE_CV.notify_all()
+    _record_line_ip_drift(tag, old_ip, ip)
     _save_warp_line_state()
     return True
 
@@ -4672,7 +4807,8 @@ def _warp_line_note_ok(tag: str, ip: str, ts: float) -> None:
         return
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
-        if st.get("ip") != ip:
+        old_ip = st.get("ip")
+        if old_ip != ip:
             st["last_ok_ts"] = 0.0
             st["last_ok_ip"] = None
         st["ip"] = ip
@@ -4683,6 +4819,7 @@ def _warp_line_note_ok(tag: str, ip: str, ts: float) -> None:
         st["fail_streak"] = 0
         st["next_probe_ts"] = 0
         _WARP_LINE_CV.notify_all()
+    _record_line_ip_drift(tag, old_ip, ip)
 
 
 def _warp_line_invalidate(ip: str | None, now: float | None = None) -> None:
@@ -5053,11 +5190,13 @@ def _warp_line_restart(member: dict, reason: str,
             else:
                 st["last_verdict"] = "unknown"
                 st["next_probe_ts"] = now + _line_unknown_retry()
+            old_ip = st.get("ip")
             if ip:
                 st["ip"] = ip
                 st["ip_ts"] = now
                 st["port_ok"] = True
             _WARP_LINE_CV.notify_all()
+        _record_line_ip_drift(tag, old_ip, ip)
         _save_warp_line_state()
         log(f"  {'✓' if ip else '✗'} {tag} 重启后出口={ip or '探测失败'}")
         return bool(ip)
@@ -5358,7 +5497,7 @@ def _cached_warp_standby(standby: list[dict], now: float,
     TTL 取 12s：守护的探测节奏是 5s + 单次探测耗时（实测 1.2~7s），12s 覆盖
     """
     ttl = _warp().get("probe_cache_ttl_sec", 12)
-    ok_ttl = float(_warp().get("probe_ok_ttl_sec", 600))
+    ok_ttl = float(_warp().get("probe_ok_ttl_sec", 1800))
     out: list[tuple[dict, str]] = []
     for m in standby:
         ip = _warp_line_ip(m["tag"])
@@ -5505,10 +5644,15 @@ def _parse_rate429_cooldown(body: str | None) -> int | None:
 
 
 def _as_ts(value) -> float | None:
-    """把台账里的时间字段解析成 float；损坏/NaN/Inf 一律当缺失。"""
+    """把台账里的时间字段解析成 float；损坏/NaN/Inf 一律当缺失。
+
+    `OverflowError` 必须一起接住：`json.loads` 会把超长整数字面量解析成
+    Python int，`float(10**400)` 抛的不是 ValueError，于是会穿出 `/rotate`
+    的解析段、整条换线请求被丢弃（回 500 → 客户端当「没换线」）。
+    """
     try:
         out = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return out if math.isfinite(out) else None
 
@@ -5982,7 +6126,12 @@ def _warp_ip_prefix(ip: str | None) -> str | None:
         return None
 
 
-@functools.lru_cache(maxsize=8192)
+# maxsize 必须大于台账条目数：`_warp_prefix_rest` 每算一个候选就要把整张台账
+# 的 IP 各解析一遍，缓存装不下就等于没有缓存。台账实测 14842 条而原来只给 8192，
+# 每轮扫描都把缓存整个冲掉 —— py-spy 实测单次 126ms、12 个候选合计 1.35s，
+# 占换线请求线程 28/36 的样本，且全程握着 `_WARP_IP_LOCK`，把并发请求一起拖慢。
+# 放到 65536 后同一基准 12 次合计 10ms。台账按 24h 窗口自然淘汰，条目数有上界。
+@functools.lru_cache(maxsize=65536)
 def _warp_ip_prefix_cached(ip: str) -> str | None:
     return _warp_ip_prefix(ip)
 
@@ -6949,6 +7098,7 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
     停在 proxy 上）时会把全部成员作为候选。
     """
     global _proxy_dwell_since, _last_warp_switch_ok_ts, _last_proxy_fallback_ts
+    global _ACTIVE_WARP_IP
     if not _warp().get("proxy_fallback_enabled", False):
         # 落池已禁用（2026-10-26）：池内节点全不可用，落池即断流。
         # 没有当前线可重连时直接放弃，交给下一轮错误重试。
@@ -6968,6 +7118,8 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
         for m in _warp()["members"]:
             if active is not None and m["tag"] == active["tag"]:
                 continue
+            # 盲切：这条线的地址没探测过，传 None 而不是外面的 `ip`
+            # （那是**当前**出口的地址，不是目标线的）。
             if not _port_open(m["port"]) or not _switch_warp(m["tag"]):
                 continue
             _begin_segment(time.time())
@@ -6995,6 +7147,9 @@ def _fallback_to_proxy(active: dict | None, old_ip: str | None, now: float) -> b
     # 落池后 22s 就报了 27s≥27s）。
     _begin_segment(landed)
     _proxy_dwell_since = landed     # 落池时刻：回切判据只统计此后的拦截
+    # 清进程级出口地址：此时「当前出口」已经不是任何 WARP 线，留着旧地址会让
+    # /rotate 把「还挂在被换下那条隧道上的连接」当成新出口的连接（见 _with_active_line）。
+    _ACTIVE_WARP_IP = None
     log("✓ 已切到轮换池 proxy（WARP 隧道全部不可用）")
     return True
 
@@ -7024,6 +7179,9 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
                 # selector 没变（还是在同一条线上），但会话地址换了：不更新的话
                 # 健康行会一直显示旧 IP，成功流量打点也记在旧地址上。
                 _ACTIVE_WARP_IP = new_ip
+                # 换线历史也要跟着换址：否则迟到的 429 回溯到这条线时会拿到
+                # 换址前的旧地址，把已经不再承载流量的地址记成新的坏账。
+                _record_warp_switch_history(member["tag"], now, new_ip)
                 _begin_segment(now)  # 本段结束：主动轮换计时重新开始
                 return True
             log(f"  ✗ {member['tag']} 出口不新鲜: {new_ip or '探测失败'}")
@@ -7031,6 +7189,26 @@ def _restart_warp_inplace(member: dict, old_ip: str | None) -> bool:
             log(f"  ✗ {member['tag']} {_warp()['ready_timeout_sec']}s 内未就绪")
         time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
     return False
+
+
+_SWITCH_WAIT_CAP_SEC = 1.2   # 见 _warp_switch_wait_deadline
+
+
+def _warp_switch_wait_deadline(now: float) -> float:
+    """无备线时的等待上限。
+
+    调用方 9router 的 ASIP_TIMEOUT_MS=2000，而 _rotate_once 全程持 _API_LOCK：
+    客户端 2s 挂断后 _rotate_once 仍在锁里等，超时的代价是「客户端在旧隧道上
+    重放、出口却已经换了」（asipRotate.js:17-19），不是只丢一个响应。
+
+    实测 2026-10-31 19:31 起 159258 行日志：进入本分支 1608 次，1521 次能配上
+    它自己的超时行，其中 1042 次（68.5%）整整走满 3s —— 那 1s 是在客户端已经
+    挂断之后才等的，且此刻快照里本就没有备线，多等也变不出来。
+
+    上限是常量不是配置项：它由调用方超时反推，改了客户端就得跟着改，不该被
+    「调一调试试」。
+    """
+    return now + min(float(_warp().get("switch_wait_sec", 3)), _SWITCH_WAIT_CAP_SEC)
 
 
 def _reconnect_warp_by_table(reason: str, interrupt: bool = True,
@@ -7053,7 +7231,7 @@ def _reconnect_warp_by_table(reason: str, interrupt: bool = True,
         # 实测 74 次换线里 73 次走这条路。
         with _WARP_LINE_CV:
             _WARP_LINE_CV.notify_all()
-        deadline = now + float(_warp().get("switch_wait_sec", 3))
+        deadline = _warp_switch_wait_deadline(now)
         log("  · 暂无 120s 内 OK 的备线，已催探测器，短等写入")
         cands = _warp_line_wait_fresh(
             active["tag"] if active else None, deadline)
@@ -7086,7 +7264,7 @@ def _reconnect_warp_by_table(reason: str, interrupt: bool = True,
                 continue
             if m["tag"] == active_warp_tag():
                 continue
-            if not _switch_warp(m["tag"]):
+            if not _switch_warp(m["tag"], ip=ip):
                 continue
             switched_at = time.time()
             _mark_warp_ip_used(ip, switched_at)
@@ -7367,7 +7545,7 @@ def reconnect_warp(reason: str, interrupt: bool = True) -> bool:
         log(f"  ⚠ 选中备线 {m['tag']} 正在被刷新，本次换线放弃（等下一次错误重试）")
         return False
     try:
-        switched = _switch_warp(m["tag"])
+        switched = _switch_warp(m["tag"], ip=ip)
     finally:
         _release_refresh_slot(m["tag"])
     if not switched:
@@ -8598,6 +8776,8 @@ def restart_singbox() -> bool:
             # 恢复代理
             _set_outbound_proxy(url=_expected_proxy_url(), enabled=True)
             if prev_warp and prev_warp != _warp()["members"][0]["tag"]:
+                # 不传 ip：sing-box 刚重启，隧道会话已重开，`_ACTIVE_WARP_IP`
+                # 是重启前那个会话的地址，对恢复后的这条线不成立。
                 _switch_warp(prev_warp)
                 log(f"  ↺ WARP 线路恢复为 {prev_warp}")
             elif prev_mode == "proxy" and _warp().get("proxy_fallback_enabled", False):
@@ -9694,8 +9874,13 @@ def _warp_selector_missing() -> bool:
     members = data.get("all") or []
     if not members:
         return True           # selector 在但空着
-    # 写进 selector 的线不可能多于 members，少得离谱说明生成端丢了数据
-    return len(members) < max(1, len(_warp()["members"]) // 4)
+    # 写进 selector 的线不可能多于 members，少得离谱说明生成端丢了数据。
+    # 阈值取声明成员的**半数**，不是四分之一：四分之一在 9 条声明下只有 2，
+    # 「骤降到 3」判不出来（回归用例 test_warp_selector_missing_detects_lost_outbounds
+    # 期望 3 条触发、50 条不触发）。注意 config 的 members 只是 usque 一类，
+    # 运行时 selector 还含 H2/WG 线，实测 20 > 声明 9 —— 所以这是「相对声明」
+    # 的粗判据，宁可漏报也不误报。
+    return len(members) < max(1, len(_warp()["members"]) * 0.5)
 
 
 def _rebuild_warp_outbounds_watched() -> bool:
@@ -9985,11 +10170,53 @@ def _rotate_gap() -> float:
     return max(floor, sustain)
 
 
-def _rotate_once(reason: str) -> dict:
+def _with_active_line(payload: dict, t0: float, tag: str | None = None,
+                      egress: str | None = None) -> dict:
+    """给 /rotate 的每个分支补上「此刻哪条线、哪个地址是出口」。
+
+    线名和地址缺一不可，四种出口变更里有两项都靠它们分辨：
+      - 换另一条线：selector 变、线名变、地址变。连接不断（`_switch_warp` 只
+        改 selector），但仍挂在被烧的隧道上，调用方要换连接才能绕开。
+      - 原地重连当前线：selector 不变、线名不变、只有地址变。这条路径重启了
+        隧道，在途连接是被杀掉的 —— 只比线名完全看不见它。
+      - 落池到 proxy：线名和地址都变成 None。调用方据此知道出口已不是 WARP。
+      - 重启非当前线：三项都不变，与本进程无关，不该触发任何重置。
+
+    tag 显式传入时优先用调用方给的那条，不去读快照：刚 PUT 完 selector 的那
+    一刻，快照轮询（clash_poll_sec=0.5）可能还没刷新，读回来是刚被换下的旧线。
+    """
+    if tag is None:
+        try:
+            tag = active_warp_tag()
+        except Exception:
+            tag = None
+    if egress is None:
+        # 先读该线自己记的地址，再退回进程级当前出口：原地重连成功时线表里的
+        # 地址已被 invalidate 成 None，而 `_ACTIVE_WARP_IP` 正是新地址；盲切到
+        # 另一条线时反过来，线表才是对的那份，`_ACTIVE_WARP_IP` 还停在旧线。
+        try:
+            egress = _warp_line_ip(tag) if tag else None
+        except Exception:
+            egress = None
+        if egress is None:
+            egress = _ACTIVE_WARP_IP if tag else None
+    payload["active_tag"] = tag
+    payload["active_egress"] = egress
+    payload["ms"] = int((time.time() - t0) * 1000)
+    return payload
+
+
+def _rotate_once(reason: str, request_started_at: float | None = None) -> dict:
     """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
 
     换线本体复用 _reconnect_warp_by_table：只读状态表、不现场探测、不重启、
     不落池。那条路径本来就是为「主循环要换线」写的，语义与这里完全一致。
+
+    `request_started_at` 是调用方**发出那条 429 请求**的时刻。有它时按它回溯标脏
+    对象，而不是取此刻的活动线：429 可能迟到几十秒（实测 p99=26s / max=37s），
+    期间线已经换过，此刻这条根本没承载过那条请求 —— 实测 44/44 条迟到的 429
+    全部落在「活动线已经不是发出时那条」的情形里，把它们记到当前线上等于拿旧
+    证据给新线定罪。
 
     已知局限：与主循环自己的换线调用没有共用一把锁。两条同时发生时结果为
     最后写入者胜，记账各自完整但可能指向不同的线。两者都罕见，代价是一次
@@ -10000,30 +10227,76 @@ def _rotate_once(reason: str) -> dict:
     t0 = time.time()
     with _API_LOCK:
         _api_stats["calls"] += 1
-        # 并发去重：同一次故障的多发请求只切一次，其余拿同一个 switched_at 回去重试。
-        if t0 - _last_rotate_ts < cfg["coalesce_ms"] / 1000.0:
-            _api_stats["coalesced"] += 1
-            return {"ok": True, "switched": False, "reason": "coalesced",
-                    "switched_at": _last_rotate_ts,
-                    "ms": int((time.time() - t0) * 1000)}
-        old_ip = _warp_line_ip(active_warp_tag()) or _ACTIVE_WARP_IP
-        # 调用方带来的就是证据：它刚在我们当前出口上吃到 429/403。所以先记账再判
-        # 限速 —— 判完拒掉也不能当这条 IP 是干净的，否则同一波风暴里被拒的那些
-        # 请求会在 60s 后重新选中它。
+        current_tag = active_warp_tag()
+        old_ip = _warp_line_ip(current_tag) or _ACTIVE_WARP_IP
+        # 当前出口本身，回溯**不会**改它。下面两个判据口径不同，必须分开：
+        # `was_blocked` 问的是「此刻这条出口还脏不脏」—— 脏就别再等 gap，接着
+        # 换下一跳；而 `old_ip` 是「这条 429 该记到谁头上」，迟到时可以指向另
+        # 一条线。拿回溯后的 old_ip 判 was_blocked 是自证：下面刚把它标脏，
+        # 于是恒为真，gap 限速对每一批迟到请求全部失效（实测 4 次调用 4 次换线，
+        # 对照 2 次）。
+        cur_ip = old_ip
+        # 调用方带来的就是证据：它刚在出口上吃到 429/403。所以先记账再判限速 ——
+        # 判完拒掉也不能当这条 IP 是干净的，否则同一波风暴里被拒的那些请求会在
+        # 60s 后重新选中它。
+        # 证据属不属于**当前**这条线由调用方给的发出时刻决定。三态见 `_warp_line_at`：
+        # 不知道（None）→ 保持当前线，与旧行为一致；知道那一刻在轮换池 → 不标脏；
+        # 知道是另一条线 → 用那条线当时的地址。
+        #
+        # 判据只取「调用方给了发出时刻」：停在轮换池时 current_tag 与 old_ip
+        # 都是 None，任何一个当前值做前置都会让池上发出的 429 整个跳过回溯，
+        # 而那批请求恰恰有明确的发出线（池切换之前那条）。
+        if request_started_at is not None and request_started_at > 0:
+            hit = _warp_line_at(request_started_at)
+            if hit is not None:
+                hist_tag, hist_ip = hit
+                if hist_tag != current_tag:
+                    # 那一刻不在当前这条线上。可能是另一条线（hist_tag 为线名），
+                    # 也可能是轮换池（hist_tag 为 None）。
+                    old_ip = hist_ip
+                elif hist_ip and hist_ip != old_ip:
+                    # 同一条线，但发出之后它被原地重连换过会话地址
+                    # （`_restart_warp_inplace` 只重启隧道、selector 不动）。
+                    # 只比 tag 会当作「还是当前线」而取新地址 —— 那正是这条
+                    # 迟到的 429 唯一没被修到的分支：新地址刚换出来、干净，
+                    # 却替旧地址背上 24h 惩罚期。
+                    old_ip = hist_ip
+                # 回溯命中时必须留痕：这段逻辑是否在生产里真的跑过，只能从
+                # 日志回答。没有这行就只能靠单元测试推断「应该生效了」——
+                # 而 9router 未重启的那段时间里它一次都没执行过。
+                log(f"  ⟲ 迟到回溯: 发出于 {t0 - request_started_at:.1f}s 前"
+                    f" → {hist_tag or '轮换池'}({hist_ip or '地址未知'})"
+                    f" 当前={current_tag or '轮换池'}")
+            else:
+                log(f"  ⟲ 迟到回溯: 发出于 {t0 - request_started_at:.1f}s 前"
+                    f" 但早于历史首条，退回当前线")
+        elif request_started_at is not None:
+            log("  ⟲ 迟到回溯: request_started_at 非法，退回当前线")
         was_blocked = False
         try:
-            was_blocked = bool(old_ip) and _warp_ip_is_blocked(old_ip, t0)
+            was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
         except Exception:
             was_blocked = False
         if reason != "proactive" and old_ip:
             _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason)
+        # 合并窗放在记账**之后**：迟到的 429 常常同一批涌进来（实测客户端一次
+        # 并发几十条），若先合并再记账，第一条换线后其余全部命中合并窗，历史里
+        # 那条真正发出请求的线一条都标不到，下一批又原样选回来。合并不换线，
+        # 但证据必须照收。
+        if t0 - _last_rotate_ts < cfg["coalesce_ms"] / 1000.0:
+            _api_stats["coalesced"] += 1
+            return _with_active_line(
+                {"ok": True, "switched": False, "reason": "coalesced",
+                 "switched_at": _last_rotate_ts},
+                t0)
         gap = _rotate_gap()
         if (_last_rotate_ts and t0 - _last_rotate_ts < gap
                 and not was_blocked):
             _api_stats["too_frequent"] += 1
-            return {"ok": False, "reason": "too_frequent",
-                    "switched_at": _last_rotate_ts,
-                    "ms": int((time.time() - t0) * 1000)}
+            return _with_active_line(
+                {"ok": False, "reason": "too_frequent",
+                 "switched_at": _last_rotate_ts},
+                t0)
         # 换下来的出口必须记账：429/403 是出口 IP 级拦截，不标记就只是
         # 「用过」，60s 冷却一过又能被选中 —— 实测会在两条撑过生产流量的
         # 线上反复来回，另外十几条新鲜线永远轮不到。
@@ -10031,16 +10304,21 @@ def _rotate_once(reason: str) -> dict:
         ok = _reconnect_warp_by_table(reason, interrupt=False, out=out)
         if not ok:
             _api_stats["no_standby"] += 1
-            return {"ok": False, "reason": "no_warm_standby",
-                    "switched_at": _last_rotate_ts,
-                    "ms": int((time.time() - t0) * 1000)}
+            return _with_active_line(
+                {"ok": False, "reason": "no_warm_standby",
+                 "switched_at": _last_rotate_ts},
+                t0)
         _last_rotate_ts = float(out.get("switched_at") or t0)
         _api_stats["switched"] += 1
-        return {"ok": True, "switched": True,
-                "tag": out.get("tag"), "egress": out.get("ip"),
-                "closed": 0,
-                "switched_at": _last_rotate_ts,
-                "ms": int((time.time() - t0) * 1000)}
+        new_tag = out.get("tag")
+        # 用 out 里的 tag/ip 而不是快照：刚 PUT 完 selector 的半秒内快照可能还是
+        # 旧线，读成旧线会让调用方以为没换、继续骑在已经烧掉的隧道上。
+        return _with_active_line(
+            {"ok": True, "switched": True,
+             "tag": new_tag, "egress": out.get("ip"),
+             "closed": 0,
+             "switched_at": _last_rotate_ts},
+            t0, tag=new_tag or None, egress=out.get("ip"))
 
 
 def _api_debug_state() -> dict:
@@ -10163,7 +10441,9 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             req = {}
         try:
-            result = _rotate_once(_normalize_rotate_reason(req.get("reason")))
+            self._send(200, _rotate_once(
+                _normalize_rotate_reason(req.get("reason")),
+                _as_ts(req.get("request_started_at"))))
         except Exception as e:
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})

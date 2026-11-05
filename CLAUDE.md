@@ -168,7 +168,9 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
 - 动作（2026-10-26 起）：`warp-prober` 是唯一探测器，持续把每条线的
   `last_ok_ts/last_ok_ip` 写进 per-line 状态表；`reconnect_warp` **只读表**。
   120s 内 OK 的线直接 `PUT /proxies/opencode-out` 切过去；没有新鲜 OK 就先 `notify_all()`
-  催醒探测器、再在条件变量上等 `switch_wait_sec`(3s)，超时本次放弃，不现场探测、不盲切、
+  催醒探测器、再在条件变量上等 `switch_wait_sec`(3s)，**但实际封顶在 1.2s**
+（`daemon.py` 的 `_SWITCH_WAIT_CAP_SEC`）——调用方 9router 的 `ASIP_TIMEOUT_MS=2000`，等满 3s 的每一步
+都在客户端挂断之后（实测 1521 次可配对的等待里 1042 次走满 3s）。超时本次放弃，不现场探测、不盲切、
   不原地重连、不落 proxy。旧实现只等不催（20s）：实测 74 次换线里 73 次等满 20s 照样
   放弃，空转 24.7 分钟 —— 等待期间没有任何人能让「新鲜度」变好，所以必须催。
   换线路径不再重启目标线；重启只由探测器在**确定失败**时触发。
@@ -737,6 +739,10 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | 修复 | 说明 |
 |------|------|
 | 错误检测只查 opencode | 排除 kiro/nvidia/ollama 干扰 |
+| 迟到 429 按发出时刻定罪 | `/rotate` 带 `request_started_at`（9router 在 `executeInner` 入口取 `Date.now()`）。`_warp_line_at` 用三态回溯：`None`=不知道（早于首条历史）→ 按旧行为用当前线；`(None, None)`=那一刻在轮换池 → 谁都不标；`(tag, ip)`=那一刻是这条线且地址是 ip。地址必须随记录一起存，不能事后问 `_warp_line_ip(tag)` —— 那条线在几十秒里大概率已被重启换了地址 |
+| `was_blocked` 只看当前出口 | 它与「这条 429 记到谁头上」是两个口径。回溯会把 `old_ip` 指向历史线，而同一函数刚把它标脏，拿它判 `was_blocked` 是自证 → 恒真 → `_rotate_gap` 对每一批迟到请求全部失效（实测 4 次调用 4 次换线，对照 2 次）。故另存 `cur_ip` 专供该判据 |
+| 合并窗在记账之后 | 迟到 429 成批涌来：第一条换线成功后其余全落进 800ms 合并窗。合并分支若在记账前返回，真正发出请求那条线一条都标不到，下一批又原样选回来。合并不换线，但证据必须照收 |
+| 回溯前置只取发出时刻 | 停在轮换池时 `current_tag` 与 `old_ip` 都是 None，任一当前值做前置都会让池上回来的 429 整个跳过回溯，把一条没承载过它的线记成坏地址 |
 | 连错门控 | `consec_err ≥ 3` 才换线（窗口内从最新往前数连续失败，停在第一条成功处）；门控在采样/标脏之后、冷却判断之前；`consecutive_errors` 仅写日志 |
 | 时间戳统一 | `_now_ts()` int 秒 |
 | 死节点导出 | `cleanup_dead_ttl()` 导出到 `.bad_nodes.json` |

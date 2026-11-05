@@ -271,7 +271,35 @@ def test_single_unknown_does_not_restart(monkeypatch):
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda member, reason: restarted.append(member["tag"]) or True)
+                        lambda member, reason, **kw: restarted.append(member["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == []
     assert daemon._warp_line_state("W2")["last_verdict"] == "unknown"
+
+def test_switch_wait_deadline_stays_under_client_timeout():
+    """无候选时的等待上限必须早于调用方超时（9router ASIP_TIMEOUT_MS=2000）。
+
+    实测 2026-10-31 19:31 起 159258 行日志：进入本分支 1608 次，1521 次能配上
+    它自己的超时行，其中 1042 次（68.5%）整整走满 3s。日志里没有「等待成功」的
+    完成标记（`✓ WARP 换线成功` 由别的线程写，无法与单次等待配对），所以这里只
+    报能配对的那部分。走满 3s 的每一步都晚于客户端 2s 挂断，且 3s 在 _API_LOCK
+    内独占，把并发调用一起串行化。
+    """
+    budget = daemon._warp_switch_wait_deadline(1000.0) - 1000.0
+    assert budget <= 1.2 + 1e-6, (
+        f"无候选时等了 {budget:.2f}s，超过调用方 2s 超时前应留的余量"
+        "（ASIP_TIMEOUT_MS=2000，_rotate_once 全程持 _API_LOCK）"
+    )
+
+
+def test_switch_wait_cap_cannot_exceed_configured_wait():
+    """上限是压低的旋钮，不能反过来把原本更短的 switch_wait_sec 拉长。"""
+    saved = daemon.CFG["warp"].get("switch_wait_sec")
+    try:
+        daemon.CFG["warp"]["switch_wait_sec"] = 0.4
+        assert daemon._warp_switch_wait_deadline(0.0) == 0.4
+    finally:
+        if saved is None:
+            daemon.CFG["warp"].pop("switch_wait_sec", None)
+        else:
+            daemon.CFG["warp"]["switch_wait_sec"] = saved

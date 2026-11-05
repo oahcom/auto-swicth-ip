@@ -52,10 +52,26 @@ from config import CFG
 UA = "opencode/latest/2.0.26/cli"
 FREEMODEL = "deepseek-v4.1-flash-free"
 URL = "https://opencode.ai/inference/v1/chat/completions"
-ENV_MARKER = ("<env>\n"
-              "  Working directory: /workspace\n"
-              "  Workspace root folder: /workspace\n"
-              "</env>")
+# 9router 运行期拼的 ENV_FINGERPRINT_PROMPT（open-sse/utils/opencodeFingerprint.js）。
+# 上游把这一整块当门控项，**缺 heading 行或任一行都回 429 FreeUsageLimitError**——
+# 那个 429 带 Retry-After 到 UTC 零点，看起来完全像「每日配额耗尽」，实测与出口 IP
+# 无关。旧版本这里只抄了 4 行（漏掉 heading、git repo、Platform、Prefer tmp），于是
+# 每一条探测都被判 quota，19 条线全被打成坏线。
+# 值取 9router 服务进程的取值：cwd = WorkingDirectory(/home/administrator/.9router)、
+# platform = linux、tmp = os.tmpdir()/opencode。--check-fingerprint 会与源码逐行比对。
+ENV_WORKING_DIR = os.environ.get("OPENCODE_PROBE_WORKDIR", "/home/administrator/.9router")
+ENV_TMP_DIR = os.environ.get("OPENCODE_PROBE_TMPDIR", "/tmp/opencode")
+ENV_MARKER = "\n".join([
+    "Here is some useful information about the environment you are running in:",
+    "<env>",
+    f"  Working directory: {ENV_WORKING_DIR}",
+    f"  Workspace root folder: {ENV_WORKING_DIR}",
+    "  Is directory a git repo: no",
+    "  Platform: linux",
+    f"  Prefer {ENV_TMP_DIR} over generic system temporary directories such as /tmp; "
+    "it is pre-created and approved for external access.",
+    "</env>",
+])
 BUN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_fetch.mjs")
 SESSION_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   ".probe_sessions.json")
@@ -571,6 +587,58 @@ def probe(port: int, timeout: float) -> tuple[str, float, str, int | None]:
                 f"{type(e).__name__}: {e}"[:100], None)
 
 
+def _expected_env_marker(text: str) -> list[str] | None:
+    """从 9router 源码重建 ENV_FINGERPRINT_PROMPT 的行列表。
+
+    运行期取值（cwd / platform / tmp）在源码里是模板插值，这里归一成 {runtime}，
+    与 _normalize_our_env_marker() 对齐后再逐行比 —— 值本身由本机决定，形状才是
+    上游门控的东西。
+    """
+    import re
+    if "ENV_FINGERPRINT_PROMPT" not in text:
+        return None
+    body = re.search(r"const ENV_FINGERPRINT_PROMPT = \[(.*?)\]\.join", text, re.S)
+    if not body:
+        return None
+    consts = {}
+    for name in ("ENV_HEADING", "ENV_TAG"):
+        found = re.search(rf'const {name} = "([^"]*)"', text)
+        if not found:
+            return None
+        consts[name] = found.group(1)
+    lines = []
+    for raw in (line.strip() for line in body.group(1).splitlines()):
+        if not raw:
+            continue
+        raw = raw.rstrip(",").strip()
+        if raw in consts:
+            lines.append(consts[raw])
+        elif raw.startswith("`") and raw.endswith("`"):
+            # `${ENV_WORKING_DIR}` / `${process.platform}` 一类插值归一成占位符
+            lines.append(re.sub(r"\$\{[^}]*\}", "{runtime}", raw[1:-1]))
+        elif raw.startswith('"') and raw.endswith('"'):
+            lines.append(raw[1:-1])
+        else:
+            lines.append("{runtime}")
+    return lines
+
+
+def _normalize_our_env_marker() -> list[str]:
+    """把本地 ENV_MARKER 的运行期取值替换成 {runtime}，只留形状用于比对。"""
+    out = []
+    for line in ENV_MARKER.split("\n"):
+        if line.startswith("  Working directory: "):
+            line = "  Working directory: {runtime}"
+        elif line.startswith("  Workspace root folder: "):
+            line = "  Workspace root folder: {runtime}"
+        elif line.startswith("  Platform: "):
+            line = "  Platform: {runtime}"
+        elif line.startswith("  Prefer "):
+            line = line.replace(f"  Prefer {ENV_TMP_DIR} ", "  Prefer {runtime} ", 1)
+        out.append(line)
+    return out
+
+
 def check_fingerprint() -> int:
     """冻结的定义是否仍与 9router 源码逐字一致。源码升级后这里会先红。"""
     import os
@@ -582,16 +650,24 @@ def check_fingerprint() -> int:
         print(f"✗ 未找到 9router 源码: {src}")
         return 1
     text = open(src, encoding="utf-8").read()
-    # <env> 块和工具定义一样是上游门控项：只带 Working directory 的旧块实测
-    # 直接被 429 拒。源码升级后这里要能和工具定义一起先红。
-    env_lines = ["Working directory: /workspace", "Workspace root folder: /workspace"]
-    if "OPENCODE_ENV_MARKER" not in text:
-        print("✗ 9router 源码没有 OPENCODE_ENV_MARKER，指纹规则已变")
+    # <env> 块和工具定义一样是上游门控项，而且是**逐行**门控：只要块形状不对就回
+    # 429 FreeUsageLimitError（伪装成每日配额，与出口 IP 无关）。旧版本这里只检查
+    # 两行 "Working directory / Workspace root folder" 是否存在，于是漏掉 heading、
+    # git repo、Platform、Prefer tmp 这四行的漂移一路带到线上 —— 每条探测恒 429，
+    # 19 条线全被判坏线，换 IP 换了几千次都是量一个假信号。所以现在整块逐行比。
+    expected_env = _expected_env_marker(text)
+    if expected_env is None:
+        print("✗ 9router 源码没有 ENV_FINGERPRINT_PROMPT（或无法解析），指纹规则已变")
         return 1
-    missing_env = [line for line in env_lines if line not in text or line not in ENV_MARKER]
-    if missing_env:
-        print(f"✗ <env> 标记与 9router 源码不一致，缺: {missing_env}")
+    ours = _normalize_our_env_marker()
+    if ours != expected_env:
+        diff = [f"行{i + 1}: 源码={e!r} 本文件={o!r}"
+                for i, (e, o) in enumerate(zip(expected_env, ours)) if e != o]
+        if len(ours) != len(expected_env):
+            diff.append(f"行数不一致: 源码 {len(expected_env)} 行, 本文件 {len(ours)} 行")
+        print("✗ <env> 标记与 9router 源码不一致: " + "; ".join(diff))
         return 1
+
     # 上游比对的是 description 与 parameters 两者（opencodeFingerprint.js 的
     # isFingerprintDefinition）；只比 description 会漏掉 schema 变更 —— 那种
     # 情况下线上探测全 403，而这里仍报「一致」。JS 对象字面量与 json.dumps
@@ -609,7 +685,7 @@ def check_fingerprint() -> int:
     if missing:
         print(f"✗ 以下工具定义与 9router 源码不一致，需重新抄录: {missing}")
         return 1
-    print(f"✓ {len(FINGERPRINT_TOOLS)} 个工具定义 + <env> 标记与 9router 源码逐字一致")
+    print(f"✓ {len(FINGERPRINT_TOOLS)} 个工具定义 + {len(expected_env)} 行 <env> 标记与 9router 源码逐字一致")
     return 0
 
 
