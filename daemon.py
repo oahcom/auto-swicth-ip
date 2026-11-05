@@ -2913,8 +2913,9 @@ _LINE_DEFAULTS = {
     "restart_hist": [],
     "restart_ts": 0.0,
     "next_restart_ts": 0.0,
-    "quota_until": 0.0,
-    "quota_ip": None,
+    # `quota_until` / `quota_ip` 已删（2026-11-05，见既定事实 23d）。不在这里
+    # 声明就是把它们从盘上丢掉：`_warp_line_state_locked` 只收本表的键，
+    # 旧台账里的残留字段加载时自然被滤掉，不需要额外的清理函数。
     "warming": False,
     "port_ok": False,
     "sel": 0.0,
@@ -3032,15 +3033,13 @@ def _load_warp_line_state() -> None:
             # 把每条线锁死 40~55 分钟（存档 restart_hist 里 228~245 条）。
             st["restart_hist"] = []
             st["warming"] = False
-            if not isinstance(st.get("quota_until"), (int, float)):
-                st["quota_until"] = 0.0
             # 同一处净化时间戳字段：下面 `_rehome_held_lines` / `_channel_ban_label`
             # / `_warp_line_restart` 全是裸 `float(...)`，盘上写个 ISO 字符串
             # （人改文件最自然的写法）就会让每分钟的 channel-rehome 整趟抛
             # ValueError，锁的线永远还原不了。
             for _k in ("ban_hold_until", "ban_hold_ready", "ban_noaddr_since",
                        "restart_ts", "last_ok_ts", "next_restart_ts",
-                       "next_probe_ts", "quota_until", "ip_ts"):
+                       "next_probe_ts", "ip_ts"):
                 if not isinstance(st.get(_k), (int, float)) or isinstance(st.get(_k), bool):
                     st[_k] = 0.0
             if st.get("ban_hold_home") is not None and not isinstance(st.get("ban_hold_home"), str):
@@ -3070,7 +3069,6 @@ def _load_warp_line_state() -> None:
             if not isinstance(st.get("ban_probes"), list):
                 st["ban_probes"] = []
             _channel_ban_trim(st["ban_probes"], now)
-        _drop_legacy_quarantine_locked()
         _WARP_LINE_CV.notify_all()
     log(f"✓ 已恢复 {len(lines)} 条 WARP 线路状态")
 
@@ -4906,21 +4904,6 @@ def _warp_line_selected(tag: str, ip: str, ts: float) -> None:
         _warp_line_update_locked(tag, sel=ts, ip=ip, ip_ts=ts)
         _WARP_LINE_CV.notify_all()
     _save_warp_line_state()
-
-
-def _drop_legacy_quarantine_locked() -> None:
-    """清掉盘上遗留的 `quota_until` / `quota_ip`（调用方须持锁）。
-
-    「撞长 Retry-After 就隔离这条线 N 分钟」这套限制 2026-11-05 已整体删除：
-    它的立论是「重启买不到配额」，而实测重启换地址仍在持续命中新地址 ——
-    1800s 冷却只让线在池子最脏的时候退出战场。这里只保留清理，免得旧字段
-    留在盘上被读方（报表、`_LINE_DEFAULTS` 回填）当成还在生效。
-    """
-    for _st in _WARP_LINE_STATE.values():
-        if isinstance(_st, dict) and (float(_st.get("quota_until") or 0.0)
-                                      or _st.get("quota_ip")):
-            _st["quota_until"] = 0.0
-            _st["quota_ip"] = None
 
 
 _GLOBAL_RESTART_HIST: list[float] = []

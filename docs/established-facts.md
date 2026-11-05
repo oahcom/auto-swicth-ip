@@ -826,6 +826,91 @@ A 写的值必须与 A 掌握的事实同级。A 只知道「我有地址了」�
 `test_portability.py` 因此长期红着。源码里写明路径**不是门控项**（上游只认
 `<env>` 标记存在），所以按 `~` 推导即可，不必绑死某个用户名。
 
+### 23d. 撞到长 Retry-After 不再冷却该线（1800s 隔离已删除）
+
+**看起来像**：「这个地址的额度到 UTC 零点才恢复，先把这条线停 30 分钟再去
+抽别的地址，不然白烧。」
+
+**实际是**：2026-11-05 主人要求删掉。原因是这条推理的前提不成立 —— 它假设
+「重启只会拿回同一个已烧的地址」，而实测重启换的是新 /64、新 /128，配额
+跟着新地址走（见第 3 条）。1800s 冷却的唯一效果是在池子最脏的时候把线撤出
+战场，而这恰恰是该多换几次的时候。
+
+**删的是代码，不是开关**：`_warp_line_quarantined` / `_quarantine_line` /
+比例闸 / 四个调用点 / `config.py` 里四个 `line_quota_quarantine_*` 全部移除，
+`test_ha_quarantine.py` 整份删除。状态表里的 `quota_until` / `quota_ip`
+由 `_drop_legacy_quarantine_locked` 在加载时清零，免得旧字段被报表当成还在
+生效。
+
+**仍然存在的是地址级的惩罚期**（`.warp_ip_used.json` 的 `blocked_ts_by_kind`
+与 `ban_until`）：那不是冷却线路，是「这个地址已经烧了」的记账，作用于
+**地址**而非线 —— 换到新地址立刻不受影响。两者的区别就是第 23 条说的
+「结论说的是地址还是线路」。全局 `quota_hold_enabled` 是另一把闸（账号级
+配额窗口），本来就关着，未改动。
+
+### 23e. 出口探测的三种失败必须在台账里分开：`rc` 混装了两次
+
+**看起来像**：`asip chan` 上一批线显示 `unknown`，手工 `curl --proxy` 打过去
+`warp=on` 一切正常，于是怀疑探测逻辑算错了结论。
+
+**实际是**：`probe_egress` 把三种性质完全不同的失败压成了同一个 `rc`。
+
+| curl 退出码 | 真实含义 | 该做什么 |
+|---|---|---|
+| 28 | **超时**（`--max-time` 到点自己退出） | 隧道半死，重启能救 |
+| 7 | 连接被拒（端口没监听） | 进程没了，systemd 的活 |
+| 22 / 6 | HTTP 错误 / DNS 失败 | 该换节点 |
+
+关键陷阱：`probe_egress` 给 curl 传 `--max-time N`，curl 会在第 N 秒以
+**退出码 28** 自己结束，于是 `proc.timed_out`（进程级，N+5s）**永远轮不到**，
+所有超时都落进 `if proc.code != 0: note("rc")`。实测 2026-11-05 远端 20 条线
+6009ms 超时全记成 `rc`，与「端口没监听的 6ms `rc`」在台账里毫无区别。
+
+判据：**一个错误分类如果同时覆盖「网络挂了」和「服务端拒绝」，它就没有
+诊断价值**。28 现在单独记 `timeout`（`asip/egress.py`）。
+
+### 23f. `unreachable` 触发的是**节点轮换**，不是无效重启
+
+**看起来像**：链路抖动导致模型探测超时 → `unreachable` → 判低质 → 重启，
+应该拦掉，否则把抖动当成了故障。
+
+**实际是**：`unreachable` 的消费路径不是「重启同一条隧道」：
+
+```
+probe → unreachable
+  → _probe_cache_put（结论进缓存）
+  → _warp_ip_needs_refresh → True
+  → _prewarm_standby_warp / _ip_disqualified
+  → 重生隧道 → _node_rotation_pass 换**同块的另一个节点**
+```
+
+而「节点转发不了流量」正是 `unreachable` 的典型成因 —— 换节点是对症的，
+不是空转。`test_stale_unreachable_still_restarts_when_channel_healthy`
+（8fbc7e0，2026-10-26）锁的就是这个语义，别当 bug 改掉。
+
+**但要注意一个真实的边界**：把 `refresh_model_timeout_sec` 从 15s 提到 30s
+（2026-11-05，依据是 15s 下同端口连续 6 次全超时、手工探测却 `warp=on` 正常）
+会让超时线多占并发槽位。`model_probe_concurrency` 是 32，一轮最坏 30s，
+仍在 `node_rotation_interval_sec`(60s) 之内，不阻塞轮换 —— 提这个值之前先
+核这两个数。
+
+### 23g. 「探测不出 OK」先看端口有没有在监听，别先怀疑探测逻辑
+
+**看起来像**：`unknown` 大面积出现，怀疑探测器坏了。
+
+**实际是**：先花 1ms 查 `_port_open`，能省掉 20 秒白等。
+
+实测 2026-11-05 本机 41 条在册线里 5 条（CF-C/G/H/I、WG-23）的 systemd 单元
+早就没了（`is-enabled` 返回 `not-found`），但 `config.py` 的 members 里仍声明
+着，于是每轮探测都对一个没人监听的端口等满 20 秒超时 —— 一轮并发预算被吃掉
+四分之一。现在 `_probe_one_line` 在探测**之前**判端口，端口关着直接记
+`port_closed` 并返回：**结论记 `port_closed` 而不是 `unknown`**，且不进
+`fail_streak`（进程没了不是线的健康问题）。
+
+配套的报表口径：窗口内零样本的线，`last_verdict` 是**旧值**，不能当当前状态
+打印（CLI 表与 HTML 同一口径，`test_stale_verdict_is_not_printed_as_current`
+锁住）。
+
 ### 24. 两台机器的 429 率不同，先怀疑池子，不要先怀疑部署
 
 **看起来像**：云端 429 率 32%、本地 13%，同一套代码、同一批节点、同一个
