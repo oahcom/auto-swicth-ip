@@ -311,3 +311,46 @@ def test_switch_wait_cap_cannot_exceed_configured_wait():
             daemon.CFG["warp"].pop("switch_wait_sec", None)
         else:
             daemon.CFG["warp"]["switch_wait_sec"] = saved
+
+
+def test_running_unit_is_probed_even_without_declaration(monkeypatch):
+    """**有单元在跑就必须探测**，哪怕它的 tag 不在 members 里。
+
+    WHY：`members` 是渲染产物（`.warp/h2/channels.json`），会落后于现场。
+    实测 2026-11-05 远端 `usque-h2-25/26/28/29/30` 五个单元 active，tag 却
+    不在 channels.json 里 —— 五条隧道从来没被探测过，报表上表现为「有线但
+    永远没有结论」，日志里连它们的名字都不出现。声明是记账，单元是事实，
+    探测要跟事实走。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "members", [
+        {"tag": "DECLARED", "port": 5001, "service": "usque-h2-1.service"}])
+    monkeypatch.setattr(daemon, "_scan_running_tunnels",
+                        lambda now: {5002: ("WARP-H2-SCAN-2", "usque-h2-2.service"),
+                                     5001: ("DECLARED", "usque-h2-1.service")})
+    tags = {m["tag"] for m in daemon._probe_targets(1.0)}
+    assert tags == {"DECLARED", "WARP-H2-SCAN-2"}, tags
+
+
+def test_manual_members_survive_scan(monkeypatch):
+    """扫描只补不删：手动写进 members 的线永远留在探测列表里。
+
+    扫描靠 `systemctl list-units --state=active`，单元停着（人工关掉、正在
+    重启）时它看不见那条线。若用扫描结果**替换** members，停着的线就会从
+    探测列表里消失 —— 而它恰恰是最需要被观察的那条。
+    """
+    monkeypatch.setitem(daemon.CFG["warp"], "members", [
+        {"tag": "MANUAL-A", "port": 5001, "service": "usque-h2-1.service"},
+        {"tag": "MANUAL-B", "port": 5002, "service": "usque-h2-2.service"}])
+    monkeypatch.setattr(daemon, "_scan_running_tunnels", lambda now: {})
+    tags = {m["tag"] for m in daemon._probe_targets(1.0)}
+    assert tags == {"MANUAL-A", "MANUAL-B"}, tags
+
+
+def test_scan_does_not_duplicate_declared_port(monkeypatch):
+    """扫描到的端口已被声明时用声明的 tag，不要造出第二个目标。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "members", [
+        {"tag": "DECLARED", "port": 1180, "service": "usque-h2-0.service"}])
+    monkeypatch.setattr(daemon, "_scan_running_tunnels",
+                        lambda now: {1180: ("WARP-H2-SCAN-0", "usque-h2-0.service")})
+    targets = daemon._probe_targets(1.0)
+    assert len(targets) == 1 and targets[0]["tag"] == "DECLARED", targets

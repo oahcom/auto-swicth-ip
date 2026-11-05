@@ -5308,12 +5308,95 @@ def _warp_member_unit_running(member: dict, now: float) -> bool:
     return running
 
 
+# 端口 → (tag, service)。探测目标 = 声明成员 ∪ 这些正在监听的隧道。
+# WHY 不能只看 members：实测 2026-11-05 远端 `usque-h2-25/26/28/29/30`
+# **五个单元在跑**，但它们的 tag 不在 `channels.json` 里，于是这五条隧道
+# 从来没被探测过 —— 报表上表现为「有线但永远没有结论」，而 daemon 日志里
+# 一次都不出现它们的名字。声明是渲染产物，单元是事实；探测要跟事实走。
+_TUNNEL_SCAN_PORTS: dict[int, tuple[str, str]] = {}
+_TUNNEL_SCAN_TS = 0.0
+_TUNNEL_SCAN_TTL = 60.0
+
+
+def _scan_running_tunnels(now: float) -> dict[int, tuple[str, str]]:
+    """扫 systemd 里所有在跑的隧道单元，返回 {socks_port: (tag, service)}。
+
+    端口由单元名推出，与 `config.py` 的端口契约一致：
+      usque-h2-<N>  → tag `WARP-H2-<COLO>-<N>` 从 channels.json 取，取不到就用
+                      `WARP-H2-SCAN-<N>`；端口 1180+N
+      warp-wg-<N>   → tag `WARP-WG-<N>`；端口 1110+(N-1)（见 config 的 WG 段）
+      usque-warp-<x>→ 端口来自 CFG 声明的成员，扫不到就跳过
+
+    **不复用 `_warp_member_unit_running` 的缓存键**：那个按 service 缓存单条
+    结论，这里是批量扫一遍。60s 一次，成本可忽略。
+    """
+    global _TUNNEL_SCAN_PORTS, _TUNNEL_SCAN_TS
+    if _TUNNEL_SCAN_PORTS and now - _TUNNEL_SCAN_TS < _TUNNEL_SCAN_TTL:
+        return _TUNNEL_SCAN_PORTS
+    declared = {m.get("service"): m for m in _warp()["members"] if m.get("service")}
+    found: dict[int, tuple[str, str]] = {}
+    try:
+        r = subprocess.run(
+            ["systemctl", "list-units", "--type=service", "--state=active",
+             "--no-legend", "--plain",
+             "usque-h2-*.service", "warp-wg-*.service", "usque-warp-*.service"],
+            capture_output=True, text=True, timeout=10)
+        names = [ln.split()[0] for ln in (r.stdout or "").splitlines() if ln.strip()]
+    except (OSError, subprocess.TimeoutExpired):
+        return _TUNNEL_SCAN_PORTS              # 查不到就沿用上一轮，别把探测停掉
+    for svc in names:
+        m = declared.get(svc)
+        if m:
+            found[int(m["port"])] = (m["tag"], svc)
+            continue
+        # 未声明的单元：按名字推端口与 tag。端口契约见 config.py 的注释。
+        import re
+        hit = re.fullmatch(r"usque-h2-(\d+)\.service", svc)
+        if hit:
+            idx = int(hit.group(1))
+            found[1180 + idx] = (f"WARP-H2-SCAN-{idx}", svc)
+            continue
+        hit = re.fullmatch(r"warp-wg-(\d+)\.service", svc)
+        if hit:
+            found[1110 + int(hit.group(1)) - 1] = (f"WARP-WG-{hit.group(1)}", svc)
+    _TUNNEL_SCAN_PORTS, _TUNNEL_SCAN_TS = found, now
+    return found
+
+
+def _probe_targets(now: float) -> list[dict]:
+    """本轮该考虑探测的成员：**声明成员 ∪ 正在跑的隧道**。
+
+    声明（`members`）是渲染产物，会落后于现场：实测 2026-11-05 远端
+    `usque-h2-25/26/28/29/30` 五个单元在跑，tag 却不在 `channels.json` 里，
+    于是五条隧道从未被探测 —— 有流量、有日志，就是没有结论。**单元在跑就
+    必须探测**，tag 归属是记账问题，不是探测前提。
+
+    未声明的单元用 `WARP-H2-SCAN-<idx>` / `WARP-WG-<n>` 作为 tag：状态表
+    需要按 tag 索引，而扫描到的单元没有渲染产物里的名字。它们照样走完整
+    探测流程（拿地址、判 quota/blocked、写状态），只是**不进换线候选**
+    （`_warp_member` 查不到它们，selector 里也没有）。
+
+    手动配置照旧有效：`members` 里的线永远在列表里，不受扫描影响
+    （`_scan_running_tunnels` 只补，不删）。
+    """
+    out: dict[str, dict] = {}
+    for m in _warp()["members"]:
+        out[m["tag"]] = m
+    declared_ports = {int(m["port"]) for m in _warp()["members"] if m.get("port")}
+    for port, (tag, svc) in _scan_running_tunnels(now).items():
+        if tag in out or port in declared_ports:
+            continue
+        out[tag] = {"tag": tag, "port": port, "service": svc,
+                    "scan_only": True}
+    return list(out.values())
+
+
 def _warp_prober_loop() -> None:
     while True:
         now = time.time()
         active = active_warp_tag()
         due: list[tuple[float, dict]] = []
-        for m in _warp()["members"]:
+        for m in _probe_targets(now):
             tag = m["tag"]
             if not _warp_member_unit_running(m, now):
                 continue
