@@ -4129,12 +4129,17 @@ def _line_node_cannot_carry(tag: str) -> bool:
             # `ever_ip` 始终 False，仍每 ~2 分钟重启一次 usque-h2-N。
             # 判据只用 `_h2_repair` 已经算过的结论（它每 60s 亲自巡一遍池子），
             # 这里不额外打 Clash API —— 本函数在探测热路径上。
-            # 判死只维持一个重试窗口（`_H2_POOL_DEAD_RETRY_SEC`），到点由
-            # `_h2_repair` 自动重走整池；换节点成功或拿到出口也会立即清空。
-            # 与 WG 分支同一口径：**出过口**的线不判死 —— 那时更可能是本机
-            # usque 会话僵死，重启正是唯一能修的动作（见 `tunnel_dead`）。
-            return (tag in _H2_POOL_DEAD
-                    and not bool(_warp_line_state(tag).get("ever_ip")))
+            #
+            # ① **探过但从没出过口**（与 WG 分支同一口径）：问题在落地节点或
+            #    链路，重启 usque 拿到的是同一节点上的新会话。实测 2026-11-05
+            #    SLC-11/12/24 换完节点 1~2s 就被重启掐掉，新节点一次都没被
+            #    探测过；1779 次重启一次也没出过口。
+            # ② 出过口的线相反：更可能是本机会话僵死，重启是唯一修法，只有
+            #    整池试遍（`_H2_POOL_DEAD`）才判死。
+            st = _warp_line_state(tag)
+            if not bool(st.get("ever_ip")) and st.get("last_probe_ts"):
+                return True
+            return tag in _H2_POOL_DEAD
         line = (warp_wg._read_state().get("lines") or {}).get(tag) or {}
         node = line.get("node")
         if not node:

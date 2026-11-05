@@ -357,17 +357,31 @@ def test_h2_exhausted_pool_stops_the_restart_loop(monkeypatch):
     daemon._NODE_NEXT_CHECK.clear()
     assert daemon._h2_repair(m)
     assert daemon._line_node_cannot_carry(m["tag"]) is False
-    # **出过口的线不判死**：那种情况更可能是本机 usque 会话僵死，重启是唯一
-    # 能修的动作（与 WG 分支同一口径）。缺了这条，健康的线会被整池判死顶住。
-    daemon._H2_POOL_DEAD[m["tag"]] = _t.time()
+    # **从没出过口的线一律不重启**：重启 usque 拿到的是同一节点上的新会话，
+    # 问题在节点/链路。实测 2026-11-05 换节点后 1~2s 就重启，新节点根本没被
+    # 探测过就被掐掉，1779 次重启一次也没出过口。这条**不依赖整池试遍**。
+    daemon._H2_POOL_DEAD.clear()
     monkeypatch.setattr(daemon, "_warp_line_state",
-                        lambda t: {m["tag"]: {"ever_ip": True}}.get(t, {}))
+                        lambda t: {m["tag"]: {"ever_ip": False,
+                                              "last_probe_ts": 12345.0}}.get(t, {}))
+    assert daemon._line_node_cannot_carry(m["tag"]) is True, \
+        "探过但从没出过口 → 重启没意义，换节点才算动作"
+    # 出过口的线相反：更可能是本机会话僵死，重启是唯一修法 —— 只有整池
+    # 试遍（`_H2_POOL_DEAD`）才判死。
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {m["tag"]: {"ever_ip": True,
+                                              "last_probe_ts": 12345.0}}.get(t, {}))
     assert daemon._line_node_cannot_carry(m["tag"]) is False, \
-        "出过口的线在整池判死时仍要允许重启"
+        "出过口且池子没试遍 → 允许重启（可能只是本机会话僵死）"
+    daemon._H2_POOL_DEAD[m["tag"]] = _t.time()
+    assert daemon._line_node_cannot_carry(m["tag"]) is True, \
+        "出过口但整池试遍 → 重启也换不到能承载的节点"
+    # 还没探过的线不判死（刚 apply 完，last_probe_ts 为空不说明任何问题）。
+    daemon._H2_POOL_DEAD.clear()
     monkeypatch.setattr(daemon, "_warp_line_state",
                         lambda t: {m["tag"]: {"ever_ip": False}}.get(t, {}))
-    assert daemon._line_node_cannot_carry(m["tag"]) is True, \
-        "从没出过口的线整池判死后就别再重启"
+    assert daemon._line_node_cannot_carry(m["tag"]) is False, \
+        "没探过不能判死"
 
 
 def test_noaddr_lock_release_switches_node_first(monkeypatch):
