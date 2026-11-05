@@ -472,6 +472,34 @@ def test_penalty_restart_skipped_when_line_never_got_egress(monkeypatch):
     assert not restarted, f"节点承载不了时惩罚期不该重启，实际 {restarted}"
 
 
+def test_never_probed_line_sorts_ahead_of_recently_probed(monkeypatch):
+    """没探过的线必须排到队首，否则尾部新线永远轮不到（T-310）。
+
+    调用方 `_warp_prober_loop` 是 `due.sort(key=lambda p: p[0])` 取前
+    `probe_concurrency` 条。旧实现两条分支都返回 `now`，所有到期线的排序键
+    完全相同 —— 排序退化成成员表顺序，前 32 条固定占满槽位，排在末尾的
+    新线（GIG/LHR/SJC/BOM…）一次也探不到，状态表里 `last_probe_ts` 永远是 0。
+
+    实测 2026-11-05 14:10：远端补源新增 5 条线（SJC-35/BOM-36/DUB-37/
+    IAD-38/JNB-39）后 6 分钟，`daemon.log` 里一次都没出现过它们的 tag，
+    状态表 `probe=None`；同一时刻 69 条无 ip 的线在抢 32 个槽位。
+    """
+    now = 1_700_000_000.0
+    monkeypatch.setattr(daemon, "_WARP_LINE_STATE", {
+        "old": {"ip": None, "last_probe_ts": now - 30},
+        "virgin": {"ip": None, "last_probe_ts": 0.0},
+    })
+    monkeypatch.setattr(daemon, "_warp_line_quarantined", lambda st, t: False)
+    monkeypatch.setattr(daemon, "_warp", lambda: {"line_probe_cadence_sec": 60})
+    for tag in ("old", "virgin"):
+        needs, due = daemon._warp_line_needs_probe(tag, now)
+        assert needs is True, tag
+        if tag == "virgin":
+            assert due == 0.0, "没探过（last_probe_ts=0）必须排最前"
+        else:
+            assert due == now - 30, "到期线按最后探测时刻排，不是按 now"
+
+
 def test_cannot_carry_judgement(monkeypatch):
     """判据本身：rank 2、或「探过但从没出过口」都算重启没意义。
 

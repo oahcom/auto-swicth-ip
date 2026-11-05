@@ -4571,7 +4571,9 @@ def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
             return False, float(st["ban_hold_until"])
         ip = st.get("ip")
         if not ip:
-            return True, now
+            # 同上：返回**最后探测时刻**（没探过=0，最优先），否则所有无地址
+            # 的线都返回 `now`，排序并列——并发槽位被固定的前 N 条占满。
+            return True, float(st.get("last_probe_ts") or 0.0)
         # 隔离期内的线不参与探测排期：否则 prober 每轮都判它 due、spawn 完就
         # continue，把 CPU 烧成一个核（2026-10-28 实测 warp-prober 单线程 46%）。
         quota_until = float(st.get("quota_until") or 0.0)
@@ -4584,7 +4586,14 @@ def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
         due = float(st.get("last_probe_ts") or 0.0) + _line_probe_cadence()
         if now < due:
             return False, due
-        return True, due
+        # **已到期时按「最后被探的时刻」排**，而不是返回同一个 `due=现在`。
+        # 调用方 `due.sort(key=p[0])` 取前 `probe_concurrency` 条；cadence=0 时
+        # 每条到期线的 due 都等于 `last_probe_ts`（过去），刚探完的反而更小，
+        # 排序几乎恒定 —— 同一批线每轮被选中，尾部（GIG/LHR/SJC 等后加的
+        # H2 线）几分钟到几十分钟一次也轮不上。实测 2026-11-05 13:56：
+        # 35 条到期、并发 32，LHR-29/BOM-25/GIG-28 的 `last_probe_ts`
+        # 停在 30/28/17 分钟前不动。用「越久没探越优先」即可让尾部候补进来。
+        return True, float(st.get("last_probe_ts") or 0.0)
 
 
 def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
