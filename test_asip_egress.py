@@ -99,6 +99,18 @@ def test_nonzero_returncode(monkeypatch):
     assert result.error == "rc"
 
 
+def test_curl_max_time_exit_is_reported_as_timeout(monkeypatch):
+    """curl 自己撞上 `--max-time` 时退出码是 28 —— 那是超时，不是 `rc`。
+
+    不分开的话，「端口没监听」（7，6ms 返回）和「端到端挂起」（28，整段
+    预算）在台账里是同一个词，调用方没法据此判断该不该重启隧道。
+    """
+    _install(monkeypatch, "", returncode=28)
+    result = probe_egress()
+    assert result.ip is None
+    assert result.error == "timeout"
+
+
 def test_multiple_urls_skip_warp_off_then_succeed(monkeypatch):
     bodies = iter([TRACE_OFF, TRACE_ON])
     seen = []

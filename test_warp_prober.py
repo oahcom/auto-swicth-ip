@@ -518,7 +518,6 @@ def test_penalty_restart_skipped_when_line_never_got_egress(monkeypatch):
     WG-4 停在 rank 1 节点上每 8~10 秒重启一次，日志刷满「出口处于惩罚期」。
     """
     monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: True)
-    monkeypatch.setattr(daemon, "_quarantine_line", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_quota_hold_skips", lambda t, r: False)
     monkeypatch.setattr(daemon, "_warp_model_usable", lambda *a, **k: True)
     monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
@@ -555,7 +554,6 @@ def test_never_probed_line_sorts_ahead_of_recently_probed(monkeypatch):
         "old": {"ip": None, "last_probe_ts": now - 30},
         "virgin": {"ip": None, "last_probe_ts": 0.0},
     })
-    monkeypatch.setattr(daemon, "_warp_line_quarantined", lambda st, t: False)
     monkeypatch.setattr(daemon, "_warp", lambda: {"line_probe_cadence_sec": 60})
     for tag in ("old", "virgin"):
         needs, due = daemon._warp_line_needs_probe(tag, now)

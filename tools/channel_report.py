@@ -449,6 +449,11 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "restarts": sum(1 for t in (st.get("restart_hist") or [])
                             if isinstance(t, (int, float)) and t >= cutoff),
             "last_verdict": st.get("last_verdict") or "-",
+            # 这个结论是不是**属于当前地址**。重启换地址后 `ip_ts` 会晚于
+            # `last_probe_ts`，此时 `last_verdict` 说的是上一条地址 ——
+            # 两个视图都不能把它当现地址的判定印出来。
+            "verdict_stale": bool(
+                float(st.get("ip_ts") or 0) > float(st.get("last_probe_ts") or 0) + 1),
             "no_addr_since": st.get("ban_noaddr_since") or 0,
             "window_from": cutoff,
         })
@@ -726,7 +731,16 @@ def print_table(rows: list[dict], hours: float) -> None:
         if r["no_addr_since"]:
             flags.append("无地址")
         if not flags:
-            flags.append(r["last_verdict"])
+            # 窗口内一条样本都没有 → `last_verdict` 是**旧的**，不能当成
+            # 现在的结论印出来。WARP-CF-C/G/H/I 的单元 2026-10-28 缩容时
+            # 就删了（`is-enabled` 返回 not-found），prober 早已用
+            # `_warp_member_unit_running` 过滤掉，状态表里那句 `unknown`
+            # 是删单元当天冻住的 23 万次失败留下的。照印会读成「现在探测失败」。
+            if not r["samples"]:
+                flags.append("无样本")
+            else:
+                flags.append(f"{r['last_verdict']}（旧地址）" if r["verdict_stale"]
+                             else r["last_verdict"])
         okfail = f"{r['ok']}/{r['ban'] + r['err']}"
         print(f"{_pad(r['tag'], 18)} {_pad(r['carrier'], 5)} "
               f"{_pad(r['colo'], 4)} {_pad(r['loc'], 8)} "
@@ -889,7 +903,12 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
         if r["no_addr_since"]:
             pills.append('<span class="pill quot">无出口地址</span>')
         if not pills:
-            pills.append(f'<span class="pill">{html.escape(r["last_verdict"])}</span>')
+            # 与 CLI 表同一口径（见 `print_table`）：窗口内没有样本时
+            # `last_verdict` 是**旧值**，不能当成当前结论印出来。HTML 之前
+            # 漏了这层保护，同一份数据两个视图给出不同结论。
+            pills.append(f'<span class="pill">'
+                         f'{html.escape(r["last_verdict"] if r["samples"] else "无样本")}'
+                         f'</span>')
         cls = ' class="held"' if r["held"] else ""
         body.append(
             f'<tr{cls}><td class="mono">{html.escape(r["tag"])}</td>'

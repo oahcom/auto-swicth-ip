@@ -2791,11 +2791,7 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
     # 在测试里抛出 AttributeError 而不是走正常逻辑。
     _LAST_EGRESS_TRACE = {"port": int(port), "ip": res.ip,
                           "colo": getattr(res, "colo", None),
-                          "loc": getattr(res, "loc", None),
-                          # 失败时**为什么**失败。没有它，`unknown` 把「端口没
-                          # 监听」「端到端超时」「节点不转发」压成同一个词，
-                          # 而三者的处置完全相反（见 `_probe_one_line`）。
-                          "error": getattr(res, "error", None)}
+                          "loc": getattr(res, "loc", None)}
     return res.ip
 
 
@@ -3074,12 +3070,7 @@ def _load_warp_line_state() -> None:
             if not isinstance(st.get("ban_probes"), list):
                 st["ban_probes"] = []
             _channel_ban_trim(st["ban_probes"], now)
-        if not _warp().get("line_quota_quarantine_enabled", False):
-            for _tag, _st in _WARP_LINE_STATE.items():
-                if isinstance(_st, dict) and float(_st.get("quota_until") or 0.0):
-                    _st["quota_until"] = 0.0
-                    _st["quota_ip"] = None
-        _trim_quarantine_locked()
+        _drop_legacy_quarantine_locked()
         _WARP_LINE_CV.notify_all()
     log(f"✓ 已恢复 {len(lines)} 条 WARP 线路状态")
 
@@ -4714,9 +4705,6 @@ def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
             return True, float(st.get("last_probe_ts") or 0.0)
         # 隔离期内的线不参与探测排期：否则 prober 每轮都判它 due、spawn 完就
         # continue，把 CPU 烧成一个核（2026-10-28 实测 warp-prober 单线程 46%）。
-        quota_until = float(st.get("quota_until") or 0.0)
-        if _warp_line_quarantined(st, now):
-            return False, quota_until
         last_ok = float(st.get("last_ok_ts") or 0.0)
         if (st.get("last_ok_ip") == ip
                 and now - last_ok <= _line_fresh_sec()):
@@ -4787,10 +4775,10 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             # 旧实现无条件累加，实测 WARP-WG-17 因此涨到 2457（它每次都拿到出口
             # 地址、每次都判 quota），日志写「连续 2457 次取不到出口地址」，
             # 与事实相反 —— 真故障反而被这堆噪声埋掉。
-            if verdict in ("unknown", "timeout"):
+            if verdict == "unknown":
                 st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
             else:
-                # `port_closed` 不进 fail_streak：那是进程没了（Systemd 的活），
+                # `port_closed` 也不进 fail_streak：那是进程没了（systemd 的活），
                 # 不是「线不健康」。单元被删后仍留在 members 的线（实测
                 # CF-C/G/H/I 2026-10-28 缩容时删了单元）原先会把它累加到 23 万，
                 # 报表照着印 `unknown`，读起来像「现在探测失败」。
@@ -4920,91 +4908,19 @@ def _warp_line_selected(tag: str, ip: str, ts: float) -> None:
     _save_warp_line_state()
 
 
-def _warp_line_quarantined(st: dict, now: float) -> bool:
-    """这条线现在是否处于额度隔离。
+def _drop_legacy_quarantine_locked() -> None:
+    """清掉盘上遗留的 `quota_until` / `quota_ip`（调用方须持锁）。
 
-    隔离绑地址：换到新地址后旧结论作废，否则一次 16h 的 Retry-After 会把线
-    锁到明天（复审 P1-2）。quota_ip 缺省时视为绑当前地址。
+    「撞长 Retry-After 就隔离这条线 N 分钟」这套限制 2026-11-05 已整体删除：
+    它的立论是「重启买不到配额」，而实测重启换地址仍在持续命中新地址 ——
+    1800s 冷却只让线在池子最脏的时候退出战场。这里只保留清理，免得旧字段
+    留在盘上被读方（报表、`_LINE_DEFAULTS` 回填）当成还在生效。
     """
-    if not _warp().get("line_quota_quarantine_enabled", False):
-        return False
-    if float(st.get("quota_until") or 0.0) <= now:
-        return False
-    qip = st.get("quota_ip")
-    return not qip or st.get("ip") == qip
-
-
-def _quarantine_line(tag: str, ip: str | None, seconds: float, now: float) -> None:
-    """给一条线记隔离：夹上限，且不许把池子隔离空。
-
-    上限防「一次 24h 的 Retry-After 把线锁到后天」；比例闸防「同一事件把
-    13/20 条线一起隔离」—— 剩下的 7 条会被更快烧掉，最后 0 条可用
-    （复审 P0-1：20:46 实测 13 条隔离，其中 10 条同一时刻写入）。
-    """
-    if not _warp().get("line_quota_quarantine_enabled", False):
-        # 默认关：隔离是「重启买不到配额」这个判断的产物，而这个判断本身没有
-        # 得到主人认可（2026-10-28 23:10 明确质疑：重启多没有坏影响，反而降低
-        # 刷新效率）。留着开关，一行就能开回来。
-        return
-    cap = float(_warp().get("line_quota_quarantine_max_sec", 7200))
-    until = now + (min(float(seconds), cap) if cap > 0 else float(seconds))
-    ratio = float(_warp().get("line_quota_quarantine_max_ratio", 0.8))
-    # 分母用「状态表里的线」而不是 members：members 只登记了 15 条（12 WG + 3
-    # usque），状态表有 20 条，按 members 算 80% 会变成 12/15 —— 提前把闸关死。
-    members = _warp().get("members") or []
-    total = max(len(members), len(_WARP_LINE_STATE))
-    if ratio > 0 and total:
-        q = 0
-        for m in members:
-            if m.get("tag") == tag:
-                continue
-            if _warp_line_quarantined(_warp_line_state(m.get("tag")), now):
-                q += 1
-        if q + 1 > int(total * ratio):
-            # 池子被烧穿时这条会每条线每次探测都命中（实测 222 次），必须节流，
-            # 否则日志自己变成噪音，把真正的信号淹掉。
-            global _QUARANTINE_REFUSE_TS
-            if now - _QUARANTINE_REFUSE_TS > 60.0:
-                _QUARANTINE_REFUSE_TS = now
-                log(f"  · {tag} 撞上长 Retry-After，但隔离中的线已占 "
-                    f"{q}/{total}（上限 {int(ratio * 100)}%），本次不隔离")
-            return
-    _warp_line_update(tag, quota_until=until, quota_ip=ip)
-
-
-_QUARANTINE_REFUSE_TS = 0.0
-
-
-def _trim_quarantine_locked() -> None:
-    """把隔离数夹回比例上限内（调用方必须已持有 _WARP_LINE_CV）。
-
-    隔离是强相关的：一次账号级配额窗口会让十几条线在同一分钟写入同一个
-    quota_until（2026-10-28 实测 14/20，其中 10 条值完全相同）。超过上限就
-    提前解禁的是「最早到期」的那几条（它们本来就快解禁，放出来代价最小），
-    否则池子里只剩 6 条活线，很快被烧到 0。
-    """
-    ratio = float(_warp().get("line_quota_quarantine_max_ratio", 0.6))
-    members = _warp().get("members") or []
-    if ratio <= 0 or not members:
-        return
-    now = time.time()
-    qs = []
-    for tag, st in _WARP_LINE_STATE.items():
-        if not isinstance(st, dict):
-            continue
-        until = float(st.get("quota_until") or 0.0)
-        if until > now:
-            qs.append((until, tag))
-    qs.sort()
-    limit = int(max(len(members), len(_WARP_LINE_STATE)) * ratio)
-    # 放的是「最早解禁」的那几条：它们本来就快到期，放出来代价最小；
-    # 放最晚的等于把刚判死的线重新推回火里（实测会立刻再撞 penalty）。
-    excess = len(qs) - limit
-    if excess <= 0:
-        return
-    for _until, tag in qs[:excess]:
-        _WARP_LINE_STATE[tag]["quota_until"] = 0.0
-        log(f"  · {tag} 隔离数超上限，提前解禁（保留 {limit}/{len(members)}）")
+    for _st in _WARP_LINE_STATE.values():
+        if isinstance(_st, dict) and (float(_st.get("quota_until") or 0.0)
+                                      or _st.get("quota_ip")):
+            _st["quota_until"] = 0.0
+            _st["quota_ip"] = None
 
 
 _GLOBAL_RESTART_HIST: list[float] = []
@@ -5087,13 +5003,6 @@ def _warp_line_restart(member: dict, reason: str,
                 _NIGHT_LOG_TS["ban:" + tag] = now
                 log(f"  · {tag} 渠道锁定中（至 "
                     f"{time.strftime('%m-%d %H:%M', time.localtime(ban_hold))}），"
-                    f"跳过重启（{reason}）")
-            return False
-        quota_until = float(st.get("quota_until") or 0.0)
-        if _warp_line_quarantined(st, now) and not rebound:
-            if now - _GLOBAL_RESTART_LOG_TS[0] > 30.0:
-                _GLOBAL_RESTART_LOG_TS[0] = now
-                log(f"  · {tag} 额度隔离中（剩 {int((quota_until - now) / 60)}min），"
                     f"跳过重启（{reason}）")
             return False
         if not _warp_line_restart_allowed(st, now) and not rebound:
@@ -5254,9 +5163,6 @@ def _probe_one_line(member: dict) -> None:
     st = _warp_line_state(tag)
     if st.get("warming") or st.get("stop_probe"):
         return
-    if _warp_line_quarantined(st, now):
-        # 隔离期内不探：结论已知（quota 到点才解），再探只是重复买同一个结论。
-        return
     active = active_warp_tag()
     if (tag == active and st.get("ip")
             and now - float(st.get("ip_ts") or 0.0)
@@ -5325,15 +5231,6 @@ def _probe_one_line(member: dict) -> None:
         return
     if _warp_ip_is_blocked(ip, now):
         _warp_line_record_observation(tag, ip, "blocked", time.time(), started_at)
-        # 这条地址已判脏，惩罚期结束前换地址没有信息量：同一烧毁段里的新 /128
-        # 照样是 quota，重启只是白掐一次在途连接。隔离到确切解禁时刻。
-        left = _line_block_remaining(ip, now)
-        # 惩罚期内换地址买不到配额（实测重启后中位 9s 又撞同一结论、21.5% 拿回
-        # 同一个 IP），所以一律隔离到 max(确切解禁, 下限)，而不是「短惩罚就照常
-        # 每 5s 重启一次」。比例闸仍然兜住「全部线一起隔离」那种情况。
-        _quarantine_line(tag, ip, max(float(left or 0.0),
-                                      float(_warp().get("line_quota_quarantine_min_sec", 1800))),
-                         now)
         if tag == active:
             _reconnect_warp_now("探测发现当前出口处于惩罚期", time.time())
         elif _line_node_cannot_carry(tag):
@@ -5927,15 +5824,8 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
         # 精确解禁（Retry-After）可能早于 6h 缓存 TTL 到期：惩罚期已过就不该
         # 再凭旧结论重启，交给下一次模型实测重新判定。
         return _warp_ip_is_blocked(ip, now)
-    # `unreachable` 不是「这个地址不能服务」的结论：它说的是**探测请求没跑完**
-    # （超时/代理 502），地址和服务端都还没表态。拿它当判据重启，等于把链路
-    # 抖动算成出口被封 —— 实测 2026-11-05 同一条 WARP-CF-D 在 15 秒超时下
-    # 连续 6 次全 unreachable，而同一地址手工探测 `warp=on` 正常。
-    # 独立结论就该独立处理：不否决，退回地址层判据（下面几条）继续评估。
-    # 只有 `_warp_probe_blind` 那种「整批都探不通」才会影响全局节奏，那由
-    # `_warp_model_usable` 入口单独处理，不在这一层。
-    if verdict is not None and verdict not in ("OK", "unreachable"):
-        return True
+    if verdict is not None and verdict != "OK":
+        return not (verdict == "unreachable" and _warp_probe_blind(now))
     if _warp_ip_is_blocked(ip, now):
         return True
     if _ip_history_is_truth():
@@ -6442,7 +6332,7 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         import probe_warp
         try:
             verdict, _sec, _detail, retry_after = probe_warp.probe(
-                member["port"], w.get("refresh_model_timeout_sec", 15))
+                member["port"], w.get("refresh_model_timeout_sec", 30))
         finally:
             # 必须 finally：探测抛异常时也要把登记清掉，否则这条 tag 的
             # `_PROBING_IP` 永远留着旧地址，之后同址的别的线会被误记成并发重复。
@@ -6474,10 +6364,6 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     if (retry_after and _warp().get("quota_hold_enabled", True)
             and retry_after >= int(_warp().get("quota_hold_min_sec", 1800))):
         _QUOTA_HOLD_UNTIL = max(_QUOTA_HOLD_UNTIL, time.time() + retry_after)
-    # 逐线隔离：全局额度闸一开会把所有线一起冻住（主人否过这条）；改成只隔离
-    # 「自己撞了长 Retry-After」的那条线，其余线照常轮换。
-    if retry_after and retry_after >= int(_warp().get("line_quota_quarantine_min_sec", 1800)):
-        _quarantine_line(tag, ip, retry_after, time.time())
     hint = (f"（Retry-After {retry_after / 3600:.1f}h）"
             if retry_after and retry_after > 0 else "")
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}{hint}"
@@ -6500,7 +6386,6 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
             # 撑过流量的地址同权 —— 实测台账 2945 条里 738 条属于这种「验过没用过」。
             entry["probe_ok_ts"] = max(float(entry.get("probe_ok_ts") or 0), now)
             _save_warp_ip_used()
-        _warp_line_update(tag, quota_until=0.0, quota_ip=None)
     elif verdict in _MODEL_VERDICT_BLOCK_KIND:
         # 模型层判 quota/flagged 与生产侧 429/403 是同一件事（前者是
         # FreeUsageLimitError，后者是 abusive traffic），都该落进 blocked 台账：

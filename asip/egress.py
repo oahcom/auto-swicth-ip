@@ -106,7 +106,13 @@ def probe_egress(*, socks_port: int | None = None,
             note("curl_missing")
             continue
         if proc.code != 0:
-            note("rc")
+            # `--max-time N` 会让 curl 自己在第 N 秒以 **退出码 28** 结束，
+            # 于是 `proc.timed_out`（进程级，N+5s）永远轮不到，所有超时都被
+            # 归成 `rc`。而 `rc` 同时覆盖「连接被拒」(7)、「DNS 失败」(6)、
+            # 「HTTP 错误」(22)。调用方只能看到一个笼统的 rc，把三种性质
+            # 完全不同的失败当作同一个「unknown」——实测 2026-11-05 远端
+            # 20 条线 6009ms 超时全记成 rc，与端口没监听的 6ms rc 无区别。
+            note("timeout" if proc.code == 28 else "rc")
             continue
 
         body = proc.stdout or ""

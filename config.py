@@ -404,7 +404,14 @@ CFG = {
         # 新地址几分钟内 429 的情况真实存在，原模式会让候选池大但不保证能用。
         # 开启后每条候选多耗一格出口配额、多 1~3s（实测 B 线曾 16.8s）。
         "refresh_model_check": _env_bool("ASIP_REFRESH_MODEL_CHECK", True),
-        "refresh_model_timeout_sec": 15,
+        # 2026-11-05 实测：15s 下 WARP-CF-D(1083) 连续 6 次 `bun: The operation
+        # timed out` 全判 unreachable，而同一端口手工 curl `warp=on` 正常；
+        # 拉到 30s 才有机会拿到真实结论（OK / quota）。原 15s 的说法是
+        # 「多 1~3s」，那个数字量的是**已就绪**的线，没算链路抖动时的长尾。
+        # 代价：超时的线每次多等 15s，但并发跑（`model_probe_concurrency`），
+        # 且 unreachable 不再触发重启（见 `_warp_line_needs_restart`），
+        # 多等的时间不进入任何决策路径。
+        "refresh_model_timeout_sec": 30,
         # 换线后短暂静默让在途请求落定。固定值，不随连续失败放大 ——
         # 只要目标线能拿到窗口外的新鲜 IP，换线就值得做；拉长冷却只会让
         # 错误持续积累（实测 2^n 退避曾在风暴期锁死到 600s，九分钟零换线）。
@@ -552,15 +559,6 @@ CFG = {
         # 全局重启节流（条/分钟，0=关）。单线上限管不住 19 条线叠加：
         # 2026-10-28 19:36~20:08 实测 10028 次重启 / 125 分钟。
         "restart_max_per_minute": 0,
-        # 撞到长 Retry-After 的线隔离多久（秒，下限）。低于这个值算瞬时限流，照常换。
-        # 隔离总开关。默认关：重启换地址是主人要的刷新行为，先按原样跑。
-        # 要恢复「撞长 Retry-After 就隔离」把它改成 True。
-        "line_quota_quarantine_enabled": False,
-        "line_quota_quarantine_min_sec": 1800,
-        # 单次隔离上限（秒）。24h 的 Retry-After 会把线锁到后天，夹到 2h。
-        "line_quota_quarantine_max_sec": 7200,
-        # 同时被隔离的线占比上限。到顶不再新增隔离，保证池子里始终有活线。
-        "line_quota_quarantine_max_ratio": 0.8,
         # 同时在飞的重启数。每条 quota/blocked 线都要「重启换地址 → 等就绪 →
         # 重探」，这个闸才是现在的真正吞吐瓶颈：4 槽 × 一次 3~5s ≈ 20~40 条/分钟。
         # 12 是折中：16 条同时注册会撞 Cloudflare 的 ~9 台/窗口限流，吃 429 后

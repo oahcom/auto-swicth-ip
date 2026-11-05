@@ -108,7 +108,7 @@ fixed 到点那次换线会把 requests 的配额计数一起清零，150 格永
 | `channel_rehome_enabled` | 重定位总闸 | 关掉后锁线不再搬 colo，但**补位照开**（`_backfill_open` 传 `ignore_enabled=True`，主人的硬要求） |
 | `channel_rehome_min_samples` | 目标 colo 的样本下限 | 10。低于它的 colo 不配当"ban 率最低" —— 3 条零封禁会把整批线吸过去 |
 | `night_window.enabled` | 夜间锁 | 当前 `false`。它防的是"深夜重启刷不出地址"（10-31 实测 17036 次重启、**0 次刷新成功** —— 不是重启坏了，是池子干了） |
-| `line_quota_quarantine_enabled` | 撞长 Retry-After 就隔离 | 当前 `false`。重启换地址是主人要的刷新行为 |
+| ~~`line_quota_quarantine_*`~~ | ~~撞长 Retry-After 就隔离该线~~ | **2026-11-05 已删除**：blocked 之后的 1800s 冷却不再存在。立论「重启买不到配额」与实测不符，冷却只会让线在池子最脏时退出战场 |
 
 **四把锁在"刚换过节点"时必须让路**（`_warp_line_restart(..., rebound=True)`）。
 它们防的是"在同一个烂地址池里反复抽签"，换了节点池子就变了。

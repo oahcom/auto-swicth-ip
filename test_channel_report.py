@@ -265,3 +265,25 @@ def test_old_string_ledger_still_reads(mod, tmp_path):
     r = mod.summarize({}, _chans(), {"n1": "air.example/x?flag=sing"}, 6, now)[0]
     assert r["source_label"] == "air.example/x?flag=sing"
     assert r["node_name"] == "-"
+
+
+def test_stale_verdict_is_not_printed_as_current(mod, tmp_path):
+    """窗口内**零样本**的线，不能把它旧的 `last_verdict` 当当前状态印出来。
+
+    WHY：`last_verdict` 只在探测/重启路径写。一条线停探几个小时（单元没了、
+    渠道锁定）之后，那个词仍是最后一次留下的值 —— 实测 2026-11-05
+    WARP-CF-C/G/H/I 的单元 10-28 就删了，报表照印 `unknown`，`fail_streak`
+    冻在 14 万，读起来像「现在探测失败」。CLI 表与 HTML 必须同一口径：
+    两个视图对同一份数据给出不同结论本身就是缺陷。
+    """
+    (tmp_path / "hist.jsonl").write_text("")
+    now = 1_800_000_000.0
+    state = {"WARP-WG-1": {"last_verdict": "quota", "ban_probes": [],
+                           "fail_streak": 141263}}
+    rows = mod.summarize(state, _chans(), {}, 6, now)
+    assert rows[0]["samples"] == 0
+    out = tmp_path / "r.html"
+    mod.render_html(rows, 6, out)
+    text = out.read_text(encoding="utf-8")
+    assert "无样本" in text, "HTML 把旧结论当成了当前状态"
+    assert ">quota<" not in text
