@@ -74,7 +74,7 @@ def _is_own_pid(pid: int) -> bool:
 
 def check_rules(cfg: dict) -> None:
     inbounds = {i["tag"] for i in cfg["inbounds"]}
-    outbounds = {o["tag"] for o in cfg["outbounds"]}
+    outbounds = {o["tag"]: o for o in cfg["outbounds"]}
     seen = set()
     for rule in cfg["route"]["rules"]:
         for ib in rule.get("inbound") or []:
@@ -83,8 +83,13 @@ def check_rules(cfg: dict) -> None:
             if ib in seen:
                 err(f"入站 {ib} 有多条规则")
             seen.add(ib)
-        if rule.get("outbound") not in outbounds:
-            err(f"规则引用不存在的出站 {rule.get('outbound')}")
+        tag = rule.get("outbound")
+        if tag not in outbounds:
+            err(f"规则引用不存在的出站 {tag}")
+        elif outbounds[tag].get("type") != "selector":
+            # 规则必须落在 selector 上：直连某个节点时，换节点只能重启整个
+            # asip-h2-singbox，31 条线全断（既定事实 13d 的第 2 条限制）。
+            err(f"规则 {rule.get('inbound')} 的出口 {tag} 不是 selector")
         if rule.get("action") != "route":
             err(f"规则 {rule.get('inbound')} 缺 action=route（缺省会被当 reject）")
         if rule.get("override_address") != "162.159.198.2":
@@ -92,24 +97,94 @@ def check_rules(cfg: dict) -> None:
     missing = inbounds - seen
     if missing:
         err(f"入站没有对应规则: {sorted(missing)}")
+    # selector 的成员必须是已声明的真实出站，且不能指回 selector：
+    # `PUT /proxies/<selector>` 只能切到 `all` 里已有的名字。
+    for o in cfg["outbounds"]:
+        if o.get("type") != "selector":
+            continue
+        members = o.get("outbounds") or []
+        if not members:
+            err(f"selector {o['tag']} 没有成员")
+        if o.get("default") not in members:
+            err(f"selector {o['tag']} 的 default 不在成员里")
+        for m in members:
+            if m not in outbounds:
+                err(f"selector {o['tag']} 成员 {m} 不是已声明的出站")
+            elif outbounds[m].get("type") == "selector":
+                err(f"selector {o['tag']} 成员 {m} 又是 selector")
+    # Clash API 是 daemon 换节点的唯一通道，缺了就只能退回重启。
+    api = (cfg.get("experimental") or {}).get("clash_api") or {}
+    if not api.get("external_controller"):
+        err("缺 experimental.clash_api（daemon 无法无重启换节点）")
+    if not api.get("secret"):
+        err("experimental.clash_api 没有 secret（与主配置共用，不应为空）")
+
+
+def check_selectors(cfg: dict, ledger: list[dict]) -> None:
+    """每条线一个 selector，且当前节点在它的成员里。
+
+    daemon 换节点 = `PUT /proxies/<selector>` + 节点出站 tag，两者都从台账里
+    取；台账与配置对不上时 PUT 会被 sing-box 拒（400），而现象只是「换线没
+    生效」—— 必须在这里静态拦住。
+    """
+    sels = {o["tag"]: o for o in cfg["outbounds"] if o.get("type") == "selector"}
+    for r in ledger:
+        sel = r.get("selector") or f"h2-sel-{r['index']}"
+        o = sels.get(sel)
+        if not o:
+            err(f"{r['unit']}: 配置里没有 {sel}")
+            continue
+        want = f"h2-{r['node']}"[:120]
+        if want not in (o.get("outbounds") or []):
+            err(f"{sel}: 当前节点 {r['node']} 不在候选池里")
+        if o.get("default") != want:
+            err(f"{sel}: default={o.get('default')} 不是当前节点 {want}")
+        if r.get("selector") and r["selector"] != sel:
+            err(f"{r['unit']}: 台账 selector={r['selector']} 与编号不符")
 
 
 def check_nodes(ledger: list[dict]) -> None:
-    dorm = {n["tag"] for n in json.load(open(PROJECT / "dormant-outbounds.json"))}
+    """节点必须能在**生产配置或沉睡池**里找到。
+
+    只查 `dormant-outbounds.json` 是过时的判据：那份是 okz 旧入口的手工快照，
+    新订阅的节点（etcloud 的 `*.greatgameupload.org`、yyd2tett 的
+    `*.dankenet.help`）从来不在里面。实测 2026-11-04 渲染出 18 个 etcloud
+    活节点后，校验器把其中 8 条判成错误 —— 而它们在
+    `singbox-config.json` 里好好地躺着。渲染器的 `node_outbound()` 本来就是
+    「主配置优先、沉睡池兜底」，校验器必须用同一个口径。
+    """
+    known: set[str] = set()
+    for path in (PROJECT / "singbox-config.json",
+                 PROJECT / "dormant-outbounds.json"):
+        try:
+            data = json.load(open(path))
+        except (OSError, ValueError):
+            continue
+        items = data if isinstance(data, list) else data.get("outbounds") or []
+        known |= {n["tag"] for n in items if isinstance(n, dict) and n.get("tag")}
     for r in ledger:
-        if r["node"] not in dorm:
-            err(f"{r['unit']}: 节点 {r['node']} 不在 dormant-outbounds.json")
+        if r["node"] not in known:
+            err(f"{r['unit']}: 节点 {r['node']} 既不在生产配置也不在沉睡池")
 
 
 def check_devices(ledger: list[dict]) -> None:
+    """设备必须存在，且**不能被别的组占用**。
+
+    判据不能是 `free_devices()`：它按定义排除 active 单元占着的设备，而
+    重渲染后重跑 h2-install.sh 时，19 条 usque-h2-* 正占着台账里的 19 台 ——
+    于是每条线都报「已被 active 单元占用」（2026-11-05 实测 19 条全报错），
+    恰恰把要支持的幂等重装挡在门外。台账里的设备属于**本组**，只要求占用者
+    是这条线自己的单元。
+    """
     import render_h2_lines as rd
-    free = set(rd.free_devices())
+    owner = rd.device_owner()
     for r in ledger:
         cfg = PROJECT / ".warp" / r["device"] / "config.json"
         if not cfg.exists():
             err(f"{r['unit']}: 设备配置缺失 {cfg}")
-        if r["device"] not in free:
-            err(f"{r['unit']}: 设备 {r['device']} 已被 active 单元占用")
+        held = owner.get(r["device"])
+        if held and held != r["unit"]:
+            err(f"{r['unit']}: 设备 {r['device']} 已被 {held} 占用")
 
 
 def check_units(ledger: list[dict]) -> None:
@@ -154,6 +229,7 @@ def main() -> int:
 
     check_ports(cfg, ledger)
     check_rules(cfg)
+    check_selectors(cfg, ledger)
     check_nodes(ledger)
     check_devices(ledger)
     check_units(ledger)

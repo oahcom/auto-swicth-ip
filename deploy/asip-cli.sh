@@ -97,6 +97,17 @@ asip — auto-switch-ip 日志与出口诊断
   asip warp status     各隧道状态 + 各自出口 IP + 当前出口
   asip warp ip         出口 IP 使用记录（是否被标记、多久以前）
   asip warp cycles     24h IP 可用周期样本与生效的最小周期
+  asip chan            渠道健康：成功率/ban 率/机房/colo/出口段/订阅源（-h 看参数）
+  asip chan --html F   同上，输出可直接打开的 HTML
+  asip blk             块视图：每个 colo 块有哪些节点、延迟、谁在用
+  asip blk --blocks    块池视角：块内**全部**节点，标出哪几个排成线位、哪些是候补
+  asip blk --colo NRT  只看一个块；加 --delay 现测延迟（慢，并发会打满出口）
+  asip blk --channels  渠道视角：每条渠道选中哪个节点、候选池多大、和谁撞同一台
+  asip blk --pools     附带打印每块的完整候选节点池
+
+  承载口径（不再是笼统的 proxy）：
+    warp-proxy   WG over UDP，经机场节点中转     h2-warp   MASQUE over HTTP/2
+    warp-direct  直连 WARP，不经节点              proxy     纯代理，不承载 WARP
 
 WARP 控制
   asip warp start      解除屏蔽并启动全部隧道
@@ -109,6 +120,12 @@ WARP 控制
   asip warp jlog all   同上，不过滤
   asip vercel status   Vercel 中继：台账 + 9router 池/策略 + 开关
   asip vercel probe    经每条中继探出口 IP（-h 看全部子命令）
+
+订阅
+  asip sub             列已配置的订阅源（固定 + 追加）
+  asip sub add <url>   插入一个订阅源并立即刷新（不必重启 daemon）
+  asip sub rm <url|N>  移除一个追加源（按 URL 或上表序号）并立即刷新
+  asip sub refresh     只触发一次刷新（源没变、想立刻重拉时用）
 
 收件箱（Sister Bus，各角色报给本项目的消息）
   asip inbox           本项目相关的未读消息（关键词过滤，约 4%）
@@ -525,13 +542,140 @@ PY
   esac
 }
 
+cmd_sub() {
+  # 订阅源清单不在这里解析：config.py 是唯一事实源（固定源 + 环境变量 +
+  # 台账文件），CLI 只负责写台账、打一行、叫 daemon 刷新。
+  local sub=${1:-ls}; shift || true
+  local out
+  out=$("$ASIP_PY" - "$ASIP_DIR" "$sub" "$@" <<'PY'
+import os, sys
+repo, cmd, *rest = sys.argv[1:]
+sys.path.insert(0, repo)
+# daemon 靠 systemd 的 EnvironmentFile 拿到 .env，CLI 子进程没有 —— 不先补上，
+# 固定源会显示成 0 个（订阅其实配着，只是这个进程看不见）。
+try:
+    with open(os.path.join(repo, ".env"), encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+except OSError:
+    pass
+import config
+
+urls = list(config.subscription_urls())
+extra = list(config.extra_subscription_urls())
+
+def show():
+    print(f"固定源 {len(urls)} 个（config.py / .env，改后需重启 daemon）")
+    for i, u in enumerate(urls, 1):
+        print(f"  {i:2d}. {u.split('?')[0].rsplit('/', 1)[0]}/…")
+    print(f"追加源 {len(extra)} 个（{config.EXTRA_SUBS_FILE}，改后无需重启）")
+    for i, u in enumerate(extra, 1):
+        print(f"  {i:2d}. {u.split('?')[0].rsplit('/', 1)[0]}/…")
+
+if cmd in ("", "ls", "list"):
+    show()
+elif cmd == "add":
+    if not rest:
+        sys.exit("用法: asip sub add <url>")
+    url = rest[0]
+    if "://" not in url:
+        sys.exit(f"✗ 不是合法 URL: {url[:40]}")
+    if url in urls or url in extra:
+        sys.exit("已存在，不重复添加")
+    with open(config.EXTRA_SUBS_FILE, "a", encoding="utf-8") as f:
+        f.write(url + "\n")
+    import os
+    os.chmod(config.EXTRA_SUBS_FILE, 0o600)
+    print("✓ 已加入追加源")
+elif cmd == "rm":
+    if not rest:
+        sys.exit("用法: asip sub rm <url|序号>")
+    key = rest[0]
+    target = None
+    if key.isdigit():
+        k = int(key) - 1
+        target = extra[k] if 0 <= k < len(extra) else None
+        if target is None:
+            sys.exit(f"✗ 序号超出追加源范围（1~{len(extra)}）")
+    else:
+        target = key if key in extra else None
+        if target is None:
+            sys.exit("✗ 只删追加源；固定源请改 .env 后重启 daemon")
+    keep = [u for u in extra if u != target]
+    from asip.atomic_io import write_text
+    write_text(config.EXTRA_SUBS_FILE,
+               "".join(u + "\n" for u in keep), mode=0o600)
+    print("✓ 已移除")
+elif cmd != "refresh":
+    sys.exit(f"✗ 未知子命令: {cmd}")
+PY
+)
+  local rc=$?
+  printf '%s\n' "$out"
+  # add/rm 才需要刷新；ls 只读。刷新失败不该吞掉原来的成功状态码 ——
+  # 台账已经写进去了，那是用户要的结果。
+  case "$sub" in
+    add|rm|refresh)
+      [ $rc -eq 0 ] || return $rc
+      local tok req
+      tok=$(cat "$ASIP_DIR/run/api-token" 2>/dev/null) || {
+        echo "⚠ 读不到 $ASIP_DIR/run/api-token，未触发刷新（daemon 未启用 rotate 接口？）" >&2
+        return 0; }
+      req=$("$ASIP_PY" - "$ASIP_DIR" "$tok" <<'PY'
+import http.client, json, socket, sys
+repo, tok = sys.argv[1], sys.argv[2]
+class C(http.client.HTTPConnection):
+    def __init__(self):
+        super().__init__("localhost", timeout=10)
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(10)
+        self.sock.connect(f"{repo}/run/rotate.sock")
+c = C()
+body = b"{}"
+c.request("POST", "/refresh-sub", body,
+          {"X-Asip-Token": tok, "Content-Length": str(len(body))})
+r = c.getresponse()
+print(r.status, r.read().decode()[:120])
+PY
+)
+      echo "→ $req"
+      echo "  （刷新在后台跑：asip s 看换线与池子成员变化，约 10~30s）"
+      if [ "$sub" = "add" ]; then
+        # 入块是异步的、且要独占一个空闲 WARP 设备：放在前台会让 add 卡几分钟。
+        # 但必须说清楚 —— 不测 colo，新节点只是一个普通代理，永远分不到 WARP
+        # 渠道（块表里没有 colo 的节点 channels() 不会选它）。
+        echo "  下一步（让新节点进 WARP 渠道，两条承载路径分开测）："
+        echo "    # UDP / WireGuard："
+        echo "    $ASIP_PY $ASIP_DIR/warp_diag.py --from-config --new-only \\"
+        echo "        --out /tmp/asip-newdiag.jsonl --rounds 2"
+        echo "    $ASIP_PY $ASIP_DIR/warp_blocks.py merge-diag /tmp/asip-newdiag.jsonl"
+        echo "    # TCP / MASQUE(H2)：用独立探测设备，不碰生产线"
+        echo "    $ASIP_PY $ASIP_DIR/tools/probe_h2_nodes.py --new-only \\"
+        echo "        --out /tmp/asip-h2scan.json"
+        echo "    $ASIP_PY -c 'import json,sys; r=[x for x in json.load(open(\"/tmp/asip-h2scan.json\")) if x[\"ok\"]]; json.dump(r, open(\"/tmp/asip-h2ok.json\",\"w\"))'"
+        echo "    $ASIP_PY $ASIP_DIR/tools/merge_h2_blockmap.py /tmp/asip-h2ok.json"
+      fi
+      ;;
+  esac
+}
+
 case "${1:-}" in
   -h|--help|help) _usage ;;
   warp) shift; cmd_warp "$@" ;;
+  sub) shift; cmd_sub "$@" ;;
   inbox|inb) shift; cmd_inbox "$@" ;;
   # Vercel 中继：子命令全在 python 里（argparse 管，别在 bash 里再抄一份参数表）。
   # 用 exec 而不是调用后返回：退出码要原样透出去（2 = 有 relay 不可用）。
   vercel) shift; exec "$ASIP_PY" "$ASIP_DIR/vercel_relay_cli.py" "$@" ;;
+  # 渠道健康报表：参数全在 python 里（argparse 管，别在 bash 里再抄一份）。
+  chan|channel) shift; exec "$ASIP_PY" "$ASIP_DIR/tools/channel_report.py" "$@" ;;
+  # 块视图：块内节点清单 / 延迟 / 当前绑定，参数全在 python 里。
+  blk|block) shift; exec "$ASIP_PY" "$ASIP_DIR/tools/block_view.py" "$@" ;;
   st|status)
     out=$(_singbox GET /proxies/$ASIP_WARP_SELECTOR | grep -oP '"now"\s*:\s*"\K[^"]+')
     # 「当前」必须跟着模式走：WARP 模式下 opencode 走 opencode-out 指向的隧道，

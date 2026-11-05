@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 import warp_wg
+from config import CFG as _CFG
 from config import PROJECT_DIR
 
 PROJECT = Path(PROJECT_DIR)
@@ -371,6 +372,32 @@ def _load_job(path: str) -> list[dict]:
     return data
 
 
+def _probe_state_path() -> Path:
+    return PROJECT / ".warp" / "udp_probe_state.json"
+
+
+def _read_probe_state() -> dict:
+    try:
+        return (json.loads(_probe_state_path().read_text()) or {}).get("nodes") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _record_probe_state(recs: list[dict]) -> None:
+    """把这一轮的结论记进台账（成功失败都记）。失败是结论，不是没跑过 ——
+    不记它，`--new-only` 每轮都会把同一批不能承载的节点重测一遍。"""
+    nodes = _read_probe_state()
+    now = int(time.time())
+    for r in recs:
+        nodes[r["tag"]] = {"tested": True, "ok": bool(r.get("ok")),
+                           "stage": r.get("stage"),
+                           "colo": next((x.get("colo") for x in r.get("rounds") or []
+                                         if x.get("ok")), None),
+                           "ts": now}
+    from asip.atomic_io import write_json
+    write_json(str(_probe_state_path()), {"nodes": nodes}, mode=0o600, indent=1)
+
+
 def summarize(path: str) -> None:
     """把 JSONL 汇总成一张表：每个终态各多少、哪些能建隧道、落在哪个 colo。
 
@@ -410,6 +437,10 @@ def summarize(path: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="单节点 WARP 承载能力诊断")
     ap.add_argument("--job", help="{tag, node, egress_ip} 列表 JSON")
+    ap.add_argument("--from-config", action="store_true",
+                    help="从当前 singbox-config.json 取节点（新订阅节点走这条）")
+    ap.add_argument("--new-only", action="store_true",
+                    help="只测 .warp/block-map.json 里还没有 colo 的节点")
     ap.add_argument("--out", help="结果 JSONL（逐条追加，可中断续跑）")
     ap.add_argument("--rounds", type=int, default=3, help="每节点最多几轮（默认 3）")
     ap.add_argument("--family", default="v6", choices=("v6", "v4"))
@@ -434,8 +465,35 @@ def main() -> None:
         out = explain(item, spare_slots()[0])
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
+    if args.from_config and not args.job:
+        # 新插入的订阅源默认走这条：节点刚从配置里生出来，还没有 job 文件。
+        # tag 用 config 里那个（channels/plan_lines 按 tag 认节点）。
+        cfg = json.loads(Path(_CFG["singbox"]["config_file"]).read_text())
+        skip = {"selector", "urltest", "direct", "block", "dns", "socks"}
+        args.job = str(Path(args.out or "/tmp/asip-sub-job.json").with_suffix(".job.json"))
+        items = [{"tag": o["tag"], "node": o}
+                 for o in cfg.get("outbounds", [])
+                 if o.get("type") not in skip and o.get("server")
+                 and o.get("server_port")]
+        if args.new_only:
+            import warp_blocks
+            mapped = warp_blocks.load_map()
+            # 已测失败的不再重测：不能承载 WARP 是节点/中继的长期属性
+            # （实测 44 个节点连续三次全灭），每天重跑一遍只是空转 20 分钟。
+            # 想重测用 --skip-done 删掉台账，或直接 --only 点名。
+            state = _read_probe_state()
+            # **只跳过「测过且失败」的**。`tested` 不分成功失败，于是探到 ok
+            # 但还没跑 merge-diag 的那批（实测 13 个）会被永久跳过 —— 它们的
+            # colo 只在 JSONL 里，block-map 里没有，`--new-only` 却认为已处理。
+            # 成功过的节点由 `colo` 判据管（入块后在 mapped 里），不需要这个。
+            items = [i for i in items
+                     if not (mapped.get(i["tag"]) or {}).get("colo")
+                     and not ((state.get(i["tag"]) or {}).get("tested")
+                              and not (state.get(i["tag"]) or {}).get("ok"))]
+        Path(args.job).write_text(json.dumps(items, ensure_ascii=False))
+        print(f"从配置取 {len(items)} 个节点 → {args.job}", file=sys.stderr)
     if not args.job or not args.out:
-        raise SystemExit("需要 --job 与 --out（或 --summarize）")
+        raise SystemExit("需要 --job/--from-config 与 --out（或 --summarize）")
     slots = ([int(s) for s in args.slots.split(",") if s.strip()]
              if args.slots else spare_slots())
     print(f"设备槽位 {slots}（active 线路 {sorted(active_slots())} 已排除）",
@@ -455,14 +513,22 @@ def main() -> None:
         todo = [i for i in todo if i["tag"] not in done]
         print(f"跳过已完成 {len(done)} 个，剩 {len(todo)}", file=sys.stderr)
 
+    done: list[dict] = []
     with open(args.out, "a", encoding="utf-8") as fh:
         for k, item in enumerate(todo, 1):
             rec = diagnose(item, args.rounds, args.family, slots=slots)
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
+            done.append(rec)
             detail = [(x["stage"], x.get("colo") or x.get("ip")) for x in rec["rounds"]]
             print(f"[{k}/{len(todo)}] {rec['tag'][:44]:44s} {rec['stage']:9s} {detail}",
                   flush=True)
+    if done:
+        try:
+            _record_probe_state(done)
+        except OSError as e:
+            # 台账写不了不该让整轮探测失败：结论已经落在 --out 的 JSONL 里。
+            print(f"⚠ 探测台账写入失败: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

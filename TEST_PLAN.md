@@ -2049,6 +2049,323 @@ python3 -m pytest test_night_window.py test_warp_prober_gates.py -q   # daemon �
 4. `python3 warp_diag.py --job <job.json> --out <jsonl> --rounds 2` —— 先用 3 个已知可用
    节点做对照组：`stage=ok` 且 `colo` 与台账一致，否则停手查探针，不要拿它的结论判节点。
 
+## 15. 渠道健康报表（`asip chan`，T-281~T-283）
+
+**范围**：`tools/channel_report.py` 的纯函数（统计口径、出口段提取、按 colo 合并、
+段指纹映射）。全部用例离线：状态表/日志/源表都由 `tmp_path` 喂，不读生产台账。
+
+```bash
+python3 -m pytest test_channel_report.py -q     # 16 例，<0.1s
+```
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-281 | P0 | 出口段只从**带渠道归属**的日志行来 | `pytest test_channel_report.py -k channel_segments` | 三种行形（`✓ 出口 <ip>` / `✗ 出口` / `· 出口` / `重启后出口=`）都认；同 /64 的两个 /128 只算一段且段名四段齐全；`探测失败` 占位跳过；不按时间窗口截断（24h 前的行也算） |
+| T-282 | P0 | 段指纹与声明 colo 是两件事，`≠` 只标主落点 | `pytest test_channel_report.py -k "fp_mix or fp_label"` | `_fp_mix` 按 `colo_of()` 归并返回 `[(colo, n)]` 降序；主落点等于声明时不带 `≠`、不同时带；无段时 `—` |
+| T-283 | P1 | 按 colo 合并与池子三级去重 | `pytest test_channel_report.py -k "merge_segs or fp_pools or seg32_groups or seg_label"` | 同 colo 多线合并是**并集去重**（不是相加）；池按指纹 colo 分 `/48 / /64 / /128` 三级各自去重、收全日志（含已下线 tag）；`bac1:7680` 这类 PHX/SJC 共用段必须按 /64 拆分（`colo_of(/48)` 恒判 PHX，会把 SJC 的 /48 少算 4 个）；`_seg_label` 四级 `2/3/4/5`，全空为 `—` |
+
+**附加覆盖（同文件其余用例）**：verdict 只数 ban 类、窗口夹当天零点、只列在册渠道、
+tag 漂移按 `host:port` 兜底、沉睡池标 `okz / 旧入口快照`、重启数取窗口内、
+旧格式字符串源表可读。
+
+**手工验收**：
+
+1. `asip chan` —— 主表每行 `/32//48//64//128` 四级；明细表按 colo 合并，
+   每个 colo 一行三样：出口段、池、指纹落点。
+2. `asip chan --json` —— 每条渠道带 `seg_v6` / `seg_addr` / `seg_v4` / `colo_fp`。
+3. `asip chan --html /tmp/chan.html` —— 表头 17 列与行内 `<td>` 数一致（曾因加列漏 `<td>` 错位）。
+
+## 16. 补位线自造（设备用完自救，T-284~T-288）
+
+**范围**：`daemon._ensure_backfill_line` / `_install_wg_unit` / `_wg_line_state`
+与 `deploy/wg-lines-install.sh --line N`。全部用例离线：设备目录、单元目录、
+members 都由 `tmp_path` 造假，不注册真设备、不碰 `/etc`。
+
+```bash
+python3 -m pytest test_daemon_backfill.py test_daemon_backfill_create.py -q   # 10 例
+```
+
+背景：补位判据是「注册过（`profile.conf`）**且** 单元已装」。`register_line`
+只写 profile，单元由安装脚本另一步生成 —— 只注册不装单元等于不存在。
+实测 2026-11-04：31 条 WG 线里 27 被 mask、31 注册了整晚没单元、其余全在
+members，补位日志每轮报「没有能起设备的空闲线」，7 条 H2 线整晚无补位。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-284 | P0 | 已注册没单元的线优先补单元 | `pytest test_daemon_backfill_create.py -k without_unit` | `_install_wg_unit` 只对 `missing` 的线调用；不注册新设备（不烧 CF 额度）；返回该线号并记 `_LAST_WG_CREATE_TS` |
+| T-285 | P0 | mask 的线永不自动恢复 | `-k masked` | 软链 `/dev/null` 的线不进 `installed`；可以另起新线（`register_line(max+1)`），但不能把 mask 的装回来 |
+| T-286 | P1 | 注册限速读磁盘 mtime，装单元不受限 | `-k "gap or without_unit or mtime"` | 限速依据是**最新 `profile.conf` 的 mtime**（进程内变量重启即归零）；600s 内不注册新设备；但「已注册没单元」的线**照样装**（不烧额度） |
+| T-287 | P1 | 判据单源 + 硬上限 | `pytest test_daemon_backfill_create.py -k hard_cap` | `_wg_line_state()` 同时被补位判据、自造、失败诊断三处调用；线号达 `_WG_MAX_LINES`=64 后停止注册并**报错**（日志含「已达上限」），不无声膨胀 |
+
+| T-288 | P1 | 测试台账隔离与 config 快照 | `pytest test_warp_wg.py test_subscription_parse.py -q`（不需要先清线上补位线） | 两份台账在 **`import daemon` 之前**就指向空文件（`config.py` 在 import 时读它们）；`_restore_config_module` 在每条用例后恢复 config 名字表，抵消 `test_warp_wg` 的 `importlib.reload` 造成的 `CFG` 对象分家 |
+
+**手工验收**：
+
+1. `sudo -n systemd-run --pipe --wait --collect --quiet` 跑 `deploy/wg-lines-install.sh --line N`
+   —— 验证 `/etc` 只读挂载那一条（daemon 的 `ProtectSystem=strict` 让直接
+   `sudo bash` 报 `Read-only file system`，必须换宿主 namespace）。
+2. 新线单元里 `User=` / `Environment=HOME=` 必须是仓库属主，不是 `root` / `/root`。
+3. 补位上线后 `journalctl -u auto-switch-ip` 应出现
+   `⇢ <原线> 渠道被封，补位渠道 WARP-WG-N 已在 <colo> 上线`。
+
+## 17. 环内轮换的承载能力排序（T-289~T-291）
+
+**范围**：`daemon._warp_alive_rank` / `_same_block_standby` /
+`_channel_rehome_target` / `_rehome_held_lines` 的锁定分支。全部离线。
+
+```bash
+python3 test_node_rotation.py                                         # 15 项自检
+python3 -m pytest test_channel_ban_hold.py -q                         # 60 例
+```
+
+背景：`rotation` 是 `warp_wg.apply()` 按**延迟**生成的，之后不重建 ——
+22 条 WG 线的 176 个 rotation 槽位里 135 个（77%）从没有过 WG 实测记录；
+NRT 块内实测可用的 14 台节点只有 1 台进过 rotation。轮换因此在赌。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-289 | P0 | 同块候选按承载能力排序 | `test_node_rotation.py` 第 13/14 项 | 块序在前但 `wg=0/4` 的节点排到实测可用的之后；没测过（rank 1）仍排在实测不通（rank 2）之前 |
+| T-290 | P0 | 全都没测过时照常按块序选 | `test_node_rotation.py` 第 15 项 | 返回块序第一个 —— 过滤会让人工刚加的节点永远上不了线 |
+| T-291 | P0 | 锁定节点实测不能时改投而不反复重启 | `pytest test_channel_ban_hold.py -k "dead_node or cannot_carry"` | `ban_hold_node` 是 rank 2 时不调用 `_warp_line_restart`，改投到新节点；`ban_hold_home`（08:00 还原目标）不动 |
+
+**手工验收**：
+
+1. `journalctl -u auto-switch-ip | grep "承载不了 WARP"` 应出现
+   `⇢ <tag> 锁定节点 <node> 实测承载不了 WARP，改投 <colo>（<node>）`。
+2. 该线在「渠道重定位」理由下的重启次数应从每分钟级降到 ≤1 次/h，
+   且 `ban_hold_ready` 随后置位（`python3 -c` 读 `.warp_line_state.json`）。
+
+## 18. 状态表体积与渠道锁的两条死路（T-292~T-296）
+
+**范围**：`daemon._channel_ban_trim` / `_channel_ban_expand` /
+`_channel_ban_hold_hit` / `_channel_ban_note` / `_channel_noaddr_note` /
+`_rehome_one` / `_LINE_DEFAULTS`；`tools/channel_report._expand_ban_probes`。全部离线。
+
+```bash
+python3 -m pytest test_channel_ban_hold.py test_channel_report.py -q   # 78 例
+```
+
+背景三条，全部来自 2026-11-04 的生产状态表：
+
+1. **`ban_probes` 无界增长**：秒级写入 × 5s 落盘节流 ⇒ 状态文件 565 KB ⇒
+   **9.4 GB/天** 磁盘写。判据只问「当天是否全部 quota」，但排查要看时序，
+   不能按条数截断（主人明确要求「ban_probes 得留多点」）。
+2. **补位渠道被锁死 57 年**：WG-23/24/25 是补位线，`_channel_noaddr_note`
+   连续 5h 无地址就锁，而它们本来就在死节点上 —— 锁住等于让被顶的线整夜没人补位。
+3. **`restart_count` 是纯垃圾**：进程终身累计，实测最高 41982，全库零读取者
+   （报表用的是 `restart_hist` 的窗口内计数）。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-292 | P0 | 同结论相邻样本合并成段，且结论不丢 | `test_trim_merges_consecutive_same_verdict` | 10 条 quota → `[起, 止, 10, "quota"]`；换结论时开新段；段内条数总和 == 原样本数 |
+| T-293 | P0 | **不按条数截断** | `test_trim_keeps_all_samples_no_cap` | 1000 条仍全在（原 `_BAN_SAMPLES_MAX` 截断已删）；这是主人「留多点」的直接回归 |
+| T-294 | P0 | 段格式与旧二元组双向兼容 | `test_expand_round_trips_runs`、`test_malformed_state_does_not_crash_loader` | `_channel_ban_expand(_channel_ban_trim(x))` 条数**与结论序列**都不变；混入 `[ts, "quota"]` 旧格式与坏条目仍能加载，结论读 `e[3]` 而非 `e[1]` |
+| T-295 | P0 | 补位渠道永不被渠道锁 | `test_backfill_line_is_never_channel_locked` | `members[tag]["backfill_for"]` 非空时，`_channel_noaddr_note` 直接返回，`ban_noaddr_since` 保持 0 |
+| T-296 | P0 | 重写配置用**声明**的族，不用状态表 | `test_rehome_uses_declared_family_not_stale_state` | 状态表记 v4（旧拓扑残留）/ 声明 v6 时，`warp_wg.write_line` 必须收到 `family="v6"` |
+
+| T-297 | P1 | 用例不得依赖真实时钟的「当天」边界 | `_noon_today()` 构造样本时刻 | 00:00~00:30 跑测试时，回溯 30 分钟的样本仍在当天内（实测 11-05 00:02 曾让 T-292/T-295 两个用例同时变红） |
+
+**变异验证**（三条都实测过，改回旧逻辑必红）：
+
+| 改动 | 结果 |
+|------|------|
+| `family=m.get("family")` → 改成读状态表 | T-296 `1 failed` |
+| 删掉 `_channel_noaddr_note` 的 `backfill_for` 跳过 | T-295 `1 failed` |
+| 恢复按条数截断（`_BAN_SAMPLES_MAX`） | T-293 `1 failed` |
+
+**手工验收**：
+
+1. 状态文件体积：`ls -l .warp_line_state.json` 应在 **100 KB 以内**
+   （迁移前 633 KB），且 `ban_probes` 每项长度是 4（段）而不是 2（点）。
+2. 补位线不被锁：`python3 -c "import json;d=json.load(open('.warp_line_state.json'));
+   print({k:(v.get('ban_hold_until') or 0)>0 for k,v in d['lines'].items() if 'WG-2' in k})"`
+   应全 False。
+3. `restart_count` 残留 0：`grep -c restart_count .warp_line_state.json` 返回 0。
+
+## 19. 重启循环与轮回冷静期的互锁（T-298~T-302）
+
+**范围**：`daemon._probe_one_line`（两条重启入口）、`_line_node_cannot_carry`、
+`_node_rotation_pass`（冷静期）、`_node_tcp_ok`、`warp_wg.probe_node_tcp`；
+`deploy/render_h2_lines.h2_channels`。全部离线。
+
+```bash
+python3 -m pytest test_warp_prober.py test_h2_render_guard.py -q   # 34 例
+python3 test_node_rotation.py                                      # 17 项
+```
+
+背景（2026-11-05 生产实测）：
+
+1. **重启循环把唯一能救它的机制顶在门外**。同块轮回的冷静期是
+   `now - max(rebind_ts, restart_ts) < 2×60s`，而重启每次都刷新 `restart_ts`
+   ⇒ 反复重启的线永远处于「刚重启」状态 ⇒ 轮回一次也轮不到它。WG-4 就这样
+   在同一个不转发 UDP 的节点上重启到 `fail_streak` 41，`ever_ip` 始终 False。
+2. **`probe_node_tcp` 的 recv 超时抛异常**，冒到 `_node_rotation_pass` 外面，
+   整轮轮回作废 —— 一条坏节点拖住其余全部线。3 小时 18 次
+   `✗ 同块轮回异常: timed out`。
+3. **H2 扩张逻辑写在 `if not out:` 里**，块模型只要筛出任何一条就永不执行。
+   两台机器同一份代码：本地 31 条、远端 22 条。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-298 | P0 | 惩罚期重启前先问节点能不能承载 | `test_penalty_restart_skipped_when_line_never_got_egress` | `_line_node_cannot_carry` 为真时 `_warp_line_restart` 零调用 |
+| T-299 | P0 | 无出口重启同样要过承载闸 | `test_tunnel_death_restart_skipped_when_node_cannot_carry` | 同上，入口换到「连续 N 次取不到出口」分支；变异删掉分支即红 |
+| T-300 | P0 | 反复重启时冷静期让路 | `test_node_rotation.py` 10b | `restart_ts` 是刚刚 **且** `fail_streak ≥ _UNKNOWN_RESTART_STREAK` 时仍换节点；对照例（`fail_streak` 差一）仍被冷静期挡住 |
+| T-301 | P1 | 节点探测超时是结论不是故障 | `test_node_rotation.py` 17 | `probe_node_tcp` 在 SOCKS 阶段 recv 超时返回 `False`，不抛异常 |
+| T-302 | P0 | H2 扩张不依赖「块模型一条也没筛出」 | `test_expansion_runs_even_when_block_map_yields_channels` | 块模型返回 1 条时，block-map 里未覆盖的 colo 仍补出新渠道 |
+
+**变异验证**（四处，改回旧逻辑必红）：
+
+| 改动 | 结果 |
+|------|------|
+| 删掉无出口分支的 `_line_node_cannot_carry` 判断 | T-299 `1 failed` |
+| 冷静期条件去掉 `fail_streak` 判据 | T-300 自检转红 |
+| 扩张段推回 `if out: return` 之后 | T-302 `1 failed` |
+| `probe_node_tcp` 的 `except OSError` 删掉 | T-301 自检转红（抛 `socket.timeout`） |
+
+**已知未解**：`ever_ip` 为真的线（历史上出过口、现在链路坏了）不满足承载闸，
+只能靠 T-300 的 `fail_streak` 破冷静期。两者缺一，WG-4 那类线仍会被焊死。
+
+## 20. H2 承载闸与设备半成品（T-303~T-306，含 T-305b）
+
+**范围**：`daemon._line_node_cannot_carry`（H2 分支）、`_h2_repair`、
+`_H2_POOL_DEAD`；`deploy/render_h2_lines.free_devices`。全部离线。
+
+```bash
+python3 -m pytest test_h2_render_guard.py test_warp_prober.py -q   # 37 例
+```
+
+背景（2026-11-05 生产实测）：
+
+1. **H2 的承载闸从来没生效过**。`_line_node_cannot_carry` 只查 `warp_wg` 台账，
+   而 H2 的落地节点在共享 sing-box 的 selector 里 —— 查台账永远 `node=None`，
+   整段对 H2 恒返回 False。SLC-11/12/24 的 4 个 bilibili 候选 TCP 全死、
+   `ever_ip` 始终 False，仍每 ~2 分钟重启一次 `usque-h2-N`，`fail_streak`
+   涨到 **1612 / 1534 / 220**。
+2. **判死必须是可撤销的**。`_H2_TRIED` 只在拿到出口地址时清空，把它当永久判据
+   等于让线停产：节点恢复、或块模型重渲染后来了新候选，都进不来。
+3. **设备目录缺 `usque` 软链会被当成空闲**。`free_devices()` 只看 `config.json`
+   存在，渲染出的单元起上去是 `status=127` 无限重启，daemon 侧只表现为
+   「一直取不到出口」。远端 9 台 `usque-h2new*` 全是这种。
+4. **断链要单独判**。`exists()` 跟随软链、`is_symlink()` 不跟随，两者并列取反
+   （`not exists and not is_symlink`）时，断链会同时满足两个条件而跳过重建 ——
+   设备照样发出去、单元照样 `status=127`，与「完全没有链接」一模一样。只判
+   `exists()`，重建前先 `unlink(missing_ok=True)`。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-303 | P0 | H2 承载闸按「出没出过口」分两段 | `test_h2_exhausted_pool_stops_the_restart_loop` | 从没出过口且探过 → 真（不等整池试遍）；从没出过口但没探过 → 假；出过口且池子没试遍 → 假；出过口且整池试遍 → 真 |
+| T-304 | P0 | 判死有重试窗口 | 同上（后两段断言） | 把 `_H2_POOL_DEAD[tag]` 拨到 `_H2_POOL_DEAD_RETRY_SEC` 之前 → `_h2_repair` 重新走通、判死解除；池子重渲染多出新节点 → 同样解除（自愈，无需重启） |
+| T-305 | P0 | 设备目录缺 `usque` 时补链而非丢弃 | `test_device_without_usque_gets_the_symlink_not_dropped` | 只有 `config.json` 的目录仍算空闲，且事后 `usque` 是指向 `../usque/usque` 的软链 |
+| T-305b | P0 | 断链要重建，不能当成「已有链接」 | `test_broken_usque_symlink_is_rebuilt_not_passed_through` | `usque -> ../nowhere/usque`（目标不存在）仍算空闲，且事后 `is_symlink()` 与 `exists()` 同时为真 |
+| T-306 | P1 | 扩容后新 colo 拿到成员且旧编号不动 | `test_new_colo_gets_a_member_and_old_ones_keep_their_numbers` | 块模型多出的 colo 补进 `warp-outbound.json`，既有成员编号一位不变 |
+
+**变异验证**（改回旧逻辑必红）：
+
+| 改动 | 结果（基线 37 passed） |
+|------|------|
+| M1 H2 分支 `return False`（改回查台账） | `1 failed, 36 passed` |
+| M2 删掉 `_H2_POOL_DEAD_RETRY_SEC` 重走池子那三行 | `1 failed, 36 passed` |
+| M3 去掉「从没出过口」那半个判据 → 只 `return tag in _H2_POOL_DEAD` | `1 failed, 36 passed` |
+| M3b 去掉「出过口」那半个判据（一律判死） | `1 failed, 36 passed` |
+| M4 `free_devices` 的补链接改成 `continue` | `4 failed, 33 passed` |
+| M5 断链判据退回 `not exists() and not is_symlink()` | `1 failed, 36 passed` |
+
+**这组变异最初跑出的是 `37 passed`**：`ever_ip` 那半个判据当时根本没被断言
+覆盖，补上断言之后才转红。变异验证不能只写在文档里，必须真跑 —— 否则
+「已覆盖」和「没覆盖」在文档上一模一样。
+
+变异副本最少要带齐 `daemon.py` / `config.py` / `conftest.py` / `warp_wg.py` /
+`warp_blocks.py` / `warp_night.py` / `ipv6_segments.py` / `probe_warp.py` /
+`deploy/render_h2_lines.py` / `deploy/members.py` / `asip/*.py`，以及
+**`.warp/warp_wg_state.json`**（`warp_wg.state_path()` 指的是 `.warp/` 下那份，
+不是仓库根目录的 `.warp_line_state.json`）。每漏一个都会先红一例不相干的用例，
+看起来像代码坏了：少了 `probe_warp` 是 `test_model_probe_opens_hold_only_for_long_quota`
+`ModuleNotFoundError`，少了 `warp_wg_state` 是 `test_cannot_carry_judgement` 转红。
+
+变异副本必须带 `.warp/warp_wg_state.json`（`warp_wg.state_path()` 指的是
+`.warp/` 下那份，不是仓库根目录的 `.warp_line_state.json`）：少了它
+`test_cannot_carry_judgement` 会先红，看起来像代码坏了。
+
+**第一版只降频，不归零**（已修，留作判读历史日志的依据）。加第一版闸后
+SLC-11/12/24 仍然每小时 40+ 次重启，且 **100% 落在换节点后 180s 内**（平均
+间隔 26~30s）。机制是 `_h2_repair` 换节点成功当刻就 `_H2_POOL_DEAD.pop(tag)`，
+把「暂停重启」的许可一起作废；随后 60s 节流把 `_h2_repair` 挡在门外返回
+False，闸看到 `tag not in _H2_POOL_DEAD` 就放行。而新节点要 ~40s 才拿得到出口。
+
+**现行判据分两段**：从没出过口（且探过）→ 一律判死，不等整池试遍；出过口 →
+只有整池试遍才判死（那时更可能是本机会话僵死，重启是唯一修法）。
+
+验证方式（**必须跨 `daemon.log.1`**，只看 `daemon.log` 会得出「已收敛」的假象）：
+
+```bash
+# 远端：06:00 后每条 H2 线重启次数，以及有多少落在换节点后 180s 内
+python3 - <<'PY'
+import re
+rows = []
+for p in ("daemon.log.1", "daemon.log"):
+    rows += open(p, errors="replace").read().splitlines()
+pat = re.compile(r"^\[(2026-11-05 \d\d:\d\d:\d\d)\]")
+for tag in ("WARP-H2-SLC-11", "WARP-H2-SLC-12", "WARP-H2-SLC-24"):
+    last = None; n = after = 0
+    for l in rows:
+        m = pat.match(l)
+        if not m or tag not in l or m.group(1) < "2026-11-05 06:00":
+            continue
+        t = m.group(1)
+        if "换节点" in l:
+            last = t
+        elif "尝试重启" in l:
+            n += 1
+            if last and 0 <= (int(t[11:13])*3600+int(t[14:16])*60+int(t[17:19])
+                             - int(last[11:13])*3600-int(last[14:16])*60-int(last[17:19])) <= 180:
+                after += 1
+    print(tag, n, after)
+PY
+```
+
+改法（未实施，需主人决定）：换节点时记 `_H2_SWITCH_TS[tag]`，闸在
+`now - ts < 120s` 内一律返回「重启没意义」。**不要用 `bool(_H2_TRIED[tag])`
+当判据** —— 那会把「池子重渲染后换得出去」的自愈路径一起判死，T-303 末尾
+那条断言正是为它写的。
+
+**扩容后的口径**（不是测试点，是判读报表时的前提）：新 colo FRA / GIG / IST /
+LHR / SYD 在 `.warp_ip_used.json` 里没有任何历史记录，扩容后 12 分钟取到 663 个
+不同出口、655 个是台账首次出现。但单条地址仍一格配额就 429（LHR-33、SYD-34
+的新地址都在 2 分钟内被标 `rate429`）—— **扩容抬的是单位时间可用地址产出，
+不是单地址寿命**。看到「新 colo 也很快 429」不是扩容失效。
+
+### 20b. 手动部署 H2 线时「装了但进不了 selector」的验收口径（2026-11-05）
+
+这一节没有新代码，是**部署步骤的验收方法**。远端补 greatgame 源后新增 5 条线
+（SJC-35/BOM-36/DUB-37/IAD-38/JNB-39）时踩到的：单元全 active、`h2-sel-N` 全在
+9091 上、单条 SOCKS 直连也能出 `warp=on`，但主 `opencode-out` 69 项里一条都没有
+—— `h2-install.sh` 只装 H2 子 sing-box 与 usque 单元，**不写**
+`warp-outbound.json`、**不跑** `patch-wg-outbounds.py`。更迷惑的是
+`patch-wg-outbounds.py --check` 此时还报 `UNCHANGED`：它读的
+`warp-outbound.json` 本身就没这 5 条（该文件由 `members.py` 从 `config.py` 的
+`warp.members` 生成，H2 成员是 `config.py` import 期从 `channels.json` 追加的）。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-307 | P0 | 新线必须进**运行中**的 selector | `curl -H "Authorization: Bearer $SEC" http://127.0.0.1:9090/proxies/opencode-out` | `all` 里能查到每条新 tag。只查配置文件不够 —— sing-box 由 daemon `Popen` 拉起，改文件不重载无效 |
+| T-308 | P0 | 每条新线端到端出 `warp=on` 且 colo 符合声明 | `curl --proxy socks5h://127.0.0.1:<1180+N> https://www.cloudflare.com/cdn-cgi/trace` | `warp=on` 且 `colo=` 与 `channels.json` 一致（实测 BOM/DUB/IAD/JNB/SJC 五条全中） |
+| T-309 | P1 | `members.py` 会带上 `channels.json` 的新成员 | `python3 deploy/members.py --write-warp-outbound` 后查 `warp-outbound.json` | `WARP-H2-` 条数 = `channels.json` 条数（实测 32 → 37） |
+
+手动排障的完整顺序（缺一步就是上面那个症状）：
+
+```bash
+python3 deploy/render_h2_lines.py
+python3 deploy/members.py --write-warp-outbound   # ← h2-install.sh 不做
+./deploy/h2-install.sh
+python3 deploy/patch-wg-outbounds.py              # ← h2-install.sh 不做
+kill $(pgrep -f "sing-box run -c $PWD/singbox-config.json")   # watchdog 30s 内按新配置拉起
+```
+
+**补订阅源时的顺序也有讲究**：一次性链接在别处拉过之后已失效，远端刷新会走
+`_fetch_or_cache` 回退快照（日志 `本轮用快照（0.2h）`）。必须**先传
+`.sub_cache/<key>.json` 再改 `.extra_subscriptions`**，否则远端第一轮刷新拿不到
+任何节点，后续刷新还会把配置覆盖成空。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
@@ -2115,3 +2432,10 @@ python3 -m pytest test_night_window.py test_warp_prober_gates.py -q   # daemon �
 | v1.57 | 2026-11-01 | okz 复活修复（主人实测「用代理或隧道连啊」）：机场订阅的 Clash 版本明写 `dns.proxy-server-nameserver: [https://custom.juhazf.cn/inst, enter.aiokz.com/inst, custom.hk.juhazf.cn/inst]`，但生产走的是 base64 版本（不带 DNS 段），`parse_subscription.py` 也不翻译它 → 所有机场域名走系统 DNS。修在 `parse_subscription.py`：① 新增 `AIRPORT_DNS_SUFFIXES=(okzdns.com, juhazf.cn, hi2026.net, acczzz.com, bing.com)` 与 `dns-airport` DoH server（`path: /inst`，`domain_resolver: dns-default` 避免 circular）；② DNS 规则 `domain_suffix→dns-airport, strategy ipv4_only` 排在 opencode 规则之前；③ **每个机场节点写 `domain_resolver: dns-airport`** —— 这一条才是决定性的：节点上省略它时 sing-box 退回 `route.default_domain_resolver`（系统 DNS），`cn.bing.com` 被解到真 Bing 202.89.233.x，握手报 `certificate is valid for *.bing.com ... not tw-mik-55.okzdns.com`。对照实验（同一节点、只差这一个字段）：有 `domain_resolver` 通（出口 114.42.196.71），去掉即 FAIL，错误与生产日志一字不差。**效果**：okz 系节点 0/54 通 → 50/54（两轮稳定性 50、51，中位 886/974ms；`cn.bing.com:443-any` 实测 1520ms）。顺带否掉两个假说：alpn 缺失（A/B 两组都通）、机场 DoH 不可达（HTTPS `/dns-query` 404 是路径错，真实路径是 `/inst`，三个端点全 200）。`singbox-config.json` 已就地补齐 119 个节点的 `domain_resolver`（备份 `singbox-config.json.bak-dns-*`），sing-box 已重启生效 | 主人实测 |
 | v1.58 | 2026-11-01 | 独立审查（codex 缺 `@openai/codex-linux-x64` 二进制，改用对抗性审查代理）对 v1.56 的 4 项修复 + 1 项新增覆盖。**P0 测试时段相关**：`conftest.py` 未关 night_window，既有套件全用真实时钟 + 非白名单 tag → 20:00–08:00 跑 pytest 会有 9+ 例变红、`performed<=20`/`quota_until<=now` 两例假绿。修：autouse `_disable_night_window`；验证方式为 `TZ=Etc/GMT-14`（本地 23:51）复跑，改前改后同为 98 passed/4 failed，与白天逐例一致。**P1 校验洞**：① `_v` 允许 24 → `0→24` 恒真＝全天锁，且 `isinstance(True,int)` 让布尔值混进小时；改 `0<=v<=23` + 显式挡 bool。② `allow` 不校验元素类型，非字符串会被 `_night_allow_tags` 的 isinstance 静默滤空 → 夜里全锁；改导入期断言。③ 时区靠主机 localtime，unit 无 `TZ=`，主机改 UTC 就整体偏 8h；`deploy/install.sh` 与现网 unit 均加 `Environment=TZ=Asia/Shanghai`（备份 `auto-switch-ip.service.bak-tz-*`，已 daemon-reload）。④ `_refresh_idle_warp` 被锁后仍按通用失败重试 3 次（2+5s 退避）并写「端口未就绪」，把锁误报成故障；改为进循环前短路返回 None。**P2**：`_NIGHT_LOG_TS` 由单时间戳改 `dict[tag,ts]`（全局单值时 20 条线 30s 内只打一条，读日志会误判成只有一条被拦）；订阅刷新换绑定的 `now` 从循环外移进循环（跨 08:00 会多锁/少锁一夜）；补 `_warp_line_restart` 夜间用例（该闸删掉仍会被下层 `_restart_warp_line` 兜住，但那时已 `warming=True`、`restart_hist` +1、`fail_streak` +1 —— 一次没重启却记一次重启和一次失败）与按 tag 节流用例。`test_night_window.py` 12 例；`test_subscription_parse + test_night_window + test_asip_* + test_warp_line_worker` 共 209 passed / 1 failed（既有 log_file 用例） | 独立审查 |
 | v1.59 | 2026-11-01 | 渠道分配模型落地 + 夜锁分层（docs/warp-channel-allocation.md 七/八节）：① `config.warp.blocks`（9 个 colo 的静态属性 + `channels_per_block` + `enabled`，默认关）+ 导入期校验（colo 重复、`channels_per_block<1`）；② `warp_blocks.py` 从「只有渠道清单」补成完整模型：`order_nodes`（纯读延迟，未知排尾）、`plan_lines`（渠道→线路，后备先同块）、`night_line_tags`（块→线路，未知 colo 保留）、`build_map`（**按出口 IP 聚合**：一个 IP 常被 2 节点共用，按节点聚合会把同一份观测算两遍）；③ `warp_wg.apply` 新增选点分叉：`blocks.enabled` 时走 `plan_lines`，注册/写盘/发布共用，两条路径只在「选哪个节点」处不同；④ 夜锁策略拆到 `warp_night.py`（`window`/`active`/`restart_allowed`/`label`，纯函数），daemon 保留同名门面做 IO，白名单改由块生成（`_block_night_tags` 30s 缓存，异常退回配置 allow）；⑤ `warp_diag.py` 替代 `/tmp` 里那份自己拼配置的探针 —— 配置只从 `warp_wg.build_line_config` 生成，失败分 config/port/handshake/ok。**旧探针的教训**：它自拼配置（DoH、节点 tag 改名、缺 `domain_resolver`）且端口用「基准+偏移」与残留进程撞车，44 个节点全报「握手失败」，其中 15 个 UDP:53 是通的 —— 探针在测自己。回归：`test_warp_blocks.py` 22 例新绿；`test_daemon_unit + test_warp_refresh + test_portability + test_warp_line_worker + test_asip_*` 改前改后同为 **472 passed / 14 failed**（14 例为既有红，已在改动前的副本上逐例复现）；`test_night_window + test_warp_prober_gates` 44 passed / 1 既有红 | 主人需求 + 自对抗 |
+| v1.60 | 2026-11-04 | 新增 §15 渠道健康报表（T-281~T-283）+ 报表改版：`asip chan` 的出口段从「全部 /64 段名」逐步收敛为 `/32//48//64//128` 四级计数（`2/12/60/1035`），明细表**按声明 colo 合并**（同 colo 的线共用同一池子，逐条印是同一份）并给出口段、池（`/48/64/128` 三级去重，收全日志含已下线 tag）、指纹落点三样；原独立的 `colo ↔ 段指纹` 表并入（同维度）。新增 `_merge_segs` / `_fp_pools` / `_addr_sort`，`channel_segments()` 额外收集 `/128`。实测 2026-11-04：NRT 池 `12/12/1184`（10 条渠道共用 12 个 /64，/128 级 5 分钟重复率 36.1%）vs SIN `12/132/9731`（0.7%）—— 只看 /48 这两个机房一样宽。`test_channel_report.py` 17 例全绿（含 `bac1:7680` 共用段按 /64 拆分） | 主人需求 |
+| v1.61 | 2026-11-05 | 新增 §20 H2 承载闸与设备半成品 (T-303~T-306，含 T-305b)。**H2 的承载闸从来没生效过**：`_line_node_cannot_carry` 只查 `warp_wg` 台账，而 H2 落地节点在共享 sing-box 的 selector 里 ⇒ 永远 `node=None`、恒 False；SLC-11/12/24 的 4 个 bilibili 候选 TCP 全死、`ever_ip` 始终 False，仍每 ~2 分钟重启一次 `usque-h2-N`（`fail_streak` 1612/1534/220）。改为复用 `_h2_repair` 自己的结论（整池试遍 ⇒ 记 `_H2_POOL_DEAD`），热路径只读内存集合不打 Clash API。**判死可撤销**：重试窗口 `_H2_POOL_DEAD_RETRY_SEC`=1800s 到点自动重走整池（否则 `_H2_TRIED` 只在拿到出口时清空 ⇒ 节点恢复或重渲染后新候选永远进不来）；并补上与 WG 同口径的 `ever_ip` 例外（出过口的线更可能是本机会话僵死，重启是唯一能修的动作）。**设备半成品**：`free_devices()` 只看 `config.json` 存在就把目录当空闲发出去，缺 `usque` 软链的单元起上去 `status=127` 无限重启，daemon 侧只表现为「一直取不到出口」——远端 9 台 `usque-h2new*` 正是如此，扩到 10 条线时才从 journal 发现。改为幂等补链接而非排除（排除等于让这批设备永久闲置）。`test_h2_render_guard.py` 10→13 例、`test_warp_prober.py` 24 例，37 passed；五处变异全红（其中 `ever_ip` 例外**起初没被覆盖**，补断言后才转红）。**断链**：`exists()` 与 `is_symlink()` 并列取反会让断链跳过重建（两个条件同时成立），设备照样发出去、单元照样 `status=127`；改为只判 `exists()` + 先 `unlink(missing_ok=True)`。**扩容**：把 `h2_probe_state.json` 里 ok 但块表没 colo 的 31 个节点并入远端块表，多出 FRA/GIG/IST/LHR/SYD 五个 colo，H2 渠道 22→32，`opencode-out` 86 成员，`sing-box check` 通过；扩容后 12 分钟取到 663 个不同出口、655 个台账首次出现。**闸只降频不归零**：加闸后 SLC 仍每小时 40+ 次重启且 100% 落在换节点后 180s 内 —— 换节点成功当刻 `_H2_POOL_DEAD.pop()` 把重启许可一起作废，而 60s 节流期 `_h2_repair` 恒返回 False。已记为「已知未修」，改法见 §20 末 | 生产实测 |
+| v1.62 | 2026-11-05 | 新增 §20b 手动部署 H2 线的验收口径（T-307~T-309，无新代码）。远端缺 greatgame 源导致没有孟买（BOM）落点：`.extra_subscriptions` 补 etcloud（`3e136476…`）后，H2 实测 **22/28 可承载**，块数 15→19，新增 SJC/BOM/DUB/IAD/JNB 五个块、5 条线（35–39），端到端五条全部 `warp=on`（BOM `2a09:bac5:3afa:11c3::1c5:12e`）。**踩到的坑**：`h2-install.sh` 只装 H2 子 sing-box 与 usque 单元，不写 `warp-outbound.json`、不跑 `patch-wg-outbounds.py`，而后者此时还报 `UNCHANGED`（它读的文件本身就没新成员）—— 症状是单元全 active、`h2-sel-N` 全在、单条 SOCKS 直连能出 `warp=on`，但主 `opencode-out` 里一条都没有。完整顺序与验收方法记在 §20b。另：补一次性订阅源必须先传 `.sub_cache/<key>.json` 再改台账，否则远端刷新回退不到任何节点 | 生产实测 |
+| v1.32 | 2026-11-05 | 新增 §19 重启循环与轮回冷静期的互锁 (T-298~T-302)。**重启循环顶住轮回**：冷静期判据 `now - max(rebind_ts, restart_ts) < 2×60s`，而重启每次刷新 `restart_ts` ⇒ 反复重启的线永远「刚重启」⇒ 轮回一次也轮不到它。实测 WG-4 `fail_streak` 41、`ever_ip` 始终 False、每 ~60s 重启一次，轮回日志里从没出现过它。两处重启入口（惩罚期 / 连续无出口）现在共用 `_line_node_cannot_carry`；冷静期另加 `fail_streak ≥ 10` 破锁条件，覆盖 `ever_ip` 为真但链路已坏的那一类。**`probe_node_tcp` recv 超时抛异常**，冒到 `_node_rotation_pass` 外面整轮作废（3h 18 次 `✗ 同块轮回异常: timed out`）⇒ 返回 `False`（超时正是「接了端口不转发」，是结论不是故障），`_node_tcp_ok` 另兜探测进程自身异常返回 `None`。**H2 扩张段搬出 `if not out:`**：块模型只要筛出任何一条就永不扩张，两台机器同一份代码 31 vs 22。`test_warp_prober.py` 24 例、`test_h2_render_guard.py` 10 例、`test_node_rotation.py` 17 项，全量 **884 passed**；四处变异全红。 | 生产实测 |
+| v1.31 | 2026-11-04 | 新增 §18 状态表体积与渠道锁的两条死路 (T-292~T-296)。**`ban_probes` 游程化**：状态表现在是整库最大的写入源（565 KB × 12 次/分 = 9.4 GB/天），改成段格式 `[起, 止, 条数, 结论]` —— 实测 19k 样本只有 484 段同结论，压缩 **39 倍**（633 KB → 61 KB，1.02 GB/天），一条样本不丢（主人明确要求「留多点」，所以不是按条数截断）。旧二元组格式仍认；结论位置是 **`e[3]`** 不是 `e[1]`（初版写错这一处，31 条 quota 记成 31 段、`_channel_ban_hold_hit` 恒 False，用例转红）。**补位线永不被渠道锁**：`_channel_noaddr_note` 漏了 quota 分支早就有的 `backfill_for` 跳过，实测 WG-23/24/25 被锁到 `ban_hold_until` 剩 **57 年**，三条 H2 线整夜无补位。**`restart_count` 删除**（终身累计最高 41982、零读取者）。**`_rehome_one` 的族改回取声明值**：初版误以为状态表是权威（那里 WG-1/2/3 记 v4），按它重写把三条线全写成 `prefer_ipv4`，实测立刻撞成同一个 `104.28.205.117` —— 状态表的 `family` 只在 `apply()` 时写一次，改过拓扑就是旧世代残留（本机 `.env` 是 `WARP_WG_FAMILIES=v6`）。现在读 `member["family"]`，与 `write_line(family=None)` 同源。**`_warp_alive_rank` 单族判据**：`family` 指定时只看那一族，不再拿 v4 的失败否决 v6 线。`test_channel_ban_hold.py` 57→61 例，`test_node_rotation.py` 15 项，全量 **869 passed**；三处变异验证全红。另修用例的零点依赖（T-297）：样本时刻改用 `_noon_today()`，否则 00:00~00:30 跑测试时回溯 30 分钟的样本落到昨天被裁掉 | 主人需求「ban_probes得留多点」 |
+| v1.30 | 2026-11-04 | 新增 §17 环内轮换的承载能力排序 (T-289~T-291)：`rotation` 按延迟生成、从没按「能不能跑 WARP」重建，176 个槽位里 77% 无实测记录 ⇒ 39 次同块轮换 5 分钟内拿到出口的只有 15 次（38%）。新增 `_warp_alive_rank()` 三档排序（只排序不淘汰），接入 `_same_block_standby` 与 `_channel_rehome_target`；渠道锁目标落在 rank 2 节点时改投而不是每分钟重启（实测 WG-1 在 `wg=0/4` 节点上 30 分钟内被重启 71 次，改投后立刻拿到出口，降到 1 次/h）。`test_node_rotation.py` 12→15 项，`test_channel_ban_hold.py` 55→57 例，全量 864 passed |
+| v1.29 | 2026-11-04 | 新增 §16 补位线自造 (T-284~T-288)：设备用完时 `_ensure_backfill_line` 先补装「已注册但没单元」的线、再注册新设备，`_WG_CREATE_GAP`=600s 限速，mask 线永不自动恢复。关键坑：`ProtectSystem=strict` 让 `/etc` 在 daemon 的 mount namespace 只读，`sudo` 不换 namespace ⇒ 装单元必须走 `systemd-run`；以 root 跑安装脚本须显式传 `ASIP_RUN_USER/GROUP/HOME_DIR`，否则单元写成 `User=root`+`HOME=/root` 读不到 administrator 的凭据 | - |

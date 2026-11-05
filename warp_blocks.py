@@ -117,11 +117,51 @@ def _pool(nodes_map: dict, colo: str | None, category: str | None) -> list[str]:
     return out
 
 
+# 自动补块时用的机房名。只收稳定、能确认的落点；表里没有的 colo 直接
+# 用代码本身当名字 —— 编一个城市名比显示 `BOM` 更糟。
+COLO_LOC = {
+    "NRT": "东京", "PHX": "凤凰城", "LAX": "洛杉矶", "SJC": "圣何塞",
+    "SIN": "新加坡", "TPE": "台北", "HKG": "香港", "ORD": "芝加哥",
+    "ICN": "首尔", "SLC": "盐湖城", "PIT": "匹兹堡", "BOM": "孟买",
+    "AMS": "阿姆斯特丹", "FRA": "法兰克福", "LHR": "伦敦", "CDG": "巴黎",
+    "SYD": "悉尼", "SEA": "西雅图", "DFW": "达拉斯", "MIA": "迈阿密",
+    "YYZ": "多伦多", "GRU": "圣保罗", "JNB": "约翰内斯堡", "DXB": "迪拜",
+}
+
+
+def discovered_blocks(cfg: dict, nodes_map: dict) -> list[dict]:
+    """实测表里出现、但块表没收录的 colo，按实测结果补成块。
+
+    WHY 必须自动补：块表是**静态配置**（11 条），而机场随时会开出新落点。
+    实测 2026-11-04 `upoz...:28065-any` 落到 `BOM`（孟买），块表里没有它 ——
+    这个节点连同它那块的所有节点**永远拿不到渠道**，而且没有任何日志说明
+    为什么。用户的要求是「测出新 colo 就新加渠道块，不然放进原有块」。
+
+    `loc` 取 `config.COLO_LOC`；不认识的 colo 用 colo 名本身，不编造城市。
+    补出来的块**不带 `ban_rate`/`pin`**：那两样要么需要历史（ban_rate），
+    要么是人工判断（pin），都不该由一段推导自动生成。
+    """
+    known = {b.get("colo") for b in _table(cfg)}
+    extra: dict[str, dict] = {}
+    for tag, e in (nodes_map or {}).items():
+        if not isinstance(e, dict) or not e.get("colo"):
+            continue
+        colo = str(e["colo"])
+        if colo in known or colo in extra:
+            continue
+        extra[colo] = {"colo": colo, "loc": COLO_LOC.get(colo, colo),
+                       "carrier": "both", "auto": True}
+    return [extra[c] for c in sorted(extra)]
+
+
 # ---------------------------------------------------------------- 渠道
 
 def channel_tag(ch: dict) -> str:
     cat = {"regular": "REG", "irregular": "IRR", "proxy": "V4"}[ch["category"]]
-    return f"WARP-BLK-{ch['colo']}-{cat}-{ch['index']}"
+    # H2 与 WG 是同一块里的两条不同承载路径，tag 必须能分开：同名渠道会
+    # 让夜间白名单、台账、日志三处把两条线当成一条。
+    mid = "H2" if ch.get("carrier") == "h2" else "BLK"
+    return f"WARP-{mid}-{ch['colo']}-{cat}-{ch['index']}"
 
 
 def excluded_colos(cfg: dict) -> set[str]:
@@ -154,8 +194,11 @@ def channels(cfg: dict, nodes_map: dict | None = None,
     per = channels_per_block(cfg)
     skip = excluded_colos(cfg)
     nodes_map = load_map() if nodes_map is None else nodes_map
+    # 实测出来的新落点自动成块（用户规则：测出新 colo 就新加块）。补在
+    # **后面**，静态块表的顺序/优先级不变 —— 新块不能把已验证的块挤下去。
+    table = _table(cfg) + discovered_blocks(cfg, nodes_map)
     out: list[dict] = []
-    for blk in _table(cfg):
+    for blk in table:
         colo = blk.get("colo")
         if colo in skip:
             continue
@@ -184,7 +227,33 @@ def channels(cfg: dict, nodes_map: dict | None = None,
             for i in range(min(per, len(ordered))):
                 out.append({"type": "v6", "colo": colo, "category": cat,
                             "index": i, "family": "v6", "node": ordered[i],
+                            # `nodes` 是**整块的全部适配节点**（`_pool` 不截断），
+                            # `per` 只决定生成几条**渠道**（线位），不削减池子。
+                            # 块的定义就是「这个 colo 下所有能承载的节点」。
                             "nodes": ordered, "pinned": bool(pin)})
+    # **H2 渠道单独展开一份**（carrier == h2）。上面 v6 池把它们剔掉了 ——
+    # 那是给 WG 线位用的清单，H2 不占 WG 线位。但 render_h2_lines 要的是
+    # 「哪些 h2 节点、落在哪个块、第几条」，只能从这里拿；不给就会永远走
+    # 「块模型未筛出 h2 渠道，改用台账」的兜底，新插进来的节点永远渲染不出去。
+    # 与 v6 渠道的区别只在 carrier：块/类别/排序规则完全一致。
+    for blk in table:
+        colo = blk.get("colo")
+        if colo in skip:
+            continue
+        pin = [t for t in (blk.get("pin") or []) if t in nodes_map]
+        for cat in CATEGORIES:
+            pool = ([t for t in pin
+                     if (nodes_map.get(t) or {}).get("category") == cat]
+                    if pin else _pool(nodes_map, colo, cat))
+            pool = [t for t in pool
+                    if (nodes_map.get(t) or {}).get("carrier") == "h2"]
+            ordered = sorted(order_nodes(pool, delays),
+                             key=lambda t: _alive_rank(t, nodes_map, "v6"))
+            for i in range(min(per, len(ordered))):
+                out.append({"type": "h2", "colo": colo, "category": cat,
+                            "index": i, "family": "v4", "node": ordered[i],
+                            "nodes": ordered, "pinned": bool(pin),
+                            "carrier": "h2"})
     # v4 单个合并块，且**排在清单最前面**。
     # WHY 排最前：它原先排在末尾，线路数不足时整块被截断 —— 实测 29 条线时
     # v4 渠道一条都分不到，v4 承载等于死代码。排在前面才能保证只要有 v4 渠道
@@ -337,8 +406,11 @@ def merge_diag(path: Path, rows: list[dict]) -> dict[str, int]:
 
     返回 `{"v6": n, "v4": m}`：各更新了几个节点。
 
-    这是**合并**不是重建：diag 只回答「这台机器能不能承载 WARP」，回答不了
-    colo / 类别（那是出口 trace 的产物）。整表重建会把没跑 diag 的节点一起丢掉。
+    这是**合并**不是重建：已入块的节点只补 wg_ok/wg_n，不覆盖它的 colo ——
+    那份 colo 是按出口 IP 聚合多轮 trace 得出的，一条 diag 推翻不了它。
+    新节点（块表里没有的）则**建档**：diag 的成功轮次本身就带 trace 的
+    colo/ip，够格落一条 {colo, category}。没有这条，新插入的订阅节点永远
+    分不到渠道 —— 块表只认 build_map 的输入文件，而新源不在那些文件里。
 
     v6 与 v4 分开存：实测 `cn.bing.com:443` 的 v6 两轮全通，v4 两轮全
     handshake —— 合并成一份会把「能跑 v6」当成「能跑 v4」。
@@ -346,6 +418,8 @@ def merge_diag(path: Path, rows: list[dict]) -> dict[str, int]:
     data = json.loads(path.read_text())
     nodes = data.setdefault("nodes", {})
     seen: dict[str, dict[str, list[int]]] = {"v6": {}, "v4": {}}
+    colo_votes: dict[str, Counter] = {}
+    ok_ips: dict[str, str] = {}
     for x in rows:
         rounds = [r for r in (x.get("rounds") or [])
                   if r.get("stage") in ("ok", "handshake")]
@@ -355,12 +429,31 @@ def merge_diag(path: Path, rows: list[dict]) -> dict[str, int]:
         hit = seen[fam].setdefault(x["tag"], [0, 0])
         hit[0] += sum(1 for r in rounds if r.get("ok"))
         hit[1] += len(rounds)
+        for r in rounds:
+            if r.get("ok") and r.get("colo"):
+                colo_votes.setdefault(x["tag"], Counter())[r["colo"]] += 1
+                ok_ips.setdefault(x["tag"], r.get("ip") or "")
     for fam, tbl in seen.items():
         pre = "wg_" if fam == "v6" else "v4_"
         for tag, (ok, n) in tbl.items():
+            # 0 次成功的节点不新建条目：空条目会让它出现在 channels() 的候选里
+            # 又被 category 过滤掉，同时把「从没测过」和「测了不能用」混成一种。
+            if ok <= 0 and tag not in nodes:
+                continue
             e = nodes.setdefault(tag, {})
             e[pre + "ok"] = ok
             e[pre + "n"] = n
+            # 新节点建档。已有节点一律不动 colo/category：那两份证据来自
+            # build_map 的多轮聚合，diag 的 1~2 轮不该覆盖它。
+            if e.get("colo") or not ok or not colo_votes.get(tag):
+                continue
+            colo = colo_votes[tag].most_common(1)[0][0]
+            cat = category_for(ok, n)
+            if cat is None:
+                continue
+            e.update({"colo": colo, "category": cat, "ok": ok, "n": n,
+                      "egress_ip": ok_ips.get(tag) or None,
+                      "colo_mix": dict(colo_votes[tag]), "drift": []})
     from asip.atomic_io import write_json
     data["updated"] = int(time.time())
     write_json(str(path), data, mode=0o600, indent=2)

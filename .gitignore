@@ -11,6 +11,10 @@ __pycache__
 .egress_log.jsonl
 # 订阅刷新生成，含 Clash API secret + 节点凭据
 singbox-config.json
+# 与上面同源的旁路文件：节点→订阅源归属，含订阅地址/标签
+singbox-config.json.sources.json
+# 订阅原文快照（base64 里就是 token），一次性链接取回后缓存
+.sub_cache/
 # 刷新写到 .tmp 再 os.replace；超时/SIGKILL 会残留（同样含凭据）
 singbox-config.json.tmp
 *.json.tmp
@@ -25,6 +29,11 @@ singbox-config.json.tmp
 .warp_proxy_fallback.json
 # 部署密钥（订阅 token、路径覆盖）；模板见 .env.example
 .env
+
+# usque 设备凭据。`.warp/` 已整体忽略，这一条防的是**写在仓库根**的那份：
+# 2026-11-03 远端根目录实测躺着一份 config.json，含 private_key，且未被忽略。
+# 设备配置必须放 `.warp/usque<N>/`，根目录那份是注册时 cwd 不对的产物。
+/config.json
 
 # 探测会话表（按隧道端口复用，2h TTL）
 .probe_sessions.json
@@ -53,3 +62,6 @@ backups/
 
 # Vercel/Netlify 中继运行态台账（IP 与探测时间戳，随部署变化，不入库）
 .vercel_relay.json
+
+# 追加订阅源台账（`asip sub add` 写，含 token）
+.extra_subscriptions

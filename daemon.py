@@ -35,6 +35,8 @@ from datetime import datetime, timezone, timedelta
 import re as _re
 import logging
 import atexit
+import grp
+import pwd
 import shutil
 import tempfile
 import functools
@@ -59,6 +61,10 @@ from asip.redact import redact_secrets as _redact_secrets
 import warp_blocks
 import warp_night
 import warp_wg
+
+# 项目根目录。`__file__` 在 daemon 里只有一个来源，其余函数不得自己再算一遍
+# —— 各算各的在 AST 用例里会 NameError，在远端也容易漂移。
+_PROJECT = os.path.dirname(os.path.abspath(__file__))
 
 # Clash API 的唯一 HTTP 通道。daemon 侧保留 `singbox_api` 这个名字是因为
 # 测试与兄弟工具都以它为边界；内部实现统一到 asip，避免每个调用点各写一遍
@@ -1035,6 +1041,10 @@ def _release_refresh_slot(tag: str) -> None:
 # 脏线守护的探测中集合。探测不占用 _WARP_REFRESHING —— 那条集合会被换线路径
 # 当作「不可选」，探测中的干净线若也算进去，换线会看到「备线 0 条」直接落池。
 _WARP_PROBING: set[str] = set()
+# 最近一次 `warp_egress_ip` 拿到的完整 trace（port/ip/colo/loc）。
+# 只用来把落点顺手记进 `wg_colo_map.json`；带上 port 是为了让调用方确认
+# 「这条结果确实是我这次探测的」，并发探测时不会记到别人的 colo。
+_LAST_EGRESS_TRACE: dict = {}
 # 本轮因「仍在传数据」让出的线 → 冷却截止时刻。没有它守护每 5s 就会重派一次
 # 探测线程（每次 2 次出口探测 ≈ 2~14s），把活线当靶子反复打；冷却让节奏回到
 # 一条线最多每 refresh_delay_sec 被探一次。
@@ -2763,13 +2773,26 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
     起来，多等 18s 不会变好，只把换线线程钉在原处。所以刷新路径传短超时
     （见 `_refresh_idle_warp`），把单次尝试的最坏耗时从 32s 压到 19s。
     """
-    return probe_egress(
+    res = probe_egress(
         socks_port=port,
         socks_host=_warp()["socks_host"],
         urls=(TRACE_URL,),
         timeout=timeout_sec,
         require_warp=True,
-    ).ip
+    )
+    # Cloudflare trace 里本来就带 `colo=` / `loc=`，此前被直接丢掉。留住它，
+    # 节点→colo 的台账就能跟着生产探测自我更新，不必单独跑
+    # `warp_wg.survey()`（逐节点起 sing-box，一次几十秒）。
+    # 存进模块变量而不是改返回值：`warp_egress_ip` 有十几处调用方与测试桩，
+    # 改签名等于把它们全部打断，而这个信息只有探测器要用。
+    global _LAST_EGRESS_TRACE
+    # `getattr` 而不是直接取属性：测试里 `probe_egress` 常被换成只带 `ip`
+    # 的替身对象（`namedtuple`/`SimpleNamespace`），硬取会让整条探测路径
+    # 在测试里抛出 AttributeError 而不是走正常逻辑。
+    _LAST_EGRESS_TRACE = {"port": int(port), "ip": res.ip,
+                          "colo": getattr(res, "colo", None),
+                          "loc": getattr(res, "loc", None)}
+    return res.ip
 
 
 def _probe_refresh_egress(port: int) -> str | None:
@@ -2881,7 +2904,12 @@ _LINE_DEFAULTS = {
     "last_probe_ts": 0.0,
     "next_probe_ts": 0.0,
     "fail_streak": 0,
-    "restart_count": 0,
+    # 本进程内曾拿到过出口地址。与 `ip` 不同，它**不被隧道重启清空** ——
+    # 「这条线在这台机器上到底通过没有」是判断「惩罚期重启还有没有意义」
+    # 的依据（见 `_line_node_cannot_carry`）。
+    "ever_ip": False,
+    # `restart_count`（进程终身累计）已删：全库零读取者，唯一的报表用的是
+    # `restart_hist` 的窗口内计数，而它累计到 4 万+ 只是磁盘垃圾。
     "restart_hist": [],
     "restart_ts": 0.0,
     "next_restart_ts": 0.0,
@@ -2890,13 +2918,23 @@ _LINE_DEFAULTS = {
     "warming": False,
     "port_ok": False,
     "sel": 0.0,
-    # 渠道 ban 窗口：每次模型层实测按 verdict 计数，看 [(ts, blocked)] 拼出的
-    # 最近 30min 是否 100%。口径是「渠道」不是 colo —— 一条线固定落一个 colo，
-    # 整段烧穿时锁线比锁 colo 精确（colo 之间还会漂移）。
+    # 当天模型层实测样本：[(ts, verdict)]，只留当天、最多 channel_ban_max_samples 条。
+    # 锁定判据是「当天最近 1000 条是否**全部** quota」—— 一条 OK 就否决。
+    # 旧口径是 1h 窗口 100% 封禁 + 铺满半窗，只数最旧一条、不看空洞，而且
+    # 锁定期间攒下的样本会在次日到期时互相续期（实测 WG-21 锁了 17h，期间
+    # 出过 7 次 OK）。
     # 默认 None 不能用 []：_LINE_DEFAULTS 是共享对象，setdefault 会让所有渠道
     # 拿到同一个 list，于是一条线的样本会记进另一条线的窗口（自检抓到的）。
-    "ban_window": None,
+    "ban_probes": None,
+    # 连续探测不到出口地址的起点（0 = 当前能拿到地址）。连续
+    # channel_noaddr_hold_sec(5h) 拿不到地址就锁渠道：隧道/节点已经死了，
+    # 重启换地址也买不到任何东西。
+    "ban_noaddr_since": 0.0,
     "ban_hold_until": 0.0,
+    # 锁定期间不探测（主人 2026-11-04 定）。锁到期由 `_rehome_held_lines` 清掉，
+    # 顺带清掉 `ban_probes` —— 不清的话第二天第一条实测进来时窗口里还躺着
+    # 昨天的 quota，锁会立刻续到后天。
+    "stop_probe": False,
     # 锁定前这条线的落地节点，次日 08:00 换回来；None = 没被重定位过。
     "ban_hold_home": None,
     # 重定位的目标节点。只用来对账：`warp_wg.apply`/订阅换绑定会整表重写
@@ -2905,6 +2943,11 @@ _LINE_DEFAULTS = {
     "ban_hold_node": None,
     # 重定位后那次重启是否已成功；0 表示配置写了但进程还没换过来。
     "ban_hold_ready": 0.0,
+    # 补位渠道：被封的这条线由**另一条**渠道顶替（空闲设备线写到 ban 率最低
+    # 的 colo 上），次日 08:00 解封时撤除。记在**被封那条线**上，进程重启后
+    # 才撤得干净 —— 只放内存里的话重启一次就永远撤不掉。
+    "ban_backfill_tag": None,
+    "ban_backfill_node": None,
 }
 
 # 渠道锁到期还原的节流时刻（主循环每分钟对账一次）。
@@ -2995,15 +3038,22 @@ def _load_warp_line_state() -> None:
             # / `_warp_line_restart` 全是裸 `float(...)`，盘上写个 ISO 字符串
             # （人改文件最自然的写法）就会让每分钟的 channel-rehome 整趟抛
             # ValueError，锁的线永远还原不了。
-            for _k in ("ban_hold_until", "ban_hold_ready", "restart_ts",
-                       "last_ok_ts", "next_restart_ts", "next_probe_ts",
-                       "quota_until", "ip_ts"):
+            for _k in ("ban_hold_until", "ban_hold_ready", "ban_noaddr_since",
+                       "restart_ts", "last_ok_ts", "next_restart_ts",
+                       "next_probe_ts", "quota_until", "ip_ts"):
                 if not isinstance(st.get(_k), (int, float)) or isinstance(st.get(_k), bool):
                     st[_k] = 0.0
             if st.get("ban_hold_home") is not None and not isinstance(st.get("ban_hold_home"), str):
                 st["ban_hold_home"] = None
             if st.get("ban_hold_node") is not None and not isinstance(st.get("ban_hold_node"), str):
                 st["ban_hold_node"] = None
+            for _k in ("ban_backfill_tag", "ban_backfill_node"):
+                if st.get(_k) is not None and not isinstance(st.get(_k), str):
+                    st[_k] = None
+            # 盘上写 "false"/1 之类非布尔值时，`st.get("stop_probe")` 会恒真，
+            # 这条线从此永不探测也永不复活 —— 必须夹成布尔。
+            if not isinstance(st.get("stop_probe"), bool):
+                st["stop_probe"] = False
             if (st.get("last_ok_ip") != st.get("ip")
                     or now - float(st.get("last_ok_ts") or 0) > fresh):
                 st["last_ok_ts"] = 0.0
@@ -3015,12 +3065,11 @@ def _load_warp_line_state() -> None:
                 st.pop("ip", None)
                 st.pop("ip_ts", None)
             st["warming"] = False
-            # 渠道锁是跨重启的结论（锁到次日 8 点），必须保留；但窗口外的
-            # 样本在启动时裁掉，否则隔一夜再启动会把旧样本算进新的 30min。
-            if isinstance(st.get("ban_window"), list):
-                _channel_ban_level(st["ban_window"], now)
-            else:
-                st["ban_window"] = []
+            # 渠道锁是跨重启的结论（锁到次日 8 点），必须保留；但非当天的
+            # 样本在启动时裁掉，否则隔夜重启会把昨天的样本算进「当天」。
+            if not isinstance(st.get("ban_probes"), list):
+                st["ban_probes"] = []
+            _channel_ban_trim(st["ban_probes"], now)
         if not _warp().get("line_quota_quarantine_enabled", False):
             for _tag, _st in _WARP_LINE_STATE.items():
                 if isinstance(_st, dict) and float(_st.get("quota_until") or 0.0):
@@ -3050,71 +3099,179 @@ def _channel_ban_hold_secs(now: float) -> float:
     return reset - now
 
 
-def _channel_ban_level(win: list, now: float) -> tuple[int, int]:
-    """窗口内 (实测条数, 其中封禁条数)。只留 window 内的样本，纯函数。
+def _channel_ban_trim(samples: list, now: float) -> list:
+    """只留当天样本；同结论相邻样本合并成段（保留最新）。纯函数。
+
+    落盘形状是**游程**：`[(ts_start, ts_end, count, verdict), ...]`。
+    原始点 `[(ts, verdict)]` 也认（向后兼容磁盘上的旧文件、调用方手工构造）。
+
+    WHY RLE：`ban_probes` 是状态文件里唯一会无界增长的字段 —— 实测 2026-11-04
+    19k 条样本占了 526 KB / 565 KB，而探测是每秒级写入，状态表按 5s 节流落盘
+    ⇒ **9.4 GB/天**。判据本身只问「是否全部 quota」，不关心条数，但排查要看
+    时序，所以不能按条数截断。RLE 同结论连续段压掉 39 倍（526 KB → 14 KB），
+    样本一条不丢。
+
+    **不按时间间隙拆段**：合并键只有 verdict。实测 gap<=60s 时拆段会让压缩比
+    从 39x 掉到 3.6x —— 探测间隔本来就在几十秒级跳动，时间连续性不含信息。
 
     畸形元素必须在这里丢掉：`_load_warp_line_state` 用它裁剪盘上的
-    `ban_window`，而那里的 try 只包住 open/json.load —— 一条 `[null]` 就能让
-    `for t, b in win` 抛 TypeError，进程退出、systemd 10s 后拉起、同一个文件
-    再崩一次，死循环。执行顺序：先判元素形状，再解包。
+    `ban_probes`，而那里的 try 只包住 open/json.load —— 一条 `[null]` 就能让
+    `for t, v in samples` 抛 TypeError，进程退出、systemd 10s 后拉起、同一个
+    文件再崩一次，死循环。执行顺序：先判元素形状，再解包。
     """
-    span = float(_warp().get("channel_ban_window_sec", 1800))
-    keep = [(e[0], e[1]) for e in win
-            if isinstance(e, (list, tuple)) and len(e) >= 2
-            and isinstance(e[0], (int, float)) and now - e[0] <= span]
-    win[:] = keep
-    return len(keep), sum(1 for _, b in keep if b)
+    day = time.localtime(now)[:3]
+    runs: list[list] = []
+    for e in samples:
+        if not isinstance(e, (list, tuple)) or len(e) < 2:
+            continue
+        if not isinstance(e[0], (int, float)) or isinstance(e[0], bool):
+            continue
+        # 段：`[起, 止, 条数, 结论]`；旧格式是 `(ts, 结论)`。两种都认，
+        # 但结论的位置不同 —— 段格式取 e[3]，旧格式取 e[1]。搞混会把段尾
+        # 时间戳当成结论，判据变成「全部 quota」恒假、渠道永远锁不上。
+        if len(e) >= 4 and isinstance(e[2], int) and not isinstance(e[2], bool):
+            start, end, count = float(e[0]), float(e[1]), int(e[2])
+            verdict = str(e[3])
+        else:
+            start = end = float(e[0])
+            count = 1
+            verdict = str(e[1])
+        if time.localtime(start)[:3] != day or time.localtime(end)[:3] != day:
+            continue
+        if runs and runs[-1][3] == verdict:
+            runs[-1][1] = end
+            runs[-1][2] += count
+        else:
+            runs.append([start, end, count, verdict])
+    samples[:] = runs
+    return samples
 
 
-def _channel_ban_hold_hit(win: list, now: float) -> bool:
-    """最近 window 内是否 100% 封禁、样本**严格大于** min_samples，且铺满窗口。
+def _channel_ban_expand(samples: list) -> list:
+    """把段展开成 `[(ts, verdict)]`，供只关心条数的调用方（报表 / 单测）。"""
+    out: list[tuple[float, str]] = []
+    for e in samples or []:
+        if not isinstance(e, (list, tuple)) or len(e) < 2:
+            continue
+        if len(e) >= 4 and isinstance(e[2], int):
+            out.extend([(float(e[1]), str(e[3]))] * max(0, int(e[2])))
+        else:
+            out.append((float(e[0]), str(e[1])))
+    return out
 
-    阈值口径按主人 2026-11-02 定：1h 窗口、>30 条实测。低样本线（WG-4/11/12
-    实测只有 3~6 条）的 100% 只是「还没被打够」，不是烧穿。
 
-    第三条「铺满窗口」是必须的：只数条数等于「连撞 31 次就锁」。实测 19:43
-    那批 17 条线的 31 条样本只铺了 **4.7 分钟**（19:39:10→19:43:52），而要求
-    是「持续一小时都在被打」。判据取最早样本早于 `now - window/2`。
+def _channel_ban_hold_hit(samples: list, now: float) -> bool:
+    """当天最近 N 条模型层实测是否**全部**判 quota。
+
+    口径（2026-11-04 主人定）：样本里出现任何非 quota 结论（OK / flagged）
+    就否决 ——「能出 OK 的渠道不许锁」。条数不足 `channel_ban_min_samples`
+    说明今天还没被打够，也不算烧穿。
+
+    旧口径是「1h 窗口 100% 封禁 + 铺满半窗」，只看最旧一条、不看空洞，
+    锁定期间攒的样本还会在次到期时互相续期（实测 WG-21 锁了 17h，期间出过
+    7 次 OK）；而且锁定后不再探测，窗口永远凑不出新证据解锁。
+
+    样本只收地址级结论（OK / quota / flagged）。探测自身失败（err /
+    unreachable）不入账：它说的是探测器或链路不通，不是「渠道烧穿」——那类
+    故障由重启路径和「连续 5h 无出口地址」那条判据处理，混进来只会让
+    真烧穿的渠道因为探测抖动而永远锁不上。
     """
-    n, b = _channel_ban_level(win, now)
-    if n <= int(_warp().get("channel_ban_min_samples", 30)) or b != n:
+    _channel_ban_trim(samples, now)
+    n = sum(int(e[2]) for e in samples if len(e) >= 4)
+    if n < int(_warp().get("channel_ban_min_samples", 1000)):
         return False
-    span = float(_warp().get("channel_ban_window_sec", 1800))
-    if not win:
-        return False
-    return now - min(t for t, _ in win) >= float(
-        _warp().get("channel_ban_min_cover_ratio", 0.5)) * span
+    return all(e[3] == "quota" for e in samples)
 
 
-
-def _channel_ban_note(tag: str, blocked: bool, now: float) -> None:
-    """记一次模型层实测结论；命中条件就给这条线写 ban_hold_until。"""
+def _channel_ban_note(tag: str, verdict: str, now: float) -> None:
+    """记一次模型层实测结论；当天样本全 quota 就给这条线写 ban_hold_until。"""
     if not _warp().get("channel_ban_hold_enabled", True):
         # 总闸关掉后把锁解除：留着等于「关了还在锁」。但**不能清 ban_hold_home**
         # —— 那是有线在临时 colo 上的唯一记录，清了这条线就永远回不去了。
         # 到期分支会看到 until<=now 且 home 还在，下一轮把它还原。
         st = _warp_line_state(tag)
-        if st.get("ban_hold_until") or st.get("ban_window"):
-            _warp_line_update(tag, ban_hold_until=0.0, ban_window=[])
+        if st.get("ban_hold_until") or st.get("ban_probes") or st.get("stop_probe"):
+            # stop_probe 必须一起清：只在关闸时解 ban_hold_until 的话，CF/H2 线
+            # （没有 home、走不到还原分支）会永久停在「不再探测」。
+            _warp_line_update(tag, ban_hold_until=0.0, ban_probes=[],
+                              stop_probe=False, ban_noaddr_since=0.0)
             _save_warp_line_state()
         return
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
-        win = st.get("ban_window")
-        if not isinstance(win, list):
-            win = st["ban_window"] = []
-        win.append((now, bool(blocked)))
-        _channel_ban_level(win, now)  # 顺带裁掉窗口外的样本
+        samples = st.get("ban_probes")
+        if not isinstance(samples, list):
+            samples = st["ban_probes"] = []
+        # 直接追加**段**：`[起, 止, 条数, 结论]`。`_channel_ban_trim` 会把
+        # 同结论的相邻段并起来，所以这里不需要先展开再压回去。
+        samples.append([now, now, 1, str(verdict)])
+        _channel_ban_trim(samples, now)
         # 只看「当前仍在锁定中」：过期的 ban_hold_until 必须能重新锁上，
         # 否则渠道在前一天锁过之后永远不再锁（字段留着非零值，条件恒真）。
-        if _channel_ban_held(tag, now) or not _channel_ban_hold_hit(win, now):
+        if _channel_ban_held(tag, now) or not _channel_ban_hold_hit(samples, now):
             return
         until = now + _channel_ban_hold_secs(now)
         st["ban_hold_until"] = until
+        st["stop_probe"] = True
+        # 探测排期本身不看 next_probe_ts，但 prober 的空闲等待看它：留一个
+        # 过期值会让它在锁定期内每 0.1s 醒一次空转一整天。
+        st["next_probe_ts"] = until
     _save_warp_line_state(force=True)
-    log(f"  · {tag} 最近 {int(_warp().get('channel_ban_window_sec', 3600)) // 60}min "
-        f"实测 100% 封禁（{len(win)} 条），渠道锁定到 "
-        f"{time.strftime('%m-%d %H:%M', time.localtime(until))}，不再重启")
+    total = sum(int(e[2]) for e in samples if len(e) >= 4)
+    log(f"  · {tag} 当天 {total} 次实测全部 quota，渠道锁定到 "
+        f"{time.strftime('%m-%d %H:%M', time.localtime(until))}，不再重启、不再探测")
+    _submit_once("channel-rehome", _rehome_held_lines, now)
+
+
+def _channel_noaddr_note(tag: str, got_ip: bool, now: float) -> None:
+    """连续 channel_noaddr_hold_sec 探测不到出口地址 → 锁渠道。
+
+    与 quota 锁分开计：拿不到地址说的是隧道/节点死了，不是渠道被烧穿。
+    重启换地址对死节点无效，锁是唯一不白烧的动作。期间任何一次拿到地址就
+    清零，所以它只对「一直连不上」的线生效。
+    """
+    if not _warp().get("channel_ban_hold_enabled", True):
+        return
+    if got_ip:
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            if st.get("ban_noaddr_since"):
+                st["ban_noaddr_since"] = 0.0
+        return
+    # 补位渠道不锁：它的意义就是「顶替一条被封的线」，锁住它等于让被顶的那条
+    # 线整夜没人补位。实测 2026-11-04 补位线 WG-23/24/25 被锁到
+    # `ban_hold_until=498288h`（约 57 年）—— 它们本来就在死节点上，5h 计数器
+    # 一到点就把自己锁死，而 `_channel_ban_note` 的 quota 分支早有这道跳过
+    # （这里漏了）。它坏了由 `_backfill_open` 重开。
+    m = _warp_member(tag)
+    if m and m.get("backfill_for"):
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            if st.get("ban_noaddr_since"):
+                st["ban_noaddr_since"] = 0.0
+        return
+    hit_sec = float(_warp().get("channel_noaddr_hold_sec", 5 * 3600))
+    # **H2 先换节点**。这条锁的判据是「重启换的是同一节点的地址，白烧」，而
+    # selector 换节点不重启、不断流、零成本 —— 对 H2 不成立。实测 2026-11-05
+    # NRT-13/14、TPE-5/6/18、SLC-11/12 被锁到次日 08:00，其中 NRT 两条当时
+    # 就有 4 个 TCP 可达的候选。整池试遍（`_h2_next_node` 返回 None）才锁。
+    if m and m.get("kind") == "h2" and _h2_repair(m):
+        return
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        since = float(st.get("ban_noaddr_since") or 0.0)
+        if not since:
+            st["ban_noaddr_since"] = since = now
+        if (now - since < hit_sec or _channel_ban_held(tag, now)):
+            return
+        until = now + _channel_ban_hold_secs(now)
+        st["ban_hold_until"] = until
+        st["stop_probe"] = True
+        st["next_probe_ts"] = until       # 同上：别让 prober 空转等一个过期时刻
+    _save_warp_line_state(force=True)
+    log(f"  · {tag} 连续 {(now - since) / 3600:.1f}h 探测不到出口地址"
+        f"（> {hit_sec / 3600:.1f}h），渠道锁定到 "
+        f"{time.strftime('%m-%d %H:%M', time.localtime(until))}，不再重启、不再探测")
     _submit_once("channel-rehome", _rehome_held_lines, now)
 
 
@@ -3126,7 +3283,8 @@ def _channel_ban_held(tag: str, now: float) -> bool:
 # 被锁的渠道按「最近 1h ban 率最低的 colo」换落地节点，次日 08:00 换回原节点。
 # 原节点记在 ban_hold_home 里，只记一次；还原不看是否还在锁定期 —— 锁到点时
 # 本来就已经过了 08:00，两个动作是同一次维护。
-def _channel_rehome_target(now: float, exclude: set[str] | None = None
+def _channel_rehome_target(now: float, exclude: set[str] | None = None,
+                           ignore_enabled: bool = False
                            ) -> tuple[str, str] | None:
     """取最近 1h ban 率最低、且样本足够的 colo → (colo, 节点 tag)。
 
@@ -3143,32 +3301,52 @@ def _channel_rehome_target(now: float, exclude: set[str] | None = None
         exclude |= {n for n in warp_wg.line_nodes().values() if n}
     except Exception:
         pass
-    if not _warp().get("channel_rehome_enabled", True):
+    # 补位渠道占着的节点同样要排除。只信 `line_nodes()` 不够：补位用的是
+    # 台账里没有的空闲设备线，`_rehome_one` 只在 tag 已存在时才写 node，
+    # 这个节点只记在 `ban_backfill_node` 上。
+    exclude |= {st["ban_backfill_node"] for st in list(_WARP_LINE_STATE.values())
+                if isinstance(st, dict) and st.get("ban_backfill_node")}
+    # `ignore_enabled` 给补位用：补位是硬要求（主人 2026-11-04），重定位
+    # 总闸关掉时它仍必须开。
+    if not ignore_enabled and not _warp().get("channel_rehome_enabled", True):
         return None
+    try:
+        pool = {n["tag"] for n in warp_wg.udp_capable(warp_wg.load_nodes())}
+        colo_map = warp_wg.load_colo_map()
+        blocks_map = warp_blocks.load_map()
+    except Exception:
+        return None
+    for colo in _lowest_ban_colos(now):
+        nodes = [t for t, v in colo_map.items()
+                 if isinstance(v, dict) and v.get("colo") == colo
+                 and v.get("ok") is not False and t in pool and t not in exclude]
+        if not nodes:
+            continue
+        # ban 率最低的 colo 里也可能只剩跑不了 WARP 的节点。实测 WG-1 被锁到
+        # `cn.bing.com:443~13-any`（wg=0/4）后每分钟重启一次、连跑 70 次都拿不到
+        # 出口 —— 隧道死了，`ban_hold_ready` 永远写不进去，重定位循环永不收敛。
+        # 排序而不是过滤：整块都没测过时仍要能选中（新节点还没跑过 diag）。
+        nodes.sort(key=lambda t: _warp_alive_rank(t, blocks_map))
+        if _warp_alive_rank(nodes[0], blocks_map) == 2:
+            log(f"  ⚠ 重定位目标 {colo} 的候选都实测承载不了 WARP"
+                f"（{len(nodes)} 个），仍选 {nodes[0]}")
+        return colo, nodes[0]
+    return None
+
+
+def _lowest_ban_colos(now: float) -> list[str]:
+    """最近 `channel_ban_window_sec` 内 ban 率从低到高的 colo（样本不足的不算）。"""
     try:
         import ipv6_segments
         rates = ipv6_segments.colo_ban_rates(
             float(_warp().get("channel_ban_window_sec", 3600)), now)
     except Exception as e:
-        log(f"  ✗ 渠道重定位：读 colo ban 率失败: {e}")
-        return None
+        log(f"  ✗ 读 colo ban 率失败: {e}")
+        return []
     floor = int(_warp().get("channel_rehome_min_samples", 10))
     cand = [(b / n, c) for c, (n, b) in rates.items() if n >= floor and c != "UNKNOWN"]
-    if not cand:
-        return None
     cand.sort()
-    try:
-        pool = {n["tag"] for n in warp_wg.udp_capable(warp_wg.load_nodes())}
-        colo_map = warp_wg.load_colo_map()
-    except Exception:
-        return None
-    for _rate, colo in cand:
-        nodes = [t for t, v in colo_map.items()
-                 if isinstance(v, dict) and v.get("colo") == colo
-                 and v.get("ok") is not False and t in pool and t not in exclude]
-        if nodes:
-            return colo, nodes[0]
-    return None
+    return [c for _rate, c in cand]
 
 
 def _rehome_held_lines(now: float | None = None) -> None:
@@ -3185,9 +3363,23 @@ def _rehome_held_lines(now: float | None = None) -> None:
     每分钟比一次，不一致就补写并重启。
     """
     if not _warp().get("channel_ban_hold_enabled", True):
-        # 关闸时唯一还要做的事：把停放在临时 colo 上的线还原回原节点。
-        # 锁本身已被 `_channel_ban_note` 清掉，但 home 必须走一次还原。
+        # 关闸时先把所有锁清掉，再把停放在临时 colo 上的线还原回原节点。
+        # **不能只靠 `_channel_ban_note` 的关闸分支**：那条分支要探测才会执行，
+        # 而 `stop_probe` 恰好挡住探测 —— CF/H2 没有 home、在下面被 continue
+        # 掉，于是永久卡在「不探测、不解锁」。关闸是回滚动作，必须立刻生效。
         now = time.time() if now is None else now
+        for tag, st in list(_WARP_LINE_STATE.items()):
+            if not isinstance(st, dict):
+                continue
+            _backfill_close(tag)      # 关闸是回滚：补位渠道一并撤掉
+            if st.get("ban_backfill_tag"):
+                # 台账行已丢、`_backfill_close` 直接返回 False 的那种。
+                _backfill_stop(st["ban_backfill_tag"])
+                _warp_line_update(tag, ban_backfill_tag=None,
+                                  ban_backfill_node=None)
+            if float(st.get("ban_hold_until") or 0.0) or st.get("stop_probe"):
+                _warp_line_update(tag, ban_hold_until=0.0, ban_probes=[],
+                                  stop_probe=False, ban_noaddr_since=0.0)
         for tag, st in list(_WARP_LINE_STATE.items()):
             if not isinstance(st, dict) or not st.get("ban_hold_home"):
                 continue
@@ -3199,11 +3391,73 @@ def _rehome_held_lines(now: float | None = None) -> None:
                     if member:
                         _warp_line_restart(member, "渠道锁关闭还原", rebound=True)
                 _warp_line_update(tag, ban_hold_home=None, ban_hold_node=None,
-                                  ban_hold_ready=0.0)
+                                  ban_hold_ready=0.0, ban_probes=[],
+                                  stop_probe=False, ban_noaddr_since=0.0)
                 log(f"  ⇢ {tag} 渠道锁已关闭，落地节点还原为 {home}")
         return
     now = time.time() if now is None else now
     used: set[str] = set()
+    # 到期即解锁，与有没有 home 无关：CF/H2 线没有落地节点可还原，旧实现直接
+    # `continue`，锁到期后 `stop_probe` 与当天 quota 样本原样留着 —— 实测
+    # WG-21 到期 19s 就被旧样本重新锁到次日。
+    # `ban_hold_until > 0` 是必须的：从没锁过的线这个字段是 0，不带它每分钟
+    # 都会清掉正在攒的样本，1000 条永远攒不满。释放后把时间戳归零，否则下一
+    # 分钟还会再清一次（新攒的样本同样被抹掉）。
+    for tag, st in list(_WARP_LINE_STATE.items()):
+        if not isinstance(st, dict):
+            continue
+        until = float(st.get("ban_hold_until") or 0.0)
+        # **H2 的「取不到出口」锁可以在锁定期内直接解**。这条锁的前提是
+        # 「重启换的是同一个节点的地址，白烧」，而 selector 换节点不重启、
+        # 不断流、零成本 —— 前提不成立。实测 2026-11-05 NRT-13/14、TPE-5/6/18、
+        # SLC-11/12 被锁到次日 08:00，其中 NRT 两条当时就有 4 个 TCP 可达的
+        # 候选，整晚一次探测都没有。换成了就解锁放回探测；换不成（整池死）
+        # 保持锁定，`_h2_repair` 自带 60s 节流。
+        # 只认 `ban_noaddr_since`：quota 锁说的是「这个地址被烧」，节点本身
+        # 是好的，换掉等于白丢一条能用的链路。
+        if until > now and float(st.get("ban_noaddr_since") or 0.0):
+            _m = _warp_member(tag)
+            if _m and _m.get("kind") == "h2" and _h2_repair(_m):
+                _warp_line_update(tag, ban_hold_until=0.0, ban_hold_ready=0.0,
+                                  stop_probe=False, ban_noaddr_since=0.0)
+                log(f"  ⇢ {tag} 换到可用节点，解除「取不到出口」锁")
+                continue
+        # 释放条件（三者都必须先满足 until <= now，否则会把还在锁里的线放出来）：
+        #   ① 0 < until <= now —— 正常到期，也覆盖旧版本留下、没有 stop_probe
+        #      字段的存量锁（不认它的话，旧锁到期后样本不清，下一条实测就重锁）；
+        #   ② until == 0 且 stop_probe —— 人工清零 / 关闸半途崩过，否则永不复活；
+        # 从没锁过的线（until=0、stop_probe=False）必须跳过，否则每分钟清一次
+        # 正在攒的样本，1000 条永远攒不满。
+        if until <= now and (until > 0.0 or st.get("stop_probe")
+                             or st.get("ban_backfill_tag")):
+            # 解封第一步先撤补位渠道：它就是为了顶这一天的封禁而开的。
+            _backfill_close(tag)
+            # **H2 的「取不到出口」锁：先换节点再解锁**。解锁只是让它重新被
+            # 探测；不换节点的话「解锁 → 探测 → 3 次无地址 → 换节点 → 整池试遍
+            # → 5h 又被锁」一圈回到原点，这条线一整天没出过口（实测 NRT-13 /
+            # SLC-11 / TPE-5/6 各 700 分钟无探测）。换节点不重启、无成本。
+            # 只对 `ban_noaddr_since` 锁生效：quota 锁是「地址被烧」，那时节点
+            # 本身是好的，换掉等于白白丢掉一条能用的链路。
+            m = _warp_member(tag)
+            if (m and m.get("kind") == "h2"
+                    and float(st.get("ban_noaddr_since") or 0.0)):
+                _h2_repair(m)
+            _warp_line_update(tag, ban_hold_until=0.0, ban_hold_ready=0.0,
+                              stop_probe=False, ban_probes=[],
+                              ban_noaddr_since=0.0)
+    # 锁定中但还没有补位渠道的：开一条。这是「一个渠道被封，必定要有另外
+    # 一个渠道补位」的执行点 —— 放在这里而不是 `_channel_ban_note`，因为
+    # 开补位要起单元/刷新订阅（秒级），而那条路径在探测线程上。
+    # 先对账再开：台账与锁线对不上时（开/撤半途异常）先修好，否则
+    # ① 有主人没行的锁线永远被跳过、实际上没人补位；② 没主人的行永远撤不掉。
+    _backfill_reconcile(now)
+    used_bf: set[str] = used
+    for tag, st in list(_WARP_LINE_STATE.items()):
+        if not isinstance(st, dict) or st.get("ban_backfill_tag"):
+            continue
+        if float(st.get("ban_hold_until") or 0.0) <= now:
+            continue
+        _backfill_open(tag, now, used_bf)
     for tag, st in list(_WARP_LINE_STATE.items()):
         if not isinstance(st, dict):
             continue
@@ -3211,6 +3465,10 @@ def _rehome_held_lines(now: float | None = None) -> None:
         home = st.get("ban_hold_home")
         want = st.get("ban_hold_node")
         member = _warp_member(tag)
+        if member and member.get("backfill_for"):
+            # 补位渠道的位置是**指定**的（ban 率最低的那个 colo）：让它走
+            # 重定位会把它搬离补位目标，补位就名存实亡。
+            continue
         if until <= now:
             if not home:
                 continue
@@ -3240,12 +3498,12 @@ def _rehome_held_lines(now: float | None = None) -> None:
                 # 记录。清了之后进程仍跑新节点，台账却以为已经回家，永远
                 # 不会再试。留到下一分钟再还原（`_rehome_one` 是幂等的）。
             if ok:
-                # **必须一起清 `ban_window`**：不清的话，解封前那一小时
-                # 攒的 31 条样本还在，08:00 之后再记一条就直接重新锁到
-                # 次日 08:00 —— "锁一天" 退化成 "永久锁定"。
-                # 实测复现：31 条样本 → 还原 → 再记 1 条 → 立刻锁到次日。
+                # **必须一起清 `ban_probes`**：不清的话，解封前那批 quota
+                # 样本还在，08:00 之后再记一条就直接重新锁到次日 08:00 ——
+                # "锁一天" 退化成 "永久锁定"（实测 WG-21 08:00:19 复现）。
                 _warp_line_update(tag, ban_hold_home=None, ban_hold_node=None,
-                                  ban_hold_ready=0.0, ban_window=[])
+                                  ban_hold_ready=0.0, ban_probes=[],
+                                  stop_probe=False, ban_noaddr_since=0.0)
                 if r == "ok":
                     log(f"  ⇢ {tag} 渠道锁到期，落地节点还原为 {home}")
                 else:
@@ -3258,6 +3516,38 @@ def _rehome_held_lines(now: float | None = None) -> None:
             used.add(str(want))
             if _line_node(tag) == want:
                 if not st.get("ban_hold_ready") and member:
+                    # 停在一个**实测承载不了 WARP** 的节点上：重启换不到出口，
+                    # `ban_hold_ready` 永远写不进去，于是每分钟重定位一次 ——
+                    # 实测 WG-1 停在 wg=0/4 的 `cn.bing.com:443~13-any` 上每 40s
+                    # 重启一次、连跑 71 次（近 30 分钟重定位重启 119 次它占 71）。
+                    # 只对 rank 2（实测不能）改投：rank 1 是没测过，那正是待验证
+                    # 状态，不该因为没数据就搬走。
+                    blocks_map = warp_blocks.load_map()
+                    # family 只用来给 `_warp_alive_rank` 选证据列，取成员声明值。
+                    # **不读状态表**：那里的 `family` 只在 `warp_wg.apply()` 时写
+                    # 一次、从不随配置更新，改过拓扑就成旧世代残留 —— 实测本机
+                    # `.env` 是 `WARP_WG_FAMILIES=v6`（全 v6），状态表里
+                    # WG-1/2/3 却还记着上一代 `v4,v6,v6,v6` 的 v4。照它判会让
+                    # 这三条线去查 v4 的 diag 记录（它们跑的是 v6）。
+                    fam = (member or {}).get("family")
+                    if _warp_alive_rank(str(want), blocks_map, fam) == 2:
+                        target = _channel_rehome_target(now, used)
+                        # 目标也必须**实测更好**才改投。全都 rank 2 时改投只是
+                        # 把同一个死循环挪到下一个节点（每分钟换一台、永不重启）；
+                        # 那种情况还不如原地重启，至少不额外烧一次写盘。
+                        if target and _warp_alive_rank(target[1], blocks_map,
+                                                       fam) < 2:
+                            colo, node = target
+                            if _rehome_one(tag, node) == "ok":
+                                used.add(node)
+                                _warp_line_update(tag, ban_hold_node=node,
+                                                  ban_hold_ready=0.0)
+                                log(f"  ⇢ {tag} 锁定节点 {want} 实测承载不了 "
+                                    f"WARP，改投 {colo}（{node}）")
+                                if _warp_line_restart(member, "渠道重定位",
+                                                      rebound=True):
+                                    _warp_line_update(tag, ban_hold_ready=now)
+                                continue
                     if _warp_line_restart(member, "渠道重定位", rebound=True):
                         _warp_line_update(tag, ban_hold_ready=now)
                 continue
@@ -3321,23 +3611,189 @@ def _line_restarted_after_write(tag: str) -> bool:
     return ts > 0 and float(_warp_line_state(tag).get("restart_ts") or 0) >= ts
 
 
+def _record_line_colo(tag: str, colo: str | None, loc: str | None,
+                      ip: str | None) -> None:
+    """把一次成功探测里的落点写进 `wg_colo_map.json`（节点→colo 台账）。
+
+    WHY 在探测器里顺手做，而不是定期跑 `warp_wg.survey()`：
+    `survey()` 要给每个节点单独起一个 sing-box、等它握手（一次几十秒），
+    而生产探测**本来就已经拿到了整条 Cloudflare trace**（`colo=` / `loc=`
+    就在响应里），此前被 `probe_egress` 直接丢掉。实测 2026-11-05：
+    WG-3/WG-4 的落地节点 `downloadcfpro…~9-vl` / `~10-vl` 从没跑过 survey，
+    块表里没有它们 ⇒ `_same_block_standby` 判不出「同块」直接放弃，
+    两条线在死节点上无限重启。
+
+    只写 `ok: true` 的条目：一次失败的探测说明不了落点在哪，写进去反而
+    会把已知的良好记录冲成 `colo=None`（`survey(merge=True)` 同样只在
+    成功时更新，这里保持一致）。
+    """
+    if not (colo and ip):
+        return
+    try:
+        path = warp_wg.colo_map_path()
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {"nodes": {}}
+        nodes = data.setdefault("nodes", {})
+        cur = nodes.get(tag) or {}
+        if cur.get("colo") == colo and cur.get("ok"):
+            return                      # 没变化，不刷盘
+        nodes[tag] = {"colo": colo, "loc": loc, "v4": ip if ":" not in ip else None,
+                      "ok": True}
+        data["updated"] = int(time.time())
+        warp_wg.write_json(str(path), data, mode=0o600, indent=2)
+    except Exception as e:
+        log(f"  · {tag} 记录 colo 失败: {e}")
+
+
+_H2_CLASH: ClashClient | None = None
+_H2_CLASH_MTIME = -1.0
+
+
+def _h2_clash() -> ClashClient:
+    """`asip-h2-singbox` 的 Clash API 客户端（端口取自渲染产物，与主配置不同）。"""
+    global _H2_CLASH, _H2_CLASH_MTIME
+    path = os.path.join(_PROJECT, ".warp", "h2", "singbox.json")
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        mtime = 0.0
+    if _H2_CLASH is None or mtime != _H2_CLASH_MTIME:
+        try:
+            with open(path, encoding="utf-8") as f:
+                ctrl = ((json.load(f).get("experimental") or {})
+                        .get("clash_api") or {}).get("external_controller") or ""
+        except (OSError, ValueError):
+            ctrl = ""
+        _H2_CLASH = ClashClient(f"http://{ctrl or '127.0.0.1:9091'}",
+                                get_singbox_secret)
+        _H2_CLASH_MTIME = mtime
+    return _H2_CLASH
+
+
+def _h2_select(member: dict | None, node: str) -> str:
+    """H2 换节点 = `PUT /proxies/h2-sel-<i>`，**不重启任何进程**。
+
+    节点必须已由 `render_h2_lines.py` 预写成候选出站；不在候选里时 sing-box
+    回 400（池子要重渲染，返回 "gone"），selector 不存在回 404（进程还在跑
+    旧配置，换线静默失效 —— 返回 "gone" 让调用方别再每轮重试）。
+    """
+    i = (member or {}).get("index")
+    if i is None:
+        return "skip"
+    ob = f"h2-{node}"[:120]          # 出站按节点全局唯一（渲染器去重）
+    status, _ = _h2_clash().request_json("PUT", f"proxies/h2-sel-{int(i)}",
+                                         body={"name": ob})
+    if status in (200, 204):
+        return "ok"
+    if status in (400, 404):
+        return "gone"
+    return "err"
+
+
+# 每条 H2 线**本轮已试过**的候选节点；拿到出口地址时清空（见 `_probe_one_line`）。
+# 没有它，整池失效的线（实测 ORD 池只有 1 个、SLC/LAX 池全是 bilibili）会每
+# 60s 在死节点之间空转：PUT 本身无害，但每次都会清掉 `ip` 并触发一整轮探测。
+_H2_TRIED: dict[str, set[str]] = {}
+# 整池试遍仍拿不到出口的 H2 线 → 判死时刻。重启 usque 换的是同一个死节点上的
+# 新会话，重启没有意义（见 `_line_node_cannot_carry`）。拿到出口或换节点成功
+# 即清空；`_H2_POOL_DEAD_RETRY_SEC` 后再重走一遍池子，免得节点恢复后永久停产。
+_H2_POOL_DEAD: dict[str, float] = {}
+_H2_POOL_DEAD_RETRY_SEC = 1800.0
+
+
+def _h2_next_node(member: dict | None) -> str | None:
+    """这条 H2 线候选池里**下一个没试过**的节点；整池试遍返回 None。
+
+    不探活：候选池的顺序已经是渲染器按可达性排过的（`_reachable_order`），
+    而这里每探一个都要起一个临时 sing-box（机场域名只有订阅 DoH 解析得了），
+    全池 23 个就是 23 个进程 —— 正是要修的那种风暴。按池序轮转即可。
+    """
+    if not member:
+        return None
+    i = member.get("index")
+    if i is None:
+        return None
+    names, now_ob = _h2_clash().selector_state(f"h2-sel-{int(i)}")
+    cands = [o[len("h2-"):] for o in (names or []) if o.startswith("h2-")]
+    if not cands:
+        return None
+    tried = _H2_TRIED.setdefault(member["tag"], set())
+    k = cands.index(now_ob[len("h2-"):]) if (now_ob or "").startswith("h2-") \
+        and now_ob[len("h2-"):] in cands else -1
+    for step in range(1, len(cands) + 1):
+        node = cands[(k + step) % len(cands)]
+        if node not in tried:
+            return node
+    return None
+
+
+def _h2_repair(member: dict | None) -> bool:
+    """H2 线取不到出口时先换节点（无重启）；换成了返回 True。"""
+    if not member:
+        return False
+    tag = member["tag"]
+    now = time.time()
+    if now < _NODE_NEXT_CHECK.get(tag, 0.0):
+        return False
+    # 判死是暂时的：整池不通可能只是机场抖动。过了重试窗口把整池重新走一遍
+    # （否则节点恢复后这条线永远停产 —— `_h2_next_node` 只认 `_H2_TRIED`）。
+    dead = _H2_POOL_DEAD.get(tag)
+    if dead and now - dead >= _H2_POOL_DEAD_RETRY_SEC:
+        _H2_POOL_DEAD.pop(tag, None)
+        _H2_TRIED.pop(tag, None)
+    nxt = _h2_next_node(member)
+    _NODE_NEXT_CHECK[tag] = now + float(
+        _warp().get("node_rotation_interval_sec", 60))
+    if not nxt:
+        # 只有**试过候选**才判死：`_h2_next_node` 在 Clash API 读不到池子时
+        # 同样返回 None（共享 sing-box 重启中），那不是节点的结论。
+        if _H2_TRIED.get(tag):
+            # `setdefault`：这里每 60s 被调一次，重写时间戳会让重试窗口永远不到点。
+            _H2_POOL_DEAD.setdefault(tag, now)   # 整池试遍，等重渲染/重试窗口
+        return False
+    if _rehome_one(tag, nxt) != "ok":
+        return False
+    _H2_POOL_DEAD.pop(tag, None)
+    _H2_TRIED.setdefault(tag, set()).add(nxt)
+    # 新落地节点的出口地址必然不同：清掉旧地址，让探测器按新链路重新判。
+    _invalidate_warp_line_ip(tag)
+    log(f"  ⇄ {tag} 连续取不到出口 → 换节点 {nxt}（selector，未重启）")
+    return True
+
+
 def _rehome_one(tag: str, node: str | None) -> str:
     """把一条线写到指定落地节点。
 
-    返回 "ok" / "skip"（不是 WG 线或没配 index，不该重试）/ "gone"（节点不在
-    UDP 池里，原节点可能已下架）/ "err"（写失败，可重试）。
-    只处理 WG 线：usque（WARP-CF*）没有可换的落地节点，出口只随本机 colo 变。
+    返回 "ok" / "skip"（不是可换线的成员或没配 index，不该重试）/ "gone"
+    （节点不在可用池里，原节点可能已下架）/ "err"（写失败，可重试）。
+
+    WG 线：写该线自己的 `lineN/singbox.json`，由调用方重启生效。
+    H2 线：`PUT` 共享进程里这条线的 selector，立即生效、不重启（见 `_h2_select`）。
+    usque（WARP-CF*）没有可换的落地节点，出口只随本机 colo 变。
     """
     if not node:
         return "skip"
     m = _warp_member(tag)
+    if m and m.get("kind") == "h2":
+        return _h2_select(m, node)
     if not m or m.get("kind") != "wg" or not m.get("index"):
         return "skip"
     try:
         nodes = {n["tag"]: n for n in warp_wg.udp_capable(warp_wg.load_nodes())}
         if node not in nodes:
             return "gone"
-        warp_wg.write_line(int(m["index"]), nodes[node], family=m.get("family"))
+        # family 取成员声明值（`WARP_WG_FAMILIES`），**不读状态表**。
+        # 状态表里的 `family` 只在 `warp_wg.apply()` 时写一次，之后既不重建也不
+        # 随配置变 —— 改过拓扑的机器上它是**旧世代残留**。本机实测：
+        # `.env` 是 `WARP_WG_FAMILIES=v6`（22 节点 × 1 渠道，全 v6），而状态表
+        # 里 WG-1/2/3 还记着上一代 `v4,v6,v6,v6` 的 v4。照着状态表重写会把三条
+        # 线全写成 `prefer_ipv4`，v4 出口只由 colo 决定 ⇒ 三条线挤成同一个
+        # `104.28.205.117`（实测；既定事实第 27 条：v4 渠道数不应超过 colo 数）。
+        # `write_line(family=None)` 自身也按 `line_family(i)` 算，与 apply 同源。
+        warp_wg.write_line(int(m["index"]), nodes[node],
+                           family=m.get("family"))
         st = warp_wg._read_state()
         line = (st.get("lines") or {}).get(tag)
         if isinstance(line, dict):
@@ -3356,6 +3812,390 @@ def _rehome_one(tag: str, node: str | None) -> str:
         # `_start_node_rotation` 只启动一次、没有自愈。
         log(f"  ✗ 渠道重定位 {tag} -> {node} 失败（配置不可读）: {e}")
         return "err"
+
+
+# ── 补位渠道 ────────────────────────────────────────────────────
+# 一条渠道被封，必须**另有**一条渠道顶上：拿已注册但没启用的空闲设备线，
+# 在 ban 率最低的 colo 上开一条「复制」渠道，发布进主配置，让 opencode 能
+# 切过去；次日 08:00 解封时停单元、撤成员、把 selector 还原。
+#
+# 成员身份落在 `.warp/backfill.json` 而不是只在内存里：`deploy/members.py`
+# 是独立进程（`refresh_main_outbounds` 起子进程），只改 daemon 的
+# `CFG["warp"]["members"]` 它看不见，出口根本发不出去；而且 daemon 重启
+# 一次补位渠道就凭空消失，08:00 也就无从撤销。
+_BACKFILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              ".warp", "backfill.json")
+
+
+def _backfill_rows() -> list[dict]:
+    try:
+        with open(_BACKFILL_FILE, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def _wg_line_state(i: int) -> str:
+    """一条 WG 设备线的单元状态：`installed` / `missing` / `masked`。
+
+    补位判据（`_backfill_spare_indices`）与自造（`_ensure_backfill_line`）都要
+    问同一个问题，**必须共用这一份**：mask 判定一旦漂移，自造就会把主人手工
+    停用（软链 `/dev/null`）的线重新装回单元，等于自动撤销他的决定。
+    """
+    unit = f"/etc/systemd/system/{warp_wg.unit_name(i)}"
+    try:
+        real = os.path.realpath(unit)
+    except OSError:
+        return "missing"
+    if real == "/dev/null":
+        return "masked"
+    return "installed" if os.path.exists(real) else "missing"
+
+
+def _backfill_spare_indices() -> list[int]:
+    """已注册、还没进 members、且**单元已安装**的空闲设备线序号。
+
+    三项都要查，少一项就会挑中一条起不来的线：
+
+    - `profile.conf` 存在 = 设备注册过
+    - 不在 `members` 里 = 没在服务流量
+    - **单元文件存在且不是 /dev/null** = 真能 `systemctl start`
+
+    最后一项是 2026-11-04 踩的坑：`line30` 的 `profile.conf` 在（注册过），
+    但 `warp-wg-30.service` 从没生成过 —— 补位挑中它，报
+    `Unit warp-wg-30.service not found`，然后 `continue` 到下一轮又挑中
+    同一个 30（27 被 mask 跳过、28/29 已在 members），补位永远开不起来。
+    单元由 `deploy/wg-lines-install.sh` 生成，注册与装单元是**两个**步骤。
+    """
+    tags = {m.get("tag") for m in _warp()["members"]}
+    out = []
+    # ponytail: 上界写死 99 —— 设备线是安装期注册的，几十条量级；
+    # 真超过时把上界改成扫目录取 max。
+    for i in range(1, 100):
+        if not (warp_wg.line_dir(i) / "profile.conf").exists():
+            continue
+        if warp_wg.line_tag(i) in tags:
+            continue
+        # mask（/dev/null）与「根本没装过」都是起不来的，一并排除。
+        if _wg_line_state(i) != "installed":
+            continue
+        out.append(i)
+    return out
+
+
+# 开补位失败后的重试间隔。主循环每分钟调一次；不节流的话「没有空闲线」
+# 这种持续状态会每分钟打一行日志、并把 11.9MB 的 ban 率历史重扫一遍。
+_BACKFILL_TRY_TS: dict[str, float] = {}
+_BACKFILL_RETRY_SEC = 600.0
+
+
+# 自造补位设备线的限速：注册一台 wgcf 设备烧一格 CF 额度（实测约 9 台/窗口），
+# 爆封时一轮里多个渠道同时缺补位，一次性全注册会把窗口吃光。
+_WG_CREATE_GAP = 600.0
+# 线号硬上限，防跑飞：补位线在 08:00 解封时只是**停掉**（profile 与单元保留），
+# 下次被封会复用，所以总量本应停在「并发被封数」量级。但若补位判据哪天回归出
+# bug（比如新线装完单元却不被 `_backfill_spare_indices` 认），这条路径会每 10
+# 分钟造一台直到把 CF 额度与线号空间吃光。宁可停下报错，也不无声膨胀。
+_WG_MAX_LINES = 64
+
+
+def _last_wg_register_ts() -> float:
+    """最近一次注册 WG 设备的时刻 = 最新 `profile.conf` 的 mtime。
+
+    不用进程内变量：daemon 一重启就归零，爆封期一重启就能连烧几格 CF 额度
+    （实测 2026-11-04 19:35 重启后 8 秒内连造两条线）。`profile.conf` 由
+    `register_line` 写、别处不改，它的 mtime 就是「最后注册时刻」，天然跨重启。
+    **装单元不碰它** —— 装单元不烧额度，不该被限速。
+    """
+    newest = 0.0
+    for i in range(1, 100):
+        try:
+            newest = max(newest, (warp_wg.line_dir(i) / "profile.conf").stat().st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def _install_wg_unit(i: int) -> bool:
+    """装一条 WG 设备线的 systemd 单元（含 daemon-reload）。
+
+    两条约束叠在一起，决定了只能这么调：
+
+    - 单元要落进 `/etc/systemd/system`，daemon 以普通用户跑 ⇒ 必须 sudo
+      （本机 `/etc/sudoers.d/90-administrator-nopasswd`；只用 `-n`，没有免密
+      就立刻失败，绝不在服务进程里挂起等密码）
+    - **unit 自己带 `ProtectSystem=strict`，`/etc` 在它的 mount namespace 里是
+      只读的** —— `sudo` 不换 namespace，所以直接 `sudo bash wg-lines-install.sh`
+      会写进只读挂载：`/etc/systemd/system/warp-wg-32.service: Read-only file
+      system`。实测 2026-11-04 补位自造连续失败两次。
+
+    所以走 `systemd-run`：新起一个**独立**的 transient 单元，它在宿主
+    namespace 里跑，不受 daemon 那份沙箱约束。`--wait` 拿它自己的退出码，
+    `--pipe` 把子进程的 stdout/stderr 接回来 —— **少了 `--pipe` 两个流全是
+    空的**（实测 `--wait` 单独用时 `capture_output` 拿到 `[]`），失败时日志里
+    只剩一句「单元安装失败」而没有任何原因。
+
+    传给脚本的用户/家目录必须显式给：以 root 跑脚本时 `id -u`=0，
+    `getent passwd 0` 得到 `/root`，单元会写成 `User=root` + `HOME=/root`，
+    而 `.warp` 下的凭据属 administrator —— 那条线起来就读不到自己的配置。
+    """
+    argv = [os.path.join(_PROJECT, "deploy", "wg-lines-install.sh"), "--line", str(i)]
+    if os.geteuid() != 0:
+        pw = pwd.getpwuid(os.getuid())
+        argv = ["sudo", "-n", "systemd-run", "--pipe", "--wait", "--collect",
+                "--quiet",
+                f"--unit=asip-wg-install-{os.getpid()}-{i}-{int(time.time())}",
+                f"--setenv=ASIP_RUN_USER={pw.pw_name}",
+                f"--setenv=ASIP_RUN_GROUP={grp.getgrgid(pw.pw_gid).gr_name}",
+                f"--setenv=ASIP_HOME_DIR={pw.pw_dir}",
+                "/bin/bash", *argv]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        log(f"  ⚠ 补位设备线 {i} 单元安装失败: "
+            f"{(r.stderr or r.stdout or '').strip()[-140:]}")
+        return False
+    return True
+
+
+def _ensure_backfill_line(max_new: int = 1) -> list[int]:
+    """没有可用补位线时自造一条，返回当前可补位线号。
+
+    补位判据 `_backfill_spare_indices` 要求「已注册 **且** 单元已装」。
+    `warp_wg.register_line` 只写 `profile.conf`，单元归
+    `deploy/wg-lines-install.sh` 另一步 —— 只注册不装单元等于不存在
+    （实测 line31 注册了一整晚，日志每轮都报「没有能起设备的空闲线」）。
+
+    先补「已注册但没装单元」的（不烧 CF 注册额度，**不受限速**），再注册
+    新设备（每 `_WG_CREATE_GAP` 秒最多一台，CF 对 wgcf 约 9 台/窗口）。
+    """
+    spare = _backfill_spare_indices()
+    if spare or max_new <= 0:
+        return spare
+
+    tags = {m.get("tag") for m in _warp()["members"]}
+    # ① 已注册、没单元、也没被 mask 的线：装个单元就能用。
+    for i in range(1, 100):
+        if not (warp_wg.line_dir(i) / "profile.conf").exists():
+            continue
+        if warp_wg.line_tag(i) in tags:
+            continue
+        # mask（/dev/null）是主人停用的线，不许自动恢复；已装的也不用动。
+        if _wg_line_state(i) != "missing":
+            continue
+        if _install_wg_unit(i):
+            return _backfill_spare_indices()
+        return []
+
+    # ② 一台储量都没有：注册新设备，接着最大槽位往后编。
+    registered = [i for i in range(1, 100)
+                  if (warp_wg.line_dir(i) / "profile.conf").exists()]
+    if len(registered) >= _WG_MAX_LINES:
+        log(f"  ✗ 设备线已达上限 {_WG_MAX_LINES} 条，不再自造；"
+            f"检查补位判据是否把新线漏掉了")
+        return []
+    if time.time() - _last_wg_register_ts() < _WG_CREATE_GAP:
+        return []
+    start = (max(registered) if registered else 0) + 1
+    for i in range(start, start + max_new):
+        try:
+            warp_wg.register_line(i)
+        except Exception as e:
+            # 多半是 429。退避已在 register_line 里做过，这里只记账不重试。
+            log(f"  ⚠ 补位设备 {i} 注册失败，下轮再试: {type(e).__name__}")
+            return []
+        if _install_wg_unit(i):
+            break
+    return _backfill_spare_indices()
+
+
+def _backfill_open(tag: str, now: float, used: set[str]) -> str | None:
+    """给被封的 `tag` 开一条补位渠道，返回补位 tag；开不起来返回 None。
+
+    「封禁率最低的渠道其 colo 的复制」= 在 ban 率最低、还有空节点的那个
+    colo 上，用空闲设备线起一条和现有渠道同规格（WG/v6）的新线。
+    """
+    member = _warp_member(tag)
+    if not member or member.get("backfill_for"):
+        # 补位渠道自己也被封时不再套娃：否则一条封禁能无限拉新线。
+        return None
+    if now - _BACKFILL_TRY_TS.get(tag, 0.0) < _BACKFILL_RETRY_SEC:
+        return None
+    # `ignore_enabled=True`：补位是硬要求，不随 `channel_rehome_enabled` 关。
+    target = _channel_rehome_target(now, used, ignore_enabled=True)
+    if target is None:
+        _BACKFILL_TRY_TS[tag] = now
+        log(f"  ⚠ {tag} 渠道被封，但 ban 率最低的 colo 没有可用节点，无法补位")
+        return None
+    colo, node = target
+    spares = _backfill_spare_indices()
+    if not spares:
+        # 一台储量都没有：先自造（装单元 / 注册设备），**本轮就用上**。
+        # 放到循环外是有意的 —— 若放在失败分支里，新线要等下一个
+        # `_BACKFILL_RETRY_SEC`(600s) 才被看见，扁平化后同一次调用即可补位。
+        try:
+            spares = _ensure_backfill_line()
+        except Exception as e:
+            log(f"  ⚠ 补位设备线自造失败: {type(e).__name__}: {e}")
+        if spares:
+            log(f"  ＋ 已备好补位设备线 {','.join(map(str, spares))}")
+    for idx in spares:
+        btag, unit = warp_wg.line_tag(idx), warp_wg.unit_name(idx)
+        port = _warp()["wg"]["base_port"] + idx - 1
+        entry = {"tag": btag, "port": port, "service": unit, "kind": "wg",
+                 "index": idx, "family": "v6", "backfill_for": tag, "node": node}
+        _warp()["members"].append(entry)
+        if _rehome_one(btag, node) != "ok":   # 写 line{idx}/singbox.json
+            _warp()["members"].remove(entry)
+            continue
+        # 先把单元拉起来：起不来就别发布，免得把一个死端口挂进主配置。
+        # `_unit_ctl` 的 subprocess 有 timeout，超时会抛 —— 不接住的话这里
+        # 留下一条已在 members 里、却没进台账的线，下一轮会再开一条补位。
+        try:
+            cr = _unit_ctl("start", unit)
+        except Exception as e:
+            cr = type("R", (), {"returncode": -1, "stdout": "", "stderr": str(e)})()
+        if cr.returncode != 0:
+            _warp()["members"].remove(entry)
+            log(f"  ⚠ 补位设备线 {btag} 起不来，换下一条: "
+                f"{(cr.stderr or cr.stdout or '').strip()[:160]}")
+            continue
+        break
+    else:
+        _BACKFILL_TRY_TS[tag] = now
+        # 区分「没有空闲设备」与「有设备但单元没装」—— 前者是容量问题，
+        # 后者跑一次 deploy/wg-lines-install.sh 就能补，处置完全不同。
+        undeployed = [i for i in range(1, 100)
+                      if (warp_wg.line_dir(i) / "profile.conf").exists()
+                      and warp_wg.line_tag(i) not in
+                      {m.get("tag") for m in _warp()["members"]}
+                      and _wg_line_state(i) == "missing"]
+        hint = (f"（已注册但未部署单元: line{','.join(map(str, undeployed[:5]))}）"
+                if undeployed else "")
+        # 到这里说明自造也没造出来（CF 429 / 只读挂载 / 注册失败），
+        # 下一轮 `_BACKFILL_RETRY_SEC` 后再试。
+        log(f"  ✗ {tag} 渠道被封，没有能起设备的空闲线可补位{hint}")
+        return None
+    if not _wait_port_ready(port, _warp()["ready_timeout_sec"]):
+        log(f"  ⚠ 补位渠道 {btag} 端口 {port} 未就绪，仍然发布（prober 会继续探）")
+    try:
+        _atomic_write_json(_BACKFILL_FILE, _backfill_rows() + [entry])
+        try:
+            warp_wg.refresh_main_outbounds()
+        except Exception as e:
+            log(f"  ✗ 补位渠道 {btag} 发布 warp-outbound.json 失败: {e}")
+        if not refresh_subscription(reason=f"渠道补位 {btag}"):
+            log(f"  ⚠ 补位渠道 {btag} 已写入 warp-outbound.json，"
+                f"但主配置本轮未刷新（下次刷新后生效）")
+    except Exception as e:
+        # 台账写失败（磁盘满 / 权限）不能把整趟 `_rehome_held_lines` 带崩：
+        # 别的锁线还在等还原。行丢了由 `_backfill_reconcile` 下轮重开。
+        log(f"  ✗ 补位渠道 {btag} 台账写入失败: {e}（下轮对账会重开）")
+    finally:
+        # 发布成功与否都必须记账：`_atomic_write_json` / `_unit_ctl` 都会抛，
+        # 没记的话 `ban_backfill_tag` 为空，下一轮会再开一条补位 —— 前一条
+        # 单元在跑、成员在表里，却再也没人撤得掉（撤销只认这个字段）。
+        _warp_line_update(tag, ban_backfill_tag=btag, ban_backfill_node=node)
+        _save_warp_line_state(force=True)
+    used.add(node)
+    log(f"  ⇢ {tag} 渠道被封，补位渠道 {btag} 已在 {colo}（{node}）上线，"
+        f"次日 {int(_warp().get('channel_ban_reset_hour', 8)):02d}:00 撤除")
+    # 被封的那条正好在服务流量：切到补位渠道，补位才算真的补上。
+    if active_warp_tag() == tag:
+        _switch_warp(btag)
+    return btag
+
+
+def _backfill_close(tag: str) -> bool:
+    """解封：撤掉 `tag` 的补位渠道并还原 selector。返回是否还有事要做。"""
+    btag = _warp_line_state(tag).get("ban_backfill_tag")
+    if not btag:
+        return False
+    _backfill_stop(btag, back=tag)
+    _atomic_write_json(_BACKFILL_FILE,
+                       [r for r in _backfill_rows() if r.get("tag") != btag])
+    try:
+        warp_wg.refresh_main_outbounds()
+    except Exception as e:
+        log(f"  ✗ 撤补位渠道时发布 warp-outbound.json 失败: {e}")
+    refresh_subscription(reason=f"渠道补位撤销 {btag}")
+    _warp_line_update(tag, ban_backfill_tag=None, ban_backfill_node=None)
+    _save_warp_line_state(force=True)
+    _BACKFILL_TRY_TS.pop(tag, None)
+    log(f"  ⇢ {tag} 渠道解封，补位渠道 {btag} 已撤除")
+    return True
+
+
+def _backfill_stop(btag: str, back: str | None = None) -> None:
+    """停掉补位单元并把它从 members 里摘掉（不碰台账行，调用方负责）。
+
+    `back` 是 selector 的首选去向（原线）；它已经不在 members 里时退到
+    第一条别的成员。先切走再撤成员：selector 指着一个从配置里消失的 tag
+    会 404。
+
+    单元名优先从成员取，成员不在时按 tag 后缀反推 —— 台账行丢过之后
+    （`_atomic_write_json` 抛异常 / 文件被删）成员已经不在了，不反推的话
+    这条单元会一直跑下去。
+    """
+    if active_warp_tag() == btag:
+        target = back if back and _warp_member(back) else next(
+            (m["tag"] for m in _warp()["members"] if m.get("tag") != btag), None)
+        if target:
+            _switch_warp(target)
+    member = _warp_member(btag)
+    svc = (member or {}).get("service") or ""
+    if not svc:
+        try:
+            svc = warp_wg.unit_name(int(str(btag).rsplit("-", 1)[-1]))
+        except ValueError:
+            svc = ""
+    if svc:
+        try:
+            _unit_ctl("stop", svc)
+        except Exception as e:
+            log(f"  ⚠ 停补位单元 {svc} 失败: {e}")
+    members = _warp()["members"]
+    # 按 tag 删，不按对象身份：`_warp_member` 可能返回等值副本。
+    members[:] = [m for m in members if m.get("tag") != btag]
+
+
+def _backfill_reconcile(now: float) -> None:
+    """每分钟对账补位台账与锁线，修两种半途状态。
+
+    ① 行没有主人：锁线的 `ban_backfill_tag` 丢了（文件损坏 / 人工改），
+       或解封时只清了锁没清行 —— 单元还在跑、成员还在表里，正常路径
+       （按 `ban_backfill_tag` 撤）再也撤不掉它。
+    ② 主人没有行：`_atomic_write_json` 抛过。锁线以为有补位，开补位循环
+       永远跳过它 —— 那条渠道实际上没人补位，违背「被封必有补位」。
+       停掉残留单元、清空主人字段，下一轮重新开。
+    """
+    rows = _backfill_rows()
+    row_tags = {r.get("tag") for r in rows}
+    locked = {tag: st for tag, st in list(_WARP_LINE_STATE.items())
+              if isinstance(st, dict)
+              and float(st.get("ban_hold_until") or 0.0) > now}
+    for tag, st in locked.items():
+        btag = st.get("ban_backfill_tag")
+        if btag and btag not in row_tags:
+            _backfill_stop(btag)
+            _warp_line_update(tag, ban_backfill_tag=None, ban_backfill_node=None)
+            log(f"  ⇢ 补位渠道 {btag} 的台账行已丢失，已停掉并清空 "
+                f"{tag} 的补位记录，下一轮重开")
+    owned = {st.get("ban_backfill_tag") for st in locked.values()
+             if st.get("ban_backfill_tag")}
+    keep = [r for r in rows if r.get("tag") in owned]
+    if len(keep) == len(rows):
+        return
+    for r in rows:
+        if r.get("tag") not in owned:
+            _backfill_stop(str(r.get("tag")))
+            log(f"  ⇢ 补位渠道 {r.get('tag')} 没有认领的锁线，已撤除")
+    _atomic_write_json(_BACKFILL_FILE, keep)
+    try:
+        warp_wg.refresh_main_outbounds()
+    except Exception as e:
+        log(f"  ✗ 撤孤儿补位渠道时发布 warp-outbound.json 失败: {e}")
+    refresh_subscription(reason="补位渠道对账")
 
 
 # ── 同块节点轮回 ────────────────────────────────────────────────
@@ -3391,9 +4231,89 @@ def _node_tcp_ok(node: str, timeout: float = 6.0) -> bool | None:
         ob = warp_wg.node_outbound(node)
     except Exception:
         return None
-    res = None if ob is None else warp_wg.probe_node_tcp(ob, timeout=timeout)
+    if ob is None:
+        return None
+    try:
+        res = warp_wg.probe_node_tcp(ob, timeout=timeout)
+    except Exception:
+        # 探测进程自己崩了（写配置失败、subprocess 起不来）是观测者的问题，
+        # 不是节点状态。抛出去会把整轮轮回打成异常，一条节点拖住其余全部。
+        return None
     _NODE_TCP_SEEN[node] = (now, res)
     return res
+
+
+def _line_node_cannot_carry(tag: str) -> bool:
+    """这个节点在这个「惩罚期重启」路径上**重启没有意义**吗。
+
+    两种都算：
+      1. 节点实测承载不了 WARP（rank 2）—— 换多少次地址都拿不到出口；
+      2. 这条线**从没拿到过出口地址**（`ip` 从未写入）—— 惩罚期重启是为了
+         换一个新的 /128，而「从没出过口」说明问题在节点或链路上，不在地址。
+
+    只看已有结论，不现场探测：这是秒级高频路径，加探测会把主循环拖垮。
+    rank 1（没测过）不算不能承载 —— 未知不等于坏。
+    """
+    try:
+        m = _warp_member(tag)
+        if m and m.get("kind") == "h2":
+            # H2 的落地节点在共享 sing-box 的 selector 里，**不在 `warp_wg` 台账**
+            # —— 查台账永远 `node=None`，下面整段对 H2 从来没生效过。实测
+            # 2026-11-05 SLC-11/12/24 整池（4 个 bilibili 节点）TCP 全死、
+            # `ever_ip` 始终 False，仍每 ~2 分钟重启一次 usque-h2-N。
+            # 判据只用 `_h2_repair` 已经算过的结论（它每 60s 亲自巡一遍池子），
+            # 这里不额外打 Clash API —— 本函数在探测热路径上。
+            #
+            # ① **探过但从没出过口**（与 WG 分支同一口径）：问题在落地节点或
+            #    链路，重启 usque 拿到的是同一节点上的新会话。实测 2026-11-05
+            #    SLC-11/12/24 换完节点 1~2s 就被重启掐掉，新节点一次都没被
+            #    探测过；1779 次重启一次也没出过口。
+            # ② 出过口的线相反：更可能是本机会话僵死，重启是唯一修法，只有
+            #    整池试遍（`_H2_POOL_DEAD`）才判死。
+            st = _warp_line_state(tag)
+            if not bool(st.get("ever_ip")) and st.get("last_probe_ts"):
+                return True
+            return tag in _H2_POOL_DEAD
+        line = (warp_wg._read_state().get("lines") or {}).get(tag) or {}
+        node = line.get("node")
+        if not node:
+            return False
+        st = _warp_line_state(tag)
+        # **不能只看当前的 `ip`**：`_invalidate_warp_line_ip` 在每次隧道重启时
+        # 都会清空它，刚重启的线必然 `ip=None`。拿它当判据会让这条线永远不再
+        # 重启（连本来能恢复的也停掉）。看的是「这条线在本进程里成功出过口吗」
+        # ——`ever_ip` 由 `_warp_line_record_observation` 在拿到地址时置位。
+        ever = bool(st.get("ever_ip"))
+        if not ever and st.get("last_probe_ts"):
+            return True
+        return _warp_alive_rank(str(node), warp_blocks.load_map(),
+                                line.get("family")) == 2
+    except Exception:
+        return False
+
+
+def _warp_alive_rank(tag: str, nodes_map: dict, family: str | None = None) -> int:
+    """节点实测能不能承载 WARP：0 能 / 1 没测过 / 2 实测不能。
+
+    只用于**排序**，从不淘汰 —— 节点会恢复，而把没测过的排除掉等于让整池
+    只剩测过的那几台（实测 rotation 176 个槽位里 135 个从没测过，而块内
+    实测可用的 14 台 NRT 节点只有 1 台进过 rotation）。
+
+    `family=None`：这条线还不确定跑哪族（换线目标先于线号确定）。此时已测
+    的族**全部**失败才算不能用。已测两族的 5 台节点里 0 台出现两族结论相反，
+    跨族兜底不会把能用的判死。
+    """
+    e = nodes_map.get(tag) or {}
+    fams = (("v4_",) if family == "v4"
+            else ("wg_",) if family == "v6" else ("wg_", "v4_"))
+    # 指定了族就**只看那一族**：拿 v4 的失败去否决一条 v6 线是错证据 ——
+    # 实测 `cn.bing.com:443~10-any` 只有 v4 实测（0/2）、从没跑过 v6，
+    # 旧写法会把它判成 v6 也不能用。没测过就是没测过（rank 1）。
+    measured = [(e.get(f + "n") or 0, e.get(f + "ok") or 0) for f in fams]
+    measured = [x for x in measured if x[0]]
+    if not measured:
+        return 1
+    return 0 if any(ok for _n, ok in measured) else 2
 
 
 def _same_block_standby(tag: str, now: float) -> str | None:
@@ -3416,15 +4336,27 @@ def _same_block_standby(tag: str, now: float) -> str | None:
     if home_colo is None:
         # 块表里没有当前节点（`_channel_rehome_target` 挑目标用的是
         # `load_colo_map()`，两张表不同源；实测 LAX 4 个池内节点只有 1 个在块表）。
-        # 此时 `None == None` 会把**所有块表里同样缺席的节点**都算成「同块」，
-        # v6 线就会被换到另一个 colo —— 而既定事实里 v6 同 colo 换节点就够。
-        # 拿不到当前 colo 就没有「同块」可言：只走别的 colo 会白烧一个池子，
-        # 干脆不动（返回 None 让调用方下轮再看）。
-        return None
-    same = [t for t in rot if (nodes_map.get(t) or {}).get("colo") == home_colo]
-    others = [t for t in rot if t not in same]
-    # v4：跨块优先。同 colo 换节点拿回同一 /24，等于没换地址池。
-    order = (others + same) if line.get("family") == "v4" else (same + others)
+        # **不能直接放弃**：实测 WG-3/WG-4 的当前节点
+        # `downloadcfpro…~9-vl` / `~10-vl` 从没跑过 diag，块表里根本没有它们，
+        # 于是这里恒返 None —— 两条线永远换不了节点，只能在同一个
+        # 「收 TCP 不转发 UDP:2408」的节点上无限重启（实测 fail_streak 197 / 88）。
+        #
+        # 退化为**不按块分组**，只按承载能力排序：块信息缺席时「同块」无从判断，
+        # 但那不等于没有候选 —— 把整条 rotation 交给下面的 rank 排序，
+        # rank 0（实测能承载）自然会排到前面。v4 线仍然吃亏（它靠换 colo 换
+        # 地址池，没 colo 判定不了），但总好过钉死在死节点上。
+        order = list(rot)
+    else:
+        same = [t for t in rot if (nodes_map.get(t) or {}).get("colo") == home_colo]
+        others = [t for t in rot if t not in same]
+        # v4：跨块优先。同 colo 换节点拿回同一 /24，等于没换地址池。
+        order = (others + same) if line.get("family") == "v4" else (same + others)
+    # 块内顺序定了之后，同档内把**实测不能承载**的压到最后（稳定排序，块序不动）。
+    # 不加这条时轮换是在赌：实测 WG-1 在 HKG/NRT 两个 wg=0/4 的节点之间来回
+    # 换了 12 次，每次都是「节点 TCP 通但拿不到出口」；39 次同块轮回里 5 分钟内
+    # 拿到出口的只有 15 次（38%）。
+    fam = line.get("family")
+    order.sort(key=lambda t: _warp_alive_rank(t, nodes_map, fam))
     # 跳过已被别的线绑着的节点：多条线挤到同一台上等于把「分散风险」变成
     # 「集中风险」。实测 2026-11-02 一轮误换之后 WG-1/WG-2 同时绑到
     # `cn.bing.com~13`、WG-8/WG-9 同时绑到 `pq.aws48` —— 那一台的 UDP 一挂，
@@ -3470,6 +4402,11 @@ def _node_rotation_pass(now: float | None = None) -> None:
             continue
         if tag == active:
             continue                      # 当前出口不换节点（会掐断在途）
+        bf = _warp_member(tag)
+        if bf and bf.get("backfill_for"):
+            # 补位渠道的落地节点是补位目标本身（ban 率最低的那个 colo），
+            # 换个节点就补错地方了；它坏了由 `_backfill_open` 重开。
+            continue
         if now < _NODE_NEXT_CHECK.get(tag, 0.0):
             continue
         cur = line["node"]
@@ -3483,7 +4420,15 @@ def _node_rotation_pass(now: float | None = None) -> None:
         #    就被判「拿不到出口」，换到了一个已知的死节点）。
         moved = max(float(line.get("rebind_ts") or 0),
                     float(_warp_line_state(tag).get("restart_ts") or 0))
-        if now - moved < interval * 2:
+        # 冷静期是「给刚重启的隧道几十秒起来」。但一条线反复重启、每次还是
+        # 取不到出口，这个前提就不成立了 —— 而每次重启都把 `restart_ts` 顶到
+        # 现在，冷静期便永远成立，轮回一次也轮不到它。实测 2026-11-05
+        # WARP-WG-4 `fail_streak` 13、每 ~40s 重启一次、`restart_ts` 永远是
+        # 新的，轮回日志里从没出现过它。用 `fail_streak` 破这个循环：连续
+        # 取不到出口说明重启已经证明无用，该换的是节点。
+        if (now - moved < interval * 2
+                and int(_warp_line_state(tag).get("fail_streak") or 0)
+                < _UNKNOWN_RESTART_STREAK):
             _NODE_NEXT_CHECK[tag] = now + interval
             continue
         with _NODE_PROBE_SLOTS:
@@ -3741,7 +4686,8 @@ def _channel_ban_label(now: float) -> str:
     if not held:
         return "无"
     when = int(_warp().get("channel_ban_reset_hour", 8))
-    return (f"{len(held)}线→{when:02d}:00" + (f"·{pending}待重启" if pending else ""))
+    return (f"{len(held)}线→{when:02d}:00" + (f"·{pending}待重启" if pending else "")
+            + (f"·{len(_backfill_rows())}补位" if _backfill_rows() else ""))
 
 
 def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
@@ -3753,6 +4699,10 @@ def _warp_line_needs_probe(tag: str, now: float) -> tuple[bool, float]:
     """
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
+        # 锁定期间不探测：旧实现锁了还照探，探出的 quota 又进窗口，到期时
+        # 互相续期（WG-21 锁了 17h，期间其实出过 7 次 OK）。
+        if float(st.get("ban_hold_until") or 0.0) > now:
+            return False, float(st["ban_hold_until"])
         ip = st.get("ip")
         if not ip:
             return True, now
@@ -3804,6 +4754,10 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             st["ip"] = ip
             st["ip_ts"] = ts
             st["port_ok"] = True
+            # 本进程内**曾经**拿到过出口。与 `ip` 不同，它不被隧道重启清空 ——
+            # 「这条线在这台机器上到底有没有通过」是判断「重启还有没有意义」
+            # 的依据（见 `_line_node_cannot_carry`）。
+            st["ever_ip"] = True
         st["last_verdict"] = verdict
         st["last_probe_ts"] = ts
         if verdict == "OK":
@@ -4110,8 +5064,8 @@ def _warp_line_restart(member: dict, reason: str,
         # `.warp_line_state.json`。
         if ban_hold > now and not rebound and _warp().get(
                 "channel_ban_hold_enabled", True) and not tunnel_dead:
-            # 渠道锁：最近窗口内实测 100% 封禁，重启只会换到同一 colo 的另一个
-            # 已烧地址。按 tag 节流日志，否则每条线每次探测都会刷一行。
+            # 渠道锁：当天实测全 quota 或连续 5h 无出口，重启只会换到同一 colo
+            # 的另一个已烧地址。按 tag 节流日志，否则每条线每次探测都会刷一行。
             if now - _NIGHT_LOG_TS.get("ban:" + tag, 0.0) > 300.0:
                 _NIGHT_LOG_TS["ban:" + tag] = now
                 log(f"  · {tag} 渠道锁定中（至 "
@@ -4210,7 +5164,6 @@ def _warp_line_restart(member: dict, reason: str,
         with _WARP_LINE_CV:
             st = _warp_line_state_locked(tag)
             st["warming"] = False
-            st["restart_count"] = int(st.get("restart_count") or 0) + 1
             st["restart_ts"] = now
             # 冷却对成功路径同样有效：清零等于「重启成功就能立刻再重启」，
             # 而 restart_max_per_hour_per_line 已设为 0（不设上限），
@@ -4272,7 +5225,7 @@ def _probe_one_line(member: dict) -> None:
     tag = member["tag"]
     now = time.time()
     st = _warp_line_state(tag)
-    if st.get("warming"):
+    if st.get("warming") or st.get("stop_probe"):
         return
     if _warp_line_quarantined(st, now):
         # 隔离期内不探：结论已知（quota 到点才解），再探只是重复买同一个结论。
@@ -4285,7 +5238,19 @@ def _probe_one_line(member: dict) -> None:
         return
     started_at = time.time()
     ip = warp_egress_ip(member["port"])
+    if ip:
+        # 落点台账跟着生产流量自更新：这条线绑的是哪个落地节点、它实际出口
+        # 在哪个 colo —— 一次成功探测就够了，不需要单独的 survey。
+        # 台账的键是**落地节点**（`wg_colo_map.json` 的 nodes 表按节点 tag
+        # 索引，与 `survey()` / `load_colo_map()` 同一口径），不是线路 tag。
+        # trace 由 `warp_egress_ip` 顺手存在 `_LAST_EGRESS_TRACE` 里；
+        # 端口对不上说明那次结果不是本次探测的，宁可不记。
+        tr = _LAST_EGRESS_TRACE or {}
+        node = _line_node(tag) if tr.get("port") == int(member["port"]) else None
+        if node:
+            _record_line_colo(str(node), tr.get("colo"), tr.get("loc"), ip)
     if not ip:
+        _channel_noaddr_note(tag, False, time.time())
         _warp_line_record_observation(tag, None, "unknown", time.time(), started_at)
         # 连续拿不到地址 = 隧道半死（进程在、上游不通）。单次 unknown 是瞬态，
         # 不重启；连续多次且端口仍开着才是确定失败 —— 端口开着说明进程还活着、
@@ -4293,11 +5258,33 @@ def _probe_one_line(member: dict) -> None:
         # 靠 systemd 的 Restart=always 永远等不到，只能这里重启）。
         # 端口关着则相反：进程已经没了，那是 systemd 的活，再从这儿重启等于抢它的活。
         streak = int(_warp_line_state(tag).get("fail_streak") or 0)
+        # H2 线先换节点：落地节点在共享 sing-box 里，`_rehome_one` 走 selector，
+        # 换完不重启任何进程。连续 3 次拿不到出口就换 —— 重启 usque 换的是同一个
+        # 节点上的新会话，节点不转发 TCP 到 CF 时重启多少次都没用。
+        if (tag != active and member.get("kind") == "h2" and streak >= 3
+                and _h2_repair(member)):
+            return
         if (tag != active and streak >= _UNKNOWN_RESTART_STREAK
                 and _port_open(member["port"])):
+            # 节点根本不转发 UDP 时，重启只是把同一个节点再拉一遍；更糟的是
+            # 每次重启都刷新 `restart_ts`，把同块轮回的冷静期（2×60s）永远
+            # 顶住 —— 轮回一次也轮不到它，线就焊死在这个节点上。实测
+            # 2026-11-05 WG-4 `fail_streak` 41、每 ~60s 重启一次、
+            # `ever_ip` 始终 False，而轮回日志里从没出现过它。
+            # 停掉重启，换节点交给轮回（它换完自己会重启）。
+            if _line_node_cannot_carry(tag):
+                return
             _warp_line_restart(member, f"连续 {streak} 次取不到出口地址",
                                tunnel_dead=True)
         return
+    # 拿到地址就清零「连续无地址」计时 —— 必须放在下面所有早退分支之前，
+    # 否则一条刚恢复的线走「OK 新鲜」早退时计时不清，之后每次失败都从旧起点
+    # 算起，5 小时那条判据会被一次历史故障带偏。
+    _channel_noaddr_note(tag, True, now)
+    # 这条链路能出地址了：H2 的候选池从头开始记（见 `_h2_next_node`）。
+    if member.get("kind") == "h2":
+        _H2_TRIED.pop(tag, None)
+        _H2_POOL_DEAD.pop(tag, None)
     cur = _warp_line_state(tag)
     if tag != active and _warp_line_ok_fresh(tag, now) and cur.get("ip") == ip:
         return
@@ -4314,6 +5301,14 @@ def _probe_one_line(member: dict) -> None:
                          now)
         if tag == active:
             _reconnect_warp_now("探测发现当前出口处于惩罚期", time.time())
+        elif _line_node_cannot_carry(tag):
+            # **节点本身不转发 UDP 时，重启同一个节点是死循环**：惩罚期重启
+            # 换的是这个节点下的新 /128，节点要是不通 2408，换多少次都拿不到
+            # 出口。实测 2026-11-05 WG-4 停在 rank 1 节点上每 8~10s 重启一次、
+            # 日志刷满「出口处于惩罚期」，而 `_same_block_standby` 明明能给它
+            # 选出备线 —— 这条路径根本没问过节点能不能承载。
+            # 换节点交给同块轮回（它有自己的两轮判死节流），这里只是别重启。
+            return
         elif not _quota_hold_skips(tag, "出口处于惩罚期"):
             _warp_line_restart(member, "出口处于惩罚期")
         return
@@ -4338,9 +5333,11 @@ def _probe_one_line(member: dict) -> None:
     if not _warp_line_record_observation(tag, ip, verdict,
                                          time.time(), started_at):
         return
-    # 渠道 ban 窗口只认地址级持久结论（quota/flagged），与台账同一口径。
+    # 渠道锁的样本只认地址级持久结论（quota/flagged），与台账同一口径。
+    # OK 也入账：它是「这条渠道还能出 OK」的唯一证据，而当天样本只要出现一条
+    # 非 quota 就不再锁（`_channel_ban_hold_hit`）。
     if verdict == "OK" or verdict in _WARP_PROBE_PERSISTENT:
-        _channel_ban_note(tag, verdict != "OK", time.time())
+        _channel_ban_note(tag, verdict, time.time())
     if verdict == "OK":
         return
     if tag == active:
@@ -4503,10 +5500,12 @@ def _cached_warp_standby(standby: list[dict], now: float,
         if _probe_cache_verdict(m["tag"], ip, now) != "OK":
             continue
         # ② 窗口内没被切过。`_warp_ip_last_ts` 读 `ts`（最近一次被选为出口的
-        # 时刻），从未用过返回 0 —— 显式判 0 放行，不靠「now 足够大」这个隐含前提
-        # （假时钟用例里 now=1000 就翻车）。
-        last = _warp_ip_last_ts(ip)
-        if last and now - last < ok_ttl:
+        # 时刻），**从未用过要显式放行**：不能靠 `now - 0 > 窗口` 兜，那只在
+        # 真实墙钟成立。用例用合成时钟（now=1000）时 `1000-0 < 1800` 会把从没
+        # 用过的地址判成「刚用过」——`probe_ok_ttl_sec` 从 600 抬到 1800
+        # （T-225）后 5 个缓存用例一起转红，就是这条隐式假设破的。
+        used_ts = _warp_ip_last_ts(ip)
+        if used_ts and now - used_ts < ok_ttl:
             continue
         if _ip_disqualified(ip, now, guard):
             continue
@@ -7983,17 +8982,44 @@ def _record_pool_sample(pool: int) -> None:
         log(f"⚠ 护栏样本写不进去（{e}），基线会一直用旧窗口")
 
 
-def _drop_stats(path: str) -> None:
-    """删掉生成侧写在配置旁边的那份统计（`<cfg>.stats.json`）。
+# 生成侧写在配置旁边的旁路文件：统计（护栏水位）与节点→订阅源归属。
+_SIDECAR_SUFFIXES = (".stats.json", ".sources.json")
 
-    刷新用的是 `<config>.tmp`，统计落在 `<config>.tmp.stats.json`；配置被 rename
-    走之后这份就没人读了，不清会每次刷新留一个文件。
+
+def _drop_stats(path: str) -> None:
+    """删掉生成侧写在配置旁边的旁路文件（`<cfg>.stats.json` 等）。
+
+    刷新用的是 `<config>.tmp`，旁路文件落在 `<config>.tmp.<suffix>`；配置被
+    rename 走之后这份就没人读了，不清会每次刷新留一份（且 sources 里带订阅源
+    归属，没必要留）。判据是**父目录里的同名旁路文件**，不是只认 `.tmp` 版本。
     """
-    for p in (str(path) + ".stats.json", str(path) + ".stats.json.tmp"):
+    base = str(path)
+    for suffix in _SIDECAR_SUFFIXES:
+        for p in (base + suffix, base + suffix + ".tmp"):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _promote_sidecars(tmp_path: str, final_path: str) -> None:
+    """把 `<tmp>.stats.json` / `<tmp>.sources.json` 搬到 `<final>` 旁边。
+
+    `os.replace` 只搬配置本身。不搬的话 `singbox-config.json.sources.json`
+    永远停在 `.tmp` 版本上 —— 渠道报表读不到订阅源归属，只能显示 `-`，
+    而它恰恰是「这个节点来自哪家机场」的唯一记录（tag 里不含来源）。
+    """
+    for suffix in _SIDECAR_SUFFIXES:
         try:
-            os.unlink(p)
+            os.replace(tmp_path + suffix, final_path + suffix)
         except OSError:
-            pass
+            # 这一轮**没生成**这份旁路（例如解析器提前退出）。必须删掉上一轮
+            # 的旧文件：留着会让下游把旧归属当成当前配置的归属（sources 尤其
+            # 糟，tag 相同、机器已换）。删不掉也不该让刷新失败。
+            try:
+                os.unlink(final_path + suffix)
+            except OSError:
+                pass
 
 
 def _discard(path: str):
@@ -8036,8 +9062,365 @@ _SUB_URLS = [
     CFG.get("dasho", {}).get("sub_url", ""),
     CFG.get("dasho_alt", {}).get("sub_url", ""),
 ]
+# 追加源在**每次刷新时**现读环境：`asip sub add` 写进 .env 后不必重启 daemon
+# （重启会掐断在途 SSE，代价远大于一次 list 拼接）。固定源仍冻结在 import 期，
+# 它们来自 config.py，改它们本来就要重启。
+def _sub_urls() -> list[str]:
+    from config import extra_subscription_urls
+    return [u for u in _SUB_URLS + extra_subscription_urls() if u]
 
 _REFRESH_LOCK = threading.Lock()   # 串行化订阅刷新：启动路径与主循环会撞在一起
+
+# ── 新节点自动实测（刷新后触发）──────────────────────────────────
+# 用户规则：池子里的节点要么测出 colo 进块，要么根本不该存在。块模型只认
+# `.warp/block-map.json` 的 colo，而那份表是**手动跑探测**产出的 —— 实测
+# 2026-11-04 订阅里 187 个节点有 112 个从未测过，其中 49 个是新加的源。
+# 结果是「节点在池子里，但永远选不上」，日志里没有任何说明。
+#
+# 这里只做**调度**：真正的探测仍是 `warp_diag.py`（WG）与
+# `tools/probe_h2_nodes.py`（H2），判据、设备分配、台账全在它们里面，不复制。
+_AUTODIAG_LOCK = threading.Lock()
+_AUTODIAG_LAST = 0.0
+_H2DIAG_LAST = 0.0
+# H2 探测结论台账。与 WG 的分开：同一节点在两条承载上的结论互不代表。
+_H2_STATE = os.path.join(_PROJECT, ".warp", "h2_probe_state.json")
+# 两次自动探测的间隔。一轮 20 个节点 × 2 轮 ≈ 4~8 分钟，全程占一台设备。
+# 取 900s（15min）而不是 30min：49 个待测节点按 20 个/轮要 3 轮才有结论，
+# 30min 一轮意味着新订阅源的节点进块要等一个多小时。探测是**串行**的，
+# 两轮之间本来就不会重叠；这个间隔只是防「刷新风暴时反复起探测进程」。
+_AUTODIAG_MIN_GAP = 900
+
+
+def _pending_probe_nodes(limit: int = 12,
+                         state_path: str | None = None) -> list[dict]:
+    """待实测的节点，按源比例取 N 个。
+
+    两条判据**分开**：
+      - WG（`state_path=None`）：`block-map` 里没有 colo，且 WG 台账没记过失败
+      - H2（`state_path=.warp/h2_probe_state.json`）：同上，用 **H2 自己的**
+        台账
+
+    WHY 不能用同一份台账：`block-map` 的 `colo` 是 WG 探测写进去的，而
+    `carrier=h2` 是 H2 探测写的。一个节点「有 colo」不代表它测过 H2 ——
+    实测 296 个生产节点里只有 61 个有 h2 结论。共用台账会让 H2 探测永远
+    认为「已测过」，`carrier=h2` 再也不会增加，H2 池子就死在老节点上。
+
+    **按源分配名额**而不是取前 N 个：同一家机场的节点常常整批同性质，按顺序取
+    会让排在前面的源每次都占满名额，新加的源永远轮不上。
+    """
+    try:
+        import warp_blocks
+        with open(CFG["singbox"]["config_file"], encoding="utf-8") as f:
+            cfg = json.load(f)
+        mapped = warp_blocks.load_map()
+        with open(CFG["singbox"]["config_file"] + ".sources.json",
+                  encoding="utf-8") as f:
+            ledger = json.load(f)
+    except (OSError, ValueError):
+        return []
+    # 该路径自己的「测过且失败」台账：失败的不重测（长期属性），成功的靠
+    # colo/carrier 判据排掉。
+    probed: dict = {}
+    if state_path:
+        try:
+            with open(state_path, encoding="utf-8") as f:
+                probed = (json.load(f) or {}).get("nodes") or {}
+        except (OSError, ValueError):
+            probed = {}
+    skip = {"selector", "urltest", "direct", "block", "dns", "socks", "wireguard"}
+    by_sub: dict[str, list[dict]] = {}
+    for o in cfg.get("outbounds") or []:
+        tag = o.get("tag")
+        if (not tag or o.get("type") in skip or not o.get("server")
+                or not o.get("server_port")):
+            continue
+        if state_path:
+            # H2：只跳过「H2 测过且失败」的。有 colo 不代表测过 H2。
+            st = probed.get(tag) or {}
+            if st.get("tested") and not st.get("ok"):
+                continue
+        elif (mapped.get(tag) or {}).get("colo"):
+            continue                      # WG：已有 colo 就是测过了
+        src = (ledger.get(tag) or {}).get("sub") or "?"
+        by_sub.setdefault(src, []).append({"tag": tag, "node": o})
+    if not by_sub:
+        return []
+    # 名额按各源**待测数成比例**分配，不是每源一个。
+    # 每源一个看着公平，实则把「源的大小」当成噪声：实测 yyd2tett 49 个待测、
+    # etcloud 11 个，各给 1 个名额意味着前者要 49 轮（30min 一轮 ≈ 24h）才测完，
+    # 而后者 11 轮就空了。按比例分则 49:11 → 12 个名额里拿 9~10 个。
+    # 每步取「已取/待测」比例最低的源，等价于最大余数法，且不需要预先算配额。
+    picked: list[dict] = []
+    taken: dict[str, int] = {s: 0 for s in by_sub}
+    while len(picked) < limit:
+        avail = [s for s, lst in by_sub.items() if taken[s] < len(lst)]
+        if not avail:
+            break
+        src = min(avail, key=lambda s: (taken[s] / len(by_sub[s]), s))
+        picked.append(by_sub[src][taken[src]])
+        taken[src] += 1
+    return picked
+
+
+def _ensure_spare_devices(want: int = 2, max_new: int = 3) -> list[int]:
+    """探测前补足空闲设备，返回当前空闲槽位。
+
+    没有空闲设备时 `warp_diag.spare_slots()` 直接退出（它不能拿生产线的设备
+    去探 —— 两条会话抢同一个 CF 设备身份，双方都掉线）。于是「设备用完」就
+    等于「新节点永远测不出 colo、永远进不了块」，而这正是节点大面积不进池的
+    原因之一。
+
+    每轮最多补 `max_new` 台：CF 一个窗口约限流 9 台，`register_line` 自带
+    30/90/240s 退避，撞上了就等下一轮（`_AUTODIAG_MIN_GAP`=30min），不在
+    本地硬撑重试 —— 那只会把限流窗口越拉越长。
+    """
+    try:
+        import warp_diag
+        import warp_wg
+        registered = warp_diag.registered_slots()
+        used = warp_diag.active_slots()
+    except Exception as e:
+        log(f"  ⚠ 设备台账不可用: {type(e).__name__}: {e}")
+        return []
+    spare = [s for s in registered if s not in used]
+    need = want - len(spare)
+    if need <= 0:
+        return spare
+    start = (max(registered) if registered else 0) + 1
+    for i in range(start, start + min(need, max_new)):
+        try:
+            warp_wg.register_line(i)
+            spare.append(i)
+            log(f"  ＋ 注册 WARP 设备 {i}（空闲 {len(spare)}）")
+        except Exception as e:
+            # 多半是 429。退避已在 register_line 里做过，这里只记账不重试。
+            log(f"  ⚠ 设备 {i} 注册失败，下轮再试: {type(e).__name__}")
+            break
+    return spare
+
+
+def _run_h2_probe(limit: int = 12) -> None:
+    """对未测 H2 承载的节点跑一轮实测，并并入 block-map。
+
+    WHY 必须单独一条路径：`warp_diag` 测的是 **WG（UDP 2408）** 承载，
+    `probe_h2_nodes` 测的是 **H2（MASQUE over HTTP/2，TCP）** 承载。两条
+    承载路径互不代表 —— 实测 22 条 WG 线里 13 条 STUN 不通但 WARP 正常，
+    反过来也有 TCP 通而 UDP 被封的。只跑 WG 探测的话 `carrier=h2` 这个
+    标记永远不会增加，H2 渠道池就永远是那一批老节点，新订阅的节点一个都
+    进不来。这正是「节点只在代理池里、进不了 H2」的根因。
+
+    判据不在这里重写：`--new-only` 的 colo 判据、设备分配、`warp=on` 的
+    trace 验证全在 `tools/probe_h2_nodes.py` 里，daemon 只做调度。
+    """
+    global _H2DIAG_LAST
+    with _AUTODIAG_LOCK:
+        if time.time() - _H2DIAG_LAST < _AUTODIAG_MIN_GAP:
+            return
+        _H2DIAG_LAST = time.time()
+    # **两边各测各的结论**：H2 与 WG 是两条独立承载，同一节点可能只通一条。
+    # 但「H2 还没测过」的筛子要用 H2 自己的台账，不能用 WG 的 —— 否则
+    # WG 测过的节点会被认为「测过了」，H2 永远不测它（实测 296 个节点里
+    # 只有 61 个有 h2 结论，其余 235 个从没测过 H2）。
+    todo = _pending_probe_nodes(limit, state_path=_H2_STATE)
+    if not todo:
+        return
+    out = os.path.join(tempfile.gettempdir(), "asip-h2scan.json")
+    log(f"🔬 自动实测 H2 承载 {len(todo)} 个节点")
+    import subprocess
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__),
+                                          "tools", "probe_h2_nodes.py"),
+             "--tags", *[x["tag"] for x in todo], "--out", out, "--rounds", "2"],
+            capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            log(f"  ✗ H2 实测退出码 {r.returncode}: "
+                f"{(r.stderr or '').strip().splitlines()[-1][:120] if r.stderr else ''}")
+            return
+        try:
+            with open(out, encoding="utf-8") as f:
+                rows = json.load(f)
+        except (OSError, ValueError):
+            return
+        ok = [x for x in rows if x.get("ok")]
+        if ok:
+            m = subprocess.run(
+                [sys.executable, os.path.join(os.path.dirname(__file__),
+                                              "tools", "merge_h2_blockmap.py"),
+                 out],
+                capture_output=True, text=True, timeout=120)
+            log(f"  ✓ H2 实测完成：{len(ok)}/{len(rows)} 可承载，已并入 block-map")
+            if m.returncode != 0:
+                log(f"  ⚠ H2 合并失败: {(m.stderr or '').strip()[-120:]}")
+        else:
+            log(f"  · H2 实测完成：{len(rows)} 个节点均未通过")
+    except subprocess.TimeoutExpired:
+        log("  ✗ H2 自动实测超时（15min），下轮再试")
+    except Exception as e:
+        log(f"  ✗ H2 自动实测失败: {type(e).__name__}: {e}")
+    # 实测刚并入的新 colo 要马上成块成线，否则要等到下一次整点刷新。
+    _submit_once("h2sync", _run_h2_sync)
+
+
+_H2SYNC_LOCK = threading.Lock()
+_H2SYNC_LAST = 0.0
+_H2SYNC_MIN_GAP = 1800
+
+
+def _run_h2_sync() -> None:
+    """块模型里出现新渠道（新 colo / 同 colo 多一条）就自动补线并安装。
+
+    WHY 要定时做：`_run_h2_probe` 只把实测结论并进 block-map，它不渲染、
+    也不装单元。没有这一步的话，新测出的 BOM/FRA/GIG/LHR 永远停在
+    「块有了、线没有」—— 2026-11-05 实测 29 条渠道只投产了 19 条。
+
+    动作顺序与手工流程一致（渲染 → 校验 → 装单元 → 重启主 sing-box），
+    只是全部自动：渲染器自己会在设备不足时调 h2-add-devices.sh 注册。
+
+    安装要写 /etc/systemd/system，所以提权。**渲染必须在提权之前、以本用户
+    跑完**：以 root 跑渲染会把 `.warp/h2/*` 的属主改成 root，daemon 之后
+    就读不回来了。所以用 `--no-render` 让安装脚本直接用这份产物。
+    """
+    global _H2SYNC_LAST
+    with _H2SYNC_LOCK:
+        if time.time() - _H2SYNC_LAST < _H2SYNC_MIN_GAP:
+            return
+        _H2SYNC_LAST = time.time()
+    proj = _PROJECT
+    render = os.path.join(proj, "deploy", "render_h2_lines.py")
+    try:
+        gap = subprocess.run([sys.executable, render, "--check"],
+                             cwd=proj, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"  ⚠ H2 差集检查失败: {type(e).__name__}")
+        return
+    if gap.returncode == 0:
+        return
+    if gap.returncode != 1:
+        log(f"  ⚠ H2 差集检查异常 rc={gap.returncode}: "
+            f"{(gap.stderr or '').strip()[-120:]}")
+        return
+    added = [x for x in (gap.stdout or "").split() if x]
+    log(f"＋ H2 块模型新增 {len(added)} 条渠道（{', '.join(added[:6])}"
+        f"{' …' if len(added) > 6 else ''}），自动补线")
+    try:
+        r = subprocess.run([sys.executable, render], cwd=proj,
+                           capture_output=True, text=True, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"  ✗ H2 渲染失败: {type(e).__name__}")
+        return
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()
+        log(f"  ✗ H2 渲染失败 rc={r.returncode}: {tail[-1][:160] if tail else ''}")
+        return
+    install = os.path.join(proj, "deploy", "h2-install.sh")
+    argv = ["bash", install, "--no-render"]
+    if os.geteuid() != 0:
+        # 与 `_install_wg_unit` 同一个理由：daemon 自己带着 ProtectSystem=strict，
+        # sudo 不换 mount namespace，直接 sudo 写 /etc 会撞只读挂载。
+        argv = ["sudo", "-n", "systemd-run", "--pipe", "--wait", "--collect",
+                "--quiet", f"--unit=asip-h2-sync-{os.getpid()}-{int(time.time())}",
+                *argv]
+    try:
+        r = subprocess.run(argv, cwd=proj, capture_output=True,
+                           text=True, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"  ✗ H2 单元安装失败: {type(e).__name__}")
+        return
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or "").strip().splitlines()
+        log(f"  ✗ H2 单元安装失败 rc={r.returncode}: {tail[-1][:160] if tail else ''}")
+        return
+    log(f"  ✓ H2 新线已安装（{len(added)} 条），并入主配置让 selector 看见")
+    # 新成员要靠 config.py 在 import 时读台账才进 CFG["warp"]["members"]，
+    # 再经 members.py 落进 warp-outbound.json。**必须用子进程**：daemon 里的
+    # CFG 是启动时读的，不重读台账。
+    # 之后走 patch-wg-outbounds 而不是整轮 refresh_subscription：后者要重拉
+    # 全部订阅（几分钟 + 骤降护栏），而这里只多了几条本地出口。
+    proj = _PROJECT
+    try:
+        m = subprocess.run([sys.executable,
+                            os.path.join(proj, "deploy", "members.py"),
+                            "--write-warp-outbound"],
+                           cwd=proj, capture_output=True, text=True, timeout=180)
+        if m.returncode != 0:
+            log(f"  ✗ 重建 warp-outbound.json 失败 rc={m.returncode}")
+            return
+        p = subprocess.run([sys.executable,
+                            os.path.join(proj, "deploy", "patch-wg-outbounds.py")],
+                           cwd=proj, capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"  ✗ 主配置并入失败: {type(e).__name__}")
+        return
+    if p.returncode != 0:
+        log(f"  ⚠ 主配置并入失败 rc={p.returncode}: "
+            f"{(p.stderr or p.stdout or '').strip()[-120:]}")
+        return
+    if "CHANGED" in (p.stdout or ""):
+        log(f"  ✓ {(p.stdout or '').strip()}；重启 sing-box 加载")
+        restart_singbox()
+    else:
+        log("  · 主配置无需并入")
+
+
+def _run_autodiag() -> None:
+    """对未测节点跑一轮承载实测，并把结论并进 block-map。
+
+    失败不重试、不阻塞主循环：探测是加分项，它挂了不该影响换线。唯一的
+    硬要求是**不能占用生产线的设备** —— 这一点由 `warp_diag.spare_slots()`
+    保证（它发现没有空闲设备会直接退出）；设备不够时先补注册。
+    """
+    global _AUTODIAG_LAST
+    with _AUTODIAG_LOCK:
+        if time.time() - _AUTODIAG_LAST < _AUTODIAG_MIN_GAP:
+            return
+        _AUTODIAG_LAST = time.time()
+    todo = _pending_probe_nodes()
+    if not todo:
+        return
+    if not _ensure_spare_devices():
+        log("  · 无空闲设备且补注册失败，本轮不实测（下轮再试）")
+        return
+    log(f"🔬 自动实测 {len(todo)} 个未入块节点（"
+        f"{', '.join(sorted({(x['tag'] or '').split(':')[0] for x in todo}))[:80]}）")
+    import subprocess
+    out = os.path.join(tempfile.gettempdir(), "asip-autodiag.jsonl")
+    job = os.path.join(tempfile.gettempdir(), "asip-autodiag.job.json")
+    try:
+        with open(job, "w", encoding="utf-8") as f:
+            f.write(json.dumps(todo, ensure_ascii=False))
+        r = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "warp_diag.py"),
+             "--job", job, "--out", out, "--rounds", "2", "--skip-done"],
+            capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            log(f"  ✗ 自动实测退出码 {r.returncode}: "
+                f"{(r.stderr or '').strip().splitlines()[-1][:120] if r.stderr else ''}")
+            return
+        ok = 0
+        try:
+            with open(out, encoding="utf-8") as f:
+                for line in f:
+                    if json.loads(line).get("ok"):
+                        ok += 1
+        except (OSError, ValueError):
+            pass
+        if ok:
+            m = subprocess.run(
+                [sys.executable, os.path.join(os.path.dirname(__file__),
+                                              "warp_blocks.py"),
+                 "merge-diag", out],
+                capture_output=True, text=True, timeout=120)
+            log(f"  ✓ 实测完成：{ok}/{len(todo)} 可承载，已并入 block-map")
+            if m.returncode != 0:
+                log(f"  ⚠ 合并失败: {(m.stderr or '').strip()[-120:]}")
+        else:
+            log(f"  · 实测完成：{len(todo)} 个节点均未通过，不并入")
+    except subprocess.TimeoutExpired:
+        log("  ✗ 自动实测超时（15min），下轮再试")
+    except Exception as e:
+        log(f"  ✗ 自动实测失败: {type(e).__name__}: {e}")
+
 
 def _rebind_wg_lines_after_refresh() -> None:
     """订阅刷新后，把绑定已失效的 WG 线换到后备节点。
@@ -8098,7 +9481,7 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
     try:
         parse_script = os.path.join(os.path.dirname(__file__), "parse_subscription.py")
         config_file = CFG["singbox"]["config_file"]
-        urls = [u for u in _SUB_URLS if u]
+        urls = _sub_urls()
         if not urls:
             log("✗ 无可用订阅源")
             return False
@@ -8225,6 +9608,7 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
             return False
         _log_pool_diff(config_file, tmp_file)
         os.replace(tmp_file, config_file)
+        _promote_sidecars(tmp_file, config_file)
         _drop_stats(tmp_file)
         if not fallback and not unjudgeable:
             # 只记"真的上线了"的样本：试跑、被拒的、口径不明的都不进窗口。
@@ -8232,6 +9616,14 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
         _rebind_wg_lines_after_refresh()
         log(f"✓ 订阅刷新完毕（池子成员 {old_n} → {new_n}），"
             f"重启 sing-box 加载新配置...")
+        # 新节点要测出 colo 才进得了块；放在重启之后异步跑，不拖慢刷新。
+        # WG 与 H2 是两条独立承载，各测各的：只跑 WG 时 carrier=h2 永远不增加，
+        # H2 渠道池就停在那一批老节点上（实测 etcloud 的 18 个活节点因此一直
+        # 只在代理池里躺着）。
+        _submit_once("autodiag", _run_autodiag)
+        _submit_once("h2diag", _run_h2_probe)
+        # 实测只更新 block-map；真正把新块变成线的是这条（自限 30min）。
+        _submit_once("h2sync", _run_h2_sync)
         return restart_singbox()
     except Exception as e:
         log(f"✗ 订阅刷新失败: {e}")
@@ -8556,7 +9948,6 @@ def _run_user_name() -> str:
             return name
     except (OSError, subprocess.TimeoutExpired):
         pass
-    import pwd
     return pwd.getpwuid(os.geteuid()).pw_name
 
 
@@ -9014,6 +10405,20 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         self._send(200, _api_debug_state())
 
     def do_POST(self):
+        if self.path == "/refresh-sub":
+            # 订阅源刚被改过（`asip sub add`）时用它立刻生效。后台线程跑：
+            # 刷新要拉 4~5 个源 + 重启 sing-box，十几秒起步，阻塞在 HTTP
+            # 响应里会让调用方超时，看起来像失败。
+            if not self._authed():
+                self._send(401, {"ok": False, "reason": "unauthorized"})
+                return
+            # 不在这里判「是否已在刷新」：refresh_subscription 自己拿非阻塞锁，
+            # 重复调用只会打一行「已有订阅刷新在进行」。预判一次反而多一个竞态。
+            threading.Thread(target=refresh_subscription,
+                             args=("手动插入订阅",), daemon=True,
+                             name="manual-sub-refresh").start()
+            self._send(200, {"ok": True, "started": True})
+            return
         if self.path != "/rotate":
             self._send(404, {"ok": False, "reason": "not_found"})
             return
@@ -9127,7 +10532,10 @@ def main():
     last_health_check = 0
     # 启动时不立即触发刷新；但配置文件缺失时必须立刻重建，否则 sing-box
     # 起不来且要等到下一个 1h 刷新周期（配置不入库，全新 clone/误删即此状态）
-    last_sub_refresh = 0 if not os.path.exists(CFG["singbox"]["config_file"]) else time.time()
+    # 配置存在也别等满一小时才刷：实测 18:05 重启后到 18:45 一次都没刷过，
+    # 而新订阅的节点正等着进池。改为**启动后先跑一轮**（首次立即触发），
+    # 之后按 1h 周期。代价是一次额外 fetch，收益是新节点最晚 1 小时内进块。
+    last_sub_refresh = 0
     last_node_info_cleanup = time.time()
     last_proxy_check = 0
     last_summary_ts = 0

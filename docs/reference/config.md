@@ -100,10 +100,13 @@ fixed 到点那次换线会把 requests 的配额计数一起清零，150 格永
 | 键 | 控制什么 | 改了会怎样 |
 |---|---|---|
 | `channel_ban_reset_hour` | 渠道锁解封时刻 | 8（早八点）。**这是 opencode 官方的配额重置时刻，不是我们定的闹钟**。改了锁会提前或滞后于真实恢复 |
-| `channel_ban_window_sec` | 样本窗口 | 3600 |
-| `channel_ban_min_samples` | 样本条数下限（**严格大于**） | 30。降到只数条数时，17 条线的 31 条样本只用了 4.7 分钟就锁了 —— 那是"连撞 31 次"，不是"持续一小时没产出" |
-| `channel_ban_min_cover_ratio` | 样本要铺满窗口的比例 | 0.5。三个条件缺一都会把「还没被打够」误判成「烧穿」 |
-| `channel_ban_hold_enabled` | 渠道锁总闸 | 关掉后已写入的锁立刻失效，并触发一次"还原回原节点" |
+| `channel_ban_min_samples` | 样本条数下限（**达到**才判，取当天最近 N 条） | 1000。判据是这 N 条**全部** quota 才锁；出现任何一条 OK/flagged 就否决。旧口径「1h 窗口 100% + 铺满半窗」已废（能出 OK 的线被锁一整天，实测 WG-21） |
+| `channel_noaddr_hold_sec` | 连续拿不到出口地址多久锁渠道 | 5h。与 quota 判据独立：拿不到地址 = 隧道/节点死了，重启换地址也买不到东西 |
+| `channel_ban_window_sec` | **不再是锁的窗口**，只给 `ipv6_segments.colo_ban_rates` 算 colo ban 率用（重定位/补位挑 colo） | 3600。改它只影响挑 colo 的统计口径，不影响锁 |
+| ~~`channel_ban_min_cover_ratio`~~ | **已删除** | 旧口径「样本要铺满半窗」的产物，随判据一起废弃 |
+| `channel_ban_hold_enabled` | 渠道锁总闸 | 关掉后已写入的锁立刻失效，并触发一次"还原回原节点"；补位渠道一并撤除（关闸是回滚） |
+| `channel_rehome_enabled` | 重定位总闸 | 关掉后锁线不再搬 colo，但**补位照开**（`_backfill_open` 传 `ignore_enabled=True`，主人的硬要求） |
+| `channel_rehome_min_samples` | 目标 colo 的样本下限 | 10。低于它的 colo 不配当"ban 率最低" —— 3 条零封禁会把整批线吸过去 |
 | `night_window.enabled` | 夜间锁 | 当前 `false`。它防的是"深夜重启刷不出地址"（10-31 实测 17036 次重启、**0 次刷新成功** —— 不是重启坏了，是池子干了） |
 | `line_quota_quarantine_enabled` | 撞长 Retry-After 就隔离 | 当前 `false`。重启换地址是主人要的刷新行为 |
 

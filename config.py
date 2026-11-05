@@ -570,20 +570,21 @@ CFG = {
         # 关掉的代价是恢复保护没了 —— 真遇到账号级配额窗口时会看到 190 次/分
         # 那一类重启风暴，那时把这里改回 True。
         "quota_hold_enabled": False,
-        # 按渠道的 ban 率锁：某条线最近 window_sec 内的模型层实测**全部**判
-        # quota/flagged（且样本数 ≥ min_samples），说明整条渠道（同 colo 全段）
-        # 都烧穿了，重启换地址不会产出，锁到次日 reset_hour 点。
-        # 2026-11-02 实测：中午后 94% 的换址记录都是 ban，89.6% 的地址首用即
-        # quota；WG-1..6 在 NRT 12 个段上 100% 烧穿，每线刷了 1200~1600 次。
+        # 按渠道的 ban 率锁。判据（2026-11-04 主人定）：
+        #   当天最近 `channel_ban_min_samples`(1000) 条模型层实测**全部**判
+        #   quota —— 出现任何一条 OK/flagged/err 就否决；或
+        #   连续 `channel_noaddr_hold_sec`(5h) 探测不到出口地址。
+        # 命中后锁到次日 reset_hour，并且**锁定期间不再探测、不再重启**。
+        # 旧口径（1h 窗口 100% 封禁 + 铺满半窗）实测会把能出 OK 的线锁一整天：
+        # WG-21 锁在 11-03 08:00 后，10:52~13:37 期间换两个新 IP 出了 7 次 OK，
+        # 但锁不解除；到期时窗口里的旧样本又把它续到次日。
         "channel_ban_hold_enabled": True,
-        # 30min 窗口 + 2 条样本会把 WG-4/11/12 这种低流量线误锁（实测各只有
-        # 3~6 条实测）。改成 1h 窗口、且**严格大于** 30 条实测才算数 ——
-        # 低于这个量级的 100% 只是「还没被打够」，不是烧穿。
+        "channel_ban_min_samples": 1000,
+        # 转义给了 `ipv6_segments.colo_ban_rates`（重定位挑 colo 用），与本锁无关。
         "channel_ban_window_sec": 3600,
-        "channel_ban_min_samples": 30,
-        # 样本还得铺满窗口的一半。只数条数时实测 31 条只用了 4.7 分钟就锁了
-        # 17 条线 —— 那是「连撞 31 次」，不是「持续一小时都没产出」。
-        "channel_ban_min_cover_ratio": 0.5,
+        # 连续拿不到出口地址多久锁渠道。与 quota 锁分开：拿不到地址 = 隧道/节点
+        # 死了，重启换地址也买不到东西。期间任何一次拿到地址就清零。
+        "channel_noaddr_hold_sec": 5 * 3600,
         "channel_ban_reset_hour": 8,
         # 命中后不只是停刷：把这条线换到最近 1h ban 率最低的 colo 上重定位，
         # 次日 08:00 再换回原节点（`rehome_from`）。
@@ -816,7 +817,8 @@ def _append_h2_members(cfg: dict) -> None:
     文件不存在（未渲染过）时什么都不做，行为回到旧版。
     """
     import json
-    p = os.path.join(PROJECT_DIR, ".warp", "h2", "channels.json")
+    p = _env_path("ASIP_H2_CHANNELS_PATH",
+                  os.path.join(PROJECT_DIR, ".warp", "h2", "channels.json"))
     try:
         with open(p, encoding="utf-8") as f:
             rows = json.load(f)
@@ -838,6 +840,44 @@ def _append_h2_members(cfg: dict) -> None:
             continue
 
 _append_h2_members(CFG)
+
+def _append_backfill_members(cfg: dict) -> None:
+    """补位渠道并入 members（`.warp/backfill.json`，daemon 开/撤时写）。
+
+    必须在这里读、而不是只改 daemon 内存里的 members：`deploy/members.py`
+    与 `parse_subscription.py` 都是**独立进程**，各自 import 一次 config。
+    只在 daemon 里 append，warp-outbound.json 与主配置都看不见它 —— 补位
+    渠道起来了却没人能切过去。
+
+    文件里是 daemon 自己的台账，读不到就当没有（补位只在锁定期存在）。
+    """
+    import json
+    p = _env_path("ASIP_BACKFILL_FILE_PATH",
+                  os.path.join(PROJECT_DIR, ".warp", "backfill.json"))
+    try:
+        with open(p, encoding="utf-8") as f:
+            rows = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(rows, list):
+        return
+    tags = {m.get("tag") for m in cfg["warp"]["members"]}
+    for r in rows:
+        # 同 tag 重复进 outbounds，sing-box check 直接 FATAL（同 members.py 的注释）。
+        if not isinstance(r, dict) or not r.get("tag") or r["tag"] in tags:
+            continue
+        try:
+            cfg["warp"]["members"].append({
+                "tag": r["tag"], "port": int(r["port"]),
+                "service": r["service"], "kind": "wg",
+                "index": int(r["index"]), "family": r.get("family") or "v6",
+                "backfill_for": r.get("backfill_for"),
+            })
+            tags.add(r["tag"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+_append_backfill_members(CFG)
 
 # ============= 便捷常量 =============
 # ponytail: SINGBOX_SECRET 不在此导出为模块级常量——CFG["singbox"]["secret"] 是 import 时冻结的
@@ -883,6 +923,36 @@ def needs_airport_dns(server: str | None) -> bool:
 def subscription_urls() -> list[str]:
     """Configured subscription URLs, in merge order, empty entries dropped."""
     return [url for url in (CFG.get(k, {}).get("sub_url", "") for k in SUBSCRIPTION_KEYS) if url]
+
+
+EXTRA_SUBS_FILE = _env_path("ASIP_EXTRA_SUBS_FILE",
+                            os.path.join(PROJECT_DIR, ".extra_subscriptions"))
+
+
+def extra_subscription_urls() -> list[str]:
+    """追加订阅源：环境变量 ASIP_EXTRA_SUB_URLS + `asip sub add` 写的台账文件。
+
+    为什么用文件而不是只写 .env：daemon 的 EnvironmentFile 只在启动时读一次，
+    写 .env 必须重启才生效 —— 而重启会掐断在途 SSE。台账文件在每次刷新的
+    `_sub_urls()` 里现读，插一个源不用动进程。环境变量仍优先（临时覆盖/试跑）。
+
+    顺序排在固定源之后：固定源是主力，追加源是补充。
+    """
+    raw = os.environ.get("ASIP_EXTRA_SUB_URLS") or ""
+    urls = [p for p in raw.replace(",", " ").split() if "://" in p]
+    try:
+        with open(EXTRA_SUBS_FILE, encoding="utf-8") as f:
+            urls += [ln.strip() for ln in f
+                     if "://" in ln and not ln.lstrip().startswith("#")]
+    except OSError:
+        pass
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 # ============= 启动校验 =============
 # requests 模式整个判据就是「数哪个模型的成功调用」。键写错时 daemon 不该

@@ -84,7 +84,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文档 | 内容 |
 |---|---|
-| **[established-facts.md](established-facts.md)** | **既定事实（29 条），先读这个** |
+| **[established-facts.md](established-facts.md)** | **既定事实（44 条），先读这个** |
 | [glossary.md](glossary.md) | **名词表**：节点/线路/渠道/成员的确切定义 |
 | [BUILD-PLAN.md](BUILD-PLAN.md) | 文档构建计划与更新规范 |
 
@@ -100,7 +100,18 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
   2026-11-03 远端因此丢了 3.5 小时出口（30362 次 `status=404`）而日志无声。
   自愈重建必须走骤降护栏，裸跑 `parse_subscription.py` 会把可疑产出推上线。
 - **第 29 条** `proxy` 池成员数是**动态**的（按实测判死摘出），两台机器同刻
-  可以差 5 倍（远端 120 / 本地 25）。不要把它当故障，也不要写进阈值。
+  可以差近 7 倍（远端 165 / 本地 25）。不要把它当故障，也不要写进阈值。
+- **第 25b 条** 重启循环会把唯一能救它的机制（同块轮回）顶在门外——
+  `ever_ip` 为假的线重启没有意义，得换节点。H2 线的承载闸查的是另一个集合
+  `_H2_POOL_DEAD`（它们的落地节点不在 `warp_wg` 台账里）。
+- **第 13h 条** 部分 H2 线绑在死节点上是**预期状态**；2026-11-05 扩容后多出
+  FRA/GIG/IST/LHR/SYD 五个 colo，当天下午补 greatgame 源后又多出
+  BOM/JNB/DUB/IAD 四个（28 个节点实测 22 个可承载 H2）。但**新 colo 抬的是
+  单位时间地址产出，不是单地址寿命** —— 看到「新 colo 也很快 429」不是扩容失效。
+- **第 13c 条** 手动跑 `h2-install.sh` **只装了一半**：它不写
+  `warp-outbound.json`、不跑 `patch-wg-outbounds.py`，于是新线单元全 active、
+  单条 SOCKS 直连能出 `warp=on`，但主 `opencode-out` 里一条都没有。完整顺序
+  见 TEST_PLAN §20b。
 
 **架构层**（看代码看不出来的设计）
 
@@ -164,6 +175,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | `deploy/remote-deploy.sh` | **一键复刻本机拓扑到远端**（代码/状态表/设备/单元/验收） |
 | [ops-20261028-security-changes.md](ops-20261028-security-changes.md) | 安全变更操作记录 |
 | [9router-task-book-20261028.md](9router-task-book-20261028.md) | 9router 任务书 |
+| [task-20261104-channel-backfill.md](task-20261104-channel-backfill.md) | 渠道封禁补位：任务、实现、验证、踩过的坑 |
 | [9router-dev-logic-20261028.md](9router-dev-logic-20261028.md) | 9router 开发逻辑（已不存在于本项目的 proxy-global.js 那一层） |
 
 ---
@@ -178,6 +190,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | `warp_blocks.py` | 渠道模型（纯函数，可单测） |
 | `warp_wg.py` | WG 线路的生成、探测、apply |
 | `warp_diag.py` | 单节点 WARP 承载诊断（**判断节点能不能用只信它**） |
+| `tools/channel_report.py` | 渠道健康报表（`asip chan`）：成功率 / 出口段四级 / 每 colo 的池与指纹落点，纯只读 |
 | `deploy/render_h2_lines.py` | H2 线路渲染 |
 | `deploy/install.sh` | 单元生成与安装 |
 
@@ -186,6 +199,9 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 ```bash
 # 看当前拓扑
 asip warp status
+
+# 看渠道健康与出口段（纯读；-h 看 --hours/--html/--json/--by）
+asip chan
 
 # 看渠道清单（纯读）
 set -a; . ./.env; set +a; python3 warp_blocks.py plan

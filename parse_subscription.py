@@ -5,6 +5,8 @@
 import base64
 import os
 import json
+import re
+import time
 import urllib.parse
 import sys
 from pathlib import Path
@@ -33,17 +35,104 @@ AIRPORT_DNS_TAG = config.AIRPORT_DNS_TAG
 
 
 # ============= 解析订阅 =============
-def fetch_and_decode_sub(url: str) -> list[str]:
-    """拉订阅，base64 解码，返回原始 URL 列表
-    支持：标准 base64 订阅、明文 URL 列表、Clash YAML 配置（提取 proxy 节点）
+def source_label(url: str) -> str:
+    """订阅源的展示名：`主机/末段[?flag=…]`，**绝不带 token**。
+
+    路径末段常是账户 token（`/api/v1/pq/<token>`），query 里也常有 `token=`。
+    台账会被 CLI/仪表盘原样打印，带上就等于把凭据写进终端回滚缓冲区。
     """
-    import yaml
-    # 仅对 dasho 等需要 UA 的源添加 headers
+    try:
+        u = urllib.parse.urlparse(url)
+    except ValueError:
+        return "?"
+    host = u.hostname or "?"
+    seg = [s for s in (u.path or "").split("/") if s]
+    tail = ""
+    if seg:
+        last = seg[-1]
+        # 长串十六进制/字母数字几乎一定是账户 token（dasho 的 /api/v1/pq/<32 hex>）
+        tail = "/***" if re.fullmatch(r"[0-9a-fA-F]{16,}", last) else f"/{last}"
+    flag = ""
+    for part in (u.query or "").split("&"):
+        k, _, v = part.partition("=")
+        if k.lower() == "flag" and v:
+            flag = f"?flag={v}"
+            break
+    return f"{host}{tail}{flag}"
+
+
+def sub_name(url: str) -> str:
+    """订阅的短名：固定源用配置键（okz/dasho…），追加源用主机首段。
+
+    与 `source_label` 的区别是用途：label 用来核对「是不是同一个 URL」，
+    短名用来在报表里一列放下。追加源的域名常常被 CDN 包了一层
+    （`etcloud-zone-3qpz…eo-edgefunctions.com`），取首个可读段就够认人。
+    """
+    try:
+        for key in config.SUBSCRIPTION_KEYS:
+            if url and url == (config.CFG.get(key) or {}).get("sub_url"):
+                return key
+    except (AttributeError, TypeError):
+        pass
+    try:
+        host = urllib.parse.urlparse(url).hostname or "?"
+    except ValueError:
+        return "?"
+    if "etcloud" in host:
+        return "etcloud"
+    first = host.split(".")[0]
+    return first or host
+
+
+# 机场塞在订阅头的「信息节点」：名字是套餐状态文案，本身也是可拨号节点
+# （会真的进池子）。判据必须是**「状态词 + 冒号/剩余」**这种完整形态：
+# 只匹配前缀会把 `官网线路`、`订阅节点1`、`重置专用` 这些真实节点名一起清空
+# —— 实测 okz/dasho 都没有这种名字，但机场换命名习惯时就会误伤。
+_INFO_NAME = re.compile(
+    r"^(剩余流量|套餐到期|距离下次重置|到期时间|到期日期)\s*[：:]"
+    r"|^(官网|订阅|官网地址)\s*[：:]"
+    r"|^(距离下次重置剩余|重置剩余)\s*[：:]")
+
+
+def display_name(name: str) -> str:
+    """机场节点名 → 报表里的节点名。空/信息节点返回空串。"""
+    n = (name or "").strip()
+    return "" if not n or _INFO_NAME.match(n) else n
+
+
+def _raw_body(result) -> str:
+    """JSON 响应走 data；非 JSON（base64/Clash YAML/明文列表）走全文 text。
+
+    request_json 显式传 text_limit=None，不能截断；结构化 data 重新序列化，
+    后面的 base64/YAML/splitlines 解析都针对字符串。
+    """
+    if result.data is not None:
+        return (result.data if isinstance(result.data, str)
+                else json.dumps(result.data, ensure_ascii=False))
+    return result.text or ""
+
+
+def _fetch_raw(url: str) -> str:
+    """抓订阅正文。默认 UA 被拒时用 clash-verge UA 重试一次。
+
+    WHY 重试而不是继续按域名特判：2026-11-04 实测 etcloud 系订阅源默认 UA
+    直接 503，带 `clash-verge/1.0` 才返回内容。按域名加 UA 的旧写法只能覆盖
+    已知机场，新源要么改代码要么插不进来 —— 而 503/403 恰恰是"这个源按 UA
+    决定给不给"的典型症状，重试一次的成本远低于让人回来改代码。
+    okz 这类默认 UA 正常的源不会走到重试，行为不变。
+    """
     headers = {"User-Agent": "clash-verge/1.0"} if "dasho" in url else {}
-    # text_limit=None：非 JSON 订阅是整段 base64/明文，截断到 2000 字符
-    # 会静默丢掉后面的节点（多源合并后按截断内容生成配置）。
     result = request_json("GET", url, timeout=30, headers=headers,
                           text_limit=None)
+    # 只在**服务器答了**时才换 UA 重试：status=None 是连不上/DNS 超时，换个 UA
+    # 不会让死源复活，重试只会把单源失败耗时从 30s 翻到 60s（实测该用例因此
+    # 撞上 60s 超时）。
+    if not result.ok and not headers and result.status is not None:
+        retry = request_json("GET", url, timeout=30,
+                             headers={"User-Agent": "clash-verge/1.0"},
+                             text_limit=None)
+        if retry.ok:
+            return _raw_body(retry)
     if not result.ok:
         # 与 raise_for_status 等价：传输失败单独说明，非 2xx 带上状态码。
         if result.status is None:
@@ -51,14 +140,119 @@ def fetch_and_decode_sub(url: str) -> list[str]:
         else:
             detail = f"HTTP {result.status}"
         raise RuntimeError(f"订阅拉取失败: {detail}")
-    # JSON 响应走 data；非 JSON（base64/Clash YAML/明文列表）走全文 text
-    # （request_json 显式传 text_limit=None，不能截断）。
-    # 结构化 data 重新序列化，后面的 base64/YAML/splitlines 解析都针对字符串。
-    if result.data is not None:
-        raw = (result.data if isinstance(result.data, str)
-               else json.dumps(result.data, ensure_ascii=False))
-    else:
-        raw = result.text or ""
+    return _raw_body(result)
+
+
+def singbox_outbounds(raw: str) -> list[dict]:
+    """sing-box 配置里的节点出站，原样返回（已经是 make_config 要的形状）。
+
+    `flag=sing` 这类源直接下发 sing-box JSON，不是 base64/Clash/明文 URI。
+    **不转成 URL 再解析回来**：往返会丢字段（tls / transport / alpn），而
+    parse_* 的产物与这份 dict 本来就是同构的 —— 转一趟只是给自己造坑。
+    """
+    try:
+        cfg = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(cfg, dict):
+        return []
+    obs = cfg.get("outbounds")
+    if not isinstance(obs, list):
+        return []
+    # 逻辑出站（selector/urltest）与内建类型不是可拨号节点；wireguard 是
+    # endpoint 而不是 outbound，混进池子会让 sing-box check FATAL。
+    skip = {"selector", "urltest", "direct", "block", "dns", "wireguard"}
+    out = [o for o in obs
+           if isinstance(o, dict) and o.get("type") not in skip
+           and o.get("server") and o.get("server_port") and o.get("tag")]
+    for o in out:
+        # 机场给的原名先留一份再改写 tag：`_display` 是**非 sing-box 字段**，
+        # 只在生成 `<cfg>.sources.json` 时读，写进配置前会被剥掉。
+        o["_display"] = str(o["tag"])
+        # tag 一律重算成 `host:port-<协议>`，与 URI 源同一个规则。
+        # WHY：机场的 sing-box tag 是给人看的中文名，而且**每次刷新都变**
+        # （`剩余流量：59.98 GB` → `59.99 GB`）。tag 是 daemon 判死表、
+        # block-map、selector 成员共同的身份键 —— 让它跟着流量数字漂，
+        # 等于每轮刷新都把整池节点当成新节点重来一遍。
+        o["tag"] = f"{o['server']}:{o['server_port']}-{_SCHEME_ABBR.get(o['type'], o['type'])}"
+    return out
+
+
+def sub_cache_dir() -> Path:
+    """源快照目录。默认 `<项目>/.sub_cache`，可用 `ASIP_SUB_CACHE_DIR` 覆盖（测试用）。"""
+    return Path(os.environ.get("ASIP_SUB_CACHE_DIR")
+                or (Path(__file__).resolve().parent / ".sub_cache"))
+
+
+def _cache_key(url: str) -> str:
+    """源 → 稳定的文件名。**不能**把 URL 直接当文件名：里面就有 token。"""
+    import hashlib
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _read_cache(url: str) -> tuple[str, float] | None:
+    """上一轮成功拉到的正文。返回 (正文, 落盘时刻)；没有则 None。"""
+    p = sub_cache_dir() / (_cache_key(url) + ".json")
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    raw, ts = d.get("raw"), d.get("ts")
+    return (raw, float(ts)) if isinstance(raw, str) else None
+
+
+def _write_cache(url: str, raw: str) -> None:
+    """把成功拉到的正文落一份。写失败不影响本次刷新 —— 缓存是加分项。"""
+    if not raw:
+        return
+    from asip.atomic_io import write_json as _wj
+    p = sub_cache_dir() / (_cache_key(url) + ".json")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _wj(str(p), {"ts": time.time(), "raw": raw}, mode=0o600)
+    except OSError as e:
+        print(f"  ⚠ 源快照写不进去（{e}），下次该源失败时会丢节点",
+              file=sys.stderr)
+
+
+def _fetch_or_cache(url: str) -> tuple[str, str]:
+    """抓订阅；失败时退回上一轮快照。返回 (正文, 来源说明)。
+
+    WHY 必须有这层：订阅链接可能是**一次性的**（服务端发一次就失效）。
+    实测 2026-11-04：`iqiyi29ji` 源 15:39 还能拉到 49 个节点，15:48 再拉
+    就是 HTTP 403，那一轮刷新直接把 49 个节点从生产配置里删掉了 —— 旧逻辑
+    遇错 `continue`，等于「一次拉取失败 = 该源所有节点消失」。
+
+    缓存是**按源**分的：一个源失败不连累其它源；所有源都失败时，回退到
+    各自快照，配置至少不会比上一轮更差。
+    """
+    try:
+        raw = _fetch_raw(url)
+        _write_cache(url, raw)
+        return raw, "ok"
+    except Exception as e:
+        cached = _read_cache(url)
+        detail = redact_secrets(str(e))[:100]
+        if not cached:
+            raise RuntimeError(f"订阅拉取失败且无快照: {detail}") from None
+        raw, ts = cached
+        age = (time.time() - ts) / 3600
+        src = source_label(url)
+        print(f"  ♻ {src} 拉取失败（{detail}），改用 {age:.1f}h 前的快照",
+              file=sys.stderr)
+        return raw, f"cache:{age:.1f}h"
+
+
+def fetch_and_decode_sub(url: str) -> list[str]:
+    """拉订阅，base64 解码，返回原始 URL 列表
+    支持：标准 base64 订阅、明文 URL 列表、Clash YAML 配置（提取 proxy 节点）
+    """
+    return _decode_sub(_fetch_raw(url))
+
+
+def _decode_sub(raw: str) -> list[str]:
+    """把一份订阅正文解码成 URI 列表（base64 / Clash YAML / 明文）。"""
+    import yaml
 
     all_lines = []
 
@@ -218,6 +412,11 @@ def _clash_proxy_to_url(proxy: dict) -> str | None:
 def _tag_for(u, scheme: str) -> str:
     """tag 用 host:port-scheme 防止重复（订阅里多个不同名字同节点）"""
     return f"{u.hostname}:{u.port}-{scheme}"
+
+# 解析器用的两字母缩写。sing-box 源要生成**同一套** tag，否则同一个节点从
+# 两种源进来会得到两个 tag（同一台机器被当成两条线）。
+_SCHEME_ABBR = {"vless": "vl", "vmess": "vm", "trojan": "tr",
+                "shadowsocks": "ss", "hysteria2": "h2", "anytls": "any"}
 
 def parse_hysteria2(url: str) -> dict:
     u = urllib.parse.urlparse(url)
@@ -540,10 +739,14 @@ def _load_warp_outbounds() -> list[dict]:
 
 
 def _load_dormant_outbounds() -> list[dict]:
-    """休眠节点：订阅源暂时不可用、但节点随时可能复活的。
+    """休眠节点：`dormant-outbounds.json` 里那份手工固化的旧入口快照。
 
-    现状（2026-10-28 实测）：okz 的订阅**是活的**（HTTP 200、64 条 URL），但里面的
-    节点全死。所以它们被抽出来放在这份外挂文件里：出站保留，池子成员按实测动态剔除。
+    它**不是**「订阅源挂了才用」的备份：2026-11-04 实测，okz 现在仍供这批后端，
+    只是入口域名从 `bilibili-image-cdn.juhazf.cn:<5xxxx>` 换成了 `cn.bing.com:443`
+    / `us.bing.com:443`。按 (SNI, 协议) 对齐后 63/63 密码相同 —— 也就是**同一批
+    节点的旧入口**。留着它当 bing 前置被墙时的备胎。
+
+    （文件 2026-10-28 15:52 手工固化后再没变过，okz 再换入口不会自动跟进。）
 
     与 WARP 出站共用「主配置外挂一份 JSON」的做法，区别是这些节点要进
     主池 selector —— daemon 的轮换与降级判断看的是主池成员。放在订阅节点
@@ -806,7 +1009,7 @@ def make_config(nodes: list[dict], listen_port: int = 0,
     warps = [w for w in _load_warp_outbounds()
              if w["tag"] not in node_tags and w["tag"] not in dormant_tags]
     if dormant:
-        print(f"  + {len(dormant)} 个休眠节点（订阅源暂时不可用，等它复活）",
+        print(f"  + {len(dormant)} 个休眠节点（okz 旧入口快照，非当前订阅）",
               file=sys.stderr)
     outbounds = nodes[:] + dormant + warps
     outbounds.append({"type": "direct", "tag": "direct"})
@@ -956,32 +1159,59 @@ if __name__ == "__main__":
             sys.exit(1)
     sub_urls = (args.urls or file_urls
                 or ([args.url] if args.url else [])
-                or config.subscription_urls())
+                or config.subscription_urls() + config.extra_subscription_urls())
     if not sub_urls:
         print("ERROR: no subscription URLs provided (use --urls or --url)", file=sys.stderr)
         sys.exit(1)
 
-    all_urls = []
+    all_urls: list[tuple[str, str]] = []      # (uri, 来源 URL)
+    all_nodes: list[tuple[dict, str]] = []    # (出站, 来源 URL)
     for url in sub_urls:
         safe_url = url.split("@")[-1] if "@" in url else url[:60]
         print(f"fetching subscription from {safe_url}...")
         try:
-            urls = fetch_and_decode_sub(url)
+            raw, origin = _fetch_or_cache(url)
         except Exception as e:
             # 异常串可能带完整 URL（含 token），stderr 会进 daemon.log。
             print(f"  ✗ 源失败，跳过: {type(e).__name__}: "
                   f"{redact_secrets(str(e))[:120]}", file=sys.stderr)
             continue
+        if origin != "ok":
+            # 快照救回了这个源：节点不会消失，但这一轮的数据是陈的，
+            # 日志里必须能看出来（否则「为什么机场换了节点这边没变」无从追起）。
+            print(f"  · {source_label(url)} 本轮用快照（{origin.split(':', 1)[1]}）",
+                  file=sys.stderr)
+        # sing-box JSON 源（flag=sing）：出站已经可直接入池，不经过 URL 往返。
+        direct = singbox_outbounds(raw)
+        if direct:
+            print(f"  got {len(direct)} sing-box outbounds")
+            all_nodes.extend((n, url) for n in direct)
+            continue
+        try:
+            urls = _decode_sub(raw)
+        except Exception as e:
+            print(f"  ✗ 源解析失败，跳过: {type(e).__name__}: "
+                  f"{redact_secrets(str(e))[:120]}", file=sys.stderr)
+            continue
         print(f"  got {len(urls)} raw URLs")
-        all_urls.extend(urls)
+        all_urls.extend((u, url) for u in urls)
 
     print(f"total raw URLs from all sources: {len(all_urls)}")
 
     nodes = []
     seen_urls: set[str] = set()
     seen_tags: set[str] = set()
+    # 跨格式身份：同一台机器可能从 URI 源和 sing-box 源各来一次（同一个 token
+    # 换 flag 就是两份订阅）。两者 tag 已统一成 `host:port-协议`，但只靠 tag
+    # 去重会在 sni/transport 不同的情况下误合并，靠 URL 去重又认不出 JSON 源。
+    # `_node_fp`（server/port/type/transport/sni）正好是同一台机器的稳定身份。
+    seen_fps: set[str] = set()
+    # 节点 → 来源。value 是 dict 而不是字符串：报表要同时显示「哪个订阅」
+    # 和「机场给这个节点起的名字」（`🇸🇬新加坡01-0.1倍`），只存 URL 标签
+    # 不够 —— 名字是人工核对「这条线到底是哪台机器」的唯一依据。
+    sources: dict[str, dict] = {}
     filter_sub = args.filter.lower() if args.filter else None
-    for u in all_urls:
+    for u, src in all_urls:
         # 身份 = 去掉 #名字 的整条 URL：同一台机器上靠 ws path / sni 区分的
         # 多条节点身份不同，必须都留下；只有名字不同的重复项才该合并。
         ident = u.split("#", 1)[0]
@@ -1005,19 +1235,65 @@ if __name__ == "__main__":
             n["tag"] = f"{stem}~{i}-{scheme}"
         seen_urls.add(ident)
         seen_tags.add(n["tag"])
+        seen_fps.add(_node_fp(n))
+        name = urllib.parse.unquote(u.split("#", 1)[1]) if "#" in u else ""
+        sources[n["tag"]] = {"sub": sub_name(src), "label": source_label(src),
+                             "name": display_name(name)}
+        nodes.append(n)
+
+    # sing-box 源直接给的出站：身份去重与 tag 撞名规则与上面一致（tag 撞名
+    # 不能整条丢 —— 那台机器上可能只有 path/入口不同）。指纹用 _node_fp：
+    # 它由 server/port/type/transport/sni 组成，与订阅到达顺序无关，正好当身份。
+    for n, src in all_nodes:
+        if filter_sub and filter_sub not in str(n["tag"]).lower():
+            continue
+        ident = _node_fp(n)
+        if ident in seen_fps:
+            continue
+        if n["tag"] in seen_tags:
+            scheme = str(n["tag"]).rsplit("-", 1)[-1]
+            stem = f"{n['server']}:{n['server_port']}"
+            i = 2
+            while f"{stem}~{i}-{scheme}" in seen_tags:
+                i += 1
+            n["tag"] = f"{stem}~{i}-{scheme}"
+        seen_fps.add(ident)
+        seen_tags.add(n["tag"])
+        sources[n["tag"]] = {"sub": sub_name(src), "label": source_label(src),
+                             "name": display_name(str(n.get("_display") or ""))}
         nodes.append(n)
 
     print(f"parsed {len(nodes)} usable nodes (deduplicated)")
     if not nodes:
+        # **先判空再写 sources**：写在判断之前的话，一次失败的解析会留下一份
+        # 「本轮有归属」的台账而配置根本没换新 —— 下游会把旧配置的节点配上
+        # 新台账的名字，比没有台账更误导。
         print("ERROR: no nodes parsed, aborting")
         sys.exit(1)
 
+    # `_display` 是给 sources 台账用的旁路字段，sing-box 不认未知键 ——
+    # 带进配置会让 `sing-box check` 直接 FATAL，整轮刷新被护栏拒掉。
+    for n in nodes:
+        n.pop("_display", None)
     cfg = make_config(nodes, args.port, args.clash_port, args.secret or get_singbox_secret(), include_h2=args.include_h2, stats_out=args.out)
+
     # 调用方（daemon）传进来的 args.out 本身已是 <config>.tmp：它要在 promote
     # 前做节点数/sing-box check 校验。write_json 先写同目录唯一临时文件再
     # os.replace 到 args.out，既不截断写（崩溃不会留下半份 JSON），也不改变
     # 调用方看到的路径契约。
     write_json(args.out, cfg, mode=0o600, indent=2)
+
+    # 来源台账与配置同目录、同一生命周期：sing-box 不认这个字段，单独落盘
+    # 才不会污染配置，也不会在 promote 校验时被当成未知键。
+    # **写在配置之后**：反过来一旦配置写失败，盘上会留下一份「本轮归属」的
+    # 台账而配置还是旧的，下游会把旧节点配上新名字 —— 比没有台账更误导。
+    # 只留**真正写进配置**的节点：`make_config` 默认排除 hysteria2，全记下来
+    # 会让报表以为那些节点在池里（实测 14 条 h2 只在台账、不在配置）。
+    in_cfg = {o.get("tag") for o in cfg.get("outbounds") or []
+              if o.get("server") and o.get("server_port")}
+    write_json(str(args.out) + ".sources.json",
+               {t: v for t, v in sources.items() if t in in_cfg},
+               mode=0o600, indent=None)
     print(f"wrote config to {args.out}")
     print(f"first 3 nodes:")
     for n in nodes[:3]:

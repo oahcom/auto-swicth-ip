@@ -4313,11 +4313,15 @@ def _stub_warp_cfg(monkeypatch):
     monkeypatch.setattr(daemon, "_PROBE_BLOCKED_AT", {})
 
 
-def test_cached_ok_verdict_does_not_skip_probe(monkeypatch):
-    """缓存里的 OK 不得当作「已实测」跳过探测。
+def test_cached_ok_verdict_skips_probe_within_ttl(monkeypatch):
+    """TTL 内的 OK 直接复用、不再实测 —— 这是主人 2026-10-28 拍板的取舍。
 
-    旧 OK 的 TTL 是 600s，地址被生产流量烧掉只需几秒；命中旧 OK 直接切上去
-    就是一轮 429 爆发。只有「地址已被拒」的持久负结论允许跳过。
+    原文：「600 秒的 OK 会让已被烧掉的地址被切上去，这个是可以接受的」——
+    省配额优先。`probe_ok_ttl_sec` 后来（T-225，2026-11-02）抬到 1800，
+    结论不变。只有「地址已被拒」的持久负结论同样跳过，但走另一条分支。
+
+    这条用例原本断言**相反**的行为（缓存 OK 仍须实测），与代码里记下的决定
+    冲突，一直红着。改判据时要连这里一起改，别只改代码。
     """
     _stub_warp_cfg(monkeypatch)
     monkeypatch.setattr(daemon, "_warp_model_usable", _REAL_WARP_MODEL_USABLE)
@@ -4328,8 +4332,8 @@ def test_cached_ok_verdict_does_not_skip_probe(monkeypatch):
     monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: (
         called.append(port) or ("err", 0.1, "boom", None)))
     ok = daemon._warp_model_usable({"tag": "tag-a", "port": 10001}, "1.2.3.4")
-    assert called == [10001], f"缓存 OK 时仍须实测，实际探测 {len(called)} 次"
-    assert ok is False, "实测 err 应判不可用"
+    assert called == [], f"TTL 内的 OK 不该重探，实际探测 {len(called)} 次"
+    assert ok is True, "缓存 OK 应直接放行"
 
 
 def test_cached_quota_verdict_skips_probe(monkeypatch):

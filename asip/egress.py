@@ -36,6 +36,11 @@ class EgressResult:
     warp: bool | None = None
     url: str | None = None
     error: str | None = None
+    # Cloudflare trace 里的落点，探测时**本来就已经拿到了**，此前被直接丢掉。
+    # 有了它，节点→colo 的映射不必只靠昂贵的 `warp_wg.survey()`（逐节点起
+    # sing-box，一次几十秒）：任何一次生产探测都在顺手更新台账。
+    colo: str | None = None
+    loc: str | None = None
 
 
 def _valid_ip(value: str) -> str | None:
@@ -122,7 +127,9 @@ def probe_egress(*, socks_port: int | None = None,
             warp = None
             if warp_text in ("on", "off"):
                 warp = warp_text == "on"
-            return EgressResult(ip=ip, warp=warp, url=url)
+            return EgressResult(ip=ip, warp=warp, url=url,
+                                colo=fields.get("colo") or None,
+                                loc=fields.get("loc") or None)
 
         raw = body.strip()
         if not raw:

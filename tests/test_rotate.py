@@ -96,7 +96,11 @@ def test_coalesced_within_window(monkeypatch):
 
 
 def test_too_frequent_rejected(monkeypatch):
-    monkeypatch.setattr(d, "_last_rotate_ts", time.time() - 2.0)
+    # 间隔按 `_rotate_gap()` 取，不写死：gap = rate429_guard_sec/线数，9 条线时
+    # 6.7s，线数涨到 40 条就压到 1.5s 地板，写死的 2.0 会越过闸门变成假失败。
+    gap = d._rotate_gap()
+    assert gap > 0.8, gap          # 合并窗 0.8s 必须窄于闸门，否则本用例测的是合并
+    monkeypatch.setattr(d, "_last_rotate_ts", time.time() - max(1.0, gap / 2))
     r = d._rotate_once('rate429')
     assert r['reason'] == 'too_frequent' and r['ok'] is False, r
 

@@ -207,14 +207,18 @@ def test_restart_cap_does_not_stop_probing(monkeypatch):
     )
 
 
-def test_restart_cap_survives_state_reload():
-    """restart_hist 必须随状态表落盘并被正确恢复。
+def test_restart_cap_is_reset_on_state_reload():
+    """`restart_hist` 落盘但**重启时不恢复** —— 这是有意的，不是漏了。
 
-    `_load_warp_line_state` 只恢复 `k in _LINE_DEFAULTS` 的键 ——
-    新键不加进那张表会被静默丢弃，daemon 每重启一次上限就清零。
+    `_load_warp_line_state` 里有一行 `st["restart_hist"] = []`，注释写明理由：
+    重启是人工动作，不该继承重启前的小时预算。事故中 cap=20 会让每条线在
+    启动后锁死 40~55 分钟（存档里 228~245 条）。
+
+    这条用例原本断言**相反**的行为（必须恢复 20 条），与那行代码直接冲突，
+    一直红着。要改判据时连这里一起改，别只改代码。
     """
     assert "restart_hist" in daemon._LINE_DEFAULTS, (
-        "restart_hist 不在 _LINE_DEFAULTS 中 —— 落盘后重启即丢，上限形同虚设"
+        "restart_hist 不在 _LINE_DEFAULTS 中 —— 落盘后读都读不回来"
     )
 
     now = time.time()
@@ -222,13 +226,19 @@ def test_restart_cap_survives_state_reload():
     path = os.environ["WARP_LINE_STATE_FILE_PATH"]
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"version": 1,
-                   "lines": {"W2": {"ip": "1.1.1.1", "restart_hist": hist}}}, f)
+                   "lines": {"W2": {"ip": "1.1.1.1", "fail_streak": 3,
+                                    "restart_hist": hist}}}, f)
 
     daemon._load_warp_line_state()
-    restored = daemon._warp_line_state("W2").get("restart_hist") or []
-    assert len(restored) == 20, (
-        f"重启后只恢复了 {len(restored)} 条重启记录 —— 上限窗口被清零"
+    st = daemon._warp_line_state("W2")
+    assert st.get("fail_streak") == 3, "其它字段必须恢复"
+    assert st.get("restart_hist") == [], (
+        "重启后必须清空重启预算，否则一次事故会把每条线锁死几十分钟"
     )
+    # 陈旧的 `ip` 一并清掉：它和 `last_ok_ts` 是同一份证据的两半，
+    # 只在「刚验证过」时才可信（2026-11-02 WG-22 绑死节点 4 分钟，
+    # `ip` 还是上一次会话的旧地址，同块轮回守护因此不动它）。
+    assert not st.get("ip"), "重启后不得沿用重启前那次会话的出口地址"
 
 
 def test_restart_cap_window_rolls_forward(monkeypatch):

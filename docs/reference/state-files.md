@@ -4,7 +4,12 @@
 > 哪些字段**看起来能用来判断 A，实际说的是 B**？
 
 除特别注明外，所有文件权限 `600` 且 gitignored —— 里面含隧道凭据、出口 IP
-台账这类不该进版本库的东西。
+台账这类不该进版本库的东西。**唯一例外是 `dormant-outbounds.json`（入库）**：
+它是节点定义，必须跟着仓库走，否则新机器上沉睡池直接空掉。
+
+> ⚠ **它入库的代价**：文件里有机场节点的明文 `password`（65 条 anytls 全带），
+> 2026-10-28 手工固化时就没有脱敏，也已经进了 git 历史。仓库若哪天转公开，
+> 要先轮换这批节点密码 —— 只从工作区删掉没用，历史里还在。
 
 ## 一、文件清单
 
@@ -17,10 +22,12 @@
 | `.warp_ip_used.json` | daemon | daemon | 出口 IP 使用台账 |
 | `.warp_ip_cycles.json` | daemon | 离线诊断 | 段样本（**只记错误终止的段**） |
 | `.bad_nodes.json` | daemon（独占写） | daemon | 池节点黑名单 |
-| `.dormant_state.json` | `dormant_probe.py` | `parse_subscription.py` | 沉睡池实测结果 |
+| `dormant-outbounds.json` | **手工固化**（非 gitignored） | `parse_subscription.py` | 沉睡池定义：okz 的历史快照，65 条 |
+| `.dormant_state.json` | `dormant_probe.py` | `parse_subscription.py` | 沉睡池**实测死活**（`alive`） |
 | `.pool_history.json` | daemon | daemon | 骤降护栏的基线样本 |
 | `.warp_proxy_fallback.json` | daemon | daemon | 落池时刻（3h 冷却） |
 | `.warp_segment.json` | daemon | daemon | 当前出口段起点 |
+| `.warp/backfill.json` | daemon（开/撤补位渠道） | `config.py::_append_backfill_members` | 补位渠道成员（锁定期才存在） |
 | `.warp/block-map.json` | 人工 / `warp_blocks.build_map` | `warp_blocks.channels()` | 块 → 节点归属 |
 | `.warp/h2/channels.json` | `deploy/render_h2_lines.py` | `h2-install.sh` / `remote-deploy.sh` | H2 渠道 ↔ 设备 ↔ 端口 |
 | `.warp/ipv6_segments.json` | 探测脚本 | `warp_blocks` | colo ↔ 地址段映射（实测数据） |
@@ -71,6 +78,17 @@ rebind_ts`。少了它，渠道锁还原会每分钟重写一次配置，而 `re
 `quota` 说明隧道完全正常、只是这个地址被封，把健康线当半死线重启还有一层
 后果：真故障被噪声埋掉（实测 WARP-WG-17 涨到 2457）。
 
+### `ban_backfill_tag` / `ban_backfill_node`
+
+补位渠道记在**被封的那条线**上：`ban_backfill_tag` 是顶上来的空闲设备线
+（`WARP-WG-N`），`ban_backfill_node` 是它落的节点。**必须落盘**：只放内存的话
+daemon 重启一次就再也撤不掉那条补位线了。
+
+成员身份另存 `.warp/backfill.json`（daemon 写，`config.py::_append_backfill_members`
+读）——`deploy/members.py` 与 `parse_subscription.py` 是独立进程，只看得到文件。
+两份记录**都要有**：文件让补位渠道进配置，字段让 08:00 找得到该撤哪条。
+详见 [../task-20261104-channel-backfill.md](../task-20261104-channel-backfill.md)。
+
 ### `ban_hold_*` 四个字段
 
 `ban_hold_home` / `ban_hold_node` / `ban_hold_until` / `ban_hold_ready`，
@@ -80,10 +98,11 @@ rebind_ts`。少了它，渠道锁还原会每分钟重写一次配置，而 `re
 
 - `_line_node(tag) == home` **且** `_line_restarted_after_write(tag)` → 已达目的
 - `_rehome_one` 返回 `gone`（原节点下架）→ 放弃还原，保留当前节点
-- 重启成功 → 清 `ban_hold_*` **并且清 `ban_window`**
+- 重启成功 → 清 `ban_hold_*` **并且清 `ban_probes`**
 
-**`ban_window` 必须一起清**：不清的话，解封前那一小时攒的 31 条样本还在，
-08:00 之后再记一条就直接重新锁到次日 —— "锁一天"退化成"永久锁定"（实测复现）。
+**`ban_probes` 必须一起清**：它是「当天最近 1000 条模型层实测结论」，不清的话
+解封前攒的 quota 样本还在，08:00 之后再记一条就直接重新锁到次日 —— "锁一天"
+退化成"永久锁定"（实测复现）。旧字段名是 `ban_window`，2026-11-04 换判据时改名。
 
 ## 四、`.warp_ip_used.json`
 
@@ -106,12 +125,69 @@ rebind_ts`。少了它，渠道锁还原会每分钟重写一次配置，而 `re
 `_POOL_MIN_RATIO = 0.3` 是安全阀：允许 70% 节点被拉黑，再往下就"跳过拉黑
 （保底）"—— 防止把自己清空。
 
-## 六、`.dormant_state.json`
+## 六、`.dormant_state.json` 与 `dormant-outbounds.json`
 
-`dormant_probe.py` 写，`parse_subscription.py` 读。
+这两个名字容易被混，它们管的是**同一批节点的两件事**：
 
-**它是 `proxy` 池成员数在两台机器上差 5 倍的全部原因**（2026-11-03 实测：
-本地 97 条 `alive:false` → 池子 25 条；远端没这个文件 → 120 条）。
+| 文件 | 内容 | 谁写 | 谁读 |
+|---|---|---|---|
+| `dormant-outbounds.json` | 节点**定义**（65 条出站） | **手工固化**，2026-10-28 后再没变过 | `parse_subscription.py` / H2 渲染 / 各诊断工具 |
+| `.dormant_state.json` | 这些节点**现在还活不活**（`alive: true/false`） | `dormant_probe.py`（`dormant-probe.timer`） | `parse_subscription.py` |
+
+### 沉睡池到底是哪个订阅
+
+**全部来自 `okz`**。2026-11-04 实测：
+
+- 65 条 = **55 条 `bilibili-image-cdn.juhazf.cn:50001–60194`**（SNI `*.okzdns.com`）
+  + **10 条 `*-aws-N.acczzz.com:443`**（SNI `*.hi2026.net`）—— 两个都是 okz 的域名
+- tag 一律 `host:port-any` / `-tr`，**无 `~N` 后缀**（`~N` 是 `dasho` 那种
+  「同一 host:port 挂多个节点」的源才需要的消歧后缀）
+
+**它不是「已经消失的节点」，是同一批节点的旧入口**：按 (SNI, 协议) 对齐后，
+okz 当前 63 条与沉睡池 **63/63 密码完全相同**。okz 只是把入口从
+`bilibili-image-cdn.juhazf.cn:<5xxxx>` 换成了 `cn.bing.com:443` / `us.bing.com:443`，
+后端与凭据没动。真正从订阅里消失的只有 2 条（`hk-aws-111` / `sg-aws-113`）。
+
+所以它是一份**旧入口快照**：新入口（bing 前置）被墙时，旧的高位端口可以当备胎。
+65 条里有 8~9 条与当前订阅同 tag（具体几条随 okz 当天给的入口变），
+`make_config` 按 tag 去重后实际进池 **56~57** 条。
+
+### 谁影响 `proxy` 池大小
+
+池成员 = **当前订阅节点** + **沉睡池（去重后）** − **`alive:false` 的**。
+
+**这是两台机器池子差近 7 倍的全部原因**（2026-11-03 实测）：
+
+| | 订阅节点 | 沉睡池 | 判死摘出 | 在池 |
+|---|---|---|---|---|
+| 本地 | 62 | 57 | **97** | **25** |
+| 远端 | 109 | 56 | **0** | **165** |
+
+> **池子成员数 ≠ 不同后端数**。2026-11-04 实测本地池 123 条，按
+> (TLS SNI, 协议, 密码) 归并只有 **62 组** —— 32 组是同一条后端挂了多个入口，
+> 最多的一组（`i0.hdslb.com`）有 16 个入口（`upoz.` / `normal.` 等不同前置域名
+> 与端口，密码相同）。
+>
+> 入口不同，只影响「连不连得上」（bing 前置 vs 直连域名 vs 高位端口），
+> 不改变它是哪台机场后端。所以池子大小该读作「有多少条路」，不是
+> 「有多少个可用出口」。（出口 IP 是否也相同未单独实测，但同后端同理。）
+
+本地有 `.dormant_state.json`（97 条 `alive:false` 摘出池子），远端**根本没有这个
+文件**（timer 装了但没产出），于是全量留在池里。远端订阅节点还多 47 条，那是
+`dasho` 源的可及性差异，与沉睡池无关。
+
+> **`stats.json` 的 `dead_nodes` 是「判死集合的大小」，不是「实际摘出条数」**，
+> 所以减法**可能**对不上：11-03 那份是 62 + 57 − 97 = 22，而 `pool_nodes` 报 25；
+> 11-04 那轮则刚好全对上（138 + 56 − 71 = 123 = `pool_nodes`）。两种都可能。
+>
+> 原因：`dead_nodes` 直接取 `len(sleeping)`，而 `_load_dormant_state()` 只按 `fp`
+> 挡「tag 被别的节点占了」，**不要求 tag 当前还在**。节点从订阅和沉睡池里都
+> 消失后，它的 `alive:false` 记录照样算进 `sleeping`，但摘它不改变池子大小。
+> **要池子大小就看 `pool_nodes`，不要自己减。**
+>
+> 另一头：`dormant_source_nodes` 是「去重后**新增**的沉睡节点数」，也已经是
+> `make_config` 算过的数，不是 `dormant-outbounds.json` 的行数（文件 65 行，
+> 每次只有 56~57 条能进来 —— 差的是与当前订阅重名的那些）。
 
 `alive:false` 的节点**出站仍保留**，只是不进 selector 成员。想让某条回到池子，
 改状态而不是删文件 —— 删文件等于"把判死的节点又放回来"，且没有任何记录。

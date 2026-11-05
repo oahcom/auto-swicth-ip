@@ -253,6 +253,10 @@ def test_model_probe_opens_hold_only_for_long_quota(monkeypatch):
     monkeypatch.setattr(daemon, "_warp_probe_blind", lambda now=None: False)
     monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: False)
     monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    # `quota_hold_enabled` 默认是 False（2026-10-28 主人要求关闭）。这条用例
+    # 测的是「闸一旦启用，只有长 Retry-After 的 quota 才开」这条判据本身，
+    # 所以要把开关显式打开 —— 否则断言的是配置，不是逻辑。
+    monkeypatch.setitem(daemon.CFG["warp"], "quota_hold_enabled", True)
     monkeypatch.setitem(daemon.CFG["warp"], "quota_hold_min_sec", 1800)
     import probe_warp
 
@@ -410,3 +414,110 @@ def test_tunnel_death_port_closed_defers_to_systemd(monkeypatch):
                         lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == [], "端口已关还重启，等于抢 systemd 的活"
+
+
+def test_tunnel_death_restart_skipped_when_node_cannot_carry(monkeypatch):
+    """节点不转发 UDP 时，「连续 N 次取不到出口」的重启同样是死循环。
+
+    与惩罚期那条分支同一个病根，但入口不同：这条路径每次重启都刷新
+    `restart_ts`，而同块轮回的冷静期正是 `restart_ts + 2×60s` ——
+    重启循环把唯一能救它的轮回永远顶在门外。实测 2026-11-05 WG-4
+    `fail_streak` 41、`ever_ip` 始终 False，每 ~60s 重启一次，
+    轮回日志里从没出现过它。
+    """
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            fail_streak=daemon._UNKNOWN_RESTART_STREAK * 3)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
+    # 盯调用点：判据本身由 `test_cannot_carry_judgement` 覆盖。
+    monkeypatch.setattr(daemon, "_line_node_cannot_carry", lambda t: True)
+    daemon._probe_one_line(_member())
+    assert restarted == [], \
+        "节点承载不了时重启只会顶住同块轮回的冷静期，线永远换不了节点"
+
+
+def test_successful_probe_records_node_colo(monkeypatch, tmp_path):
+    """探测成功时顺手把「落地节点 → colo」写进台账。
+
+    `.warp/wg_colo_map.json` 原来只由 `warp_wg.survey()` 写，而 survey 要给
+    每个节点起一个 sing-box（几十秒/节点），没人会定期跑。结果新节点永远
+    不在块表里 —— `_same_block_standby` 判不出同块就放弃选点（实测
+    WG-3/WG-4 fail_streak 到 197 / 88 仍在同一个死节点上打转）。
+    """
+    import json
+    ledger = tmp_path / "wg_colo_map.json"
+    monkeypatch.setattr(daemon.warp_wg, "colo_map_path", lambda: ledger)
+    monkeypatch.setattr(daemon, "_line_node", lambda t: "n.nrt:443-any")
+    monkeypatch.setattr(daemon, "_warp_probe_blind", lambda now=None: False)
+    monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
+
+    def fake_egress(port):
+        # 模拟 `warp_egress_ip`：产出口 IP 的同时把完整 trace 留在模块变量里。
+        daemon._LAST_EGRESS_TRACE = {"port": int(port), "ip": "203.0.113.7",
+                                     "colo": "NRT", "loc": "JP"}
+        return "203.0.113.7"
+
+    monkeypatch.setattr(daemon, "warp_egress_ip", fake_egress)
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r, **kw: True)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda *a, **kw: False)
+    daemon._probe_one_line(_member())
+    got = json.loads(ledger.read_text())["nodes"]["n.nrt:443-any"]
+    assert got["colo"] == "NRT" and got["ok"] is True, got
+
+
+def test_penalty_restart_skipped_when_line_never_got_egress(monkeypatch):
+    """从没拿到过出口的线，惩罚期重启是死循环，不能再重启。
+
+    惩罚期重启的目的是换一个新 /128。但「这条线从没出过口」说明问题在节点
+    或链路，而不在地址 —— 重启一万次还是同一个结论。实测 2026-11-05
+    WG-4 停在 rank 1 节点上每 8~10 秒重启一次，日志刷满「出口处于惩罚期」。
+    """
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: True)
+    monkeypatch.setattr(daemon, "_quarantine_line", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_quota_hold_skips", lambda t, r: False)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "203.0.113.9")
+    monkeypatch.setattr(daemon, "_line_block_remaining", lambda ip, now: 3600)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r, **kw: (restarted.append(r), True)[1])
+    # 只盯**调用点**：判据本身另有单元测试，这里要的是「惩罚期分支确实问了
+    # 这个问题」。不这么做的话，把 `elif _line_node_cannot_carry(tag)` 整段
+    # 删掉这个用例照样绿。
+    monkeypatch.setattr(daemon, "_line_node_cannot_carry", lambda t: True)
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {"last_probe_ts": time.time() - 60,
+                                   "ever_ip": False, "fail_streak": 5})
+    daemon._probe_one_line(_member())
+    assert not restarted, f"节点承载不了时惩罚期不该重启，实际 {restarted}"
+
+
+def test_cannot_carry_judgement(monkeypatch):
+    """判据本身：rank 2、或「探过但从没出过口」都算重启没意义。
+
+    `ever_ip` 而不是 `ip`：`_invalidate_warp_line_ip` 每次隧道重启都会清 `ip`，
+    拿它当判据会让这条线永远不再重启（连本来能恢复的也停掉）。
+    """
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {"last_probe_ts": 0.0, "ever_ip": False})
+    assert daemon._line_node_cannot_carry("WARP-WG-4") is False, \
+        "没探过不能判死（刚启动/刚 apply 的线 last_probe_ts=0）"
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {"last_probe_ts": 12345.0, "ever_ip": False})
+    assert daemon._line_node_cannot_carry("WARP-WG-4") is True, \
+        "探过但从没出过口 → 重启换地址没意义"
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {"last_probe_ts": 12345.0, "ever_ip": True})
+    line = (daemon.warp_wg._read_state().get("lines") or {}).get("WARP-WG-4") or {}
+    rank = daemon._warp_alive_rank(str(line.get("node")),
+                                   daemon.warp_blocks.load_map(),
+                                   line.get("family"))
+    assert daemon._line_node_cannot_carry("WARP-WG-4") is (rank == 2), \
+        f"出过口之后按实测承载能力判，rank={rank}"

@@ -345,3 +345,110 @@ def _ts(hour):
     import time as _t
     lt = _t.localtime()
     return _t.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, 0, 0, 0, 0, -1))
+
+
+# ---------------------------------------------------------------- 两条承载路径
+def test_h2_nodes_are_expanded_as_their_own_channels():
+    """carrier=h2 的节点必须单独展开成 H2 渠道，而不是被 v6 池剔掉。
+
+    实测（2026-11-04）：`deploy/render_h2_lines.py` 只从 `channels()` 里筛
+    `carrier == 'h2'`，而 channels() 的 v6 池把 h2 节点剔得干干净净 —— 于是
+    永远走「块模型未筛出 h2 渠道，改用台账」的兜底，新插进来的订阅节点
+    （哪怕实测能承载 MASQUE）一条也渲染不出去。
+    """
+    m = nodes_map()
+    m["h2a"] = {"colo": "NRT", "category": "regular", "ok": 1, "n": 1,
+                "carrier": "h2"}
+    chs = wb.channels(cfg(), m)
+    h2 = [c for c in chs if c.get("carrier") == "h2"]
+    assert [c["node"] for c in h2] == ["h2a"]
+    # v6 池仍然不含它（H2 不占 WG 线位）
+    assert "h2a" not in [c["node"] for c in chs if c["type"] == "v6"]
+
+
+def test_h2_channel_tag_does_not_collide_with_wg():
+    """同一块同一类别下的 H2 与 WG 渠道不能撞 tag。
+
+    tag 是夜间白名单、台账、日志共用的身份键；撞名等于两条线被当成一条。
+    """
+    m = nodes_map()
+    m["h2a"] = {"colo": "NRT", "category": "regular", "ok": 1, "n": 1,
+                "carrier": "h2"}
+    tags = [c["tag"] for c in wb.channels(cfg(), m)]
+    assert "WARP-H2-NRT-REG-0" in tags
+    assert "WARP-BLK-NRT-REG-0" in tags
+    assert len(tags) == len(set(tags)), "渠道 tag 撞名"
+
+
+# ---------------------------------------------------------- 自动补块（新 colo）
+
+def test_discovered_colo_becomes_a_block():
+    """实测出的新 colo 自动成块 —— 否则它的节点永远拿不到渠道。
+
+    实测 2026-11-04 `upoz...:28065-any` 落到 BOM，块表是静态 11 条，
+    没有 BOM 也就没有任何日志说明这个节点为什么不被使用。
+    """
+    nm = nodes_map()
+    nm["b1"] = {"colo": "BOM", "category": "regular", "ok": 2, "n": 2,
+                "carrier": "h2"}
+    extra = wb.discovered_blocks(cfg(), nm)
+    assert [b["colo"] for b in extra] == ["BOM"]
+    assert extra[0]["loc"] == "孟买"
+    assert extra[0]["auto"] is True
+    tags = {c["tag"] for c in wb.channels(cfg(), nm)}
+    assert "WARP-H2-BOM-REG-0" in tags
+
+
+def test_known_colos_are_not_duplicated():
+    """块表已有的 colo 不能因为实测里有节点就再补一条。"""
+    extra = wb.discovered_blocks(cfg(), nodes_map())
+    assert extra == []
+    # 渠道数不因补块逻辑变化
+    assert len(wb.channels(cfg(), nodes_map())) == len(
+        [c for c in wb.channels(cfg(), nodes_map())])
+
+
+def test_unknown_colo_uses_code_not_invented_city():
+    """不认识的 colo 只显示代码本身；编个城市名比显示 `XYZ` 更糟。"""
+    nm = {"x1": {"colo": "XYZ", "category": "regular", "ok": 1, "n": 1}}
+    extra = wb.discovered_blocks(cfg(), nm)
+    assert extra[0]["loc"] == "XYZ"
+
+
+def test_discovered_block_still_respects_exclude_colos():
+    """被 exclude 的 colo 即使实测出来也不该补块。"""
+    c = cfg()
+    c["warp"]["blocks"]["exclude_colos"] = ["BOM"]
+    nm = {"b1": {"colo": "BOM", "category": "regular", "ok": 1, "n": 1}}
+    # discovered_blocks 本身只负责「块表没有的 colo」；排除由 channels 管
+    tags = {x["colo"] for x in wb.channels(c, nm)}
+    assert "BOM" not in tags
+def test_rebind_uses_declared_family_not_stale_state(monkeypatch):
+    """rebind 写配置时必须用**当前声明**的族，不能读状态表里的旧值。
+
+    状态表的 `family` 只在 `apply()` 时写一次，改过拓扑就是旧世代残留。
+    实测远端 2026-11-05：`.env` 是 `WARP_WG_FAMILIES=v6`，状态表记
+    WG-1/2/3 为 v4 —— rebind 按状态表重写，把 line2/line3 写回
+    `prefer_ipv4`。v4 出口只由 colo 决定，三条线立刻撞成同一个
+    `104.28.205.117`（既定事实第 27 条：v4 渠道数不应超过 colo 数）。
+    """
+    import warp_wg as ww
+
+    got = {}
+    monkeypatch.setattr(ww, "_read_state", lambda: {"lines": {
+        "WARP-WG-2": {"node": "old", "family": "v4",
+                      "rotation": ["a", "b"], "port": 1111}}})
+    monkeypatch.setattr(ww, "udp_capable", lambda nodes, probe=False: list(nodes))
+    monkeypatch.setattr(ww, "load_nodes", lambda: [
+        {"tag": "a", "server": "a", "server_port": 1},
+        {"tag": "b", "server": "b", "server_port": 1}])
+    monkeypatch.setattr(ww, "write_line",
+                        lambda i, n, family=None: got.setdefault("f", family))
+    monkeypatch.setattr(ww, "write_json", lambda *a, **k: None)
+    monkeypatch.setattr(ww, "state_path", lambda: "/tmp/x.json")
+    monkeypatch.setattr(ww, "_wg", lambda: {"families": ["v6"],
+                                            "tag_prefix": "WARP-WG-",
+                                            "service_prefix": "warp-wg-",
+                                            "base_port": 1110})
+    ww.rebind(2)
+    assert got["f"] == "v6", f"应取声明的 v6，实际 {got}"
