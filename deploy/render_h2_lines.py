@@ -272,14 +272,22 @@ def free_devices(unit_dir: str | Path = "/etc/systemd/system") -> list[str]:
     for p in sorted((PROJECT / ".warp").glob("usque*")):
         if not (p.is_dir() and (p / "config.json").exists()):
             continue
-        # 设备目录必须带 `usque`（指向 `../usque/usque` 的软链，见 h2-add-devices.sh）。
-        # 只有 config.json 的半成品目录也会被当成可用设备，渲染出的单元起上去就是
-        # status=127 无限重启 —— 2026-11-05 远端 9 台 h2new 正是这样，直到扩容
-        # 10 条线时才从 journal 里发现。这里直接补链接（幂等），而不是把它们
-        # 排除掉：那等于把这批设备永久闲置，症状更隐蔽。
-        if not (p / "usque").exists() and not (p / "usque").is_symlink():
+        # 设备目录必须**能用** `usque`（指向 `../usque/usque` 的软链，见
+        # h2-add-devices.sh）。只有 config.json 的半成品目录也会被当成可用设备，
+        # 渲染出的单元起上去就是 status=127 无限重启 —— 2026-11-05 远端 9 台
+        # h2new 正是这样，直到扩容 10 条线时才从 journal 里发现。这里直接补链接
+        # （幂等），而不是把它们排除掉：那等于把这批设备永久闲置，症状更隐蔽。
+        #
+        # 判据用 `exists()`（**跟随软链**）而不是 `is_symlink()`：断链
+        # （`usque -> ../usque/usque` 而目标不在）时 `exists()` 为假、`is_symlink()`
+        # 为真，两者并列取反会同时成立而跳过重建 —— 那台设备照样被发出去，
+        # 症状与「没有链接」一模一样。断链必须先 unlink 再建，否则 symlink_to
+        # 直接抛 FileExistsError。
+        link = p / "usque"
+        if not link.exists():
             try:
-                (p / "usque").symlink_to("../usque/usque")
+                link.unlink(missing_ok=True)
+                link.symlink_to("../usque/usque")
             except OSError:
                 continue
         all_dev.append(p.name)

@@ -59,6 +59,31 @@ def test_device_without_usque_gets_the_symlink_not_dropped(tmp_path, monkeypatch
     assert (warp / "usque-new" / "usque").is_symlink(), "没补链接"
 
 
+def test_broken_usque_symlink_is_rebuilt_not_passed_through(tmp_path, monkeypatch):
+    """断链（软链在、目标不在）必须重建，不能当成「已经有链接」跳过。
+
+    `exists()` 跟随软链、`is_symlink()` 不跟随：两者并列取反时，断链会同时
+    满足「不存在」和「是软链」而跳过重建 —— 设备照样被发出去，单元照样
+    `status=127`，症状与「完全没有链接」一模一样。
+    """
+    mod = _render_mod()
+    warp = tmp_path / ".warp"
+    d = warp / "usque-broken"
+    d.mkdir(parents=True)
+    (d / "config.json").write_text("{}")
+    (d / "usque").symlink_to("../nowhere/usque")     # 目标不存在
+    assert not (d / "usque").exists() and (d / "usque").is_symlink()
+    # 共享二进制放到位，重建后链接才解析得开（没有它就只能断言 readlink）。
+    (warp / "usque").mkdir()
+    (warp / "usque" / "usque").write_text("")
+    monkeypatch.setattr(mod, "PROJECT", tmp_path)
+
+    free = mod.free_devices(tmp_path / "units")
+    assert free == ["usque-broken"], free
+    link = d / "usque"
+    assert link.is_symlink() and link.exists(), f"断链没重建: {link} → {link.readlink()}"
+
+
 def test_active_h2_units_occupy_their_devices(tmp_path, monkeypatch):
     """在跑 usque-h2-* 的设备必须算「已占用」。
 
@@ -302,9 +327,12 @@ def test_h2_exhausted_pool_stops_the_restart_loop(monkeypatch):
         "selector_state": lambda self, s: (names, cur["now"])})())
     monkeypatch.setattr(daemon, "_rehome_one", lambda t, n: "ok")
     monkeypatch.setattr(daemon, "_invalidate_warp_line_ip", lambda t: None)
-    daemon._NODE_NEXT_CHECK.clear()
-    daemon._H2_TRIED.clear()
-    daemon._H2_POOL_DEAD.clear()
+    # 换成新字典而不是 `.clear()`：这三个是模块级全局，clear 会漏到下一条用例
+    # （实测本用例先跑时，`test_h2_repair_switches_node_before_restarting`
+    # 看到 `_H2_TRIED` 里残留的 c，换节点断言从 b 变成 c 而转红）。
+    monkeypatch.setattr(daemon, "_NODE_NEXT_CHECK", {})
+    monkeypatch.setattr(daemon, "_H2_TRIED", {})
+    monkeypatch.setattr(daemon, "_H2_POOL_DEAD", {})
     m = {"tag": "WARP-H2-X-3", "kind": "h2", "index": 3}
     # 还没试过候选：不能判死（刚启动/池子刚重渲染）。
     assert daemon._line_node_cannot_carry(m["tag"]) is False
