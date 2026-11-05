@@ -112,6 +112,9 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
   `warp-outbound.json`、不跑 `patch-wg-outbounds.py`，于是新线单元全 active、
   单条 SOCKS 直连能出 `warp=on`，但主 `opencode-out` 里一条都没有。完整顺序
   见 TEST_PLAN §20b。
+- **第 13h 条（第二半）** 新线「一直没出过口」先查 `last_probe_ts`：**是 0 表示
+  「没探过」，不是「探了不行」**。探测排期原先按 `now` 排序、键全相同，尾部新线
+  永远抢不到并发槽位（已修，见 TEST_PLAN §20c）。
 
 **架构层**（看代码看不出来的设计）
 

@@ -2366,6 +2366,30 @@ kill $(pgrep -f "sing-box run -c $PWD/singbox-config.json")   # watchdog 30s 内
 `.sub_cache/<key>.json` 再改 `.extra_subscriptions`**，否则远端第一轮刷新拿不到
 任何节点，后续刷新还会把配置覆盖成空。
 
+### 20c. 探测排期：尾部新线永远轮不到（T-310，2026-11-05 已修）
+
+T-307 的验收做完还不算完 —— 新线进了 `opencode-out`、SOCKS 口全监听、直连
+`warp=on`，但 **daemon 一次都不会探测它们**，状态表里 `last_probe_ts` 恒为 0。
+
+根因在 `_warp_line_needs_probe`：两条到期分支都返回 `now`，而调用方是
+`due.sort(key=lambda p: p[0])` 取前 `probe_concurrency`(32) 条。所有到期线的
+排序键完全相同 ⇒ 排序退化成成员表顺序 ⇒ 前 32 条固定占满槽位，排在末尾的新线
+（GIG/LHR/SJC/BOM…）几分钟到几十分钟也轮不上。实测：远端补源新增 5 条线后
+6 分钟，`daemon.log` 里一次没出现它们的 tag，而同时 **69 条无 ip 的线在抢 32
+个槽位**。
+
+修法是返回 `last_probe_ts`（没探过=0，最优先；其余按「越久没探越优先」）。
+改完重启，5 条新线在 **8~14 秒**内全部被探到，4 条立刻拿到出口 IP。
+
+| 编号 | 级别 | 验证点 | 方法 | 通过标准 |
+|------|------|--------|------|----------|
+| T-310 | P0 | 没探过的线排到队首 | `test_never_probed_line_sorts_ahead_of_recently_probed` | `last_probe_ts=0` 的线返回 `due=0.0`；到期线返回 `last_probe_ts` 而非 `now`（变异回 `return True, now` → 该例转红） |
+
+**判读提示**：以后看到「新加的线一直没出过口」，先查状态表里它的
+`last_probe_ts` 是不是 0 —— 是 0 就是根本没探过，不是节点不行。依次排查
+「单元在不在跑」（`_warp_member_unit_running`）→「进没进 `warp.members`」
+（`channels.json` → `config.py` import 期追加）→「排期轮不轮得上」（本节）。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改内容 | 作者 |
@@ -2434,6 +2458,7 @@ kill $(pgrep -f "sing-box run -c $PWD/singbox-config.json")   # watchdog 30s 内
 | v1.59 | 2026-11-01 | 渠道分配模型落地 + 夜锁分层（docs/warp-channel-allocation.md 七/八节）：① `config.warp.blocks`（9 个 colo 的静态属性 + `channels_per_block` + `enabled`，默认关）+ 导入期校验（colo 重复、`channels_per_block<1`）；② `warp_blocks.py` 从「只有渠道清单」补成完整模型：`order_nodes`（纯读延迟，未知排尾）、`plan_lines`（渠道→线路，后备先同块）、`night_line_tags`（块→线路，未知 colo 保留）、`build_map`（**按出口 IP 聚合**：一个 IP 常被 2 节点共用，按节点聚合会把同一份观测算两遍）；③ `warp_wg.apply` 新增选点分叉：`blocks.enabled` 时走 `plan_lines`，注册/写盘/发布共用，两条路径只在「选哪个节点」处不同；④ 夜锁策略拆到 `warp_night.py`（`window`/`active`/`restart_allowed`/`label`，纯函数），daemon 保留同名门面做 IO，白名单改由块生成（`_block_night_tags` 30s 缓存，异常退回配置 allow）；⑤ `warp_diag.py` 替代 `/tmp` 里那份自己拼配置的探针 —— 配置只从 `warp_wg.build_line_config` 生成，失败分 config/port/handshake/ok。**旧探针的教训**：它自拼配置（DoH、节点 tag 改名、缺 `domain_resolver`）且端口用「基准+偏移」与残留进程撞车，44 个节点全报「握手失败」，其中 15 个 UDP:53 是通的 —— 探针在测自己。回归：`test_warp_blocks.py` 22 例新绿；`test_daemon_unit + test_warp_refresh + test_portability + test_warp_line_worker + test_asip_*` 改前改后同为 **472 passed / 14 failed**（14 例为既有红，已在改动前的副本上逐例复现）；`test_night_window + test_warp_prober_gates` 44 passed / 1 既有红 | 主人需求 + 自对抗 |
 | v1.60 | 2026-11-04 | 新增 §15 渠道健康报表（T-281~T-283）+ 报表改版：`asip chan` 的出口段从「全部 /64 段名」逐步收敛为 `/32//48//64//128` 四级计数（`2/12/60/1035`），明细表**按声明 colo 合并**（同 colo 的线共用同一池子，逐条印是同一份）并给出口段、池（`/48/64/128` 三级去重，收全日志含已下线 tag）、指纹落点三样；原独立的 `colo ↔ 段指纹` 表并入（同维度）。新增 `_merge_segs` / `_fp_pools` / `_addr_sort`，`channel_segments()` 额外收集 `/128`。实测 2026-11-04：NRT 池 `12/12/1184`（10 条渠道共用 12 个 /64，/128 级 5 分钟重复率 36.1%）vs SIN `12/132/9731`（0.7%）—— 只看 /48 这两个机房一样宽。`test_channel_report.py` 17 例全绿（含 `bac1:7680` 共用段按 /64 拆分） | 主人需求 |
 | v1.61 | 2026-11-05 | 新增 §20 H2 承载闸与设备半成品 (T-303~T-306，含 T-305b)。**H2 的承载闸从来没生效过**：`_line_node_cannot_carry` 只查 `warp_wg` 台账，而 H2 落地节点在共享 sing-box 的 selector 里 ⇒ 永远 `node=None`、恒 False；SLC-11/12/24 的 4 个 bilibili 候选 TCP 全死、`ever_ip` 始终 False，仍每 ~2 分钟重启一次 `usque-h2-N`（`fail_streak` 1612/1534/220）。改为复用 `_h2_repair` 自己的结论（整池试遍 ⇒ 记 `_H2_POOL_DEAD`），热路径只读内存集合不打 Clash API。**判死可撤销**：重试窗口 `_H2_POOL_DEAD_RETRY_SEC`=1800s 到点自动重走整池（否则 `_H2_TRIED` 只在拿到出口时清空 ⇒ 节点恢复或重渲染后新候选永远进不来）；并补上与 WG 同口径的 `ever_ip` 例外（出过口的线更可能是本机会话僵死，重启是唯一能修的动作）。**设备半成品**：`free_devices()` 只看 `config.json` 存在就把目录当空闲发出去，缺 `usque` 软链的单元起上去 `status=127` 无限重启，daemon 侧只表现为「一直取不到出口」——远端 9 台 `usque-h2new*` 正是如此，扩到 10 条线时才从 journal 发现。改为幂等补链接而非排除（排除等于让这批设备永久闲置）。`test_h2_render_guard.py` 10→13 例、`test_warp_prober.py` 24 例，37 passed；五处变异全红（其中 `ever_ip` 例外**起初没被覆盖**，补断言后才转红）。**断链**：`exists()` 与 `is_symlink()` 并列取反会让断链跳过重建（两个条件同时成立），设备照样发出去、单元照样 `status=127`；改为只判 `exists()` + 先 `unlink(missing_ok=True)`。**扩容**：把 `h2_probe_state.json` 里 ok 但块表没 colo 的 31 个节点并入远端块表，多出 FRA/GIG/IST/LHR/SYD 五个 colo，H2 渠道 22→32，`opencode-out` 86 成员，`sing-box check` 通过；扩容后 12 分钟取到 663 个不同出口、655 个台账首次出现。**闸只降频不归零**：加闸后 SLC 仍每小时 40+ 次重启且 100% 落在换节点后 180s 内 —— 换节点成功当刻 `_H2_POOL_DEAD.pop()` 把重启许可一起作废，而 60s 节流期 `_h2_repair` 恒返回 False。已记为「已知未修」，改法见 §20 末 | 生产实测 |
+| v1.63 | 2026-11-05 | 新增 §20c 探测排期缺陷 (T-310，**已修**)。`_warp_line_needs_probe` 两条到期分支都返回 `now`，调用方 `due.sort(key=p[0])` 取前 `probe_concurrency`(32) 条 ⇒ 所有到期线排序键相同、排序退化成成员表顺序 ⇒ 前 32 条固定占满槽位，**排在末尾的新线永远轮不到**。实测补源新增 5 条线后 6 分钟 `daemon.log` 一次没出现它们的 tag、`last_probe_ts` 恒 0，而同时 69 条无 ip 的线在抢 32 个槽位；线本身是好的（SOCKS 口全监听、直连 `warp=on`）。改为返回 `last_probe_ts`（没探过=0 最优先，其余越久没探越优先），重启后 5 条新线 8~14 秒内全部探到、4 条立刻出 IP。`test_never_probed_line_sorts_ahead_of_recently_probed`，变异回 `return True, now` 即转红。**判读提示**：新线「一直没出过口」先查 `last_probe_ts` 是否为 0 —— 是 0 就是没探过，不是节点不行 | 生产实测 |
 | v1.62 | 2026-11-05 | 新增 §20b 手动部署 H2 线的验收口径（T-307~T-309，无新代码）。远端缺 greatgame 源导致没有孟买（BOM）落点：`.extra_subscriptions` 补 etcloud（`3e136476…`）后，H2 实测 **22/28 可承载**，块数 15→19，新增 SJC/BOM/DUB/IAD/JNB 五个块、5 条线（35–39），端到端五条全部 `warp=on`（BOM `2a09:bac5:3afa:11c3::1c5:12e`）。**踩到的坑**：`h2-install.sh` 只装 H2 子 sing-box 与 usque 单元，不写 `warp-outbound.json`、不跑 `patch-wg-outbounds.py`，而后者此时还报 `UNCHANGED`（它读的文件本身就没新成员）—— 症状是单元全 active、`h2-sel-N` 全在、单条 SOCKS 直连能出 `warp=on`，但主 `opencode-out` 里一条都没有。完整顺序与验收方法记在 §20b。另：补一次性订阅源必须先传 `.sub_cache/<key>.json` 再改台账，否则远端刷新回退不到任何节点 | 生产实测 |
 | v1.32 | 2026-11-05 | 新增 §19 重启循环与轮回冷静期的互锁 (T-298~T-302)。**重启循环顶住轮回**：冷静期判据 `now - max(rebind_ts, restart_ts) < 2×60s`，而重启每次刷新 `restart_ts` ⇒ 反复重启的线永远「刚重启」⇒ 轮回一次也轮不到它。实测 WG-4 `fail_streak` 41、`ever_ip` 始终 False、每 ~60s 重启一次，轮回日志里从没出现过它。两处重启入口（惩罚期 / 连续无出口）现在共用 `_line_node_cannot_carry`；冷静期另加 `fail_streak ≥ 10` 破锁条件，覆盖 `ever_ip` 为真但链路已坏的那一类。**`probe_node_tcp` recv 超时抛异常**，冒到 `_node_rotation_pass` 外面整轮作废（3h 18 次 `✗ 同块轮回异常: timed out`）⇒ 返回 `False`（超时正是「接了端口不转发」，是结论不是故障），`_node_tcp_ok` 另兜探测进程自身异常返回 `None`。**H2 扩张段搬出 `if not out:`**：块模型只要筛出任何一条就永不扩张，两台机器同一份代码 31 vs 22。`test_warp_prober.py` 24 例、`test_h2_render_guard.py` 10 例、`test_node_rotation.py` 17 项，全量 **884 passed**；四处变异全红。 | 生产实测 |
 | v1.31 | 2026-11-04 | 新增 §18 状态表体积与渠道锁的两条死路 (T-292~T-296)。**`ban_probes` 游程化**：状态表现在是整库最大的写入源（565 KB × 12 次/分 = 9.4 GB/天），改成段格式 `[起, 止, 条数, 结论]` —— 实测 19k 样本只有 484 段同结论，压缩 **39 倍**（633 KB → 61 KB，1.02 GB/天），一条样本不丢（主人明确要求「留多点」，所以不是按条数截断）。旧二元组格式仍认；结论位置是 **`e[3]`** 不是 `e[1]`（初版写错这一处，31 条 quota 记成 31 段、`_channel_ban_hold_hit` 恒 False，用例转红）。**补位线永不被渠道锁**：`_channel_noaddr_note` 漏了 quota 分支早就有的 `backfill_for` 跳过，实测 WG-23/24/25 被锁到 `ban_hold_until` 剩 **57 年**，三条 H2 线整夜无补位。**`restart_count` 删除**（终身累计最高 41982、零读取者）。**`_rehome_one` 的族改回取声明值**：初版误以为状态表是权威（那里 WG-1/2/3 记 v4），按它重写把三条线全写成 `prefer_ipv4`，实测立刻撞成同一个 `104.28.205.117` —— 状态表的 `family` 只在 `apply()` 时写一次，改过拓扑就是旧世代残留（本机 `.env` 是 `WARP_WG_FAMILIES=v6`）。现在读 `member["family"]`，与 `write_line(family=None)` 同源。**`_warp_alive_rank` 单族判据**：`family` 指定时只看那一族，不再拿 v4 的失败否决 v6 线。`test_channel_ban_hold.py` 57→61 例，`test_node_rotation.py` 15 项，全量 **869 passed**；三处变异验证全红。另修用例的零点依赖（T-297）：样本时刻改用 `_noon_today()`，否则 00:00~00:30 跑测试时回溯 30 分钟的样本落到昨天被裁掉 | 主人需求「ban_probes得留多点」 |
