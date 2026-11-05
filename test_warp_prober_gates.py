@@ -269,12 +269,20 @@ def test_single_unknown_does_not_restart(monkeypatch):
     """单次取不到地址仍不得重启 —— 那是探测侧瞬态，不是隧道故障。"""
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    # 端口**开着**：本用例测的是「探测拿不到地址」，不是「进程没了」。
+    # `_member()` 的 10002 没人监听，不打这个桩会先撞上 `port_closed` 前置闸。
+    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
                         lambda member, reason, **kw: restarted.append(member["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == []
-    assert daemon._warp_line_state("W2")["last_verdict"] == "unknown"
+    # 探测真的跑过、真的没拿到地址 —— 这才该记 `unknown`。`last_probe_ts`
+    # 必须推进，否则「没探过」与「探了不行」分不开（前者会永远显示 unknown）。
+    st = daemon._warp_line_state("W2")
+    assert st["last_verdict"] == "unknown"
+    assert st["last_probe_ts"] > 0
+    assert st["fail_streak"] == 1
 
 def test_switch_wait_deadline_stays_under_client_timeout():
     """无候选时的等待上限必须早于调用方超时（9router ASIP_TIMEOUT_MS=2000）。

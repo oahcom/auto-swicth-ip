@@ -2791,7 +2791,11 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
     # 在测试里抛出 AttributeError 而不是走正常逻辑。
     _LAST_EGRESS_TRACE = {"port": int(port), "ip": res.ip,
                           "colo": getattr(res, "colo", None),
-                          "loc": getattr(res, "loc", None)}
+                          "loc": getattr(res, "loc", None),
+                          # 失败时**为什么**失败。没有它，`unknown` 把「端口没
+                          # 监听」「端到端超时」「节点不转发」压成同一个词，
+                          # 而三者的处置完全相反（见 `_probe_one_line`）。
+                          "error": getattr(res, "error", None)}
     return res.ip
 
 
@@ -4783,9 +4787,13 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             # 旧实现无条件累加，实测 WARP-WG-17 因此涨到 2457（它每次都拿到出口
             # 地址、每次都判 quota），日志写「连续 2457 次取不到出口地址」，
             # 与事实相反 —— 真故障反而被这堆噪声埋掉。
-            if verdict == "unknown":
+            if verdict in ("unknown", "timeout"):
                 st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
             else:
+                # `port_closed` 不进 fail_streak：那是进程没了（Systemd 的活），
+                # 不是「线不健康」。单元被删后仍留在 members 的线（实测
+                # CF-C/G/H/I 2026-10-28 缩容时删了单元）原先会把它累加到 23 万，
+                # 报表照着印 `unknown`，读起来像「现在探测失败」。
                 st["fail_streak"] = 0
             # 非 OK 结论一律回到固定节奏：惩罚期与持久重探地板只说明
             # 「这个地址大概还不能用」，是观测的输入，不是停止观测的理由。
@@ -5188,7 +5196,17 @@ def _warp_line_restart(member: dict, reason: str,
                 st["next_probe_ts"] = max(
                     float(st.get("next_probe_ts") or 0.0), now + block_left)
             else:
-                st["last_verdict"] = "unknown"
+                # **不许在这里写 `last_verdict`**（a377b4b 引入、2cd6845 留下的
+                # 老写法 `st["last_verdict"] = "unknown"`）。`unknown` 的语义是
+                # 「探测跑完了但没拿到出口 IP」，而这条路径刚刚拿到了地址，只是
+                # 还没做模型层探测 —— 用探测失败的词覆盖真实结论是错的词。
+                # 后果是实质性的：重启是 5~15s 一次的高频动作，字段被反复刷成
+                # `unknown`，`asip chan` 把它当「当前状态」印出来，于是 33/78 条
+                # 线看起来全是 unknown，读起来像「根本没在探测」。实测 2026-11-05
+                # 16:40：20 秒内 42 条线的 `last_probe_ts` 全在推进，30 分钟
+                # 1459 条模型层结论 —— 探测一直在跑，坏的是这个字段。
+                # 保留上一条真实结论；「地址是新的、还没探过」由 `last_ok_ts == 0`
+                # 加 `ip_ts > last_probe_ts` 表达，报表那边已有 `无地址` 口径。
                 st["next_probe_ts"] = now + _line_unknown_retry()
             old_ip = st.get("ip")
             if ip:
@@ -5246,6 +5264,19 @@ def _probe_one_line(member: dict) -> None:
             and _warp_line_ok_fresh(tag, now)):
         return
     started_at = time.time()
+    # 端口没监听就别花 20 秒去等一个不可能来的响应。实测 2026-11-05 本机：
+    # WARP-CF-C(1082) / WARP-CF-G/H/I(1086-1088) / WARP-WG-23(1132) 的单元
+    # 早就没了，每条仍在每轮探测里白等满 20s 超时——41 条线里 5 条这么烧，
+    # 一轮并发预算被吃掉四分之一。`_port_open` 本地 connect <1ms。
+    if not _port_open(member["port"]):
+        _channel_noaddr_note(tag, False, time.time())
+        # 结论记 `port_closed` 而**不是** `unknown`：进程没了是 systemd 的活，
+        # daemon 重启等于抢它的活。也不进 `fail_streak`（见
+        # `_warp_line_record_observation`），否则报表上会永远挂着一句
+        # 几天前的「unknown」。
+        _warp_line_record_observation(tag, None, "port_closed",
+                                      time.time(), started_at)
+        return
     ip = warp_egress_ip(member["port"])
     if ip:
         # 落点台账跟着生产流量自更新：这条线绑的是哪个落地节点、它实际出口
@@ -5261,11 +5292,6 @@ def _probe_one_line(member: dict) -> None:
     if not ip:
         _channel_noaddr_note(tag, False, time.time())
         _warp_line_record_observation(tag, None, "unknown", time.time(), started_at)
-        # 连续拿不到地址 = 隧道半死（进程在、上游不通）。单次 unknown 是瞬态，
-        # 不重启；连续多次且端口仍开着才是确定失败 —— 端口开着说明进程还活着、
-        # 只是 MASQUE 会话僵死（实测 :1080 僵了 3 小时，TCP 能 accept 但握不完手，
-        # 靠 systemd 的 Restart=always 永远等不到，只能这里重启）。
-        # 端口关着则相反：进程已经没了，那是 systemd 的活，再从这儿重启等于抢它的活。
         streak = int(_warp_line_state(tag).get("fail_streak") or 0)
         # H2 线先换节点：落地节点在共享 sing-box 里，`_rehome_one` 走 selector，
         # 换完不重启任何进程。连续 3 次拿不到出口就换 —— 重启 usque 换的是同一个
@@ -5901,8 +5927,15 @@ def _warp_ip_needs_refresh(ip: str | None, now: float,
         # 精确解禁（Retry-After）可能早于 6h 缓存 TTL 到期：惩罚期已过就不该
         # 再凭旧结论重启，交给下一次模型实测重新判定。
         return _warp_ip_is_blocked(ip, now)
-    if verdict is not None and verdict != "OK":
-        return not (verdict == "unreachable" and _warp_probe_blind(now))
+    # `unreachable` 不是「这个地址不能服务」的结论：它说的是**探测请求没跑完**
+    # （超时/代理 502），地址和服务端都还没表态。拿它当判据重启，等于把链路
+    # 抖动算成出口被封 —— 实测 2026-11-05 同一条 WARP-CF-D 在 15 秒超时下
+    # 连续 6 次全 unreachable，而同一地址手工探测 `warp=on` 正常。
+    # 独立结论就该独立处理：不否决，退回地址层判据（下面几条）继续评估。
+    # 只有 `_warp_probe_blind` 那种「整批都探不通」才会影响全局节奏，那由
+    # `_warp_model_usable` 入口单独处理，不在这一层。
+    if verdict is not None and verdict not in ("OK", "unreachable"):
+        return True
     if _warp_ip_is_blocked(ip, now):
         return True
     if _ip_history_is_truth():

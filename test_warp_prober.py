@@ -21,6 +21,9 @@ def _isolate_line_state(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "_save_warp_line_state", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 0.0)
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
+    # `_probe_one_line` 现在先查端口再探测（端口关着就别白等 20s 超时）。
+    # 默认按「开着」打桩，免得测试连到真实端口上；要测端口关闭的用例自己覆盖。
+    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
     yield
 
 
@@ -109,6 +112,9 @@ def test_probe_unknown_ip_does_not_restart(monkeypatch):
     m = _member()
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    # 端口**开着**才叫「隧道半死」。端口关着是进程没了，归 systemd，
+    # 结论记 `port_closed` 且不进 fail_streak（见下一条用例）。
+    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
                         lambda member, reason, **kw: restarted.append(member["tag"]) or True)
@@ -117,6 +123,31 @@ def test_probe_unknown_ip_does_not_restart(monkeypatch):
     assert st["last_verdict"] == "unknown"
     assert st["next_probe_ts"] > time.time()
     assert restarted == []
+
+
+def test_probe_port_closed_is_not_counted_as_unhealthy(monkeypatch):
+    """端口没监听 = 进程没了，是 systemd 的活，不该记成「线不健康」。
+
+    实测 2026-11-05：CF-C/G/H/I 的单元 2026-10-28 缩容时就删了
+    （`is-enabled` 返回 not-found），只因为 members 里还声明着，prober
+    的 `fail_streak` 被冻在 23 万，`asip chan` 照印 `unknown` —— 读起来
+    像「这四条现在探测失败」。
+    """
+    m = _member()
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
+    monkeypatch.setattr(daemon, "_port_open", lambda port: False)
+    with daemon._WARP_LINE_CV:
+        daemon._warp_line_state_locked("W2").update(
+            fail_streak=daemon._UNKNOWN_RESTART_STREAK)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda member, reason, **kw: restarted.append(member["tag"]) or True)
+    daemon._probe_one_line(m)
+    st = daemon._warp_line_state("W2")
+    assert st["last_verdict"] == "port_closed"
+    assert st["fail_streak"] == 0, "进程没了不是线的健康问题"
+    assert restarted == [], "重启由 systemd 负责，daemon 不该抢"
 
 
 def test_probe_quota_restarts_non_active_line(monkeypatch):
@@ -164,7 +195,11 @@ def test_restart_same_ip_reprobes_on_cadence(monkeypatch):
     st = daemon._warp_line_state("W2")
     assert st["next_probe_ts"] - time.time() < 10, \
         "重启后仍沿用 16h 停探 —— 这条线的下一次观测被推到明天"
-    assert st["last_verdict"] == "unknown"
+    # `last_verdict` **不许**被重启路径刷成 `unknown`：那个词的语义是「探测
+    # 跑完但没拿到出口 IP」，而这里刚拿到地址。重启是 5~15s 一次的高频动作，
+    # 写它等于把报表的「当前状态」列永久钉在一个假的失败态上（实测 33/78
+    # 条线同时显示 unknown，读起来像「根本没在探测」）。
+    assert st["last_verdict"] == "quota"
 
 
 def test_restart_new_ip_clears_park_for_untested_ip(monkeypatch):
@@ -176,7 +211,10 @@ def test_restart_new_ip_clears_park_for_untested_ip(monkeypatch):
     assert daemon._warp_line_restart(_member(), "模型层 quota") is True
     st = daemon._warp_line_state("W2")
     assert st["ip"] == "9.9.9.9"
-    assert st["last_verdict"] == "unknown"
+    # 同上：新地址的模型层结论还没出来，但也不能写成 `unknown` —— 那只表示
+    # 「探测拿不到出口 IP」。留着旧地址的结论，`ip_ts > last_probe_ts` 已经
+    # 说明这条结论不属于当前地址。
+    assert st["last_verdict"] == "quota"
     assert st["next_probe_ts"] - time.time() < 10
 
 
@@ -393,6 +431,7 @@ def test_stale_verdict_after_line_restart_is_dropped():
     assert kept is False
     st = daemon._warp_line_state("W2")
     assert st["ip"] == "2.2.2.2", st
+    # 旧地址的结论被丢弃，`last_verdict` 保持原样（种子值），不被覆盖成 quota。
     assert st["last_verdict"] == "unknown", st
 
 

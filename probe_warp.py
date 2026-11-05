@@ -57,9 +57,12 @@ URL = "https://opencode.ai/inference/v1/chat/completions"
 # 那个 429 带 Retry-After 到 UTC 零点，看起来完全像「每日配额耗尽」，实测与出口 IP
 # 无关。旧版本这里只抄了 4 行（漏掉 heading、git repo、Platform、Prefer tmp），于是
 # 每一条探测都被判 quota，19 条线全被打成坏线。
-# 值取 9router 服务进程的取值：cwd = WorkingDirectory(/home/administrator/.9router)、
+# 值取 9router 服务进程的取值：cwd = 它的 WorkingDirectory（数据目录）、
 # platform = linux、tmp = os.tmpdir()/opencode。--check-fingerprint 会与源码逐行比对。
-ENV_WORKING_DIR = os.environ.get("OPENCODE_PROBE_WORKDIR", "/home/administrator/.9router")
+# 路径本身**不是门控项**（opencodeFingerprint.js：上游只认 `<env>` 标记存在），
+# 所以按家目录推导即可，不写死某个用户。
+ENV_WORKING_DIR = os.environ.get(
+    "OPENCODE_PROBE_WORKDIR", os.path.expanduser("~/.9router"))
 ENV_TMP_DIR = os.environ.get("OPENCODE_PROBE_TMPDIR", "/tmp/opencode")
 ENV_MARKER = "\n".join([
     "Here is some useful information about the environment you are running in:",
@@ -643,8 +646,15 @@ def check_fingerprint() -> int:
     """冻结的定义是否仍与 9router 源码逐字一致。源码升级后这里会先红。"""
     import os
     import re
-    src = os.environ.get("OPENCODE_FINGERPRINT_JS") or os.path.join(
-        os.path.dirname(CFG["9router"]["db_path"]), "..", "open-sse/utils/opencodeFingerprint.js")
+    # `db_path` 在 `<数据目录>/db/data.sqlite`，它的 dirname 是数据目录，源码
+    # **不在那里**：本机实测 `~/.9router/` 只有 auth/db/logs，源码树在
+    # `~/9router/`。旧写法拼出 `~/.9router/open-sse/...`，永远「未找到」，
+    # 而返回值 1 没人看 —— 指纹漂移等于完全没检查。
+    home = os.path.expanduser("~")
+    cands = [os.environ.get("OPENCODE_FINGERPRINT_JS"), os.path.join(
+        home, "9router", "open-sse/utils/opencodeFingerprint.js"), os.path.join(
+        home, ".9router", "open-sse/utils/opencodeFingerprint.js")]
+    src = next((c for c in cands if c and os.path.exists(c)), cands[1])
     src = os.path.normpath(src)
     if not os.path.exists(src):
         print(f"✗ 未找到 9router 源码: {src}")
