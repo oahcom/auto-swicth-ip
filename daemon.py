@@ -10594,6 +10594,10 @@ def _api_debug_state() -> dict:
                     for m in _warp()["members"]},
         "last_rotate_ts": _last_rotate_ts,
         "stats": dict(_api_stats),
+        # 换线表是判断 already_retired 的唯一依据，而它只在进程内存里 ——
+        # 不给出来就只能靠「日志里没有 already_retired」反推，分不清是
+        # 「表里没这个地址」还是「根本没查」。按时间倒序，最近的在前。
+        "exit_ledger": list(reversed(_EXIT_LEDGER[-20:])),
     }
 
 
