@@ -961,6 +961,77 @@ colo 数）。正确的取值是 `member["family"]`，也就是 `WARP_WG_FAMILIE
 **推论**：状态表的 `family` 只能当「上一次 apply 时的快照」看。任何按族做判断的
 地方（`_warp_alive_rank` 选证据列、同块轮回的跨块优先）都取声明值。
 
+### 26c. 部署的「覆盖」语义是错的：块表/探测台账是**累积知识**，不是配置
+
+**看起来像**：`deploy/remote-deploy.sh` 的设计前提写着「拓扑以本机为准，远端只
+复刻」，于是把本机的 `.warp/*.json` 整表覆盖过去是顺理成章的。
+
+**实际是**：`.warp/block-map.json` 与 `.warp/h2_probe_state.json` **不是配置**，
+是两台机器各自跑了多久探测就攒了多少的**实验结论**。daemon 每 15 分钟自动跑
+`_run_h2_probe`，两台机器的时间线不同，覆盖面必然不同：
+
+| | 本机 | 远端 |
+|---|---|---|
+| block-map 节点 | 174 | 181（独有 7） |
+| H2 探测台账 | 38 条 / 12 ok | 156 条 / 78 ok |
+
+覆盖 + 过滤的实测代价（2026-11-05 审计）：旧脚本先按**远端上一次部署的**
+`singbox-config.json` 做白名单，而全新远端根本没这个文件 → `live` 为空 →
+只剩入库的 65 条 dormant 快照 → 本机 174 条**删掉 130 条，其中 28 个 H2 落地
+节点**。被删的远端此后不会自动加回：`warp_blocks.merge_diag()` 只给探测成功的
+节点建档，而 `h2_probe_state.json` 又没传。更糟的是删掉了 `carrier: h2` 标记，
+`warp_wg.apply()` 会把这些节点当 WG 落地 —— 拓扑直接分叉。
+
+**正确语义**（现行实现）：
+- block-map：**合并**，远端自己的观测优先（`merged = dict(mine); merged.update(cur)`）
+- probe_state / pool_history：**合并**，远端优先、本机补缺
+- `.sub_cache/`：只补不删（一次性链接失效后的唯一退路）
+- `.extra_subscriptions`：**并集合并**，不是覆盖 —— 远端有 `jiashule` 是本机
+  没有的，整文件覆盖会反向删源。它是拓扑输入，不是「每台机器自己的凭据」
+- `h2/channels.json`：远端已有就**不覆盖** —— 它是本机产物台账，本机 31 条、
+  远端 37 条，覆盖等于把远端砍到 31 条
+
+**过滤器本身也不该存在**：它的原始理由是「远端没有 greatgame/dankenet 这两个
+域名」，补源后已不成立；即便成立，`render_h2_lines.node_outbound()` 本来就会跳过
+「不在主配置/沉睡池」的节点并打 warning —— 带着它们走渲染不出坏线，删掉却不可逆。
+
+### 26d. 部署脚本漏了 `patch-wg-outbounds.py`，且渲染顺序反了
+
+**看起来像**：步骤 5 写了 `parse_subscription → members.py → h2-install`，
+看起来该有的都有。
+
+**实际是**，两处让它变成半成品：
+
+1. **缺 `patch-wg-outbounds.py`**。`members.py` 把新成员写进
+   `warp-outbound.json`，但**没有任何人**把它们并进 `singbox-config.json` 的
+   `opencode-out`。只能指望重启后那次隐式订阅刷新补上；刷新一失败就停在
+   「单元全 active、`h2-sel-N` 全在、单条 SOCKS 能出 `warp=on`，但主 selector
+   里一条新线都没有」（§20b/T-307 记的就是这个症状）。
+
+2. **顺序反了**。`members.py` 跑在 `h2-install` **之前**，而 h2-install 会重新
+   渲染并改写 `channels.json` —— `warp-outbound.json` 反映的是**上一轮**的台账。
+   正确顺序与 daemon 的 `_run_h2_sync`（唯一被生产验证过的编排）一致：
+
+   ```
+   render_h2_lines.py（本用户）→ h2-install.sh --no-render
+   → members.py --write-warp-outbound → patch-wg-outbounds.py → 重载主 sing-box
+   ```
+
+3. **`h2-install.sh` 不带 `--no-render` 时会以 root 重新渲染**，把 `.warp/h2/*`
+   的属主改成 root；而且 `get_singbox_secret()` 按**当前 uid 的家目录**找
+   `.singbox_secret`，实测 root 下读 `/root/.singbox_secret` 直接失败、返回空串
+   → 渲染出的 Clash secret 为空 → daemon 每次 `PUT` 都 401。
+
+4. **失败被管道吞掉**：`./h2-install.sh 2>&1 | tail -4` 返回的是 `tail` 的退出码，
+   H2 渲染拒绝执行时脚本照样往下走，只在验收里显示 0 条。
+
+5. **验收只报数字不比对**：旧版只印「成员 N 条」，`opencode-out` 少一半也看不出。
+   现在比对盘上配置与**运行中** selector 的 tag 集合，并对每条 H2 台账端口做
+   `warp=on` 端到端抽样。
+
+**判读提示**：`remote-deploy.sh` 跑完后必须看 `✓ 运行中 selector 与盘上配置一致`
+这一行。只有它绿，才说明「改了文件真的重载了」。
+
 ### 27. v4 线的出口数量上限 = 落地 colo 数
 
 **看起来像**：开了 3 条 v4 线，应该有 3 个 v4 出口。

@@ -84,7 +84,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文档 | 内容 |
 |---|---|
-| **[established-facts.md](established-facts.md)** | **既定事实（44 条），先读这个** |
+| **[established-facts.md](established-facts.md)** | **既定事实（46 条），先读这个** |
 | [glossary.md](glossary.md) | **名词表**：节点/线路/渠道/成员的确切定义 |
 | [BUILD-PLAN.md](BUILD-PLAN.md) | 文档构建计划与更新规范 |
 
@@ -108,6 +108,11 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
   FRA/GIG/IST/LHR/SYD 五个 colo，当天下午补 greatgame 源后又多出
   BOM/JNB/DUB/IAD 四个（28 个节点实测 22 个可承载 H2）。但**新 colo 抬的是
   单位时间地址产出，不是单地址寿命** —— 看到「新 colo 也很快 429」不是扩容失效。
+- **第 26c 条** `.warp/block-map.json` 与 `h2_probe_state.json` 是**累积知识**，
+  不是配置：部署时**合并**而不是覆盖。旧版覆盖+过滤实测会删掉 174 条里的
+  130 条（含 28 个 H2 落地节点），且远端事后不会自动加回。
+- **第 26d 条** 部署脚本曾漏 `patch-wg-outbounds.py` 且渲染顺序反了 ——
+  症状是单元全 active、单条 SOCKS 能出 `warp=on`，但主 selector 里没有新线。
 - **第 13c 条** 手动跑 `h2-install.sh` **只装了一半**：它不写
   `warp-outbound.json`、不跑 `patch-wg-outbounds.py`，于是新线单元全 active、
   单条 SOCKS 直连能出 `warp=on`，但主 `opencode-out` 里一条都没有。完整顺序

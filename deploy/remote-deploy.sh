@@ -167,48 +167,126 @@ for f in .warp/block-map.json .warp/h2/channels.json; do
     put "$f" "/tmp/$(basename "$f")"
     echo "  $f"
 done
+# **block-map 只增不删**（与 tools/merge_h2_blockmap.py 同一语义）。
+#
+# 旧版这里是「整表覆盖 + 按远端出站表过滤」，两处都会丢数据：
+#   · 覆盖本身就把远端自己测出来的条目抹掉；
+#   · 过滤用的白名单是**上一次部署**的 singbox-config.json（全新远端根本没有
+#     这个文件 → `live` 为空 → 只剩入库的 65 条 dormant 快照当白名单）。
+#     实测本机 174 条里只保住 44 条，**删掉 130 条、其中 28 个 H2 落地节点**。
+#     而被删的节点远端此后不会自动加回：`warp_blocks.merge_diag()` 只给探测
+#     成功的节点建档，`h2_probe_state.json` 又没传（见下一步）。
+# 过滤的原始理由（远端没有 greatgame/dankenet 这两个域名）在补源后已不成立；
+# 即便成立，`render_h2_lines.node_outbound()` 本来就会跳过「不在主配置/沉睡池」
+# 的节点并打一行 warning —— 带着它们走不会渲染出坏线，删掉却不可逆。
+#
+# channels.json 反过来：它是**本机产物台账**（哪台设备跑哪条线），不是配置。
+# 远端已有一份时不许覆盖 —— 本机 31 条、远端 37 条，覆盖等于把远端砍到 31 条，
+# 而 members.py 随后会按这份台账写出 31 个成员。只有远端从没渲染过才拿它兜底。
 run "cd $REMOTE_DIR && mkdir -p .warp/h2
-cp /tmp/block-map.json .warp/block-map.json 2>/dev/null || true
-cp /tmp/channels.json .warp/h2/channels.json 2>/dev/null || true
-chmod 600 .warp/block-map.json 2>/dev/null || true
-echo '  已落盘（按远端订阅过滤见下一步）'"
-
-# 两台机器的**订阅源可以不同**：本机 block-map 里 71 个 h2 节点，远端实测有
-# 28 个根本不在它的主配置/沉睡池里（`greatgame`/`dankenet` 两个域名远端一条
-# 都没有）。把这些节点带过去，`render_h2_lines.py` 会逐条报「不在主配置/沉睡池」
-# 然后跳过 —— 表面看是渲染失败，实际是拓扑不属于这台机器。
-# 所以落盘后按**远端自己**的出站表过滤，只留它真能连上的节点。
-run "cd $REMOTE_DIR && python3 - <<'PY'
+python3 - <<'PY'
 import json
 from pathlib import Path
 proj = Path('.')
-try:
-    cfg = json.loads((proj / 'singbox-config.json').read_text())
-    live = {o['tag'] for o in cfg.get('outbounds', []) if o.get('tag')}
-except (OSError, ValueError):
-    live = set()
-try:
-    dorm = {o['tag'] for o in json.loads((proj / 'dormant-outbounds.json').read_text())}
-except (OSError, ValueError, KeyError, TypeError):
-    dorm = set()
-known = live | dorm
 p = proj / '.warp' / 'block-map.json'
-if known and p.exists():
+try:
+    mine = json.loads(Path('/tmp/block-map.json').read_text())
+except (OSError, ValueError):
+    mine = {}
+mn = mine.get('nodes') if isinstance(mine.get('nodes'), dict) else mine
+if not isinstance(mn, dict):
+    mn = {}
+try:
+    cur = json.loads(p.read_text())
+except (OSError, ValueError):
+    cur = {}
+cn = cur.get('nodes') if isinstance(cur.get('nodes'), dict) else cur
+if not isinstance(cn, dict):
+    cn = {}
+merged = dict(mn)
+merged.update(cn)          # 远端自己的观测优先：同一节点以远端为准
+if isinstance(cur.get('nodes'), dict):
+    cur['nodes'] = merged
+else:
+    cur = merged
+p.write_text(json.dumps(cur, ensure_ascii=False, separators=(',', ':')))
+p.chmod(0o600)
+print(f'  block-map 合并：本机 {len(mn)} + 远端 {len(cn)} → {len(merged)}'
+      f'（新增 {len(set(mn) - set(cn))}，保留远端独有 {len(set(cn) - set(mn))}）')
+PY
+mkdir -p .warp/h2
+if [ -s .warp/h2/channels.json ]; then
+    echo '  channels.json 已存在，保留远端产物台账（不覆盖）'
+else
+    cp /tmp/channels.json .warp/h2/channels.json && echo '  channels.json 远端没有 → 用本机台账兜底'
+fi"
+
+# 探测结论与订阅快照：都不是凭据，是**两台机器各自攒出来的能力**，必须同步。
+#   h2_probe_state.json —— 「测过且失败」的节点据此跳过。不传的话远端会把 82 个
+#                          已知不可承载的节点重测一遍，而探测设备是稀缺资源
+#                          （每台都要向 CF 注册一次）。
+#   .sub_cache/         —— 一次性订阅链接失效后的唯一退路。没有它，
+#                          `_fetch_or_cache` 只能 `raise`，该源整批节点消失。
+#   .pool_history.json  —— 骤降护栏的水位基线，全新远端为空时第一次刷新没有保护。
+say "3b/7 同步探测台账与订阅快照"
+if [ -d .sub_cache ]; then
+    tar -C "$DIR" -czf "$TMP/subcache.tgz" .sub_cache 2>/dev/null || true
+    put "$TMP/subcache.tgz" /tmp/asip-subcache.tgz
+    run "cd $REMOTE_DIR && mkdir -p .sub_cache && tar -xzf /tmp/asip-subcache.tgz -C . \
+         && chmod 600 .sub_cache/*.json 2>/dev/null || true
+         echo \"  .sub_cache/ \$(ls .sub_cache/*.json 2>/dev/null | wc -l) 个快照（只补不删）\""
+fi
+for f in .warp/h2_probe_state.json .pool_history.json; do
+    [ -f "$f" ] || continue
+    put "$f" "/tmp/asip-$(basename "$f")"
+    run "cd $REMOTE_DIR && python3 - $(basename "$f") <<'PY'
+import json, sys, shutil
+from pathlib import Path
+name = sys.argv[1]
+src = Path(f'/tmp/asip-{name}')
+dst = Path('.warp/h2_probe_state.json') if 'probe_state' in name else Path('.pool_history.json')
+dst.parent.mkdir(parents=True, exist_ok=True)
+if not dst.exists():
+    shutil.copyfile(src, dst)
+    print(f'  {dst}: 远端没有 → 直接采用本机')
+else:
+    # 两边都是「结论累积」，合并策略是远端优先、本机补缺。
     try:
-        m = json.loads(p.read_text())
-    except ValueError:
-        m = {}
-    nodes = m.get('nodes') if isinstance(m.get('nodes'), dict) else m
-    if isinstance(nodes, dict):
-        kept = {k: v for k, v in nodes.items() if k in known}
-        dropped = len(nodes) - len(kept)
-        if m.get('nodes') is nodes:
-            m['nodes'] = kept
-        else:
-            m = kept
-        p.write_text(json.dumps(m, ensure_ascii=False, separators=(',', ':')))
-        print(f'  block-map 过滤：{len(nodes)} → {len(kept)}（本机没有 {dropped} 个节点）')
+        a = json.loads(src.read_text()); b = json.loads(dst.read_text())
+    except (OSError, ValueError):
+        print(f'  {dst}: 解析失败，保留远端'); raise SystemExit(0)
+    if isinstance(a, dict) and isinstance(b, dict) and 'nodes' in a and 'nodes' in b:
+        n = dict(a['nodes']); n.update(b['nodes'])     # 远端优先
+        b['nodes'] = n
+        dst.write_text(json.dumps(b, ensure_ascii=False))
+        print(f'  {dst}: 合并 → {len(n)} 条')
+    else:
+        print(f'  {dst}: 结构不认识，保留远端')
+PY
+         chmod 600 .warp/h2_probe_state.json .pool_history.json 2>/dev/null || true"
+done
+
+# 追加订阅源**并集合并**，不是覆盖：远端有 `jiashule` 是本机没有的，
+# 整文件覆盖会把它删掉 —— 而它决定远端能拉到哪些落点节点，是拓扑输入
+# 不是凭据（脚本上方那条「token 保留远端原值」的原则不适用于它）。
+if [ -f .extra_subscriptions ]; then
+    put .extra_subscriptions /tmp/asip-extra-subs
+    run "cd $REMOTE_DIR && touch .extra_subscriptions
+python3 - <<'PY'
+from pathlib import Path
+def read(p):
+    try:
+        return [l.strip() for l in Path(p).read_text().splitlines()
+                if l.strip() and '://' in l and not l.startswith('#')]
+    except OSError:
+        return []
+mine, cur = read('/tmp/asip-extra-subs'), read('.extra_subscriptions')
+merged = list(dict.fromkeys(cur + mine))          # 远端在前，顺序稳定
+Path('.extra_subscriptions').write_text(''.join(u + '\n' for u in merged))
+Path('.extra_subscriptions').chmod(0o600)
+print(f'  追加源合并：本机 {len(mine)} + 远端 {len(cur)} → {len(merged)}')
 PY"
+fi
 
 # ---------------------------------------------------------------- 4. 设备
 say "4/7 补齐 usque 设备（每条 H2 线一台，CF 侧同一设备只能一个会话）"
@@ -249,23 +327,30 @@ fi
 
 # ---------------------------------------------------------------- 5. 单元
 say "5/7 生成并安装单元"
-# 三个渲染器各管一半，顺序不能换：
-#   parse_subscription → 主配置（含 dns-airport，H2 出站解析机场域名要用）
-#   wg-lines-install   → WG 单元
-#   h2-install         → H2 单元（会先跑 verify + sing-box check）
+# **顺序与 daemon 的 `_run_h2_sync` 对齐**（daemon.py:9098 那条链是唯一
+# 被生产验证过的编排）。旧版有两个硬伤：
+#   · `members.py` 跑在 `h2-install` 之前，而 h2-install 会重新渲染并改写
+#     `channels.json` —— `warp-outbound.json` 反映的是「上一轮的台账」；
+#   · 没有 `patch-wg-outbounds.py`，新写进 warp-outbound 的成员**没有任何人**
+#     把它们并进 `singbox-config.json` 的 `opencode-out`。只能指望重启后那次
+#     隐式订阅刷新补上；刷新一失败（订阅拉不到 / 骤降护栏拦下），远端就停在
+#     「单元全 active、h2-sel-N 全在、单条 SOCKS 能出 warp=on，但主 selector
+#     里一条新线都没有」—— TEST_PLAN §20b 记的就是这个症状。
+# 每一步都必须判返回码：旧版用 `| tail -3` 收尾，**管道返回的是 tail 的码**，
+# H2 渲染拒绝执行时脚本照样往下走，只在验收里显示 0 条。
 run "cd $REMOTE_DIR
 set -a; . ./.env; set +a
 export HOME=$REMOTE_HOME
+set -e
 # 权限：warp-outbound.json 历史上被 root 写过，members.py 随后写不进去。
 sudo chown -R $REMOTE_USER:$REMOTE_USER .warp 2>/dev/null || true
 
 echo '  · 主配置'
-python3 parse_subscription.py >/dev/null 2>&1 || echo '    ⚠ parse_subscription 失败（订阅 token 可能未配）'
-echo '  · warp-outbound'
-python3 deploy/members.py --write-warp-outbound >/dev/null
+python3 parse_subscription.py >/dev/null 2>&1 \
+    || echo '    ⚠ parse_subscription 失败（订阅 token 可能未配）'
 
 echo '  · WG 线'
-# ASIP_RUN_USER 必须显式传：wg-lines-install.sh 的默认值是 $(id -un)，在
+# ASIP_RUN_USER 必须显式传：wg-lines-install.sh 的默认值是 \$(id -un)，在
 # sudo 下就是 root，于是 apply → members.py 以 root 写出 600 属主的
 # warp-outbound.json，daemon（User=$REMOTE_USER）随后读不到 —— 生成的配置
 # 没有 WARP 出口，opencode 静默落到机场池。2026-11-03 远端因此丢了
@@ -275,13 +360,34 @@ sudo env HOME=$REMOTE_HOME ASIP_RUN_USER=$REMOTE_USER \
      WARP_WG_FAMILIES=\"\$WARP_WG_FAMILIES\" \
      WARP_WG_NODES=\"\$WARP_WG_NODES\" ASIP_WARP_BLOCKS=\"\$ASIP_WARP_BLOCKS\" \
      ASIP_WARP_BLOCK_CHANNELS=\"\$ASIP_WARP_BLOCK_CHANNELS\" PYTHON=/usr/bin/python3 \
-     ./deploy/wg-lines-install.sh 2>&1 | tail -3
+     ./deploy/wg-lines-install.sh > /tmp/asip-wg.log 2>&1 \
+     || { echo '    ✗ WG 线安装失败：'; tail -5 /tmp/asip-wg.log | sed 's/^/      /'; }
+tail -3 /tmp/asip-wg.log | sed 's/^/    /'
 
-echo '  · H2 线'
+echo '  · H2 渲染（**本用户**，不是 root）'
+# 以 root 渲染会把 .warp/h2/* 的属主改成 root，daemon 之后读不回来
+# （h2-install.sh:29-31 与 daemon.py:9109 都写了这条规则）。而且
+# get_singbox_secret() 按 **当前 uid 的家目录** 找 .singbox_secret ——
+# 实测 root 下读 /root/.singbox_secret 直接失败、返回空串，渲染出的 Clash
+# secret 为空，daemon 每次 PUT 都 401。
+python3 deploy/render_h2_lines.py > /tmp/asip-h2render.log 2>&1 \
+    || { echo '    ✗ H2 渲染失败：'; tail -8 /tmp/asip-h2render.log | sed 's/^/      /'; exit 1; }
+tail -4 /tmp/asip-h2render.log | sed 's/^/    /'
+
+echo '  · H2 线（--no-render，用上面刚渲染的产物）'
 sudo env HOME=$REMOTE_HOME ASIP_RUN_USER=$REMOTE_USER \
      ASIP_WARP_BLOCKS=\"\$ASIP_WARP_BLOCKS\" \
      ASIP_WARP_BLOCK_CHANNELS=\"\$ASIP_WARP_BLOCK_CHANNELS\" PYTHON=/usr/bin/python3 \
-     ./deploy/h2-install.sh 2>&1 | tail -4
+     ./deploy/h2-install.sh --no-render > /tmp/asip-h2.log 2>&1 \
+     || { echo '    ✗ H2 安装失败：'; tail -8 /tmp/asip-h2.log | sed 's/^/      /'; exit 1; }
+tail -4 /tmp/asip-h2.log | sed 's/^/    /'
+
+# 渲染完之后才重建 warp-outbound：channels.json 此刻才是最终产物。
+# 顺序反了（旧版）会把上一轮的台账写进主配置。
+echo '  · warp-outbound'
+python3 deploy/members.py --write-warp-outbound >/dev/null
+echo '  · 并入主配置 selector'
+python3 deploy/patch-wg-outbounds.py | sed 's/^/    /'
 
 # 兜底：上面任一步以 root 写出文件，这里统一交还。缺了它，一次 sudo 就能让
 # 下一轮订阅刷新产出没有 WARP 的配置。
@@ -296,9 +402,27 @@ done"
 
 # ---------------------------------------------------------------- 6. 重启
 say "6/7 重启服务（主 sing-box 由 daemon 拉起，必须重启 daemon 才重载配置）"
-run "sudo systemctl daemon-reload
+# `patch-wg-outbounds.py` 只改了配置文件，**进程不会自己重载** —— sing-box 是
+# daemon 用 Popen 拉的，改文件对它无效。重启 daemon 也不会重拉 sing-box（它
+# 发现 9090 还活着就直接进主循环），所以这里要显式杀掉主进程、让 watchdog
+# （30s 一轮）按新配置拉起来。不杀的话 `opencode-out` 里没有新成员。
+run "set -e
+sudo systemctl daemon-reload
 sudo systemctl restart auto-switch-ip.service
-sleep 12
+sleep 10
+# 只杀主配置那一份；.warp/h2 与 .warp/wglines 各跑自己的 sing-box，
+# 宽匹配会把它们一起杀掉（每条线重启就换一个 WARP 会话）。
+P=\$(pgrep -f \"sing-box run -c \$HOME/auto-swicth-ip/singbox-config.json\" || true)
+if [ -n \"\$P\" ]; then
+    sudo kill \$P 2>/dev/null || true
+    echo \"  已停主 sing-box（pid \$P），等 watchdog 重拉\"
+fi
+for i in \$(seq 1 12); do
+    sleep 5
+    c=\$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://127.0.0.1:9090/version || true)
+    [ \"\$c\" = 200 ] || [ \"\$c\" = 401 ] && { echo '  主 sing-box 已就绪'; break; }
+    [ \"\$i\" = 12 ] && echo '  ⚠ 主 sing-box 60s 内未就绪'
+done
 systemctl is-active auto-switch-ip.service"
 
 # ---------------------------------------------------------------- 7. 验收
@@ -314,19 +438,60 @@ echo '--- 硬约束 ---'
 printf '  warp-svc: %s / %s\n' \"\$(systemctl is-active warp-svc 2>&1)\" \"\$(systemctl is-enabled warp-svc 2>&1)\"
 echo '--- selector ---'
 S=\$(cat $REMOTE_HOME/.singbox_secret 2>/dev/null)
-curl -s http://127.0.0.1:9090/proxies/opencode-out -H \"Authorization: Bearer \$S\" \
-  | python3 -c 'import json,sys
-d = json.load(sys.stdin)
-print(\"  成员 %d 条，当前 %s\" % (len(d.get(\"all\") or []), d.get(\"now\")))' 2>/dev/null \
-  || echo '  读不到 selector'
-echo '--- 出口抽样 ---'
+python3 - \"\$S\" <<'PY'
+import json, sys, urllib.request
+sec = sys.argv[1] if len(sys.argv) > 1 else ''
+def get(path):
+    r = urllib.request.Request('http://127.0.0.1:9090/proxies/' + path,
+                               headers={'Authorization': 'Bearer ' + sec})
+    return json.load(urllib.request.urlopen(r, timeout=5))
+try:
+    d = get('opencode-out')
+except Exception as e:
+    print('  读不到 selector:', e); raise SystemExit(0)
+run = set(d.get('all') or [])
+print('  成员 %d 条，当前 %s' % (len(run), d.get('now')))
+# **必须比对，不能只报数字**。旧版只印条数，「成员少一半」永远看不出问题。
+# 期望集 = 盘上配置里的 selector 成员；运行中少一条就是「改了文件没重载」。
+try:
+    cfg = json.load(open('singbox-config.json'))
+    want = set(next(o for o in cfg['outbounds']
+                    if o.get('tag') == 'opencode-out').get('outbounds') or [])
+except Exception as e:
+    print('  读不到盘上配置，跳过比对:', e); raise SystemExit(0)
+missing = want - run
+stale = run - want
+print('  盘上 %d 条 / 运行中 %d 条' % (len(want), len(run)))
+if missing:
+    print('  ✗ 运行中缺 %d 条（%s）—— 主 sing-box 没重载？'
+          % (len(missing), ', '.join(sorted(missing)[:5])))
+if stale:
+    print('  ⚠ 运行中多 %d 条已不在盘上（%s）'
+          % (len(stale), ', '.join(sorted(stale)[:3])))
+if not missing and not stale:
+    print('  ✓ 运行中 selector 与盘上配置一致')
+PY
+echo '--- 出口抽样（WG + 每条 H2）---'
 for p in \$(seq 1110 1112); do
-    r=\$(timeout 8 curl -s --socks5-hostname 127.0.0.1:\$p https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|warp)=' | tr '\\n' ' ')
+    r=\$(timeout 8 curl -s --socks5-hostname 127.0.0.1:\$p https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(ip|warp|colo)=' | tr '\\n' ' ')
     echo \"  \$p \${r:-fail}\"
 done
+# H2 的端口来自台账（socks 1180+N），不是写死的区间。
+python3 - <<'PY' > /tmp/asip-h2ports.txt 2>/dev/null
+import json
+for r in json.load(open('.warp/h2/channels.json')):
+    print(r['socks_port'])
+PY
+h2ok=0; h2n=0
+for p in \$(cat /tmp/asip-h2ports.txt 2>/dev/null); do
+    h2n=\$((h2n+1))
+    r=\$(timeout 10 curl -s --socks5-hostname 127.0.0.1:\$p https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -c '^warp=on' || true)
+    [ \"\$r\" = 1 ] && h2ok=\$((h2ok+1))
+done
+echo \"  H2 \$h2ok/\$h2n 条 warp=on\"
 echo '--- daemon 告警 ---'
-sudo journalctl -u auto-switch-ip.service --since '60 seconds ago' --no-pager 2>/dev/null \
-  | grep -E '⚠|不在白名单|不可达' | grep -v 'sudo\\[' | tail -5 || true"
+sudo journalctl -u auto-switch-ip.service --since '90 seconds ago' --no-pager 2>/dev/null \
+  | grep -E '⚠|不在白名单|不可达|400|404' | grep -v 'sudo\\[' | tail -5 || true"
 
 say "完成"
 echo "远端: $TARGET:$REMOTE_DIR"
