@@ -523,16 +523,56 @@ _EXIT_LEDGER_LOCK = threading.Lock()
 
 def _exit_ledger_note(old_ip: str | None, new_ip: str | None,
                       at: float, tag: str | None = None) -> None:
-    """记一次出口地址变更：old_ip 从此刻起不再是出口，new_ip 接替。"""
+    """记一次出口地址变更：old_ip 从此刻起不再是出口，new_ip 接替。
+
+    `新出口凭什么被判定可用` 一并记下 —— 这是排障里最容易被误读的一格：
+    `OK` 全部来自模型层探测，而探测请求极小、与真实业务流量不是一回事。
+    实测 2026-11-05 21:47：WARP-H2-SJC-35 探测 OK，切上去后业务请求照样 429。
+    不标来源，「表里说 OK」就会被当成「这条线能干活」。
+    """
+    proof = _exit_ledger_proof(tag, new_ip) if new_ip else None
     with _EXIT_LEDGER_LOCK:
         _EXIT_LEDGER.append({
             "old": old_ip or None,
             "new": new_ip or None,
             "at": float(at),
             "tag": tag,
+            "ok": proof,
         })
         if len(_EXIT_LEDGER) > _EXIT_LEDGER_MAX:
             del _EXIT_LEDGER[:-_EXIT_LEDGER_MAX]
+
+
+def _exit_ledger_proof(tag: str | None, ip: str | None) -> dict | None:
+    """这条出口被记为可用的依据。
+
+    三种来源，判读方式完全不同：
+      - `probe`  —— 刚做的模型层实测。`ok_ts` 就是本次检查的时刻。
+      - `ttl`    —— **复查**结果来自 TTL 缓存：这个地址在 `ok_ts` 那时验过，
+                    此刻没有重验。地址在这期间被生产流量烧掉，这里看不出来。
+      - `none`   —— 没有模型层结论（探测关闭 / 从没探过 / 结论已过期）。
+
+    探测的请求体是固定的极小 payload（见 probe_warp.py），成功只说明这个出口
+    此刻能通过 opencode 免费层的**指纹与配额**两道闸，不代表它能承载实际业务量。
+    """
+    if not tag:
+        return None
+    try:
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            ok_ip = st.get("last_ok_ip")
+            ok_ts = float(st.get("last_ok_ts") or 0.0)
+            cur_ip = st.get("ip")
+        if not ok_ts or ok_ip != cur_ip or cur_ip != ip:
+            return {"src": "none", "ok_ts": ok_ts or None}
+        verdict = (_PROBE_LAST_VERDICT or {}).get(tag)
+        # 探测刚做过时 `last_probe_ts` 与 `last_ok_ts` 同一刻；TTL 复用则
+        # `last_probe_ts` 不变。用两者是否相等区分，不需要另存标志。
+        dec = ("ttl" if abs(ok_ts - float(st.get("last_probe_ts") or 0.0)) > 0.5
+               else "probe")
+        return {"src": dec, "ok_ts": ok_ts, "cached": verdict}
+    except Exception:
+        return None
 
 
 def _exit_ledger_since(ip: str, before_ts: float) -> float | None:
@@ -10597,7 +10637,12 @@ def _api_debug_state() -> dict:
         # 换线表是判断 already_retired 的唯一依据，而它只在进程内存里 ——
         # 不给出来就只能靠「日志里没有 already_retired」反推，分不清是
         # 「表里没这个地址」还是「根本没查」。按时间倒序，最近的在前。
-        "exit_ledger": list(reversed(_EXIT_LEDGER[-20:])),
+        "exit_ledger": [
+            {**e, "ok_src": (e.get("ok") or {}).get("src"),
+             "ok_ago_s": (round(now - e["ok"]["ok_ts"], 1)
+                          if (e.get("ok") or {}).get("ok_ts") else None)}
+            for e in reversed(_EXIT_LEDGER[-20:])
+        ],
     }
 
 
