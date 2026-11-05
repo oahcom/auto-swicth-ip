@@ -329,6 +329,17 @@ def test_h2_exhausted_pool_stops_the_restart_loop(monkeypatch):
     daemon._NODE_NEXT_CHECK.clear()
     assert daemon._h2_repair(m)
     assert daemon._line_node_cannot_carry(m["tag"]) is False
+    # **出过口的线不判死**：那种情况更可能是本机 usque 会话僵死，重启是唯一
+    # 能修的动作（与 WG 分支同一口径）。缺了这条，健康的线会被整池判死顶住。
+    daemon._H2_POOL_DEAD[m["tag"]] = _t.time()
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {m["tag"]: {"ever_ip": True}}.get(t, {}))
+    assert daemon._line_node_cannot_carry(m["tag"]) is False, \
+        "出过口的线在整池判死时仍要允许重启"
+    monkeypatch.setattr(daemon, "_warp_line_state",
+                        lambda t: {m["tag"]: {"ever_ip": False}}.get(t, {}))
+    assert daemon._line_node_cannot_carry(m["tag"]) is True, \
+        "从没出过口的线整池判死后就别再重启"
 
 
 def test_noaddr_lock_release_switches_node_first(monkeypatch):
