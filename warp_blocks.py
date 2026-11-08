@@ -61,8 +61,82 @@ def channels_per_block(cfg: dict) -> int:
     return max(1, int(_blocks(cfg).get("channels_per_block") or 2))
 
 
+def block_channels(blk: dict, default: int) -> int:
+    """该块要几条渠道。块表写了 `channels` 就用它，否则回落到全局值。
+
+    全局 `channels_per_block` 是**一刀切**的：HKG 池深 24、ORD 池深 1，
+    同一个数字管不了两块。实测 2026-11-08 的 /48 重叠：NRT 4 条线共用同一批
+    12 个 /48（第 4 条确实在抢地址），而 ICN 3 条线各拿 12 个不同段、单线
+    唯一 IP 576/天 —— 池子质量差 10 倍，条数不该相同。
+    """
+    try:
+        n = blk.get("channels")
+    except AttributeError:
+        n = None
+    if n is None:
+        return default
+    return max(0, min(int(n), default * 8))   # 上限护栏：块表抄错别把设备烧光
+
+
 def enabled(cfg: dict) -> bool:
     return bool(_blocks(cfg).get("enabled"))
+
+
+def tier_spec() -> tuple[str | None, str | None]:
+    """当前档位名与它保留的 WG 线号表达式（`"1-22"` / `"1,3,5"` / `""`）。
+
+    读 `.warp/tiers.json`，**缺失或损坏返回 `(None, None)`**，与「合法档位里
+    写 `wg: ""`（一条都不留）」严格区分开。
+
+    WHY 不能用 `""` 兼表两种意思：`h2-only` 档位就是 `wg: ""`，而文件不存在
+    时若也返回 `""`，`tier_keep("")` 得空集 → 22 条 WG 线全被判停用。全新远端
+    （`.warp/` 未同步）和坏文件都会走到这条路上，且日志里只有一句「档位停用」，
+    看上去像是主动配置的结果。调用方拿 `None` 就是「没有档位 = 全开」。
+    """
+    try:
+        data = json.loads(map_path().with_name("tiers.json").read_text())
+        cur = str(data.get("current") or "")
+        spec = str(((data.get("tiers") or {}).get(cur) or {}).get("wg") or "")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None, None
+    return cur, spec
+
+
+def tier_keep(spec: str) -> set[str]:
+    """把 `"1-22"` / `"1,3,5"` 这类表达式展开成 WG tag 集合。"""
+    keep: set[str] = set()
+    for part in str(spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                a, b = part.split("-", 1)
+                keep.update(f"WARP-WG-{i}" for i in range(int(a), int(b) + 1))
+            else:
+                keep.add(f"WARP-WG-{int(part)}")
+        except ValueError:
+            continue
+    return keep
+
+
+def tier_disabled(declared: set[str] | None = None) -> set[str]:
+    """当前档位下停用的 WG tag。
+
+    `declared` 是「members 里声明的 WG 线」；给了就只在这个集合里判断停用，
+    这样 23+ 的闲置补位设备不会被误标（补位池与档位是两回事）。不给则
+    返回 `WARP-WG-1..99` 减去保留集合 —— 报表类工具拿不到 members，才用这条。
+
+    **一份实现三处调用**（daemon / channel_report / block_view）。此前三个
+    文件各抄了一遍展开逻辑，daemon 按 declared 算得 22 条、两个工具按 1..99
+    算得 99 条，补位线会被报表误标成「档位停用」。
+    """
+    _, spec = tier_spec()
+    if spec is None:
+        return set()                 # 没有档位文件 = 全开，不是「全停」
+    keep = tier_keep(spec)
+    if declared is not None:
+        return set(declared) - keep
+    return {f"WARP-WG-{i}" for i in range(1, 100)} - keep
 
 
 def map_path() -> Path:
@@ -207,6 +281,7 @@ def channels(cfg: dict, nodes_map: dict | None = None,
         # 在另一个块里再挂一台设备 —— 所以这类块的块名是「预期落点」，实测
         # 落点以 trace 为准，`build_map` 会把漂移记进 `drift`。
         pin = [t for t in (blk.get("pin") or []) if t in nodes_map]
+        per_blk = block_channels(blk, per)
         for cat in CATEGORIES:
             pool = ([t for t in pin
                      if (nodes_map.get(t) or {}).get("category") == cat]
@@ -224,7 +299,7 @@ def channels(cfg: dict, nodes_map: dict | None = None,
             # 同层内保持延迟序（sorted 稳定）。
             ordered = sorted(order_nodes(pool, delays),
                              key=lambda t: _alive_rank(t, nodes_map, "v6"))
-            for i in range(min(per, len(ordered))):
+            for i in range(min(per_blk, len(ordered))):
                 out.append({"type": "v6", "colo": colo, "category": cat,
                             "index": i, "family": "v6", "node": ordered[i],
                             # `nodes` 是**整块的全部适配节点**（`_pool` 不截断），
@@ -241,6 +316,7 @@ def channels(cfg: dict, nodes_map: dict | None = None,
         if colo in skip:
             continue
         pin = [t for t in (blk.get("pin") or []) if t in nodes_map]
+        per_blk = block_channels(blk, per)
         for cat in CATEGORIES:
             pool = ([t for t in pin
                      if (nodes_map.get(t) or {}).get("category") == cat]
@@ -249,7 +325,7 @@ def channels(cfg: dict, nodes_map: dict | None = None,
                     if (nodes_map.get(t) or {}).get("carrier") == "h2"]
             ordered = sorted(order_nodes(pool, delays),
                              key=lambda t: _alive_rank(t, nodes_map, "v6"))
-            for i in range(min(per, len(ordered))):
+            for i in range(min(per_blk, len(ordered))):
                 out.append({"type": "h2", "colo": colo, "category": cat,
                             "index": i, "family": "v4", "node": ordered[i],
                             "nodes": ordered, "pinned": bool(pin),
@@ -570,6 +646,22 @@ def build_map(probe_dir: str) -> dict:
         for tag in tags:
             nodes[tag] = {"colo": colo, "category": cat, "ok": ok, "n": n,
                           "egress_ip": ip, "colo_mix": mix, "drift": drift}
+    # **H2 承载标记必须跨重建保留**。`build_map` 的输入只有 WG/diag 的实测文件，
+    # 里面没有 `carrier` 这个字段 —— 它由 H2 探测单独写入（见
+    # `tools/merge_h2_blockmap.py`）。不在这里粘回去的话，每重建一次，
+    # 所有 `carrier=h2` 全部丢失，H2 渠道数一夜归零，而日志里毫无痕迹。
+    # 实测 2026-11-08：20 个节点带着 `h2: {colo, ip}` 却没有 `carrier`，
+    # 就是历次重建叠加这个漏写造成的。
+    try:
+        prev = (json.loads(map_path().read_text()).get("nodes") or {})
+    except (OSError, ValueError, AttributeError):
+        prev = {}
+    for tag, e in nodes.items():
+        old = prev.get(tag)
+        if isinstance(old, dict) and old.get("carrier") == "h2":
+            e["carrier"] = "h2"
+            if isinstance(old.get("h2"), dict):
+                e["h2"] = old["h2"]
     # v4 实测是**节点属性**，不是出口 IP 的属性（v4 出口由落地 colo 的小池子
     # 抽签，同 colo 的不同节点共用那几个地址）。所以它只挂在跑过 v4 diag 的
     # 节点上，不进按 IP 聚合的那张表。

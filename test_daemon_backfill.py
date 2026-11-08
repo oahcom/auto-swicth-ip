@@ -51,6 +51,8 @@ def _mod(monkeypatch, tmp_path, registered, members, units):
         "os": os,
         "warp_wg": warp_wg,
         "_warp": lambda: {"members": [{"tag": t} for t in members]},
+        # 档位停用的线不参与补位。测试里没有档位文件，按「全开」给空集合。
+        "_TIER_DISABLED": set(),
     }
     real = os.path.exists
 

@@ -9,6 +9,8 @@
   - 探针自己的故障（config/port）不能记成节点故障
 """
 import json
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -280,6 +282,100 @@ def test_build_map_aggregates_by_egress_ip(tmp_path):
     assert out["nodes"]["n-a"]["category"] == "regular"
     assert out["nodes"]["n-a"]["colo"] == "SJC"
     assert "n-c" not in out["nodes"]  # 0 次成功不入块
+
+
+def test_build_map_preserves_h2_carrier(tmp_path, monkeypatch):
+    """重建**不能**丢掉 `carrier=h2`。
+
+    这是 2026-11-08 实测到的真实故障：`build_map` 的输入只有 WG/diag 文件，
+    里面没有 `carrier` 字段，于是每重建一次就把 H2 标记清空一批。症状是
+    「H2 渠道越来越少」，而块映射里那些节点明明带着 `h2: {colo, ip}` ——
+    看起来像没测过，实际是测过没记上。
+    """
+    old = tmp_path / "block-map.json"
+    old.write_text(json.dumps({"nodes": {
+        "n-a": {"colo": "SJC", "category": "regular", "ok": 2, "n": 2,
+                "carrier": "h2", "h2": {"colo": "SJC", "ip": "2a09::1"}},
+        "n-b": {"colo": "SJC", "category": "regular", "ok": 2, "n": 2},
+    }}))
+    monkeypatch.setattr(wb, "map_path", lambda: old)
+    _write(tmp_path, "tunnel_inputs.json", [
+        {"egress_ip": "1.1.1.1", "tag": "n-a"},
+        {"egress_ip": "1.1.1.1", "tag": "n-b"},
+    ])
+    _write(tmp_path, "warp_probe.json", [
+        {"egress_ip": "1.1.1.1", "ok": True, "colo": "SJC"},
+        {"egress_ip": "1.1.1.1", "ok": True, "colo": "SJC"},
+    ])
+    out = wb.build_map(str(tmp_path))
+    assert out["nodes"]["n-a"]["carrier"] == "h2", "H2 标记被重建抹掉了"
+    assert out["nodes"]["n-a"]["h2"]["colo"] == "SJC"
+    assert "carrier" not in out["nodes"]["n-b"], "非 h2 节点不该被误标"
+
+
+def test_merge_h2_marks_carrier_and_heals(tmp_path, monkeypatch):
+    """合并 H2 探测结果必须同时写 `carrier`，并顺带修历史漏标。
+
+    只写 `h2` 子对象、不写 `carrier` 的话，消费方（channels 的 h2 分支、
+    render_h2_lines、block_view 都判 `meta["carrier"] == "h2"`）根本看不到 ——
+    PHX 的 8 个节点就是这样在 H2 池里消失了整个周期。
+    """
+    import importlib.util
+    proj = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location(
+        "merge_h2", proj / "tools" / "merge_h2_blockmap.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    (tmp_path / ".warp").mkdir()
+    bm = tmp_path / ".warp" / "block-map.json"
+    bm.write_text(json.dumps({"nodes": {
+        # 历史遗留：有 h2 结果但没有 carrier
+        "old-node": {"colo": "NRT", "category": "regular", "ok": 1, "n": 1,
+                     "h2": {"colo": "NRT", "ip": "2a09::9"}},
+        "wg-only": {"colo": "SJC", "category": "regular", "ok": 1, "n": 1},
+    }}))
+    scan = tmp_path / "scan.json"
+    scan.write_text(json.dumps([
+        {"tag": "wg-only", "ok": True, "colo": "SJC", "ip": "2a09::2"},
+        {"tag": "brand-new", "ok": True, "colo": "PHX", "ip": "2a09::3"},
+    ]))
+    monkeypatch.setattr(mod, "PROJECT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["merge", str(scan)])
+    assert mod.main() == 0
+    nodes = json.loads(bm.read_text())["nodes"]
+    assert nodes["wg-only"]["carrier"] == "h2", "已存在节点没标 carrier"
+    assert nodes["brand-new"]["carrier"] == "h2", "新节点没标 carrier"
+    assert nodes["old-node"]["carrier"] == "h2", "历史漏标没被自愈"
+
+
+def test_missing_tier_file_means_all_enabled(tmp_path, monkeypatch):
+    """档位文件缺失/损坏 = 全开，**不是全停**。
+
+    `h2-only` 档位的合法写法就是 `wg: ""`（一条都不留）。若「文件不存在」
+    也归成 `""`，`tier_keep("")` 得空集 → 22 条 WG 线全被判停用，而日志里
+    只有一句「档位停用」，看上去像主动配置的结果。全新远端（`.warp/` 未同步）
+    和坏文件都会走到这条路上。
+    """
+    monkeypatch.setattr(wb, "map_path", lambda: tmp_path / "block-map.json")
+    declared = {f"WARP-WG-{i}" for i in range(1, 23)}
+    # 文件不存在
+    assert wb.tier_spec() == (None, None)
+    assert wb.tier_disabled(declared) == set()
+    assert wb.tier_disabled() == set()
+    # 文件损坏
+    (tmp_path / "tiers.json").write_text("{ 坏掉的 json")
+    assert wb.tier_disabled(declared) == set()
+
+
+def test_empty_tier_spec_really_disables_everything(tmp_path, monkeypatch):
+    """合法档位写 `wg: ""` 才是「全停」—— 与上面的「文件缺失」必须分开。"""
+    monkeypatch.setattr(wb, "map_path", lambda: tmp_path / "block-map.json")
+    (tmp_path / "tiers.json").write_text(json.dumps(
+        {"current": "h2-only", "tiers": {"h2-only": {"wg": ""}}}))
+    declared = {"WARP-WG-1", "WARP-WG-2"}
+    assert wb.tier_spec() == ("h2-only", "")
+    assert wb.tier_disabled(declared) == declared
 
 
 def test_build_map_prefers_diag_over_udp_probe(tmp_path):

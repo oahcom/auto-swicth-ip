@@ -162,7 +162,11 @@ say "3/7 同步实测表与 H2 台账（gitignored，但拓扑必需）"
 # `plan` 直接报「块模型未启用」，一条渠道都开不出来。
 # h2/channels.json：已投产的渠道↔设备↔端口分配，render_h2_lines 在块模型
 # 筛不出 h2 时靠它兜底（见该文件里的注释）。
-for f in .warp/block-map.json .warp/h2/channels.json; do
+# tiers.json：当前档位（哪些 WG 线该跑）。**不传的后果是静默的**：文件缺失时
+# `warp_blocks.tier_spec()` 返回 None → 全开，远端会跑满 22 条 WG 线，与本机
+# `h2-only` 不一致，而验收里只看「单元 active 数」是看不出来的（多跑不报错）。
+# 它必须跟 block-map 一起传，否则「push 完重启就一致」不成立。
+for f in .warp/tiers.json .warp/block-map.json .warp/h2/channels.json; do
     [ -f "$f" ] || { echo "  ⚠ 本机缺 $f，跳过"; continue; }
     put "$f" "/tmp/$(basename "$f")"
     echo "  $f"
@@ -184,6 +188,12 @@ done
 # 远端已有一份时不许覆盖 —— 本机 31 条、远端 37 条，覆盖等于把远端砍到 31 条，
 # 而 members.py 随后会按这份台账写出 31 个成员。只有远端从没渲染过才拿它兜底。
 run "cd $REMOTE_DIR && mkdir -p .warp/h2
+# 档位是**配置**不是台账，直接以本机为准覆盖 —— 不做合并。
+# 合并会留下远端上一轮的档位（例如还写着 wg-on），两台机器跑不同拓扑。
+if [ -s /tmp/tiers.json ]; then
+    cp /tmp/tiers.json .warp/tiers.json && chmod 600 .warp/tiers.json
+    python3 -c 'import json,sys; d=json.load(open(\".warp/tiers.json\")); print(\"  档位 \" + str(d.get(\"current\")) + \" wg=\" + repr((d.get(\"tiers\") or {}).get(d.get(\"current\") or \"\",{}).get(\"wg\")))'
+fi
 python3 - <<'PY'
 import json
 from pathlib import Path
@@ -389,6 +399,15 @@ python3 deploy/members.py --write-warp-outbound >/dev/null
 echo '  · 并入主配置 selector'
 python3 deploy/patch-wg-outbounds.py | sed 's/^/    /'
 
+# `cli.env` 是**部署期快照**，不是每次运行现算的：里面写着隧道清单、端口、
+# 单元名。渲染出新线之后不重生成，`asip chan` / `asip warp status` 会一直
+# 少那几条（实测本机 44 → 50 条隧道后 asip chan 仍报旧清单）。它只读 .warp
+# 和 .env，不碰网络，几毫秒的事，每次部署都重来一遍。
+echo '  · asip 设置快照'
+./deploy/asip-cli-conf.sh >/dev/null 2>&1 \
+    && echo "    已重生成 $(python3 -c 'import os;print(os.path.expanduser(\"~/.config/asip/cli.env\"))')" \
+    || echo '    ⚠ asip-cli-conf.sh 失败（asip 命令会读到旧清单）'
+
 # 兜底：上面任一步以 root 写出文件，这里统一交还。缺了它，一次 sudo 就能让
 # 下一轮订阅刷新产出没有 WARP 的配置。
 sudo chown -R $REMOTE_USER:$REMOTE_USER .warp 2>/dev/null || true
@@ -434,6 +453,49 @@ for pat in 'usque-warp*.service' 'usque-h2-*.service' 'warp-wg-*.service'; do
 done
 printf '  %-24s %s\n' asip-h2-singbox \"\$(systemctl is-active asip-h2-singbox.service)\"
 printf '  %-24s %s\n' nine-router-src \"\$(systemctl is-active nine-router-src.service 2>/dev/null)\"
+echo '--- 档位 ---'
+# 必须比对**实际在跑的 WG 单元数**与档位声明，不能只印档位名：
+# 档位文件写对了但 daemon 没重载，或者单元是手动 start 的，都会让两者不一致，
+# 而「多跑了 22 条线」不会报任何错，只会在内存和 CF 配额上悄悄多花。
+python3 - <<'PY'
+import json, subprocess
+from pathlib import Path
+try:
+    d = json.loads(Path('.warp/tiers.json').read_text())
+except (OSError, ValueError):
+    print('  ⚠ 远端没有 .warp/tiers.json → WG 全开（与本机档位无关）')
+    raise SystemExit(0)
+cur = d.get('current') or ''
+spec = str((d.get('tiers') or {}).get(cur, {}).get('wg') or '')
+keep = set()
+for part in spec.replace(' ', '').split(','):
+    if not part:
+        continue
+    try:
+        if '-' in part:
+            a, b = part.split('-', 1)
+            keep.update('WARP-WG-%d' % i for i in range(int(a), int(b) + 1))
+        else:
+            keep.add('WARP-WG-%d' % int(part))
+    except ValueError:
+        pass
+out = subprocess.run(['systemctl', 'list-units', '--no-legend', '--plain',
+                      'warp-wg-*.service', '--state=active'],
+                     capture_output=True, text=True).stdout
+running = {l.split()[0].replace('warp-wg-', 'WARP-WG-').replace('.service', '')
+           for l in out.splitlines() if l.strip()}
+print('  档位 %s  声明保留 %d 条  实际在跑 %d 条' % (cur or '(无)', len(keep), len(running)))
+extra = running - keep
+missing = keep - running
+if extra:
+    print('  ✗ 多跑 %d 条不在档位内（%s）—— daemon 没重载档位？'
+          % (len(extra), ', '.join(sorted(extra)[:5])))
+if missing:
+    print('  ⚠ 档位要求但没在跑 %d 条（%s）'
+          % (len(missing), ', '.join(sorted(missing)[:5])))
+if not extra and not missing:
+    print('  ✓ 实际在跑的 WG 单元与档位一致')
+PY
 echo '--- 硬约束 ---'
 printf '  warp-svc: %s / %s\n' \"\$(systemctl is-active warp-svc 2>&1)\" \"\$(systemctl is-enabled warp-svc 2>&1)\"
 echo '--- selector ---'

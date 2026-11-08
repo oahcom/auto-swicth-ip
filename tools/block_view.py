@@ -141,12 +141,25 @@ def bearer(colo: str | None) -> str:
     return "?"
 
 
+def _tier_disabled() -> set[str]:
+    """当前档位下停用的 WG 线 tag（与 daemon._TIER_DISABLED 同一份口径）。
+
+    台账记的是「这条线绑在哪个节点」，**不等于单元在跑**。档位停用后
+    台账不变，若照样算进 `current_bindings`，块标题会写成「在用 7」而
+    实际一条都没跑 —— 与 established-facts 第 26 条「members 是声明」
+    同一类陷阱。
+    """
+    import warp_blocks
+    return warp_blocks.tier_disabled()
+
+
 def current_bindings() -> dict[str, list[dict]]:
     """节点 tag → [{channel, carrier, unit}]，当前实际绑在这台节点上的线。"""
     out: dict[str, list[dict]] = {}
+    off = _tier_disabled()
 
     def add(node, ch, carrier, unit):
-        if node:
+        if node and ch not in off:
             out.setdefault(node, []).append(
                 {"channel": ch, "carrier": carrier, "unit": unit})
 
@@ -255,6 +268,7 @@ def build(nodes_map: dict, delays: dict[str, int | None] | None = None,
           only: str | None = None, sources: dict | None = None) -> list[dict]:
     bound = current_bindings()
     plan = planned()
+    off = _tier_disabled()
     idx = load_sources() if sources is None else sources
     out = []
     for colo, tags in sorted(blocks(nodes_map).items()):
@@ -286,6 +300,10 @@ def build(nodes_map: dict, delays: dict[str, int | None] | None = None,
             "nodes": rows,
             "in_use": sum(1 for r in rows if r["bound"]),
             "planned_n": sum(1 for r in rows if r["planned"]),
+            # 该块是否因档位失去了 WG 承载（块里本来有 warp-proxy 节点，全被停用）
+            "tier_off": bool(off) and any(
+                r["carrier"] == "warp-proxy" and not r["bound"] for r in rows
+                if r["planned"] or r["ok"]),
         })
     return out
 
@@ -363,7 +381,8 @@ def print_blocks(blocks_: list[dict], delays: dict[str, int | None]) -> None:
     for b in blocks_:
         ban = b["ban_rate"]
         ban_s = f" ban={ban:.0%}" if isinstance(ban, (int, float)) else ""
-        print(f"\n■ {b['colo']} {b['loc']}  承载={b['bearer']}{ban_s}  "
+        off_s = " · WG档位停用" if b.get("tier_off") else ""
+        print(f"\n■ {b['colo']} {b['loc']}  承载={b['bearer']}{ban_s}{off_s}  "
               f"节点 {len(b['nodes'])} · 在用 {b['in_use']} · 块模型选中 {b['planned_n']}")
         print("-" * max(120, _w(head) + 10))
         print(head)

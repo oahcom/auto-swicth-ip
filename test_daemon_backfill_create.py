@@ -130,6 +130,8 @@ def _run(env, max_new=1, gap=600.0, last_register=-1e9, max_lines=64):
         "_PROJECT": str(PROJECT),
         "_WG_CREATE_GAP": gap,
         "_WG_MAX_LINES": max_lines,
+        # 档位停用的线不参与补位。测试里没有档位文件，按「全开」给空集合。
+        "_TIER_DISABLED": set(),
     }
     exec(compile(ast.Module(body=_impl(), type_ignores=[]), "daemon.py", "exec"),
          box)

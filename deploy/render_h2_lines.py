@@ -129,7 +129,12 @@ def h2_channels() -> list[dict]:
     # 从来没被补出来的新 colo。远端 block-map 里有 43 个 h2 节点、8 个 colo，
     # 实际投产的只有块模型那一份。
     have = {c["node"] for c in out}
-    cap = int((CFG["warp"].get("blocks") or {}).get("channels_per_block") or 0)
+    base_cap = int((CFG["warp"].get("blocks") or {}).get("channels_per_block") or 0)
+    # 块表里可以给单个块写 `channels` 覆盖全局值（见 warp_blocks.block_channels）。
+    blk_cap: dict[str, int] = {}
+    for blk in ((CFG["warp"].get("blocks") or {}).get("table") or []):
+        if isinstance(blk, dict) and blk.get("colo") and blk.get("channels") is not None:
+            blk_cap[str(blk["colo"])] = max(0, int(blk["channels"]))
     per_colo: dict[str, int] = {}
     for c in out:
         # 台账里的 `colo` 字段是 null（只有 `member_tag` 里有块名），从 tag 兜底，
@@ -151,6 +156,7 @@ def h2_channels() -> list[dict]:
     nxt = max([c["index"] for c in out] or [-1]) + 1
     added = 0
     for colo in sorted(cand):
+        cap = blk_cap.get(colo, base_cap)
         for node in sorted(cand[colo]):
             if cap and per_colo.get(colo, 0) >= cap:
                 break

@@ -93,10 +93,25 @@ def test_timeout(monkeypatch):
 
 
 def test_nonzero_returncode(monkeypatch):
+    """22 = HTTP 错误码，不再笼统归成 `rc`。"""
     _install(monkeypatch, "", returncode=22)
     result = probe_egress()
     assert result.ip is None
-    assert result.error == "rc"
+    assert result.error == "http_error"
+
+
+def test_curl_rc_is_classified(monkeypatch):
+    """每种 curl 退出码归到各自的类 —— 「拿不到出口」要能看出是哪一种。
+
+    7（端口没监听）、6（DNS 失败）、56（隧道被打断）处置动作完全不同：
+    前者是本地单元问题，后两者是节点/机场问题。压成一个 `rc` 就只能靠
+    人翻日志上下文猜。
+    """
+    for rc, want in ((7, "connect_refused"), (6, "dns_fail"),
+                     (56, "recv_fail"), (35, "tls_fail"),
+                     (52, "empty_reply"), (99, "rc_other")):
+        _install(monkeypatch, "", returncode=rc)
+        assert probe_egress().error == want, f"rc={rc}"
 
 
 def test_curl_max_time_exit_is_reported_as_timeout(monkeypatch):

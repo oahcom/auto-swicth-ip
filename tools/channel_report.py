@@ -63,6 +63,17 @@ COLO_FALLBACK = {
 PSEUDO_COLO = {"CF": "CF 直连", "CFB": "CF 直连", "OLD": "旧批次", "UNKNOWN": "未知"}
 
 
+def _tier_disabled() -> set[str]:
+    """当前档位下停用的 WG 线 tag（与 daemon._TIER_DISABLED 同一份口径）。
+
+    报表必须标出来：停用的线在日志里还留着半小时前的样本，成功率、ban 率
+    全是停用**之前**的 —— 与 `print_table` 里「无样本」那条同一类陷阱，
+    不标就会把一份历史数据读成「现在这条线是这个状态」。
+    """
+    import warp_blocks
+    return warp_blocks.tier_disabled()
+
+
 def _read_json(path, default=None):
     try:
         return json.loads(Path(path).read_text())
@@ -455,6 +466,10 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "verdict_stale": bool(
                 float(st.get("ip_ts") or 0) > float(st.get("last_probe_ts") or 0) + 1),
             "no_addr_since": st.get("ban_noaddr_since") or 0,
+            # 「拿不到出口」的**原因**（daemon 写的人话，见 _EGRESS_HINT）。
+            # 只印 `无地址` 的话，端口没监听、节点域名解析失败、隧道被打断
+            # 三种故障在报表上完全一样，而处置动作完全不同。
+            "egress_error": st.get("egress_error") or "",
             "window_from": cutoff,
         })
     rows.sort(key=lambda r: (r["carrier"] or "", r["colo"], r["tag"]))
@@ -722,14 +737,19 @@ def print_table(rows: list[dict], hours: float) -> None:
             f"{_pad('订阅', 8)} {_pad('节点名', 30)} 节点 / 状态")
     print(head)
     print("-" * (_w(head) + 40))
+    tier_off = _tier_disabled()
     for r in rows:
         flags = []
+        if r["tag"] in tier_off:
+            flags.append("档位停用")
         if r["held"]:
             flags.append(f"锁定至{_fmt_ts(r['hold_until'])}")
         if r["quota_until"] > time.time():
             flags.append(f"配额至{_fmt_ts(r['quota_until'])}")
         if r["no_addr_since"]:
             flags.append("无地址")
+        if r.get("egress_error"):
+            flags.append(f"取址失败:{r['egress_error']}")
         if not flags:
             # 窗口内一条样本都没有 → `last_verdict` 是**旧的**，不能当成
             # 现在的结论印出来。WARP-CF-C/G/H/I 的单元 2026-10-28 缩容时

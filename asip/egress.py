@@ -20,13 +20,47 @@ from .proc import run as proc_run
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 IPIFY_URL = "https://api.ipify.org"
 
+# curl 退出码 → 失败原因。分得越细，「拿不到出口」才越能归因：
+#   7  = 连不上 SOCKS 端口（单元没起 / 端口没监听）
+#   6  = DNS 解析失败（隧道通了但节点域名解析不了）
+#   56 = 收数据失败（隧道建立后被打断，典型是上游把会话掐了）
+#   28 = 超时（curl 自己 --max-time 到点，进程级 timeout 轮不到）
+#   22 = HTTP 错误码（隧道通了，但出口侧返回非 2xx）
+# 其余归 `rc_other` 并带上原始码，别再压成笼统的 `rc`。
+_CURL_RC = {
+    6: "dns_fail",
+    7: "connect_refused",
+    22: "http_error",
+    28: "timeout",
+    35: "tls_fail",
+    52: "empty_reply",
+    56: "recv_fail",
+}
+
+# 优先级 = 「这个失败说明了多少」。高者胜出（`note` 用 >=，同级取后者）。
+#
+# 排序理由：
+#   curl_missing —— 工具都没了，别的结论都不可信，必须冒出来；
+#   timeout      —— 整段挂起，是「拿不到出口」里最需要人看的一种；
+#   connect_refused / dns_fail / tls_fail / recv_fail —— 隧道层各有各的断法，
+#                   都指向具体环节，比「有没有拿到地址」信息量大；
+#   warp_off     —— **隧道是通的**，只是 CF 没给 WARP 会话。这条比 invalid_ip
+#                   有意义得多（说明节点能用、只是 WARP 侧拒绝），所以不能沉到底；
+#   http_error / rc_other —— 出口侧的问题，仍算隧道通了；
+#   invalid_ip / bad_body  —— 拿到了东西但格式不对，信息量最低。
 _ERROR_PRIORITY = {
-    "curl_missing": 6,
-    "timeout": 5,
-    "rc": 4,
-    "invalid_ip": 3,
-    "warp_off": 2,
-    "bad_body": 1,
+    "curl_missing": 10,
+    "timeout": 9,
+    "connect_refused": 8,
+    "dns_fail": 7,
+    "tls_fail": 6,
+    "recv_fail": 5,
+    "empty_reply": 5,
+    "warp_off": 4,
+    "http_error": 3,
+    "rc_other": 2,
+    "invalid_ip": 1,
+    "bad_body": 0,
 }
 
 
@@ -112,7 +146,7 @@ def probe_egress(*, socks_port: int | None = None,
             # 「HTTP 错误」(22)。调用方只能看到一个笼统的 rc，把三种性质
             # 完全不同的失败当作同一个「unknown」——实测 2026-11-05 远端
             # 20 条线 6009ms 超时全记成 rc，与端口没监听的 6ms rc 无区别。
-            note("timeout" if proc.code == 28 else "rc")
+            note(_CURL_RC.get(proc.code, "rc_other"))
             continue
 
         body = proc.stdout or ""

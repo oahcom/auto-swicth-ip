@@ -702,20 +702,36 @@ CFG = {
                 # ban_rate 是 2026-11-01 实测的**段封禁率**，只用于夜间取舍：
                 # 1.0 的块夜里重启动只会换到另一个同样被封的 /128。
                 # None = 没测过（HKG/TPE/ORD/PIT 当天才首现），夜间必须保留。
-                {"colo": "NRT", "loc": "东京",     "carrier": "proxy",  "ban_rate": 1.0},
+                # `channels` 覆盖全局 `channels_per_block`，按**该块的池深**给条数。
+                # 不写就回落到全局值。池深见 `.warp/block-map.json` 实测：
+                # HKG 24 / SIN 15 / NRT 9 / TPE 7 / SLC 4 / ICN 3 / LAX 3，
+                # LHR 2 / FRA 2，ORD/BOM/SJC/GIG 各 1。
+                #
+                # WHY 不能一刀切：实测 2026-11-08 的 /48 重叠显示，NRT 4 条线
+                # 共用同一批 12 个 /48（第 4 条在抢地址），而 ICN 3 条线各拿 12 个
+                # 不重叠的段、单线唯一 IP 576/天 —— 池子质量差 10 倍。
+                # 缺设备由 render_h2_lines.py 自动注册（用户规则），不要靠砍条数。
+                {"colo": "NRT", "loc": "东京",     "carrier": "proxy",  "ban_rate": 1.0,
+                 "channels": 3},
                 {"colo": "PHX", "loc": "凤凰城",   "carrier": "proxy",  "ban_rate": 0.792},
                 {"colo": "LAX", "loc": "洛杉矶",   "carrier": "both",   "ban_rate": 0.266},
                 {"colo": "SJC", "loc": "圣何塞",   "carrier": "both",   "ban_rate": 0.25},
-                {"colo": "SIN", "loc": "新加坡",   "carrier": "both",   "ban_rate": 0.152},
-                {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None},
-                {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None},
-                {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None},
+                {"colo": "SIN", "loc": "新加坡",   "carrier": "both",   "ban_rate": 0.152,
+                 "channels": 5},
+                {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None,
+                 "channels": 4},
+                {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None,
+                 "channels": 5},
+                {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None,
+                 "channels": 1},
                 # 2026-11-02 H2 实测新增（dormant 65 节点里首次出现）。
                 # carrier=proxy：H2 与 WG-over-UDP 同属「代理承载」，区别只在
                 # 传输层（TCP/HTTP2 vs UDP/WireGuard），不改变块的归类。
                 # ban_rate=None：段池从没在生产台账里出现过，夜间必须保留。
-                {"colo": "ICN", "loc": "首尔",     "carrier": "proxy",  "ban_rate": None},
-                {"colo": "SLC", "loc": "盐湖城",   "carrier": "proxy",  "ban_rate": None},
+                {"colo": "ICN", "loc": "首尔",     "carrier": "proxy",  "ban_rate": None,
+                 "channels": 3},
+                {"colo": "SLC", "loc": "盐湖城",   "carrier": "proxy",  "ban_rate": None,
+                 "channels": 2},
                 {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None,
                  # PIT 没有自己的节点：唯一落到过 PIT 的是 ORD 那条
                  # `us.bing.com:443~6-any`（5 轮里 ORD 7 / PIT 3 / SIN 1）。

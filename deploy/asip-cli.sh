@@ -15,6 +15,7 @@ fi
 # 内嵌 Python 用的是 os.environ（不解析 shell 变量），必须导出一份：
 # 台账路径和日志路径都由设置文件提供，漏导会让 warp ip / cycles 直接 KeyError。
 export ASIP_IP_USED_FILE ASIP_CYCLES_FILE ASIP_LOG ASIP_CLASH_API ASIP_PY
+export ASIP_LINE_STATE_FILE
 # 隧道探测走 xargs 起的子 shell，主机名必须导出才能在单引号脚本里取到。
 export ASIP_SOCKS_HOST
 
@@ -437,17 +438,58 @@ cmd_warp() {
       cmd_warp start
       ;;
     status|'')
-      echo "WARP:   $(_sctl is-active $UNITS 2>/dev/null | tr '\n' ' ')"
-      # 串行探测 10 条要 7s+，并行后受最慢那条决定：--max-time 3 实测 3.0s，
-      # 因为每次换线都会重启某条隧道，总有一条正好落在重连窗口。2s 下界足够
-      # （正常隧道 RTT < 300ms，2s 还不通就是真不通），-P10 与条数解耦。
-      printf '%s\n' $PORTS | xargs -P10 -I{} sh -c \
-        'ip=$(curl -s --max-time 2 --socks5-hostname $ASIP_SOCKS_HOST:{} \
+      # 逐条带单元名：`is-active` 一次收 44 个参数只回一排字母，配不上号。
+      # 非 active 的单独列出来并区分「未部署」（disabled，缩容遗留）与
+      # 「该跑没跑」（enabled 却没起来）—— 后者才是故障。
+      _down=""
+      while read -r _t _p _u; do
+        [ -n "$_u" ] || continue
+        [ "$(_sctl is-active "$_u" 2>/dev/null)" = "active" ] && continue
+        if [ "$(_sctl is-enabled "$_u" 2>/dev/null)" = "disabled" ]; then
+          _down="$_down
+  · $_t ($_u) 未部署（disabled）"
+        else
+          _down="$_down
+  ✗ $_t ($_u) 该跑没跑"
+        fi
+      done <<<"$ASIP_WARP_MEMBERS"
+      if [ -n "$_down" ]; then
+        echo "WARP:   非 active 单元 —$_down"
+      else
+        echo "WARP:   全部 active"
+      fi
+      # 串行探测 10 条要 7s+，并行后受最慢那条决定：每次换线都会重启某条隧道，
+      # 总有一条正好落在重连窗口。2s 下界太紧 —— 实测 WARP-CF-E 是**当前出口**
+      # （daemon 报 singbox=🟢），2s 下连测两次都判「不可达」，第三次 6s 才通。
+      # 6s 覆盖重连窗口又不至于让整轮等太久（-P10 与条数解耦）。
+      # 打印 `tag port ip` 三元组，由 awk 并回一行：并行探测只回 ip 的话，
+      # 44 个端口里哪条不通就得靠人对着端口表反查。
+      while read -r _t _p _u; do
+        [ -n "$_p" ] && printf '%s %s\n' "$_t" "$_p"
+      done <<<"$ASIP_WARP_MEMBERS" | xargs -P10 -n2 sh -c \
+        'ip=$(curl -s --max-time 6 --socks5-hostname $ASIP_SOCKS_HOST:$2 \
            https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -oP "^ip=\K.*")
-         case "$ip" in
-           "") printf "  :%s  %s\n" {} "不可达（也可能在重连窗口，等下再测）" ;;
-           *)  printf "  :%s  %s\n" {} "$ip" ;;
-         esac' | sort -t: -k2 -n
+         printf "%s %s %s\n" "$1" "$2" "${ip:-不可达}"' _ \
+        | sort -k2 -n | "$ASIP_PY" -c '
+import json, os, sys
+# 端口探不通时补一句**原因**。探测本身（6s 超时）只能说明「没拿到地址」，
+# 而 daemon 那边的 egress_error 分得更细：端口没监听 / DNS 失败 /
+# 隧道被打断 / 到点无响应 —— 处置动作完全不同。
+try:
+    st = json.load(open(os.environ["ASIP_LINE_STATE_FILE"]))
+except (OSError, ValueError, KeyError):
+    st = {}
+lines = (st.get("lines") if isinstance(st, dict) else None) or {}
+for row in sys.stdin:
+    parts = row.split()
+    if len(parts) < 3:
+        continue
+    tag, port, ip = parts[0], parts[1], parts[2]
+    if ip == "不可达":
+        why = (lines.get(tag) or {}).get("egress_error") or ""
+        if why:
+            ip = f"不可达（{why}）"
+    print(f"  {tag:<16} :{port:<5} {ip}")'
       echo "出口:   $(_exit_now)"
       ;;
     cycles|cycle)

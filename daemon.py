@@ -2611,6 +2611,34 @@ def _switch_warp(tag: str, *, ip: str | None = None) -> bool:
 _UNIT_CTL = "/usr/local/bin/asip-unit"
 
 
+def _load_tier_disabled() -> set[str]:
+    """本档位下**停用**的 WG 线 tag（实现在 `warp_blocks.tier_disabled`）。
+
+    档位只表达「哪些 WG 单元该跑」，不删 members、不动设备、不改 enable：
+    停掉的线随时 `start` 就能回来，切换成本只有几秒。缺文件/坏文件一律返回
+    空集合 —— 宁可全开，也不要因为台账读不出来把整批线冻死。
+
+    只统计 **members 里声明的** WG 线（`declared`），不含 23+ 的闲置补位设备：
+    档位管的是「哪些声明线在跑」，补位池是另一回事。
+    """
+    declared = {m["tag"] for m in (CFG.get("warp") or {}).get("members") or []
+                if m.get("kind") == "wg"}
+    if not declared:
+        # 声明为空多半个 `.env` 没读进来（`WARP_WG_FAMILIES` 缺失时
+        # `_append_wg_members` 直接 return）。此时按「没有档位」处理并留痕：
+        # 静默返回空集合会让 22 条线在无人察觉的情况下全部解禁。
+        log("  ⚠ 档位失效：members 里没有 WG 线声明"
+            "（检查 .env 的 WARP_WG_FAMILIES / WARP_WG_NODES），WG 全部按启用处理")
+        return set()
+    return warp_blocks.tier_disabled(declared)
+
+
+_TIER_DISABLED: set[str] = _load_tier_disabled()
+
+def _line_enabled(member: dict) -> bool:
+    """该成员在当前档位下是否应当运行。非 WG 成员永远为真。"""
+    return member.get("tag") not in _TIER_DISABLED
+
 def _unit_ctl(action: str, service: str) -> subprocess.CompletedProcess:
     """对系统级单元执行 action。
 
@@ -2698,6 +2726,8 @@ def _restart_warp_line(member: dict, rebind: bool = False) -> bool:
     # 上层会被绕过（2026-10-28 三方审查 P1-3）。
     if _night_block_restart(member["tag"], "刷新", time.time()):
         return False
+    if not _line_enabled(member):
+        return False
     if not _restart_rate_allow(time.time()):
         return False
     if rebind and member.get("kind") == "wg" and member.get("family") == "v4":
@@ -2714,6 +2744,11 @@ def _restart_warp_line(member: dict, rebind: bool = False) -> bool:
 
 
 def _restart_service(service: str, tag: str | None = None) -> bool:
+    # 与 `_restart_warp_line` 同一道闸，但**这里才是最后一道**：订阅刷新换绑定
+    # （`daemon.py` 的 `_apply_moved_bindings`）直接调本函数，绕过上面所有判据。
+    # 档位停用的线若在这里被 restart，等于档位形同虚设。
+    if tag and tag in _TIER_DISABLED:
+        return False
     try:
         # 系统级单元 + daemon 以 User=administrator 跑：没有 root，systemctl
         # restart 会被拒。asip-unit 是 sudoers NOPASSWD 放行的白名单包装。
@@ -2937,10 +2972,45 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
     # `getattr` 而不是直接取属性：测试里 `probe_egress` 常被换成只带 `ip`
     # 的替身对象（`namedtuple`/`SimpleNamespace`），硬取会让整条探测路径
     # 在测试里抛出 AttributeError 而不是走正常逻辑。
+    # `error` 是「拿不到出口」的**原因**（egress.py 的 _CURL_RC 分类）：
+    # connect_refused = 端口没监听（单元没起）、dns_fail = 节点域名解析不了、
+    # recv_fail = 隧道建立后被打断、timeout = 到点没响应、warp_off = 通了但
+    # 没走 WARP。不记它的话，日志里只剩「探测失败」四个字，四种完全不同的
+    # 故障在报表上长得一模一样。
     _LAST_EGRESS_TRACE = {"port": int(port), "ip": res.ip,
                           "colo": getattr(res, "colo", None),
-                          "loc": getattr(res, "loc", None)}
+                          "loc": getattr(res, "loc", None),
+                          "error": getattr(res, "error", None)}
     return res.ip
+
+
+# 「拿不到出口」的原因 → 人话。键来自 `asip/egress.py` 的 `_CURL_RC`。
+# 分这几类的意义：`connect_refused` 是单元/端口的问题（本地可修），
+# `dns_fail`/`recv_fail` 是节点或机场的问题，`timeout` 是链路慢，
+# `warp_off` 是隧道通了但 CF 没给 WARP 会话 —— 处置动作完全不同。
+_EGRESS_HINT = {
+    "connect_refused": "端口没监听（单元没起或崩了）",
+    "dns_fail": "节点域名解析失败",
+    "tls_fail": "TLS 握手失败",
+    "recv_fail": "隧道建立后被打断",
+    "http_error": "出口侧返回 HTTP 错误",
+    "timeout": "到点无响应",
+    "warp_off": "通了但未走 WARP",
+    "empty_reply": "空响应",
+    "bad_body": "响应不是 trace 格式",
+    "invalid_ip": "返回的不是合法地址",
+    "curl_missing": "本机缺 curl",
+    "rc_other": "curl 其它错误",
+}
+
+
+def _egress_error_hint(port: int) -> str:
+    """上一次 `warp_egress_ip(port)` 失败的原因（人话）。拿不到就返回空串。"""
+    trace = _LAST_EGRESS_TRACE
+    if not isinstance(trace, dict) or trace.get("port") != int(port):
+        return ""
+    err = trace.get("error")
+    return _EGRESS_HINT.get(str(err), str(err) if err else "")
 
 
 def _probe_refresh_egress(port: int) -> str | None:
@@ -4018,6 +4088,10 @@ def _backfill_spare_indices() -> list[int]:
             continue
         if warp_wg.line_tag(i) in tags:
             continue
+        # 档位停用的线不进补位候选：停用的 WG 线成员仍在 members 里，但补位
+        # 一旦 start 它就把档位悄悄推翻了。补位真正该用的是 line23+ 闲置设备。
+        if warp_wg.line_tag(i) in _TIER_DISABLED:
+            continue
         # mask（/dev/null）与「根本没装过」都是起不来的，一并排除。
         if _wg_line_state(i) != "installed":
             continue
@@ -4120,6 +4194,10 @@ def _ensure_backfill_line(max_new: int = 1) -> list[int]:
         if not (warp_wg.line_dir(i) / "profile.conf").exists():
             continue
         if warp_wg.line_tag(i) in tags:
+            continue
+        # 档位停用的线：装单元本身无害，但装完就会被上面当补位候选挑中并
+        # start，等于绕过档位。这里一并排除。
+        if warp_wg.line_tag(i) in _TIER_DISABLED:
             continue
         # mask（/dev/null）是主人停用的线，不许自动恢复；已装的也不用动。
         if _wg_line_state(i) != "missing":
@@ -5139,6 +5217,14 @@ def _warp_line_restart(member: dict, reason: str,
         if not _warp_line_restart_allowed(st, now) and not rebound:
             log(f"  · {tag} 本小时重启已达上限，跳过重启（{reason}）")
             return False
+        # 档位停用的线在这里就短路，别落到 `_restart_warp_line` 再被拦 ——
+        # 那条路会先打「尝试重启」再打「重启后未就绪」，档位正常工作时刷成
+        # 故障样。按 tag 节流 5 分钟，与其他锁的日志口径一致。
+        if not _line_enabled(member):
+            if now - _NIGHT_LOG_TS.get("tier:" + tag, 0.0) > 300.0:
+                _NIGHT_LOG_TS["tier:" + tag] = now
+                log(f"  · {tag} 档位停用中，跳过重启（{reason}）")
+            return False
         st["warming"] = True
     got_slot = False
     try:
@@ -5253,10 +5339,22 @@ def _warp_line_restart(member: dict, reason: str,
                 st["ip"] = ip
                 st["ip_ts"] = now
                 st["port_ok"] = True
+                st.pop("egress_error", None)
+            else:
+                # 落盘失败原因，让 `asip chan` 能显示「为什么拿不到出口」，
+                # 而不是只印一个 `无地址`。值是人话，已过 `_EGRESS_HINT`。
+                st["egress_error"] = _egress_error_hint(member["port"]) or "unknown"
             _WARP_LINE_CV.notify_all()
         _record_line_ip_drift(tag, old_ip, ip)
         _save_warp_line_state()
-        log(f"  {'✓' if ip else '✗'} {tag} 重启后出口={ip or '探测失败'}")
+        # 失败要带**原因**：`探测失败` 四个字把「端口没监听」「节点域名解析不了」
+        # 「隧道通了但没走 WARP」「到点没响应」压成同一句话，四种故障在报表上
+        # 一模一样，只能靠人翻上去看上下文。原因来自 egress.py 的 _CURL_RC。
+        why = ""
+        if not ip:
+            why = _egress_error_hint(member["port"])
+        log(f"  {'✓' if ip else '✗'} {tag} 重启后出口="
+            f"{ip or ('探测失败 / ' + why if why else '探测失败')}")
         return bool(ip)
     except Exception as e:
         with _WARP_LINE_CV:
@@ -9394,10 +9492,23 @@ def _pending_probe_nodes(limit: int = 12,
                 or not o.get("server_port")):
             continue
         if state_path:
-            # H2：只跳过「H2 测过且失败」的。有 colo 不代表测过 H2。
             st = probed.get(tag) or {}
-            if st.get("tested") and not st.get("ok"):
-                continue
+            if st.get("tested"):
+                # 测过且**失败**：不重测。承载能力是节点的长期属性，重测只是
+                # 再烧一台设备换同一个结论。
+                if not st.get("ok"):
+                    continue
+                # 测过且成功：**只有已落进块映射才跳过**。
+                # 原来只跳 `tested and not ok`，于是成功过但 merge 丢了的节点
+                # 永远占着名额空转（实测 2026-11-08：12 个名额里 6 个是刚测
+                # 通过的），而真正的新节点（JNB/IAD/IST/SYD）排不进来 ——
+                # `carrier=h2` 长期不增长就是这么来的。
+                # 但也不能一刀切跳过全部 tested：`ok=True` 而块映射里没有
+                # carrier/h2.colo，说明**合并丢了**（build_map 重建抹字段、
+                # merge 没跑完），这种必须重测，否则那个 colo 永远进不了池。
+                m = mapped.get(tag) or {}
+                if m.get("carrier") == "h2" or (m.get("h2") or {}).get("colo"):
+                    continue
         elif (mapped.get(tag) or {}).get("colo"):
             continue                      # WG：已有 colo 就是测过了
         src = (ledger.get(tag) or {}).get("sub") or "?"
@@ -10827,11 +10938,50 @@ def _start_rotate_server() -> None:
     log(f"⇄ rotate 接口就绪: {path}")
 
 
+def _tier_reconcile() -> None:
+    """启动时按档位**停掉**不该跑的 WG 单元。
+
+    `_TIER_DISABLED` 此前只做「不重启」：远端从旧拓扑 pull + restart 之后，
+    22 条 WG 单元仍在跑，`tiers.json` 写着 `wg: ""` 也拦不住 —— 文件对、
+    实际不对，而多跑的线不报任何错，只在内存和 CF 配额上悄悄多花。
+
+    只停**档位明确排除**的、且 members 里声明过的线：补位池（line23+）与
+    档位无关，不在这个集合里。停用不 disable、不删单元，`systemctl start`
+    随时回来，与设计文档「切换 = 停单元，不删设备」一致。
+    """
+    if not _TIER_DISABLED:
+        return
+    stopped = 0
+    for m in (_warp().get("members") or []):
+        tag = m.get("tag")
+        if m.get("kind") != "wg" or tag not in _TIER_DISABLED:
+            continue
+        svc = m.get("service") or ""
+        if not svc:
+            continue
+        try:
+            # 只读查询直接 systemctl：`asip-unit` 白名单只放 start/stop/restart，
+            # 走它问 is-active 会被拒，看起来像「没在跑」而漏停。
+            st = subprocess.run(["systemctl", "is-active", svc],
+                                capture_output=True, text=True,
+                                timeout=10).stdout.strip()
+            if st == "active":
+                _unit_ctl("stop", svc)
+                stopped += 1
+        except Exception as e:
+            log(f"  ⚠ 档位停用 {tag} 失败: {e}")
+    if stopped:
+        log(f"  · 档位对账：停用 {stopped} 条 WG 线（档位外的不该跑）")
+
+
 def main():
     _acquire_single_instance_lock()
     # Log first, then fetch (avoid hanging before any output)
     log("=" * 50)
     log("auto-switch-ip daemon v2 启动 (加固版)")
+    # 必须在拉起任何线之前对账：否则档位外的线会先跑起来再被停，白白换一次
+    # WARP 会话（每次 start 都是一次 CF 注册动作）。
+    _tier_reconcile()
 
     all_nodes = get_all_proxy_nodes()
     _log_startup_banner(all_nodes)

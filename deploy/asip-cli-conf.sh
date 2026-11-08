@@ -78,6 +78,10 @@ for key, val in (
     ("ASIP_SYSTEMD_SCOPE", scope),
     ("ASIP_UNIT_DIR", unit_dir),
     ("ASIP_IP_USED_FILE", used),
+    # 线路状态表：`asip warp status` 探不到端口时，从这里的 `egress_error`
+    # 读**原因**（端口没监听 / DNS 失败 / 隧道被打断 / 超时）。没有它，
+    # 44 个端口只会印一排「不可达」，四种故障长得一模一样。
+    ("ASIP_LINE_STATE_FILE", os.path.join(repo, ".warp_line_state.json")),
     ("ASIP_CYCLES_FILE", cycles),
     ("ASIP_BUS_CLIENT", os.path.join(home, ".hermes/scripts/bus_client.py")),
     ("ASIP_BLACKBOARD_DB", blackboard),

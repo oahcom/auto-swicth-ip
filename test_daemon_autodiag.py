@@ -268,6 +268,35 @@ def test_h2_probe_retests_nodes_that_passed_but_never_merged(tmp_path):
         x["tag"] for x in box["_pending_probe_nodes"](state_path=str(h2state))}
 
 
+def test_h2_probe_skips_nodes_that_passed_and_landed(tmp_path):
+    """H2 测过、成功、**且已落进块映射**的节点不再占名额。
+
+    2026-11-08 实测：12 个待测名额里 6 个是刚测通过的节点 —— 判据只跳
+    `tested and not ok`，成功过的一律留下，于是探测每小时空转一轮，而
+    JNB/IAD/IST/SYD 这些真新节点永远排不进来。`carrier=h2` 长期不增长
+    就是这么来的。
+
+    与上一个用例是一对：`ok=True` 但块映射里没有它 → 必须重测（合并丢了）；
+    `ok=True` 且块映射里有 → 跳过（已经入池）。
+    """
+    import warp_blocks
+
+    cfg = _setup(tmp_path, outs=[_out("a:443-any"), _out("b:443-any")],
+                 mapped={"a:443-any": {"colo": "NRT", "carrier": "h2",
+                                       "h2": {"colo": "NRT"}}},
+                 ledger={"a:443-any": {"sub": "s"}, "b:443-any": {"sub": "s"}})
+    h2state = tmp_path / "h2_state.json"
+    h2state.write_text(json.dumps({"nodes": {
+        "a:443-any": {"tested": True, "ok": True},
+        "b:443-any": {"tested": True, "ok": True}}}))
+    box, module_cfg = _func()
+    module_cfg["singbox"]["config_file"] = cfg
+    box["warp_blocks"] = warp_blocks
+    got = {x["tag"] for x in box["_pending_probe_nodes"](state_path=str(h2state))}
+    assert "a:443-any" not in got, "已落账的测通节点不该再占名额"
+    assert "b:443-any" in got, "测通但没落账的仍要重测"
+
+
 def test_missing_ledger_is_not_fatal(tmp_path, monkeypatch):
     """台账还没生成时返回空表，不能让刷新流程炸掉。"""
     import warp_blocks
