@@ -3239,6 +3239,16 @@ def _load_warp_line_state() -> None:
     lines = data.get("lines", data) if isinstance(data, dict) else {}
     if not isinstance(lines, dict):
         return
+    # 扫描期的兜底 tag（`WARP-H2-SCAN-<idx>`）在单元被渲染声明后就成了孤儿：
+    # 台账里留着它的 OK，而换线只认声明 tag —— 于是 `asip chan` 显示 OK、
+    # 候选池里永远没有它，也不会有任何日志解释原因（2026-11-08 实测
+    # SCAN-31/33/34 即 SIN-31/HKG-33/HKG-34 的前身，OK 结论冻结了 5 小时）。
+    # 单元已有声明归属就丢掉孤儿：状态属于「这个端口上的隧道」，名字换了，
+    # 旧名字下的结论不再指向任何东西。仍无归属的单元照旧保留。
+    declared_svc = {m.get("service") for m in (_warp().get("members") or [])}
+    lines = {t: st for t, st in lines.items()
+             if not (isinstance(t, str) and t.startswith("WARP-H2-SCAN-")
+                     and f"usque-h2-{t.rsplit('-', 1)[-1]}.service" in declared_svc)}
     now = time.time()
     fresh = _line_fresh_sec()
     with _WARP_LINE_CV:

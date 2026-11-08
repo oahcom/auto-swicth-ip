@@ -1437,6 +1437,39 @@ def test_parse_refuses_to_drop_warp_on_read_error():
     assert "except FileNotFoundError:" in src, "缺文件必须仍返回 []"
 
 
+def test_scan_tag_orphan_is_dropped_once_unit_is_declared():
+    """扫描兜底 tag 在单元被声明后就是孤儿，必须丢掉。
+
+    2026-11-08 实测：usque-h2-31/33/34 三台单元先以 `WARP-H2-SCAN-*` 被探测
+    （当时还没渲染声明），记了 OK；随后 channels/members 重建把它们收编为
+    WARP-H2-SIN-31 / HKG-33 / HKG-34。旧 tag 的 OK 冻结在台账里 → `asip chan`
+    一直显示幽灵 OK，而换线只认声明 tag（真 tag 是冷启动、无地址），
+    全程没有任何日志解释「OK 却不切」。孤儿不是数据，是名字错了。
+    """
+    _reset()
+    import json
+    path = os.environ["WARP_LINE_STATE_FILE_PATH"]
+    now = time.time()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "lines": {
+            "WARP-H2-SCAN-31": {"ip": "2a09:bac5::1", "last_ok_ip": "2a09:bac5::1",
+                                "last_ok_ts": now, "last_verdict": "OK"},
+            "WARP-H2-SCAN-99": {"ip": "2a09:bac5::2", "last_ok_ip": "2a09:bac5::2",
+                                "last_ok_ts": now, "last_verdict": "OK"}}}, f)
+    orig = daemon._warp
+    daemon._warp = lambda: {"members": [
+        {"tag": "WARP-H2-SIN-31", "kind": "h2", "service": "usque-h2-31.service"}]}
+    try:
+        daemon._WARP_LINE_STATE.clear()
+        daemon._load_warp_line_state()
+    finally:
+        daemon._warp = orig
+    assert "WARP-H2-SCAN-31" not in daemon._WARP_LINE_STATE, \
+        "已被声明收编的单元，其扫描兜底 tag 的结论必须丢弃"
+    assert "WARP-H2-SCAN-99" in daemon._WARP_LINE_STATE, \
+        "仍无声明归属的扫描单元照旧保留（它只有这一个名字）"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
