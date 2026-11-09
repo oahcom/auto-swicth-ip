@@ -267,6 +267,116 @@ def test_penalty_restart_fuses_after_repeats():
     )
 
 
+def test_penalty_restart_fused_is_read_only():
+    """熔断查询不能计数 —— 否则被冷却期拦下的轮次会把线冻住。
+
+    2026-11-10 实测：`_penalty_restart_fuse` 摆在 `_warp_line_restart` 之前，
+    而后者会因为 `next_restart_ts`（冷却）、`warp_line_busy`（判忙）、
+    刷新槽位限流提前返回 False。三次「探测判惩罚期但一次重启都没发生」
+    就能写死 `ip_stuck_until`，把一条本来正常的线冻 900s。
+    """
+    fuse = int(daemon._warp().get("restart_ip_stuck_fuse", 3))
+    now = time.time()
+    _seed()
+    for _ in range(fuse * 3):
+        assert daemon._penalty_restart_fused("W2", now) is False, (
+            "只读查询把线判进熔断了 —— 一次重启都还没发生"
+        )
+    st = daemon._warp_line_state("W2")
+    assert not st.get("penalty_restart_streak"), "只读查询写了计数"
+    assert not st.get("ip_stuck_until"), "只读查询写了熔断时间"
+
+
+def _drive_quota_probe(monkeypatch, restart_ok=True, ip="2a09:bac5:9999::1"):
+    """把一条非 active 线推到「模型层判 quota」这一步，返回重启调用记录。"""
+    calls = []
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W-OTHER")
+    monkeypatch.setattr(daemon, "_port_open", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda *a, **k: ip)
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda *a, **k: False)
+    monkeypatch.setattr(daemon, "_warp_probe_blind", lambda *a, **k: False)
+    monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
+    monkeypatch.setattr(daemon, "_warp_model_usable", lambda *a, **k: False)
+    monkeypatch.setattr(daemon, "_line_node", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_record_line_colo", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_channel_ban_note", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_MODEL_PROBE_SEM", None)
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r, **k: calls.append(r) or restart_ok)
+    daemon._PROBE_LAST_VERDICT["W2"] = "quota"
+    return calls
+
+
+def test_quota_restart_fuses_after_repeats(monkeypatch):
+    """模型层 quota 的重启也必须熔断，否则它是一条没有闸门的路。
+
+    2026-11-10 07:00 实测：3 分钟 272 次重启、池内 152 条线一条都没熔断。
+    blocked 路径有闸、quota 路径没有 —— 而 quota 才是夜里的大头（436/10min）。
+    重启换回来的全新 /128 首探照样 quota，代价却是每 30s 掐断一次在途连接。
+    """
+    fuse = int(daemon._warp().get("restart_ip_stuck_fuse", 3))
+    _seed()
+    calls = _drive_quota_probe(monkeypatch)
+    for _ in range(fuse):
+        daemon._probe_one_line(_member())
+    assert len(calls) == fuse, f"前 {fuse} 次应各重启一次，实际 {len(calls)} 次"
+    st = daemon._warp_line_state("W2")
+    assert st.get("ip_stuck_until", 0) > 0, (
+        f"连续 {fuse} 次「重启后仍 quota」却没有熔断"
+    )
+    # 熔断期内一次都不许再重启
+    for _ in range(5):
+        daemon._probe_one_line(_member())
+    assert len(calls) == fuse, (
+        f"熔断期内又重启了 {len(calls) - fuse} 次 —— 闸门没生效"
+    )
+
+
+def test_denied_restart_does_not_count_toward_fuse(monkeypatch):
+    """重启被拦下（冷却/判忙/无槽位）时不计入熔断，线不该因此被冻住。"""
+    _seed()
+    calls = _drive_quota_probe(monkeypatch, restart_ok=False)
+    for _ in range(6):
+        daemon._probe_one_line(_member())
+    assert len(calls) == 6, "重启尝试被提前掐断了 —— 闸门装错了位置"
+    st = daemon._warp_line_state("W2")
+    assert not st.get("ip_stuck_until"), (
+        "一次重启都没发生，却写了熔断时间 —— 正常线被误伤"
+    )
+    assert not st.get("penalty_restart_streak"), "被拦下的重启不该累计计数"
+
+
+def test_fuse_state_survives_daemon_restart():
+    """熔断状态必须能落盘再读回来 —— 否则 daemon 重启一次闸门就归零。
+
+    2026-11-10 实测：06:48~06:58 连做 16 次部署重启，152 条线的
+    `penalty_restart_streak` 全被打回 0，10 分钟 1225 次单元重启、0 条熔断。
+    根因是 `_LINE_DEFAULTS` 漏声明这三个键，而 `_load_warp_line_state` 只恢复
+    声明过的键 —— 闸门被它要压的那个动作（重启）自己复位，等于没有闸门。
+    """
+    now = time.time()
+    payload = {"version": 1, "lines": {"W2": {
+        "ip": "1.1.1.1",
+        "penalty_restart_streak": 2,
+        "ip_stuck_until": now + 900,
+        "restart_ip_hist": ["1.1.1.1"],
+    }}}
+    path = daemon._warp_line_state_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    daemon._load_warp_line_state()
+    st = daemon._warp_line_state("W2")
+    assert st.get("penalty_restart_streak") == 2, (
+        "重启后 streak 丢了 —— 又可以从 0 开始白烧 3 次重启"
+    )
+    assert st.get("ip_stuck_until", 0) > now, "重启后熔断窗口丢了"
+    assert st.get("restart_ip_hist") == ["1.1.1.1"], "重启后换址历史丢了"
+    assert daemon._penalty_restart_fused("W2", now) is True, (
+        "状态读回来了但闸门没认 —— 熔断形同虚设"
+    )
+
+
 def test_restart_cap_does_not_stop_probing(monkeypatch):
     """达重启上限后，探测必须照常放行 —— 压的是重启，不是观测。"""
     now = 1000.0
