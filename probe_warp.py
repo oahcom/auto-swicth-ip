@@ -69,30 +69,35 @@ URL = "https://opencode.ai/inference/v1/chat/completions"
 # /home/administrator 下的机器（本机、软路由）探测全被判 quota，台账一天烧掉
 # 1.3 万个「从未成功过」的脏 IP，把池子打空、还反过来触发无限换线。探测必须
 # 发与生产同一份 marker，否则测的不是同一条腿。
-# 路径池 + 按小时取模轮换。两端（9router 生产 / asip 探测）必须是**同一池、
-# 同一顺序、同一算法**，否则探测发的路径与生产不同，测的就不是同一条腿。
-# 不做每请求随机：真实 CLI 会话内工作目录固定，逐请求变化本身就是异常特征；
-# 而且两端独立随机后探测永远追不上生产的取值。
-ENV_WORKDIR_POOL = (
+# 每次请求现生成一条随机路径：base 只提供「看起来像真实项目」的前缀，后缀是
+# 2~3 位 CSPRNG 随机字符（secrets，不是时间取模那种可预测值）。目的是让路径
+# 永远不落进上游的静态黑名单 —— INC-018 的 /home/administrator/.9router 就是
+# 精确字符串拉黑，任何固定值都可能哪天被收进去。
+# 代价（已知并接受）：探测与生产不再发同一个值。若上游只按「路径是否在黑名单」
+# 判定，两边都能过；若它校验路径存在性/格式，随机后缀本身就是破绽，且探测结论
+# 也不再代表生产。需要钉死单值时用 OPENCODE_PROBE_WORKDIR / OPENCODE_ENV_WORKING_DIR。
+ENV_WORKDIR_BASES = (
     "/home/user/project",
     "/home/user/workspace",
     "/home/user/src",
     "/workspace/app",
     "/srv/app",
-    "/opt/9router",
 )
-ENV_WORKDIR_SLOT_SEC = 3600
+ENV_TAG = "<env>"
+_RAND_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 _ENV_WORKDIR_PIN = (os.environ.get("OPENCODE_PROBE_WORKDIR")
                     or os.environ.get("OPENCODE_ENV_WORKING_DIR") or "")
 ENV_TMP_DIR = os.environ.get("OPENCODE_PROBE_TMPDIR", "/tmp/opencode")
 
 
 def env_workdir(now: float | None = None) -> str:
-    """本小时该发哪个工作目录。显式 pin 优先，其余按 epoch 小时取模。"""
+    """每次调用生成一条新的随机工作目录（CSPRNG）。"""
     if _ENV_WORKDIR_PIN:
         return _ENV_WORKDIR_PIN
-    slot = int((time.time() if now is None else now) // ENV_WORKDIR_SLOT_SEC)
-    return ENV_WORKDIR_POOL[slot % len(ENV_WORKDIR_POOL)]
+    base = secrets.choice(ENV_WORKDIR_BASES)
+    width = 2 + secrets.randbelow(2)          # 2~3 位
+    suffix = "".join(secrets.choice(_RAND_ALPHABET) for _ in range(width))
+    return f"{base}-{suffix}"
 
 
 def env_marker(now: float | None = None) -> str:
@@ -255,12 +260,12 @@ def _apply_env_marker(body: dict) -> dict:
     if isinstance(first, dict) and first.get("role") == "system":
         content = first.get("content")
         if isinstance(content, str):
-            if marker not in content:
+            if ENV_TAG not in content:
                 merged = f"{content}\n\n{marker}" if content.strip() else marker
                 messages[0] = {**first, "content": merged}
             return body
         if isinstance(content, list):
-            marked = any(isinstance(part, dict) and marker in (part.get("text") or "")
+            marked = any(isinstance(part, dict) and ENV_TAG in (part.get("text") or "")
                          for part in content)
             if not marked:
                 messages[0] = {**first, "content": [*content,

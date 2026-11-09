@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """probe_warp 纯单元测试（无网络）：env 块、会话复用/轮换、错误分类。"""
 import json
+import re
 import time
 
 import probe_warp
@@ -11,10 +12,11 @@ def test_env_marker_prepended_when_no_system_message():
         {"messages": [{"role": "user", "content": "say ok"}]})
 
     assert [m["role"] for m in body["messages"]] == ["system", "user"]
-    assert body["messages"][0]["content"] == probe_warp.ENV_MARKER
-    # 只钉形状，不钉具体路径：路径是运行期值（9router 服务进程的 cwd），
-    # 上游门控的也是整块形状而非路径。
-    assert f"Workspace root folder: {probe_warp.ENV_WORKING_DIR}" in body["messages"][0]["content"]
+    content = body["messages"][0]["content"]
+    assert content.startswith("Here is some useful information")
+    assert content.endswith("</env>")
+    # 路径每请求随机（base + 2~3 位 CSPRNG 后缀），只钉形状不钉具体值。
+    assert re.search(r"  Workspace root folder: /(?:home/user|workspace|srv)/[a-z]+-[a-z0-9]{2,3}", content)
 
 
 def test_env_marker_appended_to_existing_system_message():
@@ -23,7 +25,7 @@ def test_env_marker_appended_to_existing_system_message():
                       {"role": "user", "content": "say ok"}]})
 
     assert body["messages"][0]["content"].startswith("be brief")
-    assert body["messages"][0]["content"].endswith(probe_warp.ENV_MARKER)
+    assert body["messages"][0]["content"].endswith("</env>")
     assert len(body["messages"]) == 2
 
 
@@ -40,7 +42,9 @@ def test_body_carries_env_marker():
     body = probe_warp._body()
 
     assert body["messages"][0]["role"] == "system"
-    assert probe_warp.ENV_MARKER in body["messages"][0]["content"]
+    content = body["messages"][0]["content"]
+    assert "<env>" in content and "</env>" in content
+    assert "Working directory: " in content
 
 
 def test_classify_quota_and_flagged():
