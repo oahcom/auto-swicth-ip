@@ -912,3 +912,59 @@ pytest 935 passed。详见 `~/.9router/docs/incident-20261109-transport-503-and-
   旧探测脚本写状态后必须清理自己的 SCAN 线。
 - sing-box 热重载（PUT /configs?force=true）回 204 不等于 selector 已更新；
   旧进程存活时需要 kill + 让 asip 重拉，才能真对账。
+
+## INC-018 探测 ENV marker 路径被上游拉黑 → 本机/软路由全量误判 quota（2026-11-10）
+
+### 现象
+- 本机与软路由的 asip 模型层探测长期 100% quota（本机 6h：7676 quota / 2 OK），
+  VPS 同一时刻 1314 quota / 156 OK（11.9% OK）。三端节点池、WARP 段池同源。
+- 台账 24h 写入 13454 个 rate429 脏地址，其中 13435 个**从未成功过一次**，
+  13075 个从拿到地址到被判死不到 10 秒；1177 个 /64 段被逐个地址烧穿。
+- 客户端表现为「本地总是 429、远端总能测到干净 IP」。
+
+### 排查（逐项排除）
+1. 配额是否按出口 IP/段、两端是否共享：13 个 VPS 判 OK 的 IP 在本机台账里是
+   blocked 且本机从未成功，但时间线显示两端不是同一时刻 —— 不能证明同 IP 同时
+   两端结论不同，也不能证明是段级共享。
+2. 探测频率：本机 21 次/分 vs VPS 4 次/分（本机 89 条线 vs 59 条），能解释消耗
+   速度，但解释不了 VPS 连续 3 次探同一条 OK 线仍全 OK。
+3. session / project / workdir 变量：把 VPS 的 session id 注入本机探测，
+   仍 quota —— 不是会话身份。
+4. 决定性实验：把 VPS 当前 8 条 OK 线的 SOCKS 端口经 SSH 转发到本机，同一分钟
+   两端各探一次：
+   - VPS 自探：6/8 OK
+   - 本机经转发探（同一隧道、同一出口、同一秒级窗口）：**8/8 quota**
+   同一隧道、同一出口、同一 bun 1.4.4，差异只能在请求文本。
+5. 只把 ENV marker 的 `Working directory` 从 `/home/administrator/.9router`
+   换成 `/home/ubuntu/.9router`：quota → **OK**；换回 → quota。
+6. 路径矩阵（同一隧道、同一分钟）：
+   - `/home/administrator/.9router` → quota
+   - `/home/administrator/.9router2` → OK
+   - `/home/ubuntu/.9router`、`/opt/9router`、`/root/.9router`、`/tmp`、
+     `/workspace/.9router` → 全 OK
+   结论：**这一条精确路径被上游拉黑**，不是用户名、不是配额、不是 TLS 栈。
+
+### 根因
+- `probe_warp.py` 的 `ENV_WORKING_DIR` 默认取 `~/.9router`，本机/软路由家目录
+  都叫 `administrator` → 每条探测都带 `/home/administrator/.9router`，上游直接
+  回 429 `FreeUsageLimitError`（带 Retry-After 到次日，长得完全像「每日配额耗尽」）。
+- `9router` 生产 marker 用的是 `opencodeFingerprint.js` 的默认
+  `/home/user/project`，没被拉黑 —— 所以生产还能跑，但 asip 探测把所有线判死，
+  于是不停换 IP/重启，把段逐个探穿，反过来压低生产可用性。
+- VPS 家目录是 `ubuntu`，路径 `/home/ubuntu/.9router` 恰好不在黑名单，所以远端
+  「总能测到干净的 IP」。
+
+### 处理
+- `probe_warp.py`：`ENV_WORKING_DIR` 默认改为生产同款 `/home/user/project`
+  （保留 `OPENCODE_PROBE_WORKDIR` / `OPENCODE_ENV_WORKING_DIR` 覆盖）。
+- 本机清除 14429 条 never-ok 的 rate429 误标（保留 53 条有成功记录的）；
+  软路由清除 10918 条。
+- 三端已拉取并重启 asip（commit `3c0846e`）。
+- 修复后本机首次探出 OK（CF-B、CF-H 用生产 marker 直接 200），生产 429 从
+  1.1 次/分降到 0.75 次/分并在 3 分钟窗口内出现过 0。
+
+### 教训
+- **探测必须发与生产完全一致的请求**（含 marker 文本），否则测的不是同一条腿。
+- 「429 + Retry-After 到次日」不等于配额耗尽：上游会把门控失败伪装成配额错误。
+- 探测路径/工作目录这类看似无害的字段，一旦被上游按精确字符串拉黑，会让整机
+  探测恒失败并反过来把 IP 池烧穿 —— 台账里「从未成功过」的脏地址激增是重要信号。
