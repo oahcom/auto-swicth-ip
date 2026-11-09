@@ -310,6 +310,27 @@ def test_rotate_reports_the_new_line_after_switching(monkeypatch, _rotate_isolat
     )
 
 
+def test_transport_rotation_does_not_blacklist_the_ip(monkeypatch, _rotate_isolated):
+    """无首字节超时只换线，不把可能是健康 IP 的出口按 429/403 记脏。"""
+    marked = []
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-OLD")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "old-egress")
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda *a, **kw: marked.append((a, kw)))
+    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
+                        lambda reason, interrupt=False, out=None: (
+                            out.update({"tag": "WG-NEW", "ip": "1.2.3.4",
+                                        "switched_at": 1234.0}) or True))
+
+    out = daemon._rotate_once("transport")
+
+    assert out["switched"] is True
+    assert marked == [], "transport 悬挂不是 IP 级封禁证据，不能写 blocked 台账"
+    assert daemon._normalize_rotate_reason("header-timeout") == "transport"
+    assert daemon._normalize_rotate_reason("upstream-stall") == "transport"
+
+
 def test_rotate_sees_in_place_reconnect_that_keeps_the_same_line(monkeypatch, _rotate_isolated):
     """原地重连：线名不变、只有地址变，也必须报出来。
 

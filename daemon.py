@@ -10482,7 +10482,7 @@ _api_stats = {"calls": 0, "switched": 0, "coalesced": 0, "retired": 0,
               "too_frequent": 0, "no_standby": 0, "failed": 0}
 
 _REASON_WHITELIST = {"rate429": "rate429", "abuse403": "abuse403",
-                     "proactive": "proactive"}
+                     "transport": "transport", "proactive": "proactive"}
 
 
 def _api_cfg() -> dict:
@@ -10516,6 +10516,8 @@ def _normalize_rotate_reason(raw) -> str:
         return _REASON_WHITELIST[v]
     if "403" in v or "abuse" in v:
         return "abuse403"
+    if "transport" in v or "timeout" in v or "stall" in v:
+        return "transport"
     if "proactive" in v:
         return "proactive"
     return "rate429"
@@ -10652,7 +10654,7 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         if egress_ip and _rotate_ip_is_retired(
                 egress_ip, request_started_at, egress_since):
             _api_stats["retired"] += 1
-            log(f"· /rotate: 429 地址 {egress_ip} 在请求发出后被换走"
+            log(f"· /rotate: 请求地址 {egress_ip} 在请求发出后被换走"
                 f"（当前 {current_tag or '轮换池'} / {old_ip or '地址未知'}），不换线")
             return _with_active_line(
                 {"ok": True, "switched": False, "reason": "already_retired",
@@ -10705,7 +10707,8 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
             was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
         except Exception:
             was_blocked = False
-        if reason != "proactive" and old_ip:
+        # transport 只证明这条连接/链路悬挂，不是 IP 级封禁证据：换线但不记脏。
+        if reason not in ("proactive", "transport") and old_ip:
             _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason)
         # 合并窗放在记账**之后**：迟到的 429 常常同一批涌进来（实测客户端一次
         # 并发几十条），若先合并再记账，第一条换线后其余全部命中合并窗，历史里
