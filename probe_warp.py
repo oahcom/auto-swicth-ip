@@ -69,21 +69,50 @@ URL = "https://opencode.ai/inference/v1/chat/completions"
 # /home/administrator 下的机器（本机、软路由）探测全被判 quota，台账一天烧掉
 # 1.3 万个「从未成功过」的脏 IP，把池子打空、还反过来触发无限换线。探测必须
 # 发与生产同一份 marker，否则测的不是同一条腿。
-ENV_WORKING_DIR = os.environ.get(
-    "OPENCODE_PROBE_WORKDIR",
-    os.environ.get("OPENCODE_ENV_WORKING_DIR", "/home/user/project"))
+# 路径池 + 按小时取模轮换。两端（9router 生产 / asip 探测）必须是**同一池、
+# 同一顺序、同一算法**，否则探测发的路径与生产不同，测的就不是同一条腿。
+# 不做每请求随机：真实 CLI 会话内工作目录固定，逐请求变化本身就是异常特征；
+# 而且两端独立随机后探测永远追不上生产的取值。
+ENV_WORKDIR_POOL = (
+    "/home/user/project",
+    "/home/user/workspace",
+    "/home/user/src",
+    "/workspace/app",
+    "/srv/app",
+    "/opt/9router",
+)
+ENV_WORKDIR_SLOT_SEC = 3600
+_ENV_WORKDIR_PIN = (os.environ.get("OPENCODE_PROBE_WORKDIR")
+                    or os.environ.get("OPENCODE_ENV_WORKING_DIR") or "")
 ENV_TMP_DIR = os.environ.get("OPENCODE_PROBE_TMPDIR", "/tmp/opencode")
-ENV_MARKER = "\n".join([
-    "Here is some useful information about the environment you are running in:",
-    "<env>",
-    f"  Working directory: {ENV_WORKING_DIR}",
-    f"  Workspace root folder: {ENV_WORKING_DIR}",
-    "  Is directory a git repo: no",
-    "  Platform: linux",
-    f"  Prefer {ENV_TMP_DIR} over generic system temporary directories such as /tmp; "
-    "it is pre-created and approved for external access.",
-    "</env>",
-])
+
+
+def env_workdir(now: float | None = None) -> str:
+    """本小时该发哪个工作目录。显式 pin 优先，其余按 epoch 小时取模。"""
+    if _ENV_WORKDIR_PIN:
+        return _ENV_WORKDIR_PIN
+    slot = int((time.time() if now is None else now) // ENV_WORKDIR_SLOT_SEC)
+    return ENV_WORKDIR_POOL[slot % len(ENV_WORKDIR_POOL)]
+
+
+def env_marker(now: float | None = None) -> str:
+    wd = env_workdir(now)
+    return "\n".join([
+        "Here is some useful information about the environment you are running in:",
+        "<env>",
+        f"  Working directory: {wd}",
+        f"  Workspace root folder: {wd}",
+        "  Is directory a git repo: no",
+        "  Platform: linux",
+        f"  Prefer {ENV_TMP_DIR} over generic system temporary directories such as /tmp; "
+        "it is pre-created and approved for external access.",
+        "</env>",
+    ])
+
+
+# 模块级快照，仅供 --check-fingerprint / 测试读取形状；请求路径一律现算。
+ENV_WORKING_DIR = env_workdir()
+ENV_MARKER = env_marker()
 BUN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_fetch.mjs")
 SESSION_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   ".probe_sessions.json")
@@ -218,6 +247,7 @@ def _apply_env_marker(body: dict) -> dict:
     workspace block (workdir AND root). 9router appends/upgrades it in place; the
     probe has to send the exact same shape or it measures the wrong thing.
     """
+    marker = env_marker()
     messages = body.get("messages")
     if not isinstance(messages, list):
         return body
@@ -225,18 +255,18 @@ def _apply_env_marker(body: dict) -> dict:
     if isinstance(first, dict) and first.get("role") == "system":
         content = first.get("content")
         if isinstance(content, str):
-            if ENV_MARKER not in content:
-                merged = f"{content}\n\n{ENV_MARKER}" if content.strip() else ENV_MARKER
+            if marker not in content:
+                merged = f"{content}\n\n{marker}" if content.strip() else marker
                 messages[0] = {**first, "content": merged}
             return body
         if isinstance(content, list):
-            marked = any(isinstance(part, dict) and ENV_MARKER in (part.get("text") or "")
+            marked = any(isinstance(part, dict) and marker in (part.get("text") or "")
                          for part in content)
             if not marked:
                 messages[0] = {**first, "content": [*content,
-                                                    {"type": "text", "text": ENV_MARKER}]}
+                                                    {"type": "text", "text": marker}]}
             return body
-    body["messages"] = [{"role": "system", "content": ENV_MARKER}, *messages]
+    body["messages"] = [{"role": "system", "content": marker}, *messages]
     return body
 
 
@@ -638,7 +668,7 @@ def _expected_env_marker(text: str) -> list[str] | None:
 def _normalize_our_env_marker() -> list[str]:
     """把本地 ENV_MARKER 的运行期取值替换成 {runtime}，只留形状用于比对。"""
     out = []
-    for line in ENV_MARKER.split("\n"):
+    for line in env_marker().split("\n"):
         if line.startswith("  Working directory: "):
             line = "  Working directory: {runtime}"
         elif line.startswith("  Workspace root folder: "):
