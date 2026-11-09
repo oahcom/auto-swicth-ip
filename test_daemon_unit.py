@@ -1046,6 +1046,7 @@ def test_full_error_window_cannot_switch_before_new_egress_speaks(monkeypatch):
     时刻 —— 闸一开，窗口里仍是旧出口的 429，于是立刻再切，在位时长恒为
     5 秒。新闸问的是「新出口自己报过错吗」：没报过就不换，报过就立刻放行。
     """
+    monkeypatch.setattr(daemon, "_SWITCHED_IN_PROCESS", True)
     monkeypatch.setitem(daemon.CFG, "warp",
                         {**daemon.CFG["warp"], "block_threshold": 1,
                          "rate429_threshold": 1, "cooldown_ok_sec": 5,
@@ -1084,6 +1085,7 @@ def test_probe_penalty_switch_is_gated_by_evidence(monkeypatch):
     p50 4s，冷却期早过了。实测修复后的 17 次换线里 5 次是这条路径在
     **1 秒内**再次触发：新出口一条请求都没发出去就被切走。
     """
+    monkeypatch.setattr(daemon, "_SWITCHED_IN_PROCESS", True)
     monkeypatch.setitem(daemon.CFG, "warp",
                         {**daemon.CFG["warp"], "switch_stale_grace_sec": 120})
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
@@ -1099,6 +1101,7 @@ def test_probe_penalty_switch_is_gated_by_evidence(monkeypatch):
 
 def test_probe_penalty_switch_allowed_once_new_egress_errors(monkeypatch):
     """新出口自己报了错 → 探测路径立刻放行（不能吃满 120s）。"""
+    monkeypatch.setattr(daemon, "_SWITCHED_IN_PROCESS", True)
     monkeypatch.setitem(daemon.CFG, "warp",
                         {**daemon.CFG["warp"], "switch_stale_grace_sec": 120})
     monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
@@ -1142,8 +1145,74 @@ def test_proactive_rotation_ignores_evidence_gate(monkeypatch):
     assert launched, "主动轮换不该被证据闸拦下"
 
 
+def test_restored_segment_start_does_not_block_switching(monkeypatch):
+    """重启时从盘上恢复的段起点，不得当作「刚换过线」而锁死换线。
+
+    `main()` 里 `_last_warp_switch_ok_ts = _load_segment_start(...)` 恢复的是
+    同一个出口 IP **上一段**的起点，用于给 `count_warp_blocked_since` 切窗口。
+    重启前刚切过的段恢复出来是几秒前 —— 若证据闸拿它当锚点，刚启动的进程会
+    在最需要换线的前 120 秒里换不了，而那正是出口可能最脏的时刻
+    （sing-box 刚复位到配置里的 default）。
+    """
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "switch_stale_grace_sec": 120})
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    # 恢复出来的段起点：1 秒前（重启前刚切过）
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 999.0)
+    monkeypatch.setattr(daemon, "_SWITCHED_IN_PROCESS", False)   # 本进程没换过
+    # **必须是「生效后一条错误都没有」**：否则闸门本来就该放行，这个用例
+    # 就测不到「段起点被误当刚换过线」。第一次写这个用例时就是给了 rate429=2，
+    # 反向验证（撤掉修复）依然通过 —— 等于什么都没锁住。
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 0, "ok": 0,
+                                    "consec_err": 0, "full_err": False})
+    launched = []
+
+    class T:
+        def __init__(self, target=None, args=(), **k): self._a = args
+        def start(self):
+            launched.append(self._a[0])
+            daemon._WARP_LOCK.release()
+
+    monkeypatch.setattr(daemon.threading, "Thread", T)
+    assert daemon._reconnect_warp_now("探测发现当前出口处于惩罚期", 1000.0) is True
+    assert launched, "重启恢复的段起点不该被当成刚换过线"
+
+
+def test_transport_dead_egress_bypasses_evidence_gate(monkeypatch):
+    """实探到出口不通 → 直接换，不看证据闸。
+
+    `warp_egress_ip()` 是刚打的实探，返回空就是这个出口此刻出不去 —— 比
+    「窗口里是哪一段的 429」强得多。拿间接信号否决直接观测，会在出口真死时
+    白等满 grace 秒（实测 2026-11-09 10:07 白等两轮 94s / 109s）。
+    """
+    monkeypatch.setattr(daemon, "log", lambda msg: None)
+    # 真正调用一次 `_switch_evidence_ready` 判定，而不是断言调用方传了什么：
+    # 传参正确但闸门实现变了，那种写法会假通过。这里让闸门处于「该拦」状态
+    # （刚换过线 + 生效后无错误），只有 respect_evidence=False 才能放过去。
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "switch_stale_grace_sec": 120})
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 999.0)
+    monkeypatch.setattr(daemon, "_SWITCHED_IN_PROCESS", True)
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 0, "ok": 0,
+                                    "consec_err": 0, "full_err": False})
+    seen = []
+    monkeypatch.setattr(daemon, "_reconnect_warp_now",
+                        lambda reason, now, ignore_cooldown=False, interrupt=True,
+                        respect_evidence=True: seen.append(respect_evidence) or True)
+    monkeypatch.setattr(daemon, "warp_egress_ip",
+                        lambda port, timeout_sec=8.0: None)
+    monkeypatch.setattr(daemon, "_LAST_TRANSPORT_PROBE_SIG", (0.0, 0))
+    daemon._verify_transport_failure("WARP-CF-X", 1080, 3)
+    assert seen == [False], f"实探出口不通时必须豁免证据闸，实际 {seen}"
+    assert daemon._LANE_FAIL_STREAK == 0
+
+
 def test_evidence_window_expires_allows_switch(monkeypatch):
     """生效满 grace 后放行 —— 闸门是延迟，不是封禁。"""
+    monkeypatch.setattr(daemon, "_SWITCHED_IN_PROCESS", True)
     monkeypatch.setitem(daemon.CFG, "warp",
                         {**daemon.CFG["warp"], "block_threshold": 1,
                          "rate429_threshold": 1, "cooldown_ok_sec": 5,
@@ -1187,6 +1256,7 @@ def test_window_full_of_old_egress_evidence_does_not_switch(monkeypatch):
     全错（旧出口的证据），`_last_warp_switch_ok_ts` 起算的窗口一条错误都没有
     （新出口还没说话）—— 必须不换。
     """
+    monkeypatch.setattr(daemon, "_SWITCHED_IN_PROCESS", True)
     monkeypatch.setitem(daemon.CFG, "warp",
                         {**daemon.CFG["warp"], "block_threshold": 1,
                          "rate429_threshold": 1, "cooldown_ok_sec": 5,
@@ -1223,6 +1293,7 @@ def test_new_egress_evidence_allows_switch_inside_grace(monkeypatch):
     与上一个用例是一对：豁免只对「还没有新出口证据」成立。否则一条真坏的
     新出口会被放行满 120 秒，等于把坏 IP 焊在出口上。
     """
+    monkeypatch.setattr(daemon, "_SWITCHED_IN_PROCESS", True)
     monkeypatch.setitem(daemon.CFG, "warp",
                         {**daemon.CFG["warp"], "block_threshold": 1,
                          "rate429_threshold": 1, "cooldown_ok_sec": 5,
@@ -4748,7 +4819,8 @@ def test_verify_transport_failure_rotates_only_when_egress_dead(monkeypatch):
     rotations = []
     sweeps = []
 
-    def fake_rotate(reason, now, ignore_cooldown=False, interrupt=True):
+    def fake_rotate(reason, now, ignore_cooldown=False, interrupt=True,
+                    respect_evidence=True):
         rotations.append(reason)
         return True
 

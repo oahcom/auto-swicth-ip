@@ -465,9 +465,20 @@ def _load_segment_start(ip: str | None, now: float | None = None) -> float:
     return ts
 
 
+# 进程内是否真的换过线。与 `_last_warp_switch_ok_ts > 0` 不等价：那个值在
+# 启动时由 `_load_segment_start()` 从 `.warp/ipv6_segments.json` 恢复（同一个
+# 出口 IP 上一段的起点），用来给 `count_warp_blocked_since` 切窗口。它不是
+# 「刚换过线」—— 重启前跑了两小时的段，恢复出来是两小时前；而重启前刚切过
+# 的段，恢复出来是几秒前。后者会让证据闸在刚启动时把换线锁死最多 120 秒，
+# 而那正是出口可能最脏的时刻（sing-box 刚复位到配置里的 default）。
+_SWITCHED_IN_PROCESS = False
+
+
 def _begin_segment(ts: float) -> None:
-    global _last_warp_switch_ok_ts
+    global _last_warp_switch_ok_ts, _SWITCHED_IN_PROCESS
     _last_warp_switch_ok_ts = float(ts)
+    # 只有这个入口代表「本进程真的把流量切到了新出口」，证据闸才认它。
+    _SWITCHED_IN_PROCESS = True
     _save_segment_start(ts)
 
 
@@ -7976,7 +7987,13 @@ def _verify_transport_failure(tag: str, port: int, count: int) -> None:
     ip = warp_egress_ip(port, timeout_sec=8.0)
     if not ip:
         log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
-        if _reconnect_warp_now(f"transport ×{count}（出口探测失败）", _now_ts()):
+        # respect_evidence=False：**这条证据比 requestDetails 强得多**。
+        # 上面那行 `warp_egress_ip()` 是刚打的实探，返回空就说明这个出口此刻
+        # 出不去 —— 与「窗口里是哪一段的 429」完全无关。证据闸问的是「新出口
+        # 说话了没有」，而这里已经有直接答案了，再拦就是拿间接信号否决直接
+        # 观测。实测 2026-11-09 10:07 因此白等了两轮（94s / 109s）。
+        if _reconnect_warp_now(f"transport ×{count}（出口探测失败）", _now_ts(),
+                               respect_evidence=False):
             with _LANE_LOCK:  # 新出口的第一条证据不该继承旧线上的计数
                 _LANE_FAIL_STREAK = 0
             return
@@ -8155,8 +8172,12 @@ def _switch_evidence_ready(now: float) -> tuple[bool, str]:
     混进了新出口的真实表现，换线才有依据。还没出现就等着 —— 生产流量 2~5 req/s，
     新证据通常 1 秒内就到，不是真的等满 grace 秒。
     """
-    if _last_warp_switch_ok_ts <= 0:
-        return True, "还没换过线"
+    if not _SWITCHED_IN_PROCESS:
+        # 启动恢复的段起点不算「刚换过线」：它是重启前那一段的开头，可能
+        # 就在几秒前（重启前刚切过），也可能在两小时前。拿它当证据闸的锚点
+        # 会让刚重启的进程在最需要换线的前 120 秒里换不了 —— 而那正是出口
+        # 可能最脏的时刻（sing-box 刚复位到配置里的 default）。
+        return True, "本进程还没换过线"
     age = now - _last_warp_switch_ok_ts
     grace = float(_warp().get("switch_stale_grace_sec", 120))
     if age >= grace:
