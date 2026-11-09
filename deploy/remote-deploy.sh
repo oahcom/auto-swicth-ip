@@ -399,13 +399,14 @@ python3 deploy/members.py --write-warp-outbound >/dev/null
 echo '  · 并入主配置 selector'
 python3 deploy/patch-wg-outbounds.py | sed 's/^/    /'
 
-# `cli.env` 是**部署期快照**，不是每次运行现算的：里面写着隧道清单、端口、
-# 单元名。渲染出新线之后不重生成，`asip chan` / `asip warp status` 会一直
+# cli.env 是**部署期快照**，不是每次运行现算的：里面写着隧道清单、端口、
+# 单元名。渲染出新线之后不重生成，asip chan / asip warp status 会一直
 # 少那几条（实测本机 44 → 50 条隧道后 asip chan 仍报旧清单）。它只读 .warp
 # 和 .env，不碰网络，几毫秒的事，每次部署都重来一遍。
+# 注意：本块整体在双引号里，反引号与 \$() 会被**本机**展开，不要出现。
 echo '  · asip 设置快照'
 ./deploy/asip-cli-conf.sh >/dev/null 2>&1 \
-    && echo "    已重生成 $(python3 -c 'import os;print(os.path.expanduser(\"~/.config/asip/cli.env\"))')" \
+    && echo '    已重生成 ~/.config/asip/cli.env' \
     || echo '    ⚠ asip-cli-conf.sh 失败（asip 命令会读到旧清单）'
 
 # 兜底：上面任一步以 root 写出文件，这里统一交还。缺了它，一次 sudo 就能让
