@@ -1078,6 +1078,85 @@ def test_maybe_reconnect_warp_min_gap_expires(monkeypatch):
     assert launched, "满 5s 必须放行"
 
 
+def test_window_full_of_old_egress_evidence_does_not_switch(monkeypatch):
+    """换线后窗口里全是**上一段**出口的 429 → 不得再换。
+
+    实测 2026-11-08 22:0x：353 次换线，在位中位 5s、80% <10s、120 秒内存活
+    的 0 次。原因就是 `blocked` 的窗口起点是触发时刻，换线生效（p50 4s）之前
+    的请求仍走旧出口，它们的 429 填满 5 条窗口 → `full_err` 恒真 → 绕过冷却，
+    只剩 min_switch_gap_sec(5s) 挡着，闸一开就切走。
+
+    这里让两个窗口给出不同答案：`_last_warp_reconnect_ts` 起算的窗口满窗
+    全错（旧出口的证据），`_last_warp_switch_ok_ts` 起算的窗口一条错误都没有
+    （新出口还没说话）—— 必须不换。
+    """
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "block_threshold": 1,
+                         "rate429_threshold": 1, "cooldown_ok_sec": 5,
+                         "min_switch_gap_sec": 5, "switch_stale_grace_sec": 120})
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "_warp_member",
+                        lambda tag: {"tag": tag, "port": 1080, "service": "s"})
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-a")
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 900.0)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 990.0)  # 10s 前刚生效
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_record_warp_cycle", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "count_segment_requests", lambda *a: (0, 10))
+
+    def fake_blocked(ts):
+        if ts == 990.0:      # 生效之后：新出口还没报过错
+            return {"abuse403": 0, "rate429": 0, "ok": 0,
+                    "consec_err": 0, "full_err": False}
+        return {"abuse403": 0, "rate429": 10, "ok": 0,
+                "consec_err": 10, "full_err": True}   # 触发以来的整段
+
+    monkeypatch.setattr(daemon, "count_warp_blocked_since", fake_blocked)
+    monkeypatch.setattr(daemon, "_latest_rate429_body_since", lambda ts: None)
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda **k: pytest.fail("窗口里全是旧出口的证据，不得换线"))
+    daemon.maybe_reconnect_warp(1000.0)
+    assert daemon._WARP_LOCK.locked() is False, "被拦下时不得占用换线锁"
+
+
+def test_new_egress_evidence_allows_switch_inside_grace(monkeypatch):
+    """换线后**新出口自己**报的错 → 豁免窗口立即失效，照常换线。
+
+    与上一个用例是一对：豁免只对「还没有新出口证据」成立。否则一条真坏的
+    新出口会被放行满 120 秒，等于把坏 IP 焊在出口上。
+    """
+    monkeypatch.setitem(daemon.CFG, "warp",
+                        {**daemon.CFG["warp"], "block_threshold": 1,
+                         "rate429_threshold": 1, "cooldown_ok_sec": 5,
+                         "min_switch_gap_sec": 5, "switch_stale_grace_sec": 120})
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "_warp_member",
+                        lambda tag: {"tag": tag, "port": 1080, "service": "s"})
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "ip-a")
+    monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 900.0)
+    monkeypatch.setattr(daemon, "_last_warp_switch_ok_ts", 990.0)
+    monkeypatch.setattr(daemon, "_warp_cooldown_until", 0)
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_record_warp_cycle", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "count_segment_requests", lambda *a: (0, 10))
+    monkeypatch.setattr(daemon, "count_warp_blocked_since",
+                        lambda ts: {"abuse403": 0, "rate429": 10, "ok": 0,
+                                    "consec_err": 10, "full_err": True})
+    monkeypatch.setattr(daemon, "_latest_rate429_body_since", lambda ts: None)
+    launched = []
+
+    class T:
+        def __init__(self, target=None, args=(), **k): self._a = args
+        def start(self):
+            launched.append(self._a[0])
+            daemon._WARP_LOCK.release()
+
+    monkeypatch.setattr(daemon.threading, "Thread", T)
+    daemon.maybe_reconnect_warp(1000.0)
+    assert launched, "新出口真报错时必须换线，不能吃满 120s 豁免"
+
+
 def test_maybe_reconnect_warp_respects_cooldown_when_window_not_full(monkeypatch):
     """冷却期内、窗口未打满 → 不换线（用户要求：切完要有短时间限制）。"""
     monkeypatch.setitem(daemon.CFG, "warp",

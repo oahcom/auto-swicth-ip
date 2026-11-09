@@ -8081,7 +8081,11 @@ def maybe_reconnect_warp(now: float) -> None:
     # `fresh` 非空，新出口真坏了照旧标脏（否则坏 IP 会被豁免窗口放行 2 分钟）。
     fresh = (count_warp_blocked_since(_last_warp_switch_ok_ts)
              if _last_warp_switch_ok_ts > 0 else {})
-    stale_only = (now - _last_warp_switch_ok_ts
+    # `_last_warp_switch_ok_ts > 0` 是必需的：0 表示「还没成功换过线」，而
+    # `now - 0` 在启动后 120 秒内恒小于窗口 —— 不排除的话，daemon 刚起来的
+    # 前两分钟会被判定成「窗口里全是上一段的证据」而完全不换线。
+    stale_only = (_last_warp_switch_ok_ts > 0
+                  and now - _last_warp_switch_ok_ts
                   < _warp().get("switch_stale_grace_sec", 120)
                   and not (fresh.get("abuse403", 0) or fresh.get("rate429", 0)))
     if not sampled and not stale_only:
@@ -8111,6 +8115,26 @@ def maybe_reconnect_warp(now: float) -> None:
                 seg_ok, seg_blocked = count_segment_requests(_last_warp_switch_ok_ts)
                 _record_warp_cycle(active_ip, cycle, now, ok=seg_ok,
                                    blocked=seg_blocked)
+    # **换线后还没有新出口的证据之前，不许再换。**
+    #
+    # `blocked` 的窗口起点是 `_last_warp_reconnect_ts`（**触发**时刻），而换线
+    # 生效是 p50 之后 4 秒（见下面 min_switch_gap_sec 的注释）。这中间的请求
+    # 仍走旧出口，它们的 429 会填满 5 条窗口 → `full_err` 恒真。而 full_err
+    # 是**唯一**能绕过冷却的判据（ignore_cooldown=full_err_bypass），于是
+    # 换线后 1 秒就再次满足触发条件，只剩 min_switch_gap_sec(5s) 挡着 ——
+    # 闸一开就切走，形成「在位时长恒等于 5 秒」的死循环。
+    #
+    # 实测 2026-11-08 22:0x：353 次换线，在位中位 5s、80% <10s、97% <30s，
+    # 120 秒内存活的 0 次，触发原因 663 次是 rate429。同一时段滑动 5 条窗口
+    # 里 53%（208/396）的时刻是 full_err，所以每轮都能立刻重新触发。
+    #
+    # `stale_only` 正是「距上次生效不足 120s 且生效后一条出口级错误都没有」，
+    # 即窗口里全是上一段的证据。此时不换线，等新出口自己说话：
+    #   · 新出口真坏 → `fresh` 非空 → stale_only 转假 → 立刻放行换线；
+    #   · 新出口正常 → 旧证据随窗口滚出，full_err 自然消失。
+    # 生产流量 2~5 req/s，新证据 1 秒内就到，不是真的等 120 秒。
+    if stale_only:
+        return
     # 用户规则：最近两条请求都报错仍允许不切，第三条连错才换线。放在采样/标脏
     # 之后 —— 连错 1~2 条时出口已收到 403，仍需把该 IP 标脏、记周期样本，只是
     # 暂不换线。实测 90 次真实触发里这条门控抑制 11 次，其中 3 次窗口内成功 ≥5
