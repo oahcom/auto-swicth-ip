@@ -968,3 +968,70 @@ pytest 935 passed。详见 `~/.9router/docs/incident-20261109-transport-503-and-
 - 「429 + Retry-After 到次日」不等于配额耗尽：上游会把门控失败伪装成配额错误。
 - 探测路径/工作目录这类看似无害的字段，一旦被上游按精确字符串拉黑，会让整机
   探测恒失败并反过来把 IP 池烧穿 —— 台账里「从未成功过」的脏地址激增是重要信号。
+
+## INC-019 — 「daemon 被反复重启」是误报；真问题是熔断闸门自己会被重启清零（2026-11-10）
+
+### 看到的
+- `auto-switch-ip` 15 分钟内被 systemd 启动 8 次，随后 10 分钟内全池
+  `asip-unit restart` 1225 次（原因：出口处于惩罚期 740 / 模型层 quota 436），
+  而「重启后仍不可用 → 熔断」的日志**一条都没有**（`⛔` 计数 0）。
+- `.warp_line_state.json` 里 152 条线的 `penalty_restart_streak` 全是 None。
+- 一度怀疑 daemon 自身崩溃被 `Restart=always` 拉起，会把内存里的熔断状态清零。
+
+### 排查
+- `systemctl show`：`Restart=always`、`RestartSec=10`、`NRestarts=0`；
+  journal 里是 `Stopping … Deactivated successfully`（收到 SIGTERM 的正常退出），
+  不是 `Main process exited` + `Scheduled restart job`。
+- 审计 sudo 记录：`COMMAND=/usr/bin/systemctl restart auto-switch-ip` 共 16 条，
+  **全部来自 `TTY=pts/5` / `pts/7`、`PWD=/mnt/c/Users/Administrator`** —— 是本机
+  调试/部署的交互终端，不是任何看护脚本（`asi-selfcheck.timer` 每 10 分钟跑一次
+  且不碰 systemctl；`/usr/local/bin/asip-unit` 的白名单也不含 auto-switch-ip）。
+  → **"daemon 被反复重启"是误报**，是我自己的部署动作。
+
+### 根因（三个，都在熔断闸门上）
+1. **状态活不过重启**：`_LINE_DEFAULTS` 没声明 `penalty_restart_streak` /
+   `ip_stuck_until` / `restart_ip_hist`，而 `_load_warp_line_state` 只恢复
+   本表声明过的键。于是每次 daemon 重启都把全池熔断清零 —— 闸门被它要压的
+   那个动作（重启）自己复位。16 次部署重启把 4 小时攒的计数全打回 0。
+2. **计数时机错了**：`_penalty_restart_fuse` 摆在 `_warp_line_restart` 之前，
+   而后者会因为 `next_restart_ts`（冷却 5s）、`warp_line_busy`（判忙）、刷新
+   槽位限流提前返回 False。三次「判惩罚期但一次重启都没发生」就能冻住一条
+   本来正常的线 900s。
+3. **quota 路径没有闸门**：`模型层 quota` 走的是直接
+   `_warp_line_restart(member, f"模型层 {verdict}")`，完全没有熔断判断，
+   实测 436 次/10min 无界。
+
+### 处理
+- `_LINE_DEFAULTS` 补三个键（列表用 None 不用 []，避开共享对象串线）。
+- 拆出只读的 `_penalty_restart_fused(tag, now)`；两条路径统一改成
+  「先查熔断 → 重启 → 只有真重启成功才调 `_penalty_restart_fuse` 计数」。
+- `test_warp_prober_gates.py` +4 例：只读查询不计数 / quota 路径会熔断 /
+  被拦下的重启不计数 / 熔断状态跨重启存活。23 passed，相关套件 92 passed。
+  `test_daemon_unit.py` 3 条失败经 `git stash` 基线核对为既有问题。
+- 上线后验证：重启前 53 条线有计数、总和 1037，重启后 53 条、总和 1040
+  （新增 3 次是重启后新发生的）—— 计数**存活了**。
+
+### 没改的（业务规则，等主人裁）
+`.env` 里仍是 `ASIP_RESTART_IP_STUCK_FUSE=999999`（熔断禁用）。这是 2026-11-09
+的裁定：「夜里配额普遍耗尽时把一条条线全熔断，池子被打空，非常愚蠢」。
+本次只保证闸门在启用那天是对的，不改这条规则。
+
+### 空转为什么停不下来（数据）
+- 抽 6 条线实测：`quota（1.0h）`、`quota（1.6h）`、`unreachable` ×2 —— 探测
+  结论是真的，不是指纹误判（A/B 对照：随机后缀 marker 与生产同款
+  `/home/user/project` 判**同一个** quota）。
+- 重启换回来的地址**每次都在不同的 /64 段**（`2a09:bac5:6212:28` →
+  `2a09:bac5:6213:1246` → `2a09:bac1:7680:28` …），所以连「同址熔断」
+  （`restart_ip_hist` 全同）也不会触发。
+- 结论：**WARP 这一段 IPv6 当前整体没有配额**，重启只是把地址换成另一个同样
+  没配额的 /64，单线以 `restart_cooldown_sec=5` 的下限约 6 秒一轮空转
+  （52 条线 streak 已攒到 31）。
+- 但是否有害：生产侧请求 30 次/10min 仍在成功，503 行数与重启次数不成比例
+  （每请求约 1.4 行 503 日志，多为 COMBO 逐模型重试）。**空转是症状，不是 503 的主因。**
+
+### 教训
+- 「状态表在内存里」的闸门，必须确认它**能被落盘再读回**；`_LINE_DEFAULTS`
+  这类白名单会把新字段静默丢掉，而且丢得毫无日志。
+- 拦截类闸门的计数点要贴着**真正被执行的动作**，不要贴着「打算做这个动作」。
+- 排查「谁在重启服务」时先看 `TTY=` 和 `PWD=`：自己调试终端的动作最容易被
+  误判成幽灵看护进程，浪费一整轮。
