@@ -57,12 +57,21 @@ URL = "https://opencode.ai/inference/v1/chat/completions"
 # 那个 429 带 Retry-After 到 UTC 零点，看起来完全像「每日配额耗尽」，实测与出口 IP
 # 无关。旧版本这里只抄了 4 行（漏掉 heading、git repo、Platform、Prefer tmp），于是
 # 每一条探测都被判 quota，19 条线全被打成坏线。
-# 值取 9router 服务进程的取值：cwd = 它的 WorkingDirectory（数据目录）、
-# platform = linux、tmp = os.tmpdir()/opencode。--check-fingerprint 会与源码逐行比对。
-# 路径本身**不是门控项**（opencodeFingerprint.js：上游只认 `<env>` 标记存在），
-# 所以按家目录推导即可，不写死某个用户。
+# 值取 9router 服务进程的取值：platform = linux、tmp = os.tmpdir()/opencode。
+# --check-fingerprint 会与源码逐行比对。
+# 默认值必须与 9router 生产 marker 完全一致（open-sse/utils/
+# opencodeFingerprint.js 的 OPENCODE_ENV_WORKING_DIR 默认 /home/user/project）。
+# 上游按这一行路径做门控，且是**精确字符串**判定：2026-11-10 实测同一隧道、
+# 同一分钟、同一 session，只把 Working directory 写成 /home/administrator/.9router
+# 就 429 FreeUsageLimitError（假装成「每日配额耗尽」，带 Retry-After 到次日），
+# 改成 /home/user/project 立刻 200；把同一个字符串加个后缀 .9router2 也 200 ——
+# 是本机这条路径被拉黑，不是用户名或配额。旧默认值取家目录推导，家目录在
+# /home/administrator 下的机器（本机、软路由）探测全被判 quota，台账一天烧掉
+# 1.3 万个「从未成功过」的脏 IP，把池子打空、还反过来触发无限换线。探测必须
+# 发与生产同一份 marker，否则测的不是同一条腿。
 ENV_WORKING_DIR = os.environ.get(
-    "OPENCODE_PROBE_WORKDIR", os.path.expanduser("~/.9router"))
+    "OPENCODE_PROBE_WORKDIR",
+    os.environ.get("OPENCODE_ENV_WORKING_DIR", "/home/user/project"))
 ENV_TMP_DIR = os.environ.get("OPENCODE_PROBE_TMPDIR", "/tmp/opencode")
 ENV_MARKER = "\n".join([
     "Here is some useful information about the environment you are running in:",
