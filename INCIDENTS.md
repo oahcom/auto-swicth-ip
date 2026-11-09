@@ -795,3 +795,82 @@ sing-box 重启 0 次（pid 跨多次 daemon 重启不变）；9router 503 从 8
 - 渠道锁仍锁 47 条线到次日 08:00（策略，非 bug）。
 
 详见 `~/.9router/docs/incident-20261109-transport-503-and-stream-cut.md` §8。
+
+## INC-015 — 503 的最后一种形状：20s + 20s 打在同一条出口上（2026-11-09）
+
+### 现象
+
+INC-014 修完之后 503 从 86 条/30min 降到 0，但 15:20–15:55 又出现 13 条，
+签名完全一致：`latency.total ≈ 43000ms`、`ttft = 0`、请求体 165–515KB。
+日志里是两条相邻的 `upstream header timeout (20000ms)` —— **20s + 20s**。
+
+### 根因：换线请求被 asip 否掉了
+
+第二次的 20s 是"换线重放"，但 asip 回的是「出口正常，不换线」：
+
+```
+[15:41:42] ⚠ 传输层 503 ×8，WARP-H2-LHR-84 出口正常（2a09:bac5:37ac:d2::15:33c）→ 仅记录
+[15:41:52] ⚠ 传输层 503 ×11，同上        ← 100 秒内 5 次，一次都没换线
+```
+
+判据是 `_opencode_lane_alive()`：它打的是 `max_tokens:1`、prompt `"1"` 的最小
+free-lane 请求，**任何** HTTP 响应（含 429）都算"活"。于是小请求能过、300KB 的
+真实请求挂着时，探针永远判"出口正常"，出口地址不变，9router 的重放撞回同一个
+出口，再烧 20 秒后 503。
+
+实测同一出口首字节随请求体线性增长：5KB→4.4s、131KB→6.8s、1000KB→7.1s、
+2000KB→10.0s；成功请求的 TTFT p90 15.8s、p99 33.6s、max 133s。真实请求体
+p50 就有 452KB —— 20s 是踩在边上的。
+
+### 处理
+
+9router 侧（commit `86f89635`）：首次仍 20s 快判，**只有换线重放**放宽到 45s
+（`OPENCODE_TRANSPORT_HEADER_TIMEOUT_REPLAY_MS`），并强制 45s < base 的 60s
+连接超时。非流式仍不设限。
+
+asip 侧**本轮不动**：`_opencode_lane_alive` 的假阳性是已知短板，但 45s 预算可能
+已把这类请求救回来。若 transport 503 再次成串出现，再改成「15s 窗口内累计 ≥N
+且探针通过时也换线」（符合「换 IP = 新配额」的裁定）。
+
+### 效果
+
+部署后 8 分钟：135 次请求完成、`ERROR 503` **0**、`header timeout` **0**、
+TTFT p50 7.95s / p90 13.1s；9 条 429 全被 combo 第 2 个模型吸收；
+sing-box pid 7248 未变（本次重启没牵连底层）。
+vitest 4503 passed（25 条失败为本仓库既有，已用 stash 基线核对）。
+
+### 顺带纠正
+
+INC-014 结尾说「`dormant-outbounds.json` 65 条 anytls 没进 selector」是错的：
+65 条全在 `proxy`（170 成员，默认出口就是其中一条）。而且 `opencode.ai` 的路由
+指向 `opencode-out`（WARP 专用），**机场节点根本不参与 opencode 流量** ——
+扩充 `proxy` 对这类 503 无效。
+
+## INC-016 — 换线后顺手修被切线的节点（渠道块内，2026-11-09）
+
+### 背景
+
+主人定性：502/断流这类「节点延迟大、超时不可用」既不是 429 配额也不是 colo 变化
+（同 colo）—— 根子在落地节点。错误换线保留，但换完之后被切下来的线不能带着坏节点
+躺回候选池，否则下一轮选线又选中它、再死一次（08:22–08:45 WG-1↔WG-9↔ICN-13 每
+15~30s 弹跳正是这个模式）。正确动作是在**同一个渠道块内**换一个延迟好的可用节点。
+
+### 实现
+
+- `daemon.py` 新增 `_demoted_node_repair(old_tag, reason)`，由 `_after_warp_switch`
+  在换线成功后异步触发。`_demoted_repair_applies(reason)` 只对节点级故障
+  （`transport`）触发；`rate429` / `惩罚期` / `低质` / `主动轮换`不修。
+- H2：`_h2_repair(member)` 换 selector，零重启、不断流。
+- WG：同 colo 候选排除其他线已绑定与 `ban_backfill_node`，按 `_warp_alive_rank`
+  → `_NODE_DELAYS` 升序取前 3，TCP 可达后 `_rehome_one` + `_warp_line_restart(rebound=True)`。
+- 护栏：单飞 + 600s 冷却（`ASIP_DEMOTED_NODE_REPAIR_COOLDOWN`，env 可关）；
+  refresh/prewarm 中的线、`stop_probe` 的线跳过。
+- `config.py` 新增 `demoted_node_repair_enabled` / `demoted_node_repair_cooldown_sec`。
+
+### 上线
+
+`systemctl restart auto-switch-ip.service`（pid 1414），sing-box 16 条线进程 pid
+全部 < 1414 未变（`KillMode=process` drop-in 生效）。重启后 20 分钟内已见 3 次
+`⇄ ... 换线后修复：已换同块节点（transport）`（SLC-15、SLC-14、TPE-7）。
+
+pytest 935 passed。详见 `~/.9router/docs/incident-20261109-transport-503-and-stream-cut.md` §10。

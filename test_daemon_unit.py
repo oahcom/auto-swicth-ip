@@ -2166,7 +2166,7 @@ def test_reconnect_warp_passes_interrupt_to_cleanup(monkeypatch):
         monkeypatch.setattr(daemon, "_switch_warp", lambda tag, **kw: True)
         seen = []
         monkeypatch.setattr(daemon, "_after_warp_switch",
-                            lambda tag, itr=False: seen.append(itr))
+                            lambda tag, itr=False, reason=None: seen.append(itr))
 
         assert daemon.reconnect_warp("test", interrupt) is True
         assert seen == [expected], f"interrupt={interrupt} 未传到清理钩子: {seen}"

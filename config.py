@@ -613,6 +613,19 @@ CFG = {
         # 5s 一轮 × 29 条线会把机器打满；而节点死亡不是秒级状态。单次不通只记
         # 一笔，下一轮复查仍不通才换 —— 机场抖动与探测冷启都会让单次探测失败。
         "node_rotation_interval_sec": 60,
+        # 错误换线（transport ×N / 链路悬挂类）成功后，顺手把被切下来的那条线
+        # 修好：在同一个渠道块（colo）内换到延迟低且 TCP 可达的节点。H2 换
+        # selector 零重启；WG 换节点后 rebound 重启一次（它刚被 demote，不在
+        # 承载流量）。不修的话坏节点躺回候选池，下一轮又被选中再死一次
+        # （实测 08:22–08:45 WG-1↔WG-9↔ICN-13 每 15~30s 弹跳）。
+        # rate429 / 惩罚期 / 低质启动校验 / 主动轮换不触发 —— 那些是 IP 或
+        # 配额级问题，节点本身是好的，换掉等于白丢一条能用的链路。
+        "demoted_node_repair_enabled":
+            _env_bool("ASIP_DEMOTED_NODE_REPAIR", True),
+        # 同一条线两次修复的最小间隔：修复含一次节点 TCP 探测与（WG）一次
+        # 重启；风暴期若每次换线都修同一条线，会复制换线弹跳。
+        "demoted_node_repair_cooldown_sec":
+            _env_int("ASIP_DEMOTED_NODE_REPAIR_COOLDOWN", 600),
         "restart_concurrency": 12,
         "ip_observe_sec": 120,
         # fixed 模式的提前量：换线从发起到达生效 p50=2s / p90=7s，等满

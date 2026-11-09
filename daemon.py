@@ -2147,7 +2147,150 @@ def _schedule_connection_cleanup(chain_tag: str | None, min_age_sec: float,
         log(f"✗ 连接清理线程启动失败: {e}")
 
 
-def _after_warp_switch(old_tag: str | None, interrupt: bool = False) -> None:
+# ---------------------------------------------------------------------------
+# 换线后修复被切下来的线（2026-11-09 主人定）。
+#
+# 错误切换保留，但被切下来的线不能带着坏节点躺回候选池 —— 否则下一轮
+# 选线又选中它、再死一次（实测 08:22–08:45 WG-1↔WG-9↔ICN-13 每 15~30s
+# 来回弹跳，正是「换线不修节点」的后果）。502/断流这类「节点延迟大、
+# 超时不可用」既不是 429 配额也不是 colo 变化（同 colo）—— 正确动作就是
+# 在**同一个渠道块内**换一个延迟好的可用节点。
+# ---------------------------------------------------------------------------
+
+# 同一条线两次修复的冷却表（tag → 冷却到期时刻）。
+_DEMOTED_REPAIR_COOLDOWN: dict[str, float] = {}
+# 单飞：同一条线的修复线程不重入（触发点在换线关键路径上，可能密集到来）。
+_DEMOTED_REPAIR_RUNNING: set[str] = set()
+_DEMOTED_REPAIR_LOCK = threading.Lock()
+
+
+def _demoted_repair_applies(reason: str) -> bool:
+    """换线原因是否属于「节点/链路级」故障 —— 只有这类修节点才有意义。
+
+    rate429 / 惩罚期 / 低质启动校验 / 主动轮换都是 IP 或配额级：节点本身
+    是好的，换掉等于白丢一条能用的链路。transport ×N（出口探测失败）与
+    （opencode 链路连续悬挂）才是「这条线的落地节点延迟大/超时不可用」
+    的直接证据 —— 主人定性：这类该换的是渠道块内的 IP，不是跨块换出口。
+    """
+    if not reason:
+        return False
+    if any(k in reason for k in ("rate429", "主动轮换", "惩罚期", "低质")):
+        return False
+    return "transport" in reason
+
+
+def _schedule_demoted_node_repair(old_tag: str, reason: str | None) -> None:
+    """异步触发：本函数在换线关键路径（_WARP_LOCK / refresh slot 持有期间）
+    被调用，判定与 I/O 都不能挡换线 —— 全部丢给 worker 线程。"""
+    if not _warp().get("demoted_node_repair_enabled", True):
+        return
+    with _DEMOTED_REPAIR_LOCK:
+        if old_tag in _DEMOTED_REPAIR_RUNNING:
+            return
+        _DEMOTED_REPAIR_RUNNING.add(old_tag)
+    try:
+        threading.Thread(target=_demoted_node_repair_worker,
+                         args=(old_tag, reason), daemon=True,
+                         name="demoted-repair").start()
+    except Exception as e:
+        with _DEMOTED_REPAIR_LOCK:
+            _DEMOTED_REPAIR_RUNNING.discard(old_tag)
+        log(f"✗ 修复被切线线程启动失败（{old_tag}）: {e}")
+
+
+def _demoted_node_repair_worker(old_tag: str, reason: str | None) -> None:
+    """线程体：异常必须落日志 —— 线程里抛异常只进 stderr，daemon.log
+    里看不到，等于修复静默失效（同 `_cleanup_connection_worker` 的教训）。"""
+    try:
+        _demoted_node_repair(old_tag, reason)
+    except Exception as e:
+        log(f"✗ 修复被切线异常（{old_tag}）: {e}")
+    finally:
+        with _DEMOTED_REPAIR_LOCK:
+            _DEMOTED_REPAIR_RUNNING.discard(old_tag)
+
+
+def _demoted_node_repair(old_tag: str, reason: str | None) -> None:
+    """把刚被切下来的线修好：同渠道块（colo）内换到延迟好的可用节点。
+
+    H2：`_h2_repair` 换 selector，零成本、不重启、不断流（自带 60s 节流
+    与整池重试窗口）。WG：同块选点 → `_rehome_one` 写配置 → `rebound=True`
+    重启一次 —— 它刚被 demote，不在承载流量，重启无害；rebound 让夜间锁/
+    渠道锁/换地址熔断让路：熔断拦的是「同一节点换地址」，这里换的就是节点。
+    CF/usque 没有可换的落地节点，跳过。
+    """
+    member = _warp_member(old_tag)
+    if not member or old_tag == active_warp_tag():
+        return          # 已不是成员（重渲染）/ 又切回来了：都不动
+    now = time.time()
+    with _DEMOTED_REPAIR_LOCK:
+        if now < _DEMOTED_REPAIR_COOLDOWN.get(old_tag, 0.0):
+            return
+        # 进入即占冷却：失败也别在下次换线时立刻重试，风暴期会复制换线弹跳。
+        _DEMOTED_REPAIR_COOLDOWN[old_tag] = now + float(
+            _warp().get("demoted_node_repair_cooldown_sec", 600))
+    with _WARP_REFRESH_LOCK:
+        busy = old_tag in _WARP_REFRESHING or old_tag in _WARP_REFRESH_PENDING
+    if busy:
+        return          # 正被后台刷新/预热：那条路径自己会处理，别抢
+    if _warp_line_state(old_tag).get("stop_probe"):
+        return          # 渠道锁判定「换地址也买不到配额」：不是节点问题
+    kind = member.get("kind")
+    if kind == "h2":
+        if _h2_repair(member):
+            log(f"  ⇄ {old_tag} 换线后修复：已换同块节点（{reason}）")
+        return
+    if kind != "wg":
+        return
+    # ---- WG：同块选点（先承载能力，再延迟缓存升序，未测过的垫后）----
+    cur = (warp_wg._read_state().get("lines") or {}).get(old_tag) or {}
+    cur_node = cur.get("node")
+    if not cur_node:
+        return
+    try:
+        pool = {n["tag"] for n in warp_wg.udp_capable(warp_wg.load_nodes())}
+        colo_map = warp_wg.load_colo_map()
+        blocks_map = warp_blocks.load_map()
+        exclude = {n for n in warp_wg.line_nodes().values() if n}
+    except Exception as e:
+        log(f"  · 修复 {old_tag} 读节点表失败: {e}")
+        return
+    cur_colo = (colo_map.get(cur_node) or {}).get("colo")
+    if not cur_colo:
+        return          # 当前节点没有实测 colo：同块无从谈起，交给轮换/重定位
+    exclude |= {str(s.get("ban_backfill_node"))
+                for s in list(_WARP_LINE_STATE.values())
+                if isinstance(s, dict) and s.get("ban_backfill_node")}
+    # 当前节点不进排除集（别的线仍可能绑它），但绝不作为候选 ——
+    # 修复的目的就是离开这个节点。
+    cands = [t for t, v in colo_map.items()
+             if t != cur_node
+             and isinstance(v, dict) and v.get("colo") == cur_colo
+             and v.get("ok") is not False and t in pool and t not in exclude]
+    if not cands:
+        log(f"  · {old_tag} 同块（{cur_colo}）无其他可用节点，修复跳过")
+        return
+    # alive rank（0 能承载/1 没测过/2 实测不能）为主判据，延迟为次 ——
+    # 一台测过不能承载 WARP 的低延迟节点比没测过的高延迟节点更没用。
+    cands.sort(key=lambda t: (_warp_alive_rank(t, blocks_map),
+                              _NODE_DELAYS.get(t) or 10 ** 9, t))
+    # 只探前 3 个：一次 TCP 探测最多 6s，同块通常 2~4 个候选
+    for node in cands[:3]:
+        if _node_tcp_ok(node) is False:
+            continue
+        r = _rehome_one(old_tag, node)
+        if r == "err":
+            continue
+        if r == "ok":
+            _warp_line_restart(member, "换线后同块修节点", rebound=True)
+            log(f"  ⇄ {old_tag} 换线后修复：{cur_node} -> {node}"
+                f"（同块 {cur_colo}，延迟 {_NODE_DELAYS.get(node, '?')}ms，{reason}）")
+        return          # gone / skip：候选不在池里，没有更多可做的
+    log(f"  · {old_tag} 同块（{cur_colo}）候选前 3 个均不可达，修复跳过")
+
+
+def _after_warp_switch(old_tag: str | None, interrupt: bool = False,
+                       reason: str | None = None) -> None:
     """换线后清掉旧链上的 opencode 长连接。interrupt=False 时不清理。
 
     interrupt 是清理开关，不是 sing-box 的参数（那个字段不存在，见
@@ -2165,7 +2308,12 @@ def _after_warp_switch(old_tag: str | None, interrupt: bool = False) -> None:
     old_tag 为 None 表示换线前停在轮换池 proxy：此时没有「旧 WARP 链」可清，
     而 `_close_opencode_connections` 把 None 当通配符（清全部链），会连刚切
     过去的新链一起清 —— 直接跳过。
+
+    reason 透传给「换线后修复被切线」（见 `_demoted_repair_applies`）：节点级
+    故障（transport）顺手修节点；IP/配额级与主动轮换不修。
     """
+    if old_tag is not None and _demoted_repair_applies(reason or ""):
+        _schedule_demoted_node_repair(old_tag, reason)
     if not interrupt or old_tag is None:
         return
     _schedule_connection_cleanup(
@@ -7615,7 +7763,8 @@ def _reconnect_warp_by_table(reason: str, interrupt: bool = True,
                 out["switched_at"] = switched_at
                 out["old_tag"] = active["tag"] if active else None
             log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip})")
-            _after_warp_switch(active["tag"] if active else None, interrupt)
+            _after_warp_switch(active["tag"] if active else None, interrupt,
+                               reason)
             return True
         finally:
             _release_refresh_slot(m["tag"])
@@ -7900,7 +8049,7 @@ def reconnect_warp(reason: str, interrupt: bool = True) -> bool:
     _from = active["tag"] if active else "proxy"
     log(f"✓ WARP 换线成功: {_from} -> {m['tag']} (出口 {ip}, "
         f"{'新段' if rest is None else f'/64 静置 {rest/60:.0f}min'})")
-    _after_warp_switch(active["tag"] if active else None, interrupt)
+    _after_warp_switch(active["tag"] if active else None, interrupt, reason)
     # 延迟刷新刚换下的线：立即重启会掐断仍在走它的在途请求，延迟到连接
     # 自然结束；预先刷好则下次切回时无需在换线路径上同步等 7~9s。
     if active is not None:
