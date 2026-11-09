@@ -112,6 +112,28 @@ def test_reset_stale_after_tier_clears_frozen_observation(monkeypatch):
     assert st["ban_hold_until"] == 0.0 and st["next_probe_ts"] == 0.0
 
 
+def test_tier_reconcile_starts_and_resets_when_tier_reenables(monkeypatch):
+    """解禁侧：档位内的线没在跑就拉起来，并清空停用期的陈旧观测。"""
+    class _R:
+        returncode = 0
+        stdout = "inactive"
+
+    monkeypatch.setattr(daemon.warp_blocks, "tier_spec", lambda: ("wg-on", "1-22"))
+    monkeypatch.setattr(daemon, "_TIER_DISABLED", set())
+    monkeypatch.setattr(daemon, "_warp", lambda: {"members": [
+        {"tag": "WARP-WG-4", "kind": "wg", "index": 4,
+         "service": "warp-wg-4.service"}]})
+    monkeypatch.setattr(daemon.subprocess, "run", lambda *a, **k: _R())
+    started, reset = [], []
+    monkeypatch.setattr(daemon, "_unit_ctl",
+                        lambda action, svc: started.append((action, svc)) or _R())
+    monkeypatch.setattr(daemon, "_wg_line_state", lambda i: "installed")
+    monkeypatch.setattr(daemon, "_reset_stale_after_tier", lambda tag: reset.append(tag))
+    daemon._tier_reconcile()
+    assert started == [("start", "warp-wg-4.service")], "档位内的线必须被拉起"
+    assert reset == ["WARP-WG-4"], "拉起时必须复位陈旧观测"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):
