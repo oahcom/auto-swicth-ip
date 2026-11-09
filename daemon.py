@@ -8115,26 +8115,6 @@ def maybe_reconnect_warp(now: float) -> None:
                 seg_ok, seg_blocked = count_segment_requests(_last_warp_switch_ok_ts)
                 _record_warp_cycle(active_ip, cycle, now, ok=seg_ok,
                                    blocked=seg_blocked)
-    # **换线后还没有新出口的证据之前，不许再换。**
-    #
-    # `blocked` 的窗口起点是 `_last_warp_reconnect_ts`（**触发**时刻），而换线
-    # 生效是 p50 之后 4 秒（见下面 min_switch_gap_sec 的注释）。这中间的请求
-    # 仍走旧出口，它们的 429 会填满 5 条窗口 → `full_err` 恒真。而 full_err
-    # 是**唯一**能绕过冷却的判据（ignore_cooldown=full_err_bypass），于是
-    # 换线后 1 秒就再次满足触发条件，只剩 min_switch_gap_sec(5s) 挡着 ——
-    # 闸一开就切走，形成「在位时长恒等于 5 秒」的死循环。
-    #
-    # 实测 2026-11-08 22:0x：353 次换线，在位中位 5s、80% <10s、97% <30s，
-    # 120 秒内存活的 0 次，触发原因 663 次是 rate429。同一时段滑动 5 条窗口
-    # 里 53%（208/396）的时刻是 full_err，所以每轮都能立刻重新触发。
-    #
-    # `stale_only` 正是「距上次生效不足 120s 且生效后一条出口级错误都没有」，
-    # 即窗口里全是上一段的证据。此时不换线，等新出口自己说话：
-    #   · 新出口真坏 → `fresh` 非空 → stale_only 转假 → 立刻放行换线；
-    #   · 新出口正常 → 旧证据随窗口滚出，full_err 自然消失。
-    # 生产流量 2~5 req/s，新证据 1 秒内就到，不是真的等 120 秒。
-    if stale_only:
-        return
     # 用户规则：最近两条请求都报错仍允许不切，第三条连错才换线。放在采样/标脏
     # 之后 —— 连错 1~2 条时出口已收到 403，仍需把该 IP 标脏、记周期样本，只是
     # 暂不换线。实测 90 次真实触发里这条门控抑制 11 次，其中 3 次窗口内成功 ≥5
@@ -8144,12 +8124,12 @@ def maybe_reconnect_warp(now: float) -> None:
         return
     if now < _warp_cooldown_until and not blocked.get("full_err"):
         return
-    # 两次换线生效间隔的硬闸，含 full_err 风暴例外 —— 上面三条都能被 bypass，
-    # 这条不能。`_last_warp_switch_ok_ts` 是上一段**生效**时刻（见 reconnect_warp
-    # 的 switched_at），不是触发时刻；差别就是 触发→生效 那 p50 4 秒。
-    if now - _last_warp_switch_ok_ts < _warp().get("min_switch_gap_sec", 5):
-        return
-    # 触发条件已满足，委托给统一入口处理冷却与并发
+    # 这里**不再单设 min_switch_gap_sec(5s)**：它只管「两次换线别挨太近」，
+    # 而真正的判据是「新出口说话了没有」—— 统一闸门 `_switch_evidence_ready`
+    # 在 `_reconnect_warp_now` 里，窗口 120s，且新出口一报错就放行。5 秒那道
+    # 闸正好解释了「在位时长恒等于 5 秒」：它是唯一挡住满窗风暴的东西，闸一开
+    # 就切走。配置项保留（旧部署仍读得到），但不再参与判定。
+    # 触发条件已满足，委托给统一入口处理冷却、证据窗口与并发
     full_err_bypass = blocked.get("full_err", False)
     _reconnect_warp_now(
         " + ".join(f"{k} ×{blocked[k]}" for k in triggered),
@@ -8158,8 +8138,40 @@ def maybe_reconnect_warp(now: float) -> None:
     )
 
 
+def _switch_evidence_ready(now: float) -> tuple[bool, str]:
+    """换线后是否已经拿到**新出口自己的**证据。返回 (可否再换, 原因)。
+
+    这是全模块唯一的「刚换过就别换」判据，四个错误/探测驱动的入口共用：
+    探测惩罚期、探测失败、传输层 503、错误率阈值。此前只有最后一条有
+    （`maybe_reconnect_warp` 的 stale_only），另外三条只受 cooldown_ok_sec(20s)
+    约束 —— 而换线生效要 p50 4 秒，20 秒冷却等于没有。
+
+    实测 2026-11-09 修复后的 17 次换线里，5 次是「探测发现当前出口处于惩罚期」
+    1 秒内再次触发、6 次是 rate429 在 1~3 秒内再次触发：新出口一条请求都还没
+    发出去，窗口里全是上一个出口在途请求的 429，就被判死并切走。在位时长中位
+    4 秒、64% 不到 10 秒。
+
+    「新出口自己的证据」= 生效之后出现过出口级错误（403/429）。这时窗口里至少
+    混进了新出口的真实表现，换线才有依据。还没出现就等着 —— 生产流量 2~5 req/s，
+    新证据通常 1 秒内就到，不是真的等满 grace 秒。
+    """
+    if _last_warp_switch_ok_ts <= 0:
+        return True, "还没换过线"
+    age = now - _last_warp_switch_ok_ts
+    grace = float(_warp().get("switch_stale_grace_sec", 120))
+    if age >= grace:
+        return True, "已过证据窗口 %.0fs" % age
+    fresh = count_warp_blocked_since(_last_warp_switch_ok_ts)
+    if fresh.get("abuse403", 0) or fresh.get("rate429", 0):
+        return True, "新出口已报错 %d+%d 条" % (
+            fresh.get("abuse403", 0), fresh.get("rate429", 0))
+    return False, ("换线仅 %.0fs，新出口尚无错误证据（窗口里 %d 条都是旧出口的）"
+                   % (age, fresh.get("other_err", 0)))
+
+
 def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False,
-                        interrupt: bool = True) -> bool:
+                        interrupt: bool = True,
+                        respect_evidence: bool = True) -> bool:
     """立刻发起一次换线，绕开 403/429 阈值。返回是否真的发起了。
 
     WHY 需要绕开阈值：`maybe_reconnect_warp()` 的触发依赖
@@ -8170,6 +8182,10 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False,
     受冷却约束就永远等不到触发。`_WARP_LOCK` 无论如何都要抢到 —— 那是并发换线
     的互斥，不是节流。错误触发路径保持受冷却约束。
 
+    respect_evidence 是**所有错误/探测驱动入口共用**的闸门（见
+    `_switch_evidence_ready`）：刚换完、新出口还没说话时不许再换。主动轮换传
+    False —— 它按配额/时钟走，与「出口好不好」无关，等证据只会让周期漂移。
+
     interrupt 决定换线后是否清理旧链在途连接（见 `_after_warp_switch`）。
     默认 True —— 调用方几乎都是错误触发（出口已判死，留着旧连接只是在等超时）。
     只有主动轮换传 False：旧出口健康，在途请求该跑完。
@@ -8179,6 +8195,14 @@ def _reconnect_warp_now(reason: str, now: float, ignore_cooldown: bool = False,
         return False
     if not _WARP_LOCK.acquire(blocking=False):
         return False
+    if respect_evidence:
+        ready, why = _switch_evidence_ready(now)
+        if not ready:
+            # 锁是刚抢到的，必须还回去，否则后续换线全部被拒（本函数不靠
+            # `_warp_reconnect_worker` 的 finally 释放这条路径）。
+            _WARP_LOCK.release()
+            log(f"  · 暂不换线（{reason}）：{why}")
+            return False
     delay = _warp()["cooldown_ok_sec"]
     prev_cooldown = _warp_cooldown_until
     _last_warp_reconnect_ts = _now_ts()
@@ -8292,7 +8316,7 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
                 f"主动轮换 固定 {elapsed:.0f}s ≥ {threshold:.0f}s"
                 f"（{target:.0f}s − 提前量 {lead:.0f}s）",
                 now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts,
-                interrupt=False)
+                interrupt=False, respect_evidence=False)
         return
 
     n = count_dsv4_ok_since(start)
@@ -8302,7 +8326,7 @@ def _maybe_proactively_rotate_warp(now: float) -> None:
         _reconnect_warp_now(
             f"主动轮换 已用配额 {n} 格 dsv4 ≥ {target}",
             now, ignore_cooldown=_last_warp_reconnect_ts <= _last_warp_switch_ok_ts,
-            interrupt=False)
+            interrupt=False, respect_evidence=False)
 
 
 def _validate_startup_egress(member: dict) -> None:
