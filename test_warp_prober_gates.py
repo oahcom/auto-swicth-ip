@@ -189,12 +189,82 @@ def test_restart_rate_is_capped(monkeypatch):
     daemon.CFG["warp"]["restart_max_per_hour_per_line"] = 0
     try:
         with daemon._WARP_LINE_CV:
-            daemon._warp_line_state_locked("W2")["restart_hist"] = []
+            _s = daemon._warp_line_state_locked("W2")
+            _s["restart_hist"] = []
+            # 桩每次都返回同一个出口 9.9.9.9，上面 40 轮已经把「换地址熔断」
+            # 点着了。那条闸管的是「换不到新地址就别再重启」，与 cap=0 的
+            # 「不设上限」是两层语义，这里只验证后者。
+            _s["ip_stuck_until"] = 0.0
+            _s["restart_ip_hist"] = []
         assert daemon._warp_line_restart(m, "test") is True, (
             "上限配 0 时重启被拒 —— 0 的语义是「不设上限」"
         )
     finally:
         daemon.CFG["warp"]["restart_max_per_hour_per_line"] = saved
+
+
+def test_restart_fuses_when_ip_never_changes(monkeypatch):
+    """连续重启拿回同一出口 = 换地址无效，必须熔断。
+
+    实测 WARP-WG-5 在 30 分钟内重启 174 次，出口只在 104.28.205.115 / .117
+    之间来回跳（CF 共享 IPv4），每次重启都掐断在途连接 —— 9router 侧就是每
+    8~10 秒一批 aborted/503。重启是为了换 IP，换不到就不该继续重启。
+    """
+    _stub_restart(monkeypatch)
+    m = _member()
+    for _ in range(3):
+        assert daemon._warp_line_restart(m, "test") is True, (
+            "前 3 次必须放行 —— 熔断不能一上来就把重启掐掉"
+        )
+        with daemon._WARP_LINE_CV:
+            daemon._warp_line_state_locked("W2")["next_restart_ts"] = 0.0
+    st = daemon._warp_line_state("W2")
+    assert st.get("ip_stuck_until", 0) > time.time(), (
+        "连续 3 次重启都是同一出口却没有熔断"
+    )
+    assert daemon._warp_line_restart(m, "test") is False, (
+        "熔断期内仍然放行重启 —— 死循环没被拦住"
+    )
+
+
+def test_restart_fuse_lifts_when_ip_changes(monkeypatch):
+    """换得到新地址就不该熔断 —— 「重启换 IP」的规则不能被这条闸误伤。"""
+    ips = iter(["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"])
+    _stub_restart(monkeypatch)
+    monkeypatch.setattr(daemon, "_probe_refresh_egress",
+                        lambda port: next(ips))
+    m = _member()
+    for _ in range(4):
+        assert daemon._warp_line_restart(m, "test") is True, (
+            "出口每次都变了却拒绝重启 —— 熔断误伤了正常换地址"
+        )
+        with daemon._WARP_LINE_CV:
+            daemon._warp_line_state_locked("W2")["next_restart_ts"] = 0.0
+    assert not daemon._warp_line_state("W2").get("ip_stuck_until"), (
+        "地址一直在变，不该写熔断时间"
+    )
+
+
+def test_penalty_restart_fuses_after_repeats():
+    """重启后仍是惩罚期，连续 N 次就熔断。
+
+    实测 WARP-H2-NRT-0/1/63 拿到全新 /128 后 2 秒又被判 quota(Retry-After
+    17.3h)，3 分钟各重启 20+ 次 —— 换不出配额的重启只会掐断在途连接。
+    """
+    fuse = int(daemon._warp().get("restart_ip_stuck_fuse", 3))
+    now = time.time()
+    for _ in range(fuse - 1):
+        assert daemon._penalty_restart_fuse("W2", now) is False, (
+            f"未到第 {fuse} 次就熔断 —— 正常换地址被误伤"
+        )
+    assert daemon._penalty_restart_fuse("W2", now) is True, (
+        f"连续 {fuse} 次「重启后仍惩罚期」却没有熔断"
+    )
+    st = daemon._warp_line_state("W2")
+    assert st.get("ip_stuck_until", 0) > now, "熔断只打日志没写状态"
+    assert not st.get("penalty_restart_streak"), (
+        "熔断后计数未归零 —— 到期重试时会一上来就再次熔断"
+    )
 
 
 def test_restart_cap_does_not_stop_probing(monkeypatch):

@@ -738,3 +738,60 @@ SSE 长流一并截断（正常流实测 140–242 s），用户看到的是「�
   见 `~/.9router/docs/incident-20261109-transport-503-and-stream-cut.md`
   （commit `faf4ce90` / `f6f4ce5e`，本文对应 `001ae9e`）。
 
+
+## INC-014 — 池子有 170 个出口，却被每 3.9 秒一次的重启掐断了 503（2026-11-09）
+
+### 现象
+
+14:24–14:55 的 30 分钟里 `asip-unit restart` 走了 **466 次**（每 3.9 秒一次），
+其中 `warp-wg-5` 174 次、`warp-wg-13` 100 次、`warp-wg-9` 56 次。同时
+9router 报 86 条 `ERROR 503`，底层是 `ECONNREFUSED: Unable to connect` ——
+**连本地 7890 都被拒**，与上游、配额、IP 全都无关。
+
+排查中先误判成「池子空了，只剩 19 条出口」，被主人一句「每个隧道池都有很多
+待命的代理 ip」推翻。按容量重查：229 个 outbound、170 个 `proxy` 候选、79 个
+`usque-h2-*` 全 running、57 条 WARP 线 30 条有 IP、`fresh_candidates=25`
+（`no_standby=0`）。**供给从来不缺。**
+
+### 三条互相独立的病
+
+1. **配置没变也重启 sing-box。** `refresh_subscription()` 末尾无条件
+   `return restart_singbox()`，而当天 9 次刷新里 8 次是 `169 → 169` 同一份
+   内容。每次重启动 `pkill → sleep2 → fuser -k 7890 → sleep1 → Popen →
+   startup_grace(10s)`，**7890 约 13 秒无人监听**。503 时间戳与这 4 次重启
+   窗口逐一对上（14:53:15 / 14:53:43 / 14:55:03 / 14:55:44）。
+2. **`"CHANGED" in "UNCHANGED"` 恒真。** H2 并入路径据此也每次都重启。
+3. **换不到 IP 还在无限重启。** `warp-wg-5` 每 8~10 秒重启，出口只在
+   `104.28.205.115` / `.117` 两个 CF 共享 IPv4 之间跳；H2 线拿到全新 /128 后
+   2 秒又被判 `quota(Retry-After 17.3h)`，3 分钟各重启 20+ 次。
+
+### 处理
+
+- `_config_semantically_equal()`：比对 outbounds 指纹，一致就跳过重载；
+  只有进程确实不在才 `restart_singbox()`。
+- `reload_singbox_config()`：`PUT /configs?force=true` 走 Clash API 热重载。
+  实测 1.13.0 返回 204、耗时 0.01s、50ms 粒度探测 7890 **零失败**。
+- `"CHANGED" in stdout` → 按词精确匹配。
+- 「换地址熔断」（`ip_stuck_until`）：连续 `restart_ip_stuck_fuse`(3) 次重启
+  拿回同一 IP → 900s 内不再重启。
+- 「惩罚期熔断」（`_penalty_restart_fuse`）：连续 3 次「重启后仍 blocked/quota」
+  → 同样熔断。拿到 `OK` 立即清除；`tunnel_dead` 不受约束。
+
+> 注意：熔断拦的是「换了没用」的重启，**不是**把
+> `restart_max_per_hour_per_line=0` 的「重启换 IP = 新配额」规则改回去。
+> 前两次重启照常执行，只有证明换不动之后才停手。
+
+### 效果
+
+sing-box 重启 0 次（pid 跨多次 daemon 重启不变）；9router 503 从 86 条/30min
+降到 **0 条/10min（44 次请求）**；隧道重启 15.5 → 8 次/分钟；单流 200/1.7s、
+5 并发 5/5 成功且 `[DONE]` 完整；`pytest` 924 passed。
+
+### 残留
+
+- `header-timeout`（opencode 免费层对超配额 IP 的静默挂起）是本轮之外的独立
+  503 来源，要压它得缩短首字节等待或扩大可用池。
+- `dormant-outbounds.json` 里 65 条 anytls 仍未进 selector —— 池子还有货没放出来。
+- 渠道锁仍锁 47 条线到次日 08:00（策略，非 bug）。
+
+详见 `~/.9router/docs/incident-20261109-transport-503-and-stream-cut.md` §8。

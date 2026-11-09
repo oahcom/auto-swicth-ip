@@ -29,6 +29,8 @@ import secrets
 import socketserver
 import http.server
 import traceback
+import urllib.error
+import urllib.request
 import urllib3
 from collections import deque
 from datetime import datetime, timezone, timedelta
@@ -5197,6 +5199,38 @@ def _warp_line_restart_allowed(st: dict, now: float) -> bool:
     return len(hist) < cap
 
 
+def _penalty_restart_fuse(tag: str, now: float) -> bool:
+    """「重启后仍处惩罚期」累计到阈值就熔断；True 表示本次不要再重启。
+
+    2026-11-09 15:12 实测：WARP-H2-NRT-0/1/63 重启后拿到的是全新 /128，
+    2 秒后模型层仍判 quota（Retry-After 17.3h），3 分钟内各重启 20+ 次。
+    这说明这条线在当前落地节点上换不出配额 —— 重启只是每隔十几秒掐断
+    一次在途连接，9router 侧全是 aborted。熔断后交给池内其他待命线。
+    只管「重启换地址」这条路；tunnel_dead（连地址都拿不到）不在此列。
+    """
+    fuse = max(2, int(_warp().get("restart_ip_stuck_fuse", 3)))
+    hold = float(_warp().get("restart_ip_stuck_hold_sec", 900))
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        # 已在熔断期：直接告诉调用方「别重启」，但不再递增、不再刷日志 ——
+        # 探测每 10s 一轮，若每轮都重新数到阈值再喊一次，一条线就能刷出
+        # 几百行「熔断至」（实测 4 分钟 535 行）。
+        if float(st.get("ip_stuck_until") or 0.0) > now:
+            return True
+        n = int(st.get("penalty_restart_streak") or 0) + 1
+        st["penalty_restart_streak"] = n
+        hit = n >= fuse
+        if hit:
+            st["penalty_restart_streak"] = 0
+            st["ip_stuck_until"] = now + hold
+    if hit:
+        _save_warp_line_state()
+        log(f"  ⛔ {tag} 连续 {n} 次「重启后仍在惩罚期」，换地址换不出配额 → "
+            f"熔断至 {time.strftime('%H:%M', time.localtime(now + hold))}，"
+            f"改由池内其他线承担")
+    return hit
+
+
 def _warp_line_restart(member: dict, reason: str,
                        rebound: bool = False,
                        tunnel_dead: bool = False) -> bool:
@@ -5216,6 +5250,20 @@ def _warp_line_restart(member: dict, reason: str,
         log(f"  · 当前出口 {tag} 不重启（失败时换线，{reason}）")
         return False
     now = time.time()
+    # 「换地址熔断」：这条线连续几次重启后拿回的是同一个出口，说明它的落地
+    # 节点只分配这一两个地址（WG 实测 104.28.205.115 / .117 来回跳，30 分钟
+    # 重启 174 次），再重启也换不到新配额，只是每 8~10 秒掐断一次在途连接。
+    # 熔断期内不重启，让它退到备位，流量由池里别的待命线承担。
+    # 重启换 IP 的规则不变：**换得到**才继续重启。
+    if not rebound and not tunnel_dead:
+        stuck_until = float(_warp_line_state(tag).get("ip_stuck_until") or 0.0)
+        if stuck_until > now:
+            if now - _NIGHT_LOG_TS.get("stuck:" + tag, 0.0) > 300.0:
+                _NIGHT_LOG_TS["stuck:" + tag] = now
+                log(f"  · {tag} 换地址熔断中（至 "
+                    f"{time.strftime('%H:%M', time.localtime(stuck_until))}），"
+                    f"跳过重启（{reason}）")
+            return False
     if not rebound and _night_block_restart(tag, reason, now):
         return False
     with _WARP_LINE_CV:
@@ -5322,6 +5370,7 @@ def _warp_line_restart(member: dict, reason: str,
             return False
         ip = _probe_refresh_egress(member["port"])
         now = time.time()
+        stuck_until_new = 0.0
         # 重启后的地址若在台账里仍处惩罚期，停探到确切解禁：这条地址已经
         # 被判脏，再探只是把同一结论再买一次。
         block_left = _line_block_remaining(ip, now) if ip else 0.0
@@ -5361,12 +5410,35 @@ def _warp_line_restart(member: dict, reason: str,
                 st["ip_ts"] = now
                 st["port_ok"] = True
                 st.pop("egress_error", None)
+                # 记「每次重启换回来的地址」。连续拿回同一个地址 = 这条线的
+                # 落地节点只发这一个出口，重启换 IP 对它无效，必须熔断 ——
+                # 否则就是每 8~10 秒重启一次、每次掐断在途连接的死循环。
+                fuse = max(2, int(_warp().get("restart_ip_stuck_fuse", 3)))
+                hist = [x for x in (st.get("restart_ip_hist") or [])
+                        if isinstance(x, str)]
+                hist.append(ip)
+                st["restart_ip_hist"] = hist[-fuse:]
+                if (len(st["restart_ip_hist"]) >= fuse
+                        and len(set(st["restart_ip_hist"])) == 1):
+                    stuck_until_new = now + float(
+                        _warp().get("restart_ip_stuck_hold_sec", 900))
+                    st["ip_stuck_until"] = stuck_until_new
             else:
+                # 取不到地址时不推进历史：那不是「换地址失败」，是隧道坏了。
+                hist = [x for x in (st.get("restart_ip_hist") or [])
+                        if isinstance(x, str)]
+                st["restart_ip_hist"] = hist[-(max(2, int(_warp().get(
+                    "restart_ip_stuck_fuse", 3))) - 1):] or []
                 # 落盘失败原因，让 `asip chan` 能显示「为什么拿不到出口」，
                 # 而不是只印一个 `无地址`。值是人话，已过 `_EGRESS_HINT`。
                 st["egress_error"] = _egress_error_hint(member["port"]) or "unknown"
             _WARP_LINE_CV.notify_all()
         _record_line_ip_drift(tag, old_ip, ip)
+        if stuck_until_new:
+            log(f"  ⛔ {tag} 连续 {fuse} 次重启后出口仍是 {ip}，"
+                f"重启换不到新地址 → 熔断至 "
+                f"{time.strftime('%H:%M', time.localtime(stuck_until_new))}，"
+                f"改由池内其他线承担")
         _save_warp_line_state()
         # 失败要带**原因**：`探测失败` 四个字把「端口没监听」「节点域名解析不了」
         # 「隧道通了但没走 WARP」「到点没响应」压成同一句话，四种故障在报表上
@@ -5493,9 +5565,11 @@ def _probe_one_line(member: dict) -> None:
             return
         else:
             # 惩罚期重启 = 换出口地址 = 新 IP 的新配额（2026-11-09 主人裁定：
-            # 不同 IP 的额度不一样，重启换 IP 永远有效）。防白烧由渠道锁
-            # （channel_ban_hold，按线判「当天实测全 quota」）与每小时重启
-            # 上限承担，不再有全局时间窗闸。
+            # 不同 IP 的额度不一样）。但「换得到」才有意义：连续几次换回来
+            # 的地址照样判 quota，说明这条线在当前节点上换不出配额，重启就
+            # 只剩掐断在途连接这一个副作用 —— 熔断它，让池里其他线承担。
+            if _penalty_restart_fuse(tag, time.time()):
+                return
             _warp_line_restart(member, "出口处于惩罚期")
         return
     if _warp_probe_blind(now):
@@ -5525,6 +5599,12 @@ def _probe_one_line(member: dict) -> None:
     if verdict == "OK" or verdict in _WARP_PROBE_PERSISTENT:
         _channel_ban_note(tag, verdict, time.time())
     if verdict == "OK":
+        # 真拿到 OK 就把熔断与计数一起清掉：线已经好了，没有理由继续压着它。
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            if st.get("penalty_restart_streak") or st.get("ip_stuck_until"):
+                st["penalty_restart_streak"] = 0
+                st.pop("ip_stuck_until", None)
         return
     if tag == active:
         _reconnect_warp_now(f"探测失败 {verdict}", time.time())
@@ -9226,6 +9306,57 @@ def restart_singbox() -> bool:
 
 
 # ============= 订阅刷新 =============
+def _clash_api() -> tuple[str, str] | None:
+    """(base_url, secret)；配置里没开 clash_api 就返回 None。"""
+    try:
+        with open(CFG["singbox"]["config_file"], encoding="utf-8") as f:
+            ca = (json.load(f).get("experimental") or {}).get("clash_api") or {}
+    except Exception:
+        return None
+    addr = ca.get("external_controller") or ""
+    if not addr:
+        return None
+    return f"http://{addr}", str(ca.get("secret") or "")
+
+
+def reload_singbox_config(path: str | None = None) -> bool:
+    """用 Clash API 热重载配置：不杀进程、不关 7890、不禁用 outboundProxyUrl。
+
+    实测 sing-box 1.13.0（本机，2026-11-09）：
+      PUT /configs?force=true  → 204，耗时 0.01s，50ms 粒度探测 7890 全程 0 次失败。
+    而 pkill + 重新 Popen 那条路是 sleep2 + fuser + sleep1 + startup_grace ≈ 13s，
+    期间 9router 的每个请求都 ECONNREFUSED → 503。订阅刷新、节点并入这类
+    「配置级」动作根本不值得拿出口可用性去换这 13 秒。
+
+    只在**确认进程活着**时用；进程死了必须走 restart_singbox（那才是看门狗的活）。
+    """
+    api = _clash_api()
+    if not api:
+        return False
+    base, secret = api
+    cfg_path = path or CFG["singbox"]["config_file"]
+    body = json.dumps({"path": os.path.abspath(cfg_path)}).encode()
+    req = urllib.request.Request(
+        f"{base}/configs?force=true", data=body, method="PUT",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {secret}"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            code = r.status
+    except urllib.error.HTTPError as e:
+        log(f"  ✗ sing-box 热重载被拒 HTTP {e.code}；回退整进程重启")
+        return False
+    except Exception as e:
+        log(f"  ✗ sing-box 热重载失败 {type(e).__name__}: {e}；回退整进程重启")
+        return False
+    if code not in (200, 204):
+        log(f"  ✗ sing-box 热重载返回 {code}；回退整进程重启")
+        return False
+    log(f"✓ sing-box 热重载完成（{int((time.time() - t0) * 1000)}ms，端口未中断）")
+    return True
+
+
 def _dormant_tags() -> set[str]:
     """休眠源里的 tag（`.dormant-outbounds.json`）。读不到就当空集。"""
     try:
@@ -9275,6 +9406,34 @@ def _pool_members(path: str) -> set[str]:
     except Exception:
         pass
     return set()
+
+
+def _outbound_signature(path: str) -> list | None:
+    """整份配置的出口指纹；读不出来返回 None。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return None
+    outs = cfg.get("outbounds") or []
+    return sorted(
+        (str(o.get("tag") or ""),
+         json.dumps(o, sort_keys=True, ensure_ascii=False))
+        for o in outs)
+
+
+def _config_semantically_equal(a: str, b: str) -> bool:
+    """两份配置的出口集合一模一样时返回 True。
+
+    订阅刷新真正决定出口的只有 outbounds 这一块（端口、api、路由都是本地
+    生成侧固定写的）。实测 09:00~14:55 的 9 次刷新里 8 次是 169 → 169 同一
+    份内容，却每次都 pkill 重启 sing-box，白送 13 秒出口空窗 —— 9router 侧
+    就表现为一批 ECONNREFUSED → 503。没变化就不该动进程。
+    任一份读不出来一律返回 False：宁可多热载一次，也不能拿解不开的配置当
+    「没变化」。
+    """
+    sa, sb = _outbound_signature(a), _outbound_signature(b)
+    return sa is not None and sa == sb
 
 
 def _log_pool_diff(old_path: str, new_path: str) -> None:
@@ -9788,9 +9947,13 @@ def _run_h2_sync() -> None:
         log(f"  ⚠ 主配置并入失败 rc={p.returncode}: "
             f"{(p.stderr or p.stdout or '').strip()[-120:]}")
         return
-    if "CHANGED" in (p.stdout or ""):
-        log(f"  ✓ {(p.stdout or '').strip()}；重启 sing-box 加载")
-        restart_singbox()
+    # 别写 `"CHANGED" in stdout`：脚本输出的是 UNCHANGED，子串匹配恒真，
+    # 于是「主配置无需并入」也照样重启 sing-box —— 每次白送 13 秒出口空窗。
+    words = set((p.stdout or "").split())
+    if "CHANGED" in words:
+        log(f"  ✓ {(p.stdout or '').strip()}；热重载 sing-box 加载")
+        if not reload_singbox_config():
+            restart_singbox()
     else:
         log("  · 主配置无需并入")
 
@@ -10038,6 +10201,26 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
             log(f"✗ 新配置未通过 sing-box check，保留现有配置: {err}")
             _discard(tmp_file)
             return False
+        # 池子一个字都没变时**什么都不做**：不覆盖、不重载、不重启。
+        # 实测 09:00~14:55 九次刷新里八次是 169 → 169 的同一份内容，却每次都
+        # 走 restart_singbox（13 秒出口空窗），9router 侧就是成批 ECONNREFUSED
+        # → 503。用户要的「重启换 IP」针对的是出口地址，不是把配置重读一遍。
+        if _config_semantically_equal(config_file, tmp_file):
+            _discard(tmp_file)
+            if not fallback and not unjudgeable:
+                # 样本照记：这份配置确实在跑，基线窗口不该因为「没变化」断档。
+                _record_pool_sample(new_n)
+            log(f"✓ 订阅刷新完毕（池子成员 {old_n} → {new_n}），"
+                f"配置无实质变化，跳过 sing-box 重载")
+            _submit_once("autodiag", _run_autodiag)
+            _submit_once("h2diag", _run_h2_probe)
+            _submit_once("h2sync", _run_h2_sync)
+            # 「配置没变」不等于「进程活着」：看门狗和启动路径都会在 sing-box
+            # 不通时调本函数，这里若不接住，刷新返回成功而进程永远是死的。
+            if not is_singbox_alive():
+                log("  · 配置无变化但 sing-box 未运行，改为重启进程")
+                return restart_singbox()
+            return True
         _log_pool_diff(config_file, tmp_file)
         os.replace(tmp_file, config_file)
         _promote_sidecars(tmp_file, config_file)
@@ -10047,8 +10230,8 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
             _record_pool_sample(new_n)
         _rebind_wg_lines_after_refresh()
         log(f"✓ 订阅刷新完毕（池子成员 {old_n} → {new_n}），"
-            f"重启 sing-box 加载新配置...")
-        # 新节点要测出 colo 才进得了块；放在重启之后异步跑，不拖慢刷新。
+            f"热重载 sing-box 加载新配置...")
+        # 新节点要测出 colo 才进得了块；放在重载之后异步跑，不拖慢刷新。
         # WG 与 H2 是两条独立承载，各测各的：只跑 WG 时 carrier=h2 永远不增加，
         # H2 渠道池就停在那一批老节点上（实测 etcloud 的 18 个活节点因此一直
         # 只在代理池里躺着）。
@@ -10056,6 +10239,10 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
         _submit_once("h2diag", _run_h2_probe)
         # 实测只更新 block-map；真正把新块变成线的是这条（自限 30min）。
         _submit_once("h2sync", _run_h2_sync)
+        # 配置真变了才需要让 sing-box 重读：优先 Clash API 热载（端口不断），
+        # 进程已经不在了才回退到整进程重启。
+        if reload_singbox_config():
+            return True
         return restart_singbox()
     except Exception as e:
         log(f"✗ 订阅刷新失败: {e}")
@@ -10951,11 +11138,15 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             req = {}
         try:
             ip = req.get("egress_ip")
-            self._send(200, _rotate_once(
+            # 必须先拿结果再回传。写成 _send(200, _rotate_once(...)) 时，下面
+            # 那次 _send(200, result) 会踩未定义的 result —— 每调一次 /rotate
+            # 就抛一次 NameError，栈打满日志，client_gone 也永远记不上账。
+            # 换线本身是成功的，坏的只是回传这一步。
+            result = _rotate_once(
                 _normalize_rotate_reason(req.get("reason")),
                 _as_ts(req.get("request_started_at")),
                 str(ip).strip() if isinstance(ip, str) and ip.strip() else None,
-                _as_ts(req.get("egress_since"))))
+                _as_ts(req.get("egress_since")))
         except Exception as e:
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})
