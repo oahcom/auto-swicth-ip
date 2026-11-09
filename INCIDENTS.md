@@ -874,3 +874,13 @@ INC-014 结尾说「`dormant-outbounds.json` 65 条 anytls 没进 selector」是
 `⇄ ... 换线后修复：已换同块节点（transport）`（SLC-15、SLC-14、TPE-7）。
 
 pytest 935 passed。详见 `~/.9router/docs/incident-20261109-transport-503-and-stream-cut.md` §10。
+
+### 同步与审查（2026-11-09 19:48）
+
+- 本改动已同步到两台中继：软路由（WSL 内 `~/auto-swicth-ip` 拉取重启）与 VPS
+  （hermes `~/auto-swicth-ip` 拉取重启）。两台 9router 也同步上线（软路由 buildId
+  `uQOnPm9YhIXyjhSI8ccMT`；VPS buildId `2YmW7xigR-gK2S8-d7vpq`）。
+- 上线后 2 小时观测：三处 asip 0 Traceback；本机同块修复 10 次、VPS 5 次、软路由 0；
+  修复的线未在 600s 冷却内被重复选中。502 在三处清零（本机 20:00 后 0，之前 13 条
+  全是 VPS 宕机前/中的 252s 旧模式）；503 全为 combo 中间态，被三模型轮转吸收，不达
+  客户端。`_opencode_lane_alive` 假阳性仍未改，先观测再决定。
