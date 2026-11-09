@@ -409,6 +409,23 @@ def _write_json_atomic(path: str, payload: dict) -> None:
         log(f"✗ 写 {os.path.basename(path)} 失败: {e}")
 
 
+def _record_udp_bad_node(node: str, now: float) -> None:
+    """实测握手失败（TCP 通但拿不到出口）的节点落盘，供 `warp_wg.udp_capable`
+    过滤。不设过期：节点 UDP 能力是相对稳定的网络属性，靠后续成功握手清除
+    （`_rehome_one` 拿到出口时会调 `_udp_bad_clear`，见下）。"""
+    try:
+        path = warp_wg.udp_bad_nodes_path()
+        data = {}
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            pass
+        data[str(node)] = {"ok": False, "ts": now}
+        _write_json_atomic(str(path), data)
+    except Exception as e:
+        log(f"✗ 写 udp_bad_nodes 失败: {e}")
+
+
 def _save_warp_ip_used() -> None:
     """把 IP 使用记录落盘。
 
@@ -3567,6 +3584,16 @@ def _channel_ban_hold_hit(samples: list, now: float) -> bool:
 
 def _channel_ban_note(tag: str, verdict: str, now: float) -> None:
     """记一次模型层实测结论；当天样本全 quota 就给这条线写 ban_hold_until。"""
+    # CF/usque 是直连 WARP 隧道池，没有可换的落地节点，锁它等于把直连出口
+    # 白关到 08:00 —— 主人定性「永远都不能禁掉」。CF 的 quota 是 WARP 账号
+    # 级配额，锁线不解决配额，只会把池子打空。已有锁也一并清掉。
+    if tag.startswith("WARP-CF"):
+        st = _warp_line_state(tag)
+        if st.get("ban_hold_until") or st.get("ban_probes") or st.get("stop_probe"):
+            _warp_line_update(tag, ban_hold_until=0.0, ban_probes=[],
+                              stop_probe=False, ban_noaddr_since=0.0)
+            _save_warp_line_state()
+        return
     if not _warp().get("channel_ban_hold_enabled", True):
         # 总闸关掉后把锁解除：留着等于「关了还在锁」。但**不能清 ban_hold_home**
         # —— 那是有线在临时 colo 上的唯一记录，清了这条线就永远回不去了。
@@ -4868,6 +4895,7 @@ def _node_rotation_pass(now: float | None = None) -> None:
                         f"（第 {_NODE_FAILS[tag]['n']} 轮观察，第 3 轮确认）")
                     continue
                 _NODE_FAILS[tag]["why"] = "节点 TCP 通但拿不到出口地址(UDP 不通)"
+                _record_udp_bad_node(cur, now)
             else:
                 # 节点通、出口也有：这条线是健康的，把上一轮的观察计数清掉。
                 # 不清的话，一次「TCP 通但没出口」留下的 n=1 会一直躺着，下一

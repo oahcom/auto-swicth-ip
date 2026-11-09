@@ -510,8 +510,24 @@ def probe_node_tcp(node: dict, timeout: float = 6.0,
                 proc.kill()
 
 
+def udp_bad_nodes_path() -> Path:
+    """实际 WARP 握手失败（TCP 通但拿不到出口）的节点台账，由 daemon 写。"""
+    return PROJECT / ".warp" / "udp_bad_nodes.json"
+
+
+def load_udp_bad_nodes() -> set[str]:
+    try:
+        data = json.loads(udp_bad_nodes_path().read_text())
+    except (OSError, ValueError):
+        return set()
+    if isinstance(data, dict):
+        return {str(k) for k, v in data.items()
+                if isinstance(v, dict) and v.get("ok") is False}
+    return set()
+
+
 def udp_capable(nodes: list[dict], probe: bool = False) -> list[dict]:
-    """**已废弃的 STUN 判据，现在只做原样透传。**
+    """过滤掉**实测握手失败**的节点。
 
     历史：这里曾用临时 sing-box 向 162.159.207.0:3478 发 STUN，结论落
     `.warp/wg_node_udp.json` 缓存 6h。它是错的 —— WARP 走 2408，节点完全可以
@@ -519,11 +535,15 @@ def udp_capable(nodes: list[dict], probe: bool = False) -> list[dict]:
     WARP-WG-5 正在正常出 v6 流量（colo=NRT）。缓存里 228 条有 192 条记成
     False，`apply()` 据此把 22 条渠道砍到 8 条，v4 合并块直接清空。
 
-    节点能否承载 WARP 只能靠**实际握手**验证：`apply()` 之后每条线跑一次
-    出口探测（`_trace_fields`），daemon 的同块轮回守护也在持续做这件事。
+    节点能否承载 WARP 只能靠**实际握手**验证：daemon 的同块轮回守护探到
+    「TCP 通但拿不到出口地址(UDP 不通)」时把节点写进 `.warp/udp_bad_nodes.json`，
+    这里据此排除。未测过的不拦（旧 STUN 误伤教训）。
     `probe` 参数保留只为不破坏调用方签名，传什么都不影响结果。
     """
-    return list(nodes)
+    bad = load_udp_bad_nodes()
+    if not bad:
+        return list(nodes)
+    return [n for n in nodes if n.get("tag") not in bad]
 
 
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
