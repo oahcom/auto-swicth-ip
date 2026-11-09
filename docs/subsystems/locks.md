@@ -102,7 +102,9 @@
 保留的只有清理：`_trim_quarantine_locked` 在加载状态表时把盘上遗留的
 `quota_until` / `quota_ip` 清零，免得旧字段误导读方。
 
-`quota_hold_enabled`（**全局**额度闸）仍是 `False`，与原状一致。
+全局额度闸 `quota_hold_enabled` / `_QUOTA_HOLD` 也已删除（2026-11-09，
+主人裁定配额按出口 IP 计、重启换 IP 永远有效，详见 INCIDENTS.md INC-012
+更正段）。防白烧由本节的渠道锁与第五节的小时配额承担。
 
 ---
 

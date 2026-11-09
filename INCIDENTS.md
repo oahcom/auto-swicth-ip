@@ -690,3 +690,16 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
   「quota/惩罚期/429」类线，短 Retry-After 与隧道半死照常处理。
 - 效果：改动前 30 分钟重启 253 次，改动后同口径 2 次。
 
+### 更正（2026-11-09）：`_QUOTA_HOLD` 的理论被证伪，机制已删除
+
+主人裁定：**不同 IP 的额度是不一样的，重启就是为了换 IP**——配额按出口 IP
+计（与 INC-005/INC-008 红线一致），重启线 = 拿新出口地址 = 新配额。
+「长 Retry-After 的 quota 是账号级时间窗、换出口改不了结论」这个立论错误；
+当年 1711 条 quota 解禁时刻集中在 08:00、换址后 98.4% 仍判 quota 的观测，
+正确解释是**当日可达 IP 池的配额整体耗尽**（等每日重置才恢复），不是账号
+级窗口。全池同烧的场景由**渠道锁**（`channel_ban_hold`，按线判「当天实测
+全 quota」）承担，它是按证据按线锁，比全局时间窗正确。
+
+处置：`_QUOTA_HOLD_UNTIL` / `_quota_hold_skips` / `quota_hold_enabled` 配置项
+及对应测试全部删除；quota 与惩罚期路径照常重启刷 IP。
+

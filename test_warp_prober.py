@@ -228,84 +228,39 @@ def _stub_probe(monkeypatch, verdict="quota"):
     monkeypatch.setitem(daemon._PROBE_LAST_VERDICT, "W2", verdict)
 
 
-def test_long_quota_hold_blocks_quota_restart(monkeypatch):
-    """长 Retry-After 的 quota 是账号级时间窗，换 IP 改不了结论。
+def test_quota_verdict_restarts_line_for_fresh_ip(monkeypatch):
+    """quota(429) 照常重启该线：重启 = 换出口地址 = 新 IP 的独立配额。
 
-    实测（2026-10-28）：1711 条 quota 结论反推的解禁时刻全部落在 08:00:03
-    ±3 分钟内；换址后首探 1495/1519（98.4%）仍判 quota。此时重启隧道只是
-    换一个同样耗尽的地址，换来 190 次/分的重启风暴。
+    2026-11-09 主人裁定：「长 Retry-After 的 quota 是账号级时间窗」是错误
+    理论 —— 不同 IP 的额度不一样，换 IP 永远有效。旧的全局额度闸
+    （_QUOTA_HOLD，按 Retry-After 时长冻结所有线的重启）已删除；
+    刷不出干净地址的线由渠道锁（当天实测全 quota）按线冷却。
     """
-    _stub_probe(monkeypatch)
-    monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
-    restarted = []
-    monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
-    daemon._probe_one_line(_member())
-    assert restarted == [], \
-        "额度闸开着仍重启 quota 线 —— 换 IP 不能让账号级配额提前恢复"
-
-
-def test_quota_hold_also_blocks_penalty_restart(monkeypatch):
-    """quota 把新地址写进台账后，别的线会走「惩罚期」路径继续重启同一轮风暴。
-
-    实测两条路径在 190 次/分里各占一半（模型层 quota 2383 / 出口处于惩罚期
-    1316 次重启后首探仍 quota），故闸必须同时覆盖两者。
-    """
-    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "1.1.1.1")
-    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: True)
-    monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
-    restarted = []
-    monkeypatch.setattr(daemon, "_warp_line_restart",
-                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
-    daemon._probe_one_line(_member())
-    assert restarted == [], \
-        "额度闸只拦了 quota 路径，惩罚期路径仍在重启 —— 同一轮风暴从另一半漏过去"
-
-
-def test_quota_hold_does_not_block_tunnel_death_restart(monkeypatch):
-    """额度闸只拦「换地址」这一类，隧道半死照常重启。
-
-    半死 = 进程还在（端口开着）、上游取不到地址。
-    端口关着的那种是进程死了，交给 systemd 的 Restart=always。
-    """
-    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
-    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: None)
-    monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", time.time() + 3600)
-    with daemon._WARP_LINE_CV:
-        daemon._warp_line_state_locked("W2").update(
-            fail_streak=daemon._UNKNOWN_RESTART_STREAK)
-    monkeypatch.setattr(daemon, "_port_open", lambda port: True)
+    _stub_probe(monkeypatch, verdict="quota")
     restarted = []
     monkeypatch.setattr(daemon, "_warp_line_restart",
                         lambda m, r, **kw: restarted.append(m["tag"]) or True)
     daemon._probe_one_line(_member())
     assert restarted == ["W2"], \
-        "额度闸把隧道半死的自愈路径也挡了 —— 那是地址没了，不是配额没了"
+        "quota 线没有重启 —— 换出口 IP 即新配额，这是免费额度的唯一来源"
 
 
-def test_model_probe_opens_hold_only_for_long_quota(monkeypatch):
-    """只有长 Retry-After 的 quota 开闸；短冷却与 403 不开。"""
-    monkeypatch.setattr(daemon, "_probe_cache_get", lambda tag, ip: "")
-    monkeypatch.setattr(daemon, "_probe_cache_put", lambda *a, **k: True)
-    monkeypatch.setattr(daemon, "_warp_probe_blind", lambda now=None: False)
-    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: False)
-    monkeypatch.setattr(daemon, "_mark_warp_ip_used", lambda *a, **k: None)
-    # `quota_hold_enabled` 默认是 False（2026-10-28 主人要求关闭）。这条用例
-    # 测的是「闸一旦启用，只有长 Retry-After 的 quota 才开」这条判据本身，
-    # 所以要把开关显式打开 —— 否则断言的是配置，不是逻辑。
-    monkeypatch.setitem(daemon.CFG["warp"], "quota_hold_enabled", True)
-    monkeypatch.setitem(daemon.CFG["warp"], "quota_hold_min_sec", 1800)
-    import probe_warp
+def test_penalty_path_restarts_line_for_fresh_ip(monkeypatch):
+    """台账判脏（惩罚期）的线照常重启换地址；防白烧由渠道锁按线承担。
 
-    for verdict, retry, expect in [("quota", 7200, True), ("quota", 20, False),
-                                   ("flagged", 7200, False)]:
-        monkeypatch.setattr(daemon, "_QUOTA_HOLD_UNTIL", 0.0)
-        monkeypatch.setattr(probe_warp, "probe",
-                            lambda *a, _v=verdict, _r=retry, **k: (_v, 0, "", _r))
-        daemon._warp_model_usable(_member(), "1.1.1.1")
-        held = daemon._QUOTA_HOLD_UNTIL > time.time()
-        assert held is expect, f"{verdict}/{retry}s 开闸结果 {held}，应为 {expect}"
+    旧的「额度闸拦惩罚期路径」已删除：那会把所有线一起冻到 Retry-After
+    到期，白白放弃换 IP 的新配额。
+    """
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "W1")
+    monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "1.1.1.1")
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: True)
+    monkeypatch.setattr(daemon, "_line_node_cannot_carry", lambda tag: False)
+    restarted = []
+    monkeypatch.setattr(daemon, "_warp_line_restart",
+                        lambda m, r, **kw: restarted.append(m["tag"]) or True)
+    daemon._probe_one_line(_member())
+    assert restarted == ["W2"], \
+        "惩罚期路径不再重启 —— 全局闸删除后这条路径必须照常换地址"
 
 
 def test_restart_clears_warming_when_busy_check_raises(monkeypatch):
@@ -518,7 +473,6 @@ def test_penalty_restart_skipped_when_line_never_got_egress(monkeypatch):
     WG-4 停在 rank 1 节点上每 8~10 秒重启一次，日志刷满「出口处于惩罚期」。
     """
     monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now: True)
-    monkeypatch.setattr(daemon, "_quota_hold_skips", lambda t, r: False)
     monkeypatch.setattr(daemon, "_warp_model_usable", lambda *a, **k: True)
     monkeypatch.setattr(daemon, "_probe_rate_allow", lambda: True)
     monkeypatch.setattr(daemon, "warp_egress_ip", lambda port: "203.0.113.9")

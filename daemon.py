@@ -5480,7 +5480,11 @@ def _probe_one_line(member: dict) -> None:
             # 选出备线 —— 这条路径根本没问过节点能不能承载。
             # 换节点交给同块轮回（它有自己的两轮判死节流），这里只是别重启。
             return
-        elif not _quota_hold_skips(tag, "出口处于惩罚期"):
+        else:
+            # 惩罚期重启 = 换出口地址 = 新 IP 的新配额（2026-11-09 主人裁定：
+            # 不同 IP 的额度不一样，重启换 IP 永远有效）。防白烧由渠道锁
+            # （channel_ban_hold，按线判「当天实测全 quota」）与每小时重启
+            # 上限承担，不再有全局时间窗闸。
             _warp_line_restart(member, "出口处于惩罚期")
         return
     if _warp_probe_blind(now):
@@ -5513,21 +5517,11 @@ def _probe_one_line(member: dict) -> None:
         return
     if tag == active:
         _reconnect_warp_now(f"探测失败 {verdict}", time.time())
-    elif verdict != "quota" or not _quota_hold_skips(tag, f"模型层 {verdict}"):
+    else:
+        # quota(429) 也重启：换出口地址 = 换一个有独立配额的新 IP
+        # （2026-11-09 主人证伪「账号级时间窗」理论，见 INCIDENTS.md INC-012 更正）。
+        # 刷不出干净地址的线由渠道锁（当天全 quota）自行冷却。
         _warp_line_restart(member, f"模型层 {verdict}")
-
-
-def _quota_hold_skips(tag: str, reason: str) -> bool:
-    """额度闸生效中时，跳过「换个出口地址」这一类重启。
-
-    长 Retry-After 的配额是账号级时间窗，换出口改不了结论，而重启后新地址
-    也会被判 quota 并写进 block 台账 —— 于是「惩罚期」路径再把其余线一轮轮
-    重启，实测 190 次/分。隧道半死（拿不到出口地址）不走这里。
-    """
-    if time.time() >= _QUOTA_HOLD_UNTIL:
-        return False
-    log(f"  · {tag} 额度闸生效中，跳过重启（{reason}）")
-    return True
 
 
 # 单元是否在跑的缓存：{单元名: (是否在跑, 检查时刻)}。
@@ -6075,13 +6069,6 @@ _WARP_PROBE_BLIND_SEC = 120.0
 # 低于这个数时 all(unreachable) 对单条恒真 —— 一次瞬断就锁死 120s 实测。
 _WARP_PROBE_BLIND_MIN_BATCH = 3
 _probe_blind_until: float = 0.0
-# 账号级额度闸的开闸时刻。Retry-After 很长的 quota 是账号时间窗，不是出口 IP
-# 被拦 —— 实测 1711 条 quota 反推的解禁时刻都落在 08:00:03±3 分钟，且换址后
-# 首探 1495/1519（98.4%）仍判 quota。此时重启隧道只会换个同样耗尽的地址，
-# 换来 190 次/分的重启风暴。只拦「换地址」这一动作，隧道半死照常重启。
-_QUOTA_HOLD_UNTIL: float = 0.0
-# ponytail: 闸只存内存，daemon 重启即清零（下一个 quota 结论会立刻重开）。
-# 天花板：重启瞬间可能多重启几轮。升级路径：并进 _warp_line_state 落盘。
 # 各线最近一次探测结论，供 `_note_probe_batch` 判断「整批」而非单条。
 _PROBE_LAST_VERDICT: dict[str, str] = {}
 
@@ -6598,7 +6585,6 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     w = _warp()
     if not w.get("refresh_model_check", True):
         return True
-    global _QUOTA_HOLD_UNTIL
     tag = member["tag"]
     if _warp_ip_is_blocked(ip):
         # 台账（403/429 惩罚期）已经判这个地址脏，再探一次只是把同一个结论
@@ -6681,12 +6667,9 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
     _PROBE_LAST_VERDICT[tag] = verdict
     ok = verdict == "OK"
     # 只有 quota(429) 的 Retry-After 会写进惩罚期；403 带限流头不算。
+    # Retry-After 不再触发任何全局冻结：配额按出口 IP 计，换地址即新配额
+    # （2026-11-09 主人裁定，详见 INCIDENTS.md INC-012 更正段）。
     retry_after = retry_after if verdict == "quota" else None
-    # quota_hold_enabled=false 时永不写 _QUOTA_HOLD_UNTIL：账号级配额不恢复也照样
-    # 换地址。（2026-10-28 按主人要求默认关闭；要恢复保护把配置改回 true 即可。）
-    if (retry_after and _warp().get("quota_hold_enabled", True)
-            and retry_after >= int(_warp().get("quota_hold_min_sec", 1800))):
-        _QUOTA_HOLD_UNTIL = max(_QUOTA_HOLD_UNTIL, time.time() + retry_after)
     hint = (f"（Retry-After {retry_after / 3600:.1f}h）"
             if retry_after and retry_after > 0 else "")
     log(f"  {'✓' if ok else '✗'} {tag} 出口 {ip} 模型层: {verdict}{hint}"
