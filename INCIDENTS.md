@@ -884,3 +884,31 @@ pytest 935 passed。详见 `~/.9router/docs/incident-20261109-transport-503-and-
   修复的线未在 600s 冷却内被重复选中。502 在三处清零（本机 20:00 后 0，之前 13 条
   全是 VPS 宕机前/中的 252s 旧模式）；503 全为 combo 中间态，被三模型轮转吸收，不达
   客户端。`_opencode_lane_alive` 假阳性仍未改，先观测再决定。
+
+
+## INC-017 — 本地渠锁虚高：H2-SCAN 残留线 + sing-box 旧进程未重载（2026-11-09）
+
+### 现象
+订阅对齐到 247 节点后，本地状态行仍 `节点=170 dead=103 渠锁=48线→08:00`，
+而 VPS `节点=245 dead=133 渠锁=10线`。同样节点/线，本地被锁满。
+
+### 根因
+1. `.warp_line_state.json` 残留 48 条 `WARP-H2-SCAN-*` 旧探测线，全部
+   `ban_hold_until=08:00 + stop_probe=True`，且 `ban_probes=0`（没真实样本
+   也被锁）。VPS 状态文件里没有这些 SCAN 线。它们虚增渠锁计数，还因
+   `stop_probe` 挡住探测，导致 dead 虚高。
+2. sing-box 主进程（pid 6730）跨多次 asip 重启存活（`KillMode=process`），
+   订阅刷新的「热重载」虽回 204，但 Clash selector `all` 仍 170，旧进程没
+   真正加载新配置。
+
+### 处理
+- 从 `.warp_line_state.json` 删除 48 条 `WARP-H2-SCAN-*`，清掉其余线的
+  `ban_hold_until/stop_probe/ban_probes`。
+- kill 旧 sing-box 主进程后重启 asip，由 asip 重新拉起 sing-box。
+- 对账结果：Clash `proxy` selector `all` 170 → 247；状态行 `渠锁=无 dead=0`。
+
+### 教训
+- 渠锁计数来自内存 `_WARP_LINE_STATE`，SCAN 类残留线会污染计数且挡探测；
+  旧探测脚本写状态后必须清理自己的 SCAN 线。
+- sing-box 热重载（PUT /configs?force=true）回 204 不等于 selector 已更新；
+  旧进程存活时需要 kill + 让 asip 重拉，才能真对账。
