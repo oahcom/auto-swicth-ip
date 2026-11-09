@@ -572,6 +572,12 @@ CFG = {
         # 全局重启节流（条/分钟，0=关）。单线上限管不住 19 条线叠加：
         # 2026-10-28 19:36~20:08 实测 10028 次重启 / 125 分钟。
         "restart_max_per_minute": 0,
+        # 「重启后仍处惩罚期」熔断：连续 N 次重启仍 quota 就停 hold 秒。
+        # 2026-11-09 夜里配额普遍耗尽时把一条条线全熔断，池子被打空，
+        # 主人定性「非常愚蠢」。设 ASIP_RESTART_IP_STUCK_FUSE=0 表示禁用
+        # （代码用 max(2,...)，0 仍会变 2，故用极大值 999999 禁用）。
+        "restart_ip_stuck_fuse": _env_int("ASIP_RESTART_IP_STUCK_FUSE", 3),
+        "restart_ip_stuck_hold_sec": _env_int("ASIP_RESTART_IP_STUCK_HOLD_SEC", 900),
         # 同时在飞的重启数。每条 quota/blocked 线都要「重启换地址 → 等就绪 →
         # 重探」，这个闸才是现在的真正吞吐瓶颈：4 槽 × 一次 3~5s ≈ 20~40 条/分钟。
         # 12 是折中：16 条同时注册会撞 Cloudflare 的 ~9 台/窗口限流，吃 429 后
