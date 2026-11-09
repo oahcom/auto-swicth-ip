@@ -703,3 +703,38 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
 处置：`_QUOTA_HOLD_UNTIL` / `_quota_hold_skips` / `quota_hold_enabled` 配置项
 及对应测试全部删除；quota 与惩罚期路径照常重启刷 IP。
 
+## INC-013 — 传输层故障也要能换线：新增 `reason=transport`（2026-11-09）
+
+### 现象
+
+9router 的 opencode 免费层请求在出口故障时直接给客户端 503，换线发生在**客户端
+拿到 503 之后**，等于这次请求白费。10:23 那批：
+
+- 10:23:07 起 WARP-CF-B 上的请求连续 20 s 拿不到响应头
+- 10:23:39 daemon 才判该出口失败，10:23:40 切到 WARP-WG-8，10:24:01 恢复
+- 期间 9router 侧已经走完「20s 超时 → 原出口重连 → 再 20s 超时 → 503」
+
+同一时段还有更隐蔽的一类：sidecar 退役时 30 s 强杀，把同进程里**健康**的
+SSE 长流一并截断（正常流实测 140–242 s），用户看到的是「字节流传输中断」。
+
+### 结论
+
+- 「换线」有两个消费者：daemon 自己的判死循环（定时/探测驱动），和 9router 的
+  请求路径（请求驱动）。后者原来只有 429/403 两个入口，**传输层故障（无首字节
+  超时、连接建立失败）没有入口** —— 于是它在旧出口上重试一次，然后把 503 甩给
+  客户端，而此刻 daemon 还没判死那条线。
+- `transport` 不是封禁证据：它说明这条线连不上，不说明这个地址被上游拉黑。
+  因此必须 `interrupt=false`（不掐在途连接）且**不进 blocked 台账** —— 池里
+  119/170 节点已 dead，经不起把干净地址误记成烧过的。
+
+### 处理
+
+- `_REASON_WHITELIST` 增加 `transport`；`timeout` / `stall` 归一化到 transport。
+- transport 走「只切 selector」路径：不快照 429/403 的记脏
+  （`_mark_warp_ip_used(..., blocked=True)` 跳过），不主动断在途连接。
+- 实测：`{"ok":true,"switched":true,"tag":"WARP-CF","closed":0}`，
+  daemon 日志记 `↻ WARP 换线 (transport)`；`closed=0` 就是「没掐在途连接」的证据。
+- 9router 侧配套（换线后限一次重放、退役 sidecar 不再强杀、连接超时也走这条路）
+  见 `~/.9router/docs/incident-20261109-transport-503-and-stream-cut.md`
+  （commit `faf4ce90` / `f6f4ce5e`，本文对应 `001ae9e`）。
+

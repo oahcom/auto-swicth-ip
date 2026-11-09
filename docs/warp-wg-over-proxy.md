@@ -392,6 +392,13 @@ sing-box。**订阅一旦配回来，这一步会被 `parse_subscription.py` 自
 （`proactive` 除外）。修复后同样 10 次轮换落到 WG-5/6/7/9、CF-D、WG-4/15
 共 7 条不同线。
 
+> **2026-11-09 例外：`transport` 也不拉黑。** 该 reason 由 9router 在「连响应头
+> 都建不起来」时调用（`INC-013`），它说明这条线连不上，不说明这个地址被上游
+> 封了。按 429/403 那样写 `blocked` 台账，会把一个其实干净、只是抖动的地址
+> 永久踢出候选池 —— 池里 119/170 节点已 dead，经不起这种误伤。所以
+> transport 只切 selector：`interrupt=false`、不写 `blocked`，实测响应
+> `closed:0`。
+
 同时发现 `tests/test_rotate.py` 仍在 monkeypatch 已删除的 `_rotate_pick` /
 `_finalize_warp_switch` / `_close_line_conns_now`，**这条路径早就没有回归覆盖**
 —— 这才是缺陷能溜进主干的直接原因。已按当前实现重写（合并窗口、限速、
