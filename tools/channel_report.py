@@ -27,6 +27,7 @@ import ipaddress
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -61,6 +62,30 @@ COLO_FALLBACK = {
 }
 # ipv6_segments.colo_of() 里几个值不是落地机房，是地址段批次。
 PSEUDO_COLO = {"CF": "CF 直连", "CFB": "CF 直连", "OLD": "旧批次", "UNKNOWN": "未知"}
+
+
+def _unit_states(tags: dict[str, str]) -> dict[str, bool]:
+    """成员 tag → 对应 systemd 单元此刻是否在跑（与 daemon 同一口径）。
+
+    WHY 报表要亲自查：config.py 的 members 是**声明**不是**在跑**。2026-11-09
+    本地 usque-warp-c/e/f/g/h/i 六个单元根本没装，状态表里冻着删单元那天的
+    quota / 无地址，报表照印就成了「这条线配额耗尽」—— 真实原因是「这条线
+    根本不存在」。三种故障的处置完全不同，不能共用一句历史结论。
+
+    查不到（systemctl 缺失/超时）按在跑处理：宁可漏标，也不能把整张表打成
+    「全部停用」。
+    """
+    svcs = sorted({v for v in tags.values() if v})
+    if not svcs:
+        return {}
+    try:
+        r = subprocess.run(["systemctl", "is-active", *svcs],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {x: True for x in svcs}
+    states = r.stdout.strip().splitlines()
+    return {x: (i < len(states) and states[i].strip() == "active")
+            for i, x in enumerate(svcs)}
 
 
 def _tier_disabled() -> set[str]:
@@ -393,6 +418,9 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
     idx = source_index(sources)
     colos = colo_ban_rates(hours * 3600, now)
     segs = segments or {}
+    svc_of = {m.get("tag"): m.get("service")
+              for m in CFG["warp"]["members"] if m.get("tag")}
+    units = _unit_states(svc_of)
     rows = []
     for tag, meta in chans.items():
         st = state.get(tag) or {}
@@ -470,6 +498,9 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             # 只印 `无地址` 的话，端口没监听、节点域名解析失败、隧道被打断
             # 三种故障在报表上完全一样，而处置动作完全不同。
             "egress_error": st.get("egress_error") or "",
+            # 单元此刻在不在跑。为 False 时上面那些 quota/无地址/取址失败一律
+            # 是停用前冻住的旧值，两个视图都只印这一条。
+            "unit_ok": units.get(svc_of.get(tag), True),
             "window_from": cutoff,
         })
     rows.sort(key=lambda r: (r["carrier"] or "", r["colo"], r["tag"]))
@@ -742,15 +773,19 @@ def print_table(rows: list[dict], hours: float) -> None:
         flags = []
         if r["tag"] in tier_off:
             flags.append("档位停用")
-        if r["held"]:
+        if not r.get("unit_ok", True):
+            # 主因，且**独占**：单元没在跑时，状态表里的 quota / 无地址 /
+            # 取址失败全是停用前冻住的旧值，同时印出来会让人以为是配额问题。
+            flags.append("单元停用（线没跑）")
+        elif r["held"]:
             flags.append(f"锁定至{_fmt_ts(r['hold_until'])}")
-        if r["quota_until"] > time.time():
+        elif r["quota_until"] > time.time():
             flags.append(f"配额至{_fmt_ts(r['quota_until'])}")
-        if r["no_addr_since"]:
+        elif r["no_addr_since"]:
             flags.append("无地址")
-        if r.get("egress_error"):
+        elif r.get("egress_error"):
             flags.append(f"取址失败:{r['egress_error']}")
-        if not flags:
+        else:
             # 窗口内一条样本都没有 → `last_verdict` 是**旧的**，不能当成
             # 现在的结论印出来。WARP-CF-C/G/H/I 的单元 2026-10-28 缩容时
             # 就删了（`is-enabled` 返回 not-found），prober 早已用
@@ -916,13 +951,15 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
     body = []
     for r in rows:
         pills = []
-        if r["held"]:
+        if not r.get("unit_ok", True):
+            pills.append('<span class="pill hold">单元停用（线没跑）</span>')
+        elif r["held"]:
             pills.append(f'<span class="pill hold">锁定至 {_fmt_ts(r["hold_until"])}</span>')
-        if r["quota_until"] > time.time():
+        elif r["quota_until"] > time.time():
             pills.append(f'<span class="pill quot">配额至 {_fmt_ts(r["quota_until"])}</span>')
-        if r["no_addr_since"]:
+        elif r["no_addr_since"]:
             pills.append('<span class="pill quot">无出口地址</span>')
-        if not pills:
+        else:
             # 与 CLI 表同一口径（见 `print_table`）：窗口内没有样本时
             # `last_verdict` 是**旧值**，不能当成当前结论印出来。HTML 之前
             # 漏了这层保护，同一份数据两个视图给出不同结论。

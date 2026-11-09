@@ -2813,6 +2813,33 @@ def _load_tier_disabled() -> set[str]:
 
 _TIER_DISABLED: set[str] = _load_tier_disabled()
 
+
+def _tier_mtime() -> float:
+    try:
+        return warp_blocks.map_path().with_name("tiers.json").stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+_TIER_MTIME: float = _tier_mtime()
+
+
+def _refresh_tier_disabled() -> bool:
+    """tiers.json 变了就重算停用集合，返回「是否变了」。
+
+    此前 _TIER_DISABLED 是 import 期常量：改档位不重启 daemon 就永不生效，
+    而 _tier_reconcile 又只在启动时跑一次 —— 于是「tiers.json 写着 h2-only、
+    WG 单元还在跑还在探」可以一直持续到下次重启。档位是运维动作，必须热生效。
+    """
+    global _TIER_DISABLED, _TIER_MTIME
+    mt = _tier_mtime()
+    if mt == _TIER_MTIME:
+        return False
+    _TIER_MTIME = mt
+    _TIER_DISABLED = _load_tier_disabled()
+    log(f"  · 档位变更：停用 {len(_TIER_DISABLED)} 条 WG 线")
+    return True
+
 def _line_enabled(member: dict) -> bool:
     """该成员在当前档位下是否应当运行。非 WG 成员永远为真。"""
     return member.get("tag") not in _TIER_DISABLED
@@ -3585,15 +3612,17 @@ def _channel_ban_hold_hit(samples: list, now: float) -> bool:
 def _channel_ban_note(tag: str, verdict: str, now: float) -> None:
     """记一次模型层实测结论；当天样本全 quota 就给这条线写 ban_hold_until。"""
     # CF/usque 是直连 WARP 隧道池，没有可换的落地节点，锁它等于把直连出口
-    # 白关到 08:00 —— 主人定性「永远都不能禁掉」。CF 的 quota 是 WARP 账号
-    # 级配额，锁线不解决配额，只会把池子打空。已有锁也一并清掉。
-    if tag.startswith("WARP-CF"):
+    # 白关到 08:00 —— 主人定性「永远都不能禁掉」。所以 CF 只是**不写锁**，
+    # 不豁免采样：早先这里直接 return，ban_probes 从此不再增长，报表显示
+    # 「无样本」，而 last_verdict 还停在锁之前那次的 quota —— 两个字段互相
+    # 矛盾，读起来就是「原因标错了」。样本照记，末尾跳过写锁。
+    cf_direct = tag.startswith("WARP-CF")
+    if cf_direct:
         st = _warp_line_state(tag)
-        if st.get("ban_hold_until") or st.get("ban_probes") or st.get("stop_probe"):
-            _warp_line_update(tag, ban_hold_until=0.0, ban_probes=[],
-                              stop_probe=False, ban_noaddr_since=0.0)
+        if st.get("ban_hold_until") or st.get("stop_probe"):
+            # 只清锁，不清 ban_probes：那是报表唯一的样本来源。
+            _warp_line_update(tag, ban_hold_until=0.0, stop_probe=False)
             _save_warp_line_state()
-        return
     if not _warp().get("channel_ban_hold_enabled", True):
         # 总闸关掉后把锁解除：留着等于「关了还在锁」。但**不能清 ban_hold_home**
         # —— 那是有线在临时 colo 上的唯一记录，清了这条线就永远回不去了。
@@ -3615,6 +3644,14 @@ def _channel_ban_note(tag: str, verdict: str, now: float) -> None:
         # 同结论的相邻段并起来，所以这里不需要先展开再压回去。
         samples.append([now, now, 1, str(verdict)])
         _channel_ban_trim(samples, now)
+        # CF 直连永不写锁：配额是账号级的，锁线既不解配额也没有可换的落地
+        # 节点（_rehome_held_lines 对 CF 是空操作），只会把直连出口关掉。
+        if cf_direct:
+            if _channel_ban_held(tag, now):
+                st["ban_hold_until"] = 0.0
+                st["stop_probe"] = False
+                _save_warp_line_state()
+            return
         # 只看「当前仍在锁定中」：过期的 ban_hold_until 必须能重新锁上，
         # 否则渠道在前一天锁过之后永远不再锁（字段留着非零值，条件恒真）。
         if _channel_ban_held(tag, now) or not _channel_ban_hold_hit(samples, now):
@@ -3874,6 +3911,9 @@ def _rehome_held_lines(now: float | None = None) -> None:
         home = st.get("ban_hold_home")
         want = st.get("ban_hold_node")
         member = _warp_member(tag)
+        if member and not _line_enabled(member):
+            # 档位外的线不重定位：重定位会写节点配置，解禁后带着改过的绑定回来。
+            continue
         if member and member.get("backfill_for"):
             # 补位渠道的位置是**指定**的（ban 率最低的那个 colo）：让它走
             # 重定位会把它搬离补位目标，补位就名存实亡。
@@ -4820,6 +4860,10 @@ def _node_rotation_pass(now: float | None = None) -> None:
         if tag == active:
             continue                      # 当前出口不换节点（会掐断在途）
         bf = _warp_member(tag)
+        # 档位外的线不换节点：_rehome_one 会写配置 + 改台账，重启虽被最后
+        # 一道闸拦住，绑定已经被改掉了 —— 解禁回来就是一条跑偏的线。
+        if bf and not _line_enabled(bf):
+            continue
         if bf and bf.get("backfill_for"):
             # 补位渠道的落地节点是补位目标本身（ban 率最低的那个 colo），
             # 换个节点就补错地方了；它坏了由 `_backfill_open` 重开。
@@ -5772,7 +5816,10 @@ def _probe_one_line(member: dict) -> None:
     # 渠道锁的样本只认地址级持久结论（quota/flagged），与台账同一口径。
     # OK 也入账：它是「这条渠道还能出 OK」的唯一证据，而当天样本只要出现一条
     # 非 quota 就不再锁（`_channel_ban_hold_hit`）。
-    if verdict == "OK" or verdict in _WARP_PROBE_PERSISTENT:
+    # blocked 必须入账：它是「这个地址已被判惩罚期」，与 quota 同属地址级结论。
+    # 漏掉它时 CF 线（结论几乎全是 blocked）的 ban_probes 永远为空，报表印
+    # 「无样本」而 last_verdict 仍是上一次的 quota —— 就是主人说的「原因标错」。
+    if verdict == "OK" or verdict in _WARP_PROBE_PERSISTENT or verdict == "blocked":
         _channel_ban_note(tag, verdict, time.time())
     if verdict == "OK":
         # 真拿到 OK 就把熔断与计数一起清掉：线已经好了，没有理由继续压着它。
@@ -5915,6 +5962,10 @@ def _warp_prober_loop() -> None:
         due: list[tuple[float, dict]] = []
         for m in _probe_targets(now):
             tag = m["tag"]
+            # 档位外的线不探：单元可能还在跑（改档位没重启、reconcile 漏停），
+            # 单元判据看不出来；用档位判据兜一道，别让停用线继续烧探测与日志。
+            if not _line_enabled(m):
+                continue
             if not _warp_member_unit_running(m, now):
                 continue
             with _WARP_LINE_CV:
@@ -7116,6 +7167,13 @@ def _dirty_line_janitor() -> None:
     （每条线每轮一次探测），不是调度周期。
     """
     while True:
+        try:
+            # 档位是运维动作：tiers.json 一变就重算停用集合并双向对账，
+            # 别等到下次重启才生效（此前改档位对运行中的 daemon 完全无效）。
+            if _refresh_tier_disabled():
+                _tier_reconcile()
+        except Exception as e:
+            log(f"✗ 档位热更新异常: {e}")
         try:
             # 先换节点、再刷 IP：节点本身死了的话，后面的出口探测必然失败，
             # 白等一轮超时；换到活的节点后同一轮就能继续判 IP 质量。
@@ -11371,23 +11429,51 @@ def _start_rotate_server() -> None:
     log(f"⇄ rotate 接口就绪: {path}")
 
 
-def _tier_reconcile() -> None:
-    """启动时按档位**停掉**不该跑的 WG 单元。
+_TIER_STALE_KEYS = ("ip_ts", "last_ok_ts", "last_probe_ts", "quota_until",
+                    "ban_noaddr_since", "next_probe_ts", "restart_ts",
+                    "next_restart_ts", "rebind_ts")
 
-    `_TIER_DISABLED` 此前只做「不重启」：远端从旧拓扑 pull + restart 之后，
-    22 条 WG 单元仍在跑，`tiers.json` 写着 `wg: ""` 也拦不住 —— 文件对、
-    实际不对，而多跑的线不报任何错，只在内存和 CF 配额上悄悄多花。
 
-    只停**档位明确排除**的、且 members 里声明过的线：补位池（line23+）与
-    档位无关，不在这个集合里。停用不 disable、不删单元，`systemctl start`
-    随时回来，与设计文档「切换 = 停单元，不删设备」一致。
+def _reset_stale_after_tier(tag: str) -> None:
+    """一条线从档位停用里被拉起：清掉停用期间冻住的观测。
+
+    WHY 必须清：停用期间不探测，fail_streak 停在停用前那一刻（实测有上千
+    次的），last_verdict / ip / quota_until 说的都是**上一个会话的地址**。
+    带着这些回池子，第一轮探测就按旧结论判死 → 重启风暴 → 又被渠道锁，
+    等于「解禁即炸」。
     """
-    if not _TIER_DISABLED:
-        return
-    stopped = 0
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        st["last_verdict"] = ""
+        st["fail_streak"] = 0
+        st["ip"] = None
+        st["last_ok_ip"] = None
+        for k in _TIER_STALE_KEYS:
+            st[k] = 0.0
+        st["ban_hold_until"] = 0.0
+        st["ban_probes"] = []
+        st["stop_probe"] = False
+        st["ban_noaddr_since"] = 0.0
+    _save_warp_line_state(force=True)
+
+
+def _tier_reconcile() -> None:
+    """按档位对齐 WG 单元：档位外的停掉，档位内但没在跑的拉起来。
+
+    此前只做「停」：远端从旧拓扑 pull + restart 之后，22 条 WG 单元仍在跑，
+    `tiers.json` 写着 `wg: ""` 也拦不住 —— 文件对、实际不对。反过来「解禁」
+    也只是改文件，单元照旧停着，整套 WG 一条线都没回来。两个方向都要对账。
+
+    只碰**档位明确管到**的、且 members 里声明过的线：补位池（line23+）与
+    档位无关。停用不 disable、不删单元，`systemctl start` 随时回来。
+    """
+    _, spec = warp_blocks.tier_spec()
+    if spec is None:
+        return                    # 没有档位文件 = 全开，不主动动单元
+    stopped = started = 0
     for m in (_warp().get("members") or []):
         tag = m.get("tag")
-        if m.get("kind") != "wg" or tag not in _TIER_DISABLED:
+        if m.get("kind") != "wg" or not tag:
             continue
         svc = m.get("service") or ""
         if not svc:
@@ -11398,13 +11484,31 @@ def _tier_reconcile() -> None:
             st = subprocess.run(["systemctl", "is-active", svc],
                                 capture_output=True, text=True,
                                 timeout=10).stdout.strip()
+        except Exception as e:
+            log(f"  ⚠ 档位对账查询 {tag} 失败: {e}")
+            continue
+        if tag in _TIER_DISABLED:
             if st == "active":
                 _unit_ctl("stop", svc)
                 stopped += 1
-        except Exception as e:
-            log(f"  ⚠ 档位停用 {tag} 失败: {e}")
+            continue
+        if st == "active":
+            continue
+        # 解禁侧：单元没在跑就拉起来。装没装过要判一下 —— members 声明了但
+        # 单元文件不存在时 start 只会得到一条 systemd 报错。
+        try:
+            idx = int(m.get("index") or 0)
+        except (TypeError, ValueError):
+            idx = 0
+        if idx and _wg_line_state(idx) != "installed":
+            continue
+        if _unit_ctl("start", svc).returncode == 0:
+            _reset_stale_after_tier(tag)
+            started += 1
     if stopped:
         log(f"  · 档位对账：停用 {stopped} 条 WG 线（档位外的不该跑）")
+    if started:
+        log(f"  · 档位对账：拉起 {started} 条 WG 线，并清空停用期陈旧观测")
 
 
 def main():

@@ -1470,6 +1470,25 @@ def test_scan_tag_orphan_is_dropped_once_unit_is_declared():
         "仍无声明归属的扫描单元照旧保留（它只有这一个名字）"
 
 
+def test_cf_direct_records_samples_but_never_locks():
+    """CF 直连只豁免「写锁」，不豁免采样。
+
+    2026-11-09 的回归：早先 CF 分支在 _channel_ban_note 开头直接 return，
+    ban_probes 从此不再增长，报表显示「无样本」，而 last_verdict 仍停在锁之前
+    那次的 quota —— 两个字段互相矛盾，读起来就是「原因标错了」。
+    """
+    _reset()
+    W["channel_ban_min_samples"] = 30
+    now = _noon_today()
+    for i in range(40):
+        daemon._channel_ban_note("WARP-CF-B", "quota", now - 1800 + i)
+    st = daemon._WARP_LINE_STATE["WARP-CF-B"]
+    assert daemon._channel_ban_held("WARP-CF-B", now) is False, "CF 直连永不写锁"
+    assert not st.get("stop_probe"), "CF 不该停探"
+    total = sum(int(e[2]) for e in st.get("ban_probes") or [] if len(e) >= 4)
+    assert total == 40, f"样本必须照记，实际 {total}"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

@@ -287,3 +287,27 @@ def test_stale_verdict_is_not_printed_as_current(mod, tmp_path):
     text = out.read_text(encoding="utf-8")
     assert "无样本" in text, "HTML 把旧结论当成了当前状态"
     assert ">quota<" not in text
+
+
+def test_disabled_unit_is_primary_reason(mod, tmp_path, monkeypatch, capsys):
+    """单元没在跑时只印「单元停用」，不把停用前冻住的 quota 印成当前原因。
+
+    2026-11-09 实测：本地 usque-warp-c/e/f/g/h/i 六个单元根本没装，状态表里
+    冻着删单元那天的 quota，报表照印就成了「这条线配额耗尽」——处置动作完全
+    不同（配额要等重置，单元没装要去装）。
+    """
+    now = 1_800_000_000.0
+    (tmp_path / "hist.jsonl").write_text("")
+    monkeypatch.setattr(mod, "_unit_states",
+                        lambda svc: {v: False for v in svc.values()})
+    chans = {"WARP-CF-B": {"node": None, "colo": "NRT", "carrier": "usque",
+                           "family": "v6", "ip": None}}
+    state = {"WARP-CF-B": {"ban_probes": [[now - 120, now - 60, 5, "quota"]],
+                           "last_verdict": "quota",
+                           "quota_until": now + 3600}}
+    row = mod.summarize(state, chans, {}, 6, now)[0]
+    assert row["unit_ok"] is False, "单元 inactive 必须反映到行上"
+    mod.print_table([row], 6)
+    out = capsys.readouterr().out
+    assert "单元停用" in out, "主因必须是「单元停用」"
+    assert "配额至" not in out, "单元没跑时不能再印配额原因"
