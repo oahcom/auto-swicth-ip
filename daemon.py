@@ -11958,6 +11958,10 @@ def _slot_snapshot():
         out.append({
             "name": s["name"],
             "selector": s["selector"],
+            # 端口是 9router 侧唯一稳定的槽位键：它只知道 127.0.0.1:789N，
+            # 不知道 slot-N。/slots 不吐端口的话，客户端只能靠数组下标猜，
+            # 而 consumer_slots() 的端口跳过 7891，下标与端口不是同一套编号。
+            "port": s.get("port"),
             "status": h["status"],
             "status_age_s": round(now - h["ts"], 1) if h.get("ts") else None,
             "verdict": h.get("verdict"),
@@ -12127,6 +12131,50 @@ def _slot_pick_key(slot, tag, ip, now, serving):
     )
 
 
+# ── 出口地址短冷却 ─────────────────────────────────────────────────────
+# 真实请求撞墙（429，或 20s 连响应头都不回的 transport）时，探针往往在几秒
+# 前刚判过 OK —— 探针是 3KB 小请求，代表不了 20KB+ 的真实流量，等它自己改口
+# 太慢。这里按 **asip 自己看到的出口地址**（_slot_current，不是调用方报来的
+# 那个）打一个 90 秒短冷却：这段时间不把这个地址再选给任何请求。
+#
+# 与 ban_until 的分工：ban_until 是「上游判了这个地址多久配额」，按
+# Retry-After 走（生产 429 兜底 12 小时）；这里只求躲开当前这一波，不写长期
+# 账、不参与隔离判定、不进探针台账。
+_EGRESS_COOLING: dict[str, float] = {}
+_EGRESS_COOLING_LOCK = threading.Lock()
+
+
+def _egress_cooling_sec() -> float:
+    try:
+        return float((CFG.get("api") or {}).get("egress_cooling_sec", 90.0))
+    except (TypeError, ValueError):
+        return 90.0
+
+
+def _mark_egress_cooling(ip, now=None):
+    """记一次「真实流量在这个出口上失败」。ip 必须是 asip 眼里的当前出口。"""
+    if not ip:
+        return
+    ttl = _egress_cooling_sec()
+    if ttl <= 0:
+        return
+    t = float(now if now is not None else time.time())
+    with _EGRESS_COOLING_LOCK:
+        # 顺手清过期：这张表按 /128 记，长跑里不清只增不减。
+        for k in [k for k, until in _EGRESS_COOLING.items() if until <= t]:
+            _EGRESS_COOLING.pop(k, None)
+        _EGRESS_COOLING[ip] = t + ttl
+
+
+def _egress_cooling_left(ip, now=None) -> float:
+    if not ip:
+        return 0.0
+    t = float(now if now is not None else time.time())
+    with _EGRESS_COOLING_LOCK:
+        until = _EGRESS_COOLING.get(ip) or 0.0
+    return max(0.0, until - t)
+
+
 def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
     """挑一台当前健康、且不是刚失败那台的 sing-box，返回 (slot, tag, ip)。
 
@@ -12162,6 +12210,11 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
         if ip and ip in avoid_ip_set:
             log("· 秒切候选 %s 出口=%s 是这条请求刚撞过的地址，跳过"
                 % (s["name"], ip))
+            continue
+        cooling_left = _egress_cooling_left(ip, t0)
+        if cooling_left > 0:
+            log("· 秒切候选 %s 出口=%s 冷却中（剩 %.0fs：真实请求刚在它上面失败）"
+                % (s["name"], ip or "未知", cooling_left))
             continue
         if _slot_ip_is_quarantined(ip, t0):
             log("· 秒切候选 %s 出口=%s 已隔离（生产标脏/quota），跳过"
@@ -12781,6 +12834,13 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
             was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
         except Exception:
             was_blocked = False
+        # 真实流量刚在这个地址上失败：不管上游是回 429，还是干脆 20 秒连响应头
+        # 都不吐（transport），都给它打一段短冷却。判据必须用 asip 自己
+        # _slot_current 读到的 cur_ip —— 调用方传来的 egress_ip 有可能是别的
+        # 请求残留的（9router 侧 currentAsipEgress 是进程级全局），拿它冷却
+        # 会去惩罚一条无辜的线，而真正该躲的那条继续放行。
+        if cur_ip and reason in ("rate429", "transport", "abuse403"):
+            _mark_egress_cooling(cur_ip, t0)
         if reason not in ("proactive", "transport") and cur_ip:
             _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason,
                                ban_after=ban_after)
