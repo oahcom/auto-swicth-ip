@@ -12498,7 +12498,8 @@ def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
     return payload
 
 
-def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None):
+def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
+                      req_id=None):
     """带防重的槽位 /rotate：迟到请求只重连，不为旧证据烧掉新线。
 
     与主路径一一对应：
@@ -12584,8 +12585,12 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None):
                 except Exception as e:
                     log(f"✗ {name} 后台修整启动失败: {e}")
         if accepted or h["status"] == "repairing":
-            log("⇢ %s 报 %s（%s），重试改走 %s"
-                % (name, reason, reason_out,
+            # 排查通道：把请求 id 和这台闸**此刻**绑定的线名、出口 IP 一起留下。
+            # 少了这三项，出问题时只能拿时间戳去猜「哪条请求走了哪个出口」——
+            # 槽位状态是内存态、事后还会被后台修整改写，无法回溯。
+            log("⇢ %s 报 %s（%s）[req=%s] 线=%s 出口=%s，重试改走 %s"
+                % (name, reason, reason_out, req_id or "-",
+                   cur_tag or "未知", cur_ip or "未知",
                    out.get("switch_to") or "无健康备槽"))
         return out
 
@@ -12656,6 +12661,10 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             req = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             req = {}
+        # 排查通道：9router 把本次请求 id 透传过来，下面所有 /rotate 日志带上
+        # 它，才能把「一条失败请求」和「哪台闸/哪条线/哪个出口」串成一条链。
+        _rid = req.get("req_id")
+        rid = str(_rid).strip()[:64] if _rid else None
         # 多端口：带 egress_proxy_url 的请求按端口定位槽位，走独立 sing-box 路径。
         # 每台 sing-box 独立连接池，9router 轮询，429 时后台修那台，立即返回
         # 让 9router 重连到别的端口。不走下面的单主出口逻辑。
@@ -12668,7 +12677,8 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                     _as_ts(req.get("request_started_at")),
                     str(req.get("egress_ip")).strip()
                     if isinstance(req.get("egress_ip"), str)
-                    and req.get("egress_ip").strip() else None)
+                    and req.get("egress_ip").strip() else None,
+                    rid)
             except Exception as e:
                 log(f"✗ 槽位 /rotate 异常: {e}")
                 self._send(500, {"ok": False, "reason": "internal_error"})
@@ -12677,8 +12687,9 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             # 9router 收到后自行重启重建连接池，等后台把被报槽修好。主链路
             # 不做同步兜底，也不把空出口身份写回调用方。
             if payload.get("restart_required"):
-                log("⇢ %s 报 %s（%s）无健康备槽，通知 9router 自重启"
-                    % (slot["name"], req.get("reason"), payload.get("reason")))
+                log("⇢ %s 报 %s（%s）[req=%s] 无健康备槽，通知 9router 自重启"
+                    % (slot["name"], req.get("reason"), payload.get("reason"),
+                       rid or "-"))
             self._send(200, payload)
             return
         try:
@@ -12699,7 +12710,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         # 主路径秒切失败：回包已经表达「无可用闸口，自己重启」，这里留一行
         # 生产日志，免得只能从 9router 侧反推 asip 到底有没有发出信号。
         if result.get("restart_required"):
-            log("⇢ 主路径无可用闸口，通知 9router 自重启")
+            log("⇢ 主路径无可用闸口[req=%s]，通知 9router 自重启" % (rid or "-"))
         # 换线与回传分成两步：换线成功但客户端已超时断开时，记账为「回传超时」
         # 而不是异常。否则 except 里再补写一次 500 必然二次 Broken pipe。
         if not self._send(200, result):

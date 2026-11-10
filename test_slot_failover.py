@@ -293,6 +293,16 @@ def test_already_retired_without_standby_does_not_restart(monkeypatch):
     assert out["reason"] == "already_retired"
 
 
+def test_rotate_slot_log_links_request_to_slot_egress(isolated, monkeypatch):
+    """排查通道：日志必须把 req_id 与这台闸此刻的线名、出口 IP 一起留下。"""
+    lines = []
+    monkeypatch.setattr(daemon, "log", lambda msg: lines.append(msg))
+    daemon._rotate_slot_once(SLOTS[0], "rate429", req_id="REQ-TRACE-1")
+    hit = [s for s in lines if "REQ-TRACE-1" in s]
+    assert hit, lines
+    assert "线=WARP-A" in hit[0] and "出口=2606:a::1" in hit[0], hit
+
+
 def test_slot_repair_thread_starts_only_after_payload_is_built(isolated, monkeypatch):
     """秒切（挑健康槽）期间后台线程不许动状态表。"""
     import types as _types
