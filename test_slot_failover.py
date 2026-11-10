@@ -330,16 +330,27 @@ def test_slot_repair_thread_starts_only_after_payload_is_built(isolated, monkeyp
 
 
 def test_startup_unknown_slots_do_not_trigger_restart(monkeypatch):
-    """刚重启六条闸都是 unknown 时不能让 9router 白重启。"""
+    """首轮探测没收敛前，任何 unknown 都不算「闸全废」。"""
+    # 复现 19:52:19 启动、19:52:25 / 19:52:39 连发两次自重启信号的窗口。
+    monkeypatch.setattr(daemon, "_SLOT_BOOT_TS", daemon.time.time())
     monkeypatch.setattr(daemon, "consumer_slots",
                         lambda: [{"name": "slot-1"}, {"name": "slot-2"}])
     monkeypatch.setattr(daemon, "_slot_health",
                         lambda name: {"status": "unknown"})
     assert daemon._slot_no_usable_gate() is False
-    # 只要有一条已经判过（哪怕其余还在 unknown），就不是纯启动窗口了。
+    # 1 bad + 1 unknown：首轮还没探完，旧判据在这里误判成全废（线上 2 次
+    # 白重启就是这个组合）。宽限期内必须压住。
     monkeypatch.setattr(daemon, "_slot_health",
                         lambda name: {"status": "bad"} if name == "slot-1"
                         else {"status": "unknown"})
+    assert daemon._slot_no_usable_gate() is False
+    # 硬上限：超过宽限期后，同样的混态仍要发信号，不能无限抑制。
+    monkeypatch.setattr(daemon, "_SLOT_BOOT_TS", 0.0)
+    assert daemon._slot_no_usable_gate() is True
+    # 六条都出过首轮结论、无一可用：即便在宽限期内也是真全废。
+    monkeypatch.setattr(daemon, "_SLOT_BOOT_TS", daemon.time.time())
+    monkeypatch.setattr(daemon, "_slot_health",
+                        lambda name: {"status": "repairing"})
     assert daemon._slot_no_usable_gate() is True
     monkeypatch.setattr(daemon, "_slot_health",
                         lambda name: {"status": "repairing"})
@@ -354,7 +365,10 @@ def test_startup_unknown_slots_do_not_trigger_restart(monkeypatch):
 
 
 def test_mixed_gate_states_still_signal_no_healthy_slot(monkeypatch):
-    """混态（在修 + 未探 + 仅剩一条 ok 但挑不中）必须给出重启信号。"""
+    """稳态混态（在修 + 未探 + 仅剩一条 ok 但挑不中）必须给出重启信号。"""
+    # 明确站在宽限期之外：启动窗口的抑制不能把 18:41 / 19:02 / 19:03
+    # 那类稳态漏发又带回来。
+    monkeypatch.setattr(daemon, "_SLOT_BOOT_TS", 0.0)
     monkeypatch.setattr(daemon, "_pick_healthy_slot",
                         lambda name, avoid_tags=None: (None, None, None))
     monkeypatch.setattr(daemon, "consumer_slots",
@@ -369,3 +383,22 @@ def test_mixed_gate_states_still_signal_no_healthy_slot(monkeypatch):
     assert out["reason"] == "no_healthy_slot"
     assert out["restart_required"] is True
     assert out["switch_to_url"] is None
+
+
+def test_startup_window_payload_does_not_ask_for_restart(monkeypatch):
+    """启动窗口内同样「无健康备槽」，但不该让 9router 重启。"""
+    monkeypatch.setattr(daemon, "_SLOT_BOOT_TS", daemon.time.time())
+    monkeypatch.setattr(daemon, "_pick_healthy_slot",
+                        lambda name, avoid_tags=None: (None, None, None))
+    monkeypatch.setattr(daemon, "consumer_slots",
+                        lambda: [{"name": "slot-%d" % i} for i in range(1, 7)])
+    monkeypatch.setattr(daemon, "_slot_health",
+                        lambda name: {"status": "repairing"} if name == "slot-1"
+                        else {"status": "unknown"})
+    slot = {"name": "slot-1", "selector": "opencode-out-1", "port": 7890}
+    out = daemon._slot_redirect_payload(slot, "WARP-A", "2606:a::1",
+                                        "rate429", 0.0)
+    assert out["reason"] == "no_healthy_slot"
+    assert out["line_unknown"] is True
+    assert out["switch_to_url"] is None
+    assert "restart_required" not in out

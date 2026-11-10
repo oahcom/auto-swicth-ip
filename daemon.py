@@ -11441,6 +11441,10 @@ def _probe_line_before_rotate(tag, ip, fresh=False):
 _SLOT_HEALTH = {}
 # 槽位状态表的读改写锁。RLock：_slot_begin_repair 持锁时还会调 _slot_mark。
 _SLOT_STATE_LOCK = threading.RLock()
+# daemon 启动时刻。启动时六条槽位都是 unknown，要等各自首轮探测出结论；
+# 这段窗口里「没有健康备槽」不等于「闸全废」。main() 里会重新赋值为
+# 真正打印启动日志的时刻，避免把模块导入耗时算进宽限期。
+_SLOT_BOOT_TS = time.time()
 # 当前服务主出口的槽位名。None = 主出口用的是主循环挑的线，不属于任何槽位
 # （此时被换下的线按游离线处理，由 _repair_line 复核）。
 _MAIN_SLOT_NAME = {"name": None}
@@ -12445,23 +12449,35 @@ def _note_client_gone(result: dict) -> None:
 
 
 def _slot_no_usable_gate():
-    """「这次确实没有可用闸口」：只排除 daemon 刚重启、六条全 unknown 的窗口。
+    """「这次确实没有可用闸口」：只在首轮探测收敛后给出重启信号。
 
-    _pick_healthy_slot 已经回答了「有没有能立刻接管的健康备槽」，这里只补一道
-    启动窗口保护：刚起来六条都是 unknown（还没探过线），不是闸坏了，让 9router
-    自重启只会白打断刚接上的连接。
+    调用点只有在 _pick_healthy_slot 返回 None 时才进来，所以「有没有能立刻
+    接管的健康备槽」已经回答过了。这里补的是时间维度的判定：
 
-    旧实现要求「没有一条 ok 且没有一条 unknown」才算全废，把混态全漏了 ——
-    几条在修、几条还在探、甚至只剩被报槽自己 ok 但被 avoid 排除时，
-    _pick_healthy_slot 已经返回 None，这里却不肯发重启信号。线上 18:41 /
-    19:02 / 19:03 三次「重试改走 无健康备槽」都没有「通知 9router 自重启」，
-    调用方既不切线也不重建连接池，请求直接吃 429。
+    启动窗口内，只要还有一条槽位没出首轮结论（unknown），就不算闸坏了。
+    线上 19:52:19 daemon 启动，19:52:25 slot-1 才从 unknown → repairing、
+    19:52:39 slot-2 同样、直到 19:52:43 才有第一条 unknown → ok；旧判据只
+    排除「六条全 unknown」，于是 19:52:25 / 19:52:39 两次照发
+    restart_required，9router 连重启 2 次。闸正在后台修，重启调用方重建
+    连接池帮不上忙，只会打断刚接上的连接。
+
+    宽限期结束后回到稳态判据：混态（在修 / 坏 / 仅剩一条 ok 但被 avoid
+    排除）一律发信号。更早一版要求「没有一条 ok 且没有一条 unknown」，把
+    18:41 / 19:02 / 19:03 三次全漏了，调用方既不切线也不重建连接池，
+    请求直接吃 429 —— 不能再退回去。
+
+    宽限期有硬上限（slot_boot_grace_sec）：超时后即便还有 unknown 也不再
+    抑制，避免某条线长期探不出结果时永远不发信号。
     """
     slots = consumer_slots()
     if not slots:
         return False
     statuses = [_slot_health(s["name"])["status"] for s in slots]
-    return not all(st == "unknown" for st in statuses)
+    grace = float(_api_cfg().get("slot_boot_grace_sec", 60))
+    if time.time() - _SLOT_BOOT_TS < grace:
+        if any(st == "unknown" for st in statuses):
+            return False
+    return True
 
 
 def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
@@ -12876,6 +12892,8 @@ def main():
     # Log first, then fetch (avoid hanging before any output)
     log("=" * 50)
     log("auto-switch-ip daemon v2 启动 (加固版)")
+    global _SLOT_BOOT_TS
+    _SLOT_BOOT_TS = time.time()
     # 必须在拉起任何线之前对账：否则档位外的线会先跑起来再被停，白白换一次
     # WARP 会话（每次 start 都是一次 CF 注册动作）。
     _tier_reconcile()
