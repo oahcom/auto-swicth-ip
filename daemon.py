@@ -12127,7 +12127,7 @@ def _slot_pick_key(slot, tag, ip, now, serving):
     )
 
 
-def _pick_healthy_slot(name, avoid_tags=None):
+def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
     """挑一台当前健康、且不是刚失败那台的 sing-box，返回 (slot, tag, ip)。
 
     多端口架构下每台是独立进程、独立连接池，换端口不需要断连、不需要等
@@ -12136,11 +12136,15 @@ def _pick_healthy_slot(name, avoid_tags=None):
     排序依据是 _slot_pick_key：新鲜度档位第一、探测延迟第二；serving 槽永远
     排在最后（只剩它健康时仍返回它 —— 独立端口本身就是可用备份）。
     候选按轮询游标顺序收集，稳定排序下同分者仍轮换，避免永远压 slot-1。
+
+    avoid_ips 收「调用方刚在上面吃到 429 的出口地址」：六条线共用一个 /64 池，
+    单看「哪台闸健康」会挑到挂着同一个 /128 的另一台闸，重试必然还是 429。
     """
     slots = consumer_slots()
     if not slots:
         return None, None, None
     avoid = set(avoid_tags or ())
+    avoid_ip_set = {x for x in (avoid_ips or ()) if x}
     serving = _slot_serving_name()
     t0 = time.time()
     n = len(slots)
@@ -12154,6 +12158,10 @@ def _pick_healthy_slot(name, avoid_tags=None):
             continue
         tag, ip = _slot_current(s)
         if not tag or tag in avoid:
+            continue
+        if ip and ip in avoid_ip_set:
+            log("· 秒切候选 %s 出口=%s 是这条请求刚撞过的地址，跳过"
+                % (s["name"], ip))
             continue
         if _slot_ip_is_quarantined(ip, t0):
             log("· 秒切候选 %s 出口=%s 已隔离（生产标脏/quota），跳过"
@@ -12690,14 +12698,14 @@ def _slot_no_usable_gate():
 
 
 def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
-                           avoid_until=0.0):
+                           avoid_until=0.0, avoid_ips=None):
     """构造槽位轮换回包：当前槽身份 + 立即重试目标 + 原端口冷却截止。"""
     payload = {"ok": True, "switched": False, "reason": reason,
                "switched_at": switched_at, "ms": 0,
                "active_tag": cur_tag, "active_egress": cur_ip,
                "avoid_port_until": avoid_until}
     other, ttag, tip = _pick_healthy_slot(
-        slot["name"], {cur_tag} if cur_tag else None)
+        slot["name"], {cur_tag} if cur_tag else None, avoid_ips)
     if other is not None:
         payload["switched"] = True
         payload["switch_to"] = other["name"]
@@ -12761,7 +12769,8 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
             # 同一端口的新线已经就位；调用方清连接后原地重试即可。这里不再
             # 发起换线（有健康备槽时照样给出，让对端可以顺手合并连接）。
             out = _slot_redirect_payload(
-                slot, cur_tag, cur_ip, "already_retired", switched_at, 0.0)
+                slot, cur_tag, cur_ip, "already_retired", switched_at, 0.0,
+                {egress_ip} if egress_ip else None)
             out["offending_verdict"] = verdict_before
             return out
 
@@ -12812,7 +12821,8 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         # _slot_redirect_payload 万一抛异常，认领过的槽位不会永远卡在 repairing。
         try:
             out = _slot_redirect_payload(slot, cur_tag, cur_ip, reason_out,
-                                         switched_at, avoid_until)
+                                         switched_at, avoid_until,
+                                         {egress_ip} if egress_ip else None)
         finally:
             if repair_thread is not None:
                 try:
