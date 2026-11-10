@@ -3715,7 +3715,7 @@ def _channel_ban_note(tag: str, verdict: str, now: float) -> None:
         # 同结论的相邻段并起来，所以这里不需要先展开再压回去。
         samples.append([now, now, 1, str(verdict)])
         _channel_ban_trim(samples, now)
-        # CF 直连永不写锁：配额是账号级的，锁线既不解配额也没有可换的落地
+        # CF 直连永不写锁：锁线没有可换的落地
         # 节点（_rehome_held_lines 对 CF 是空操作），只会把直连出口关掉。
         if cf_direct:
             if _channel_ban_held(tag, now):
@@ -5994,7 +5994,7 @@ def _probe_one_line(member: dict) -> None:
         _reconnect_warp_now(f"探测失败 {verdict}", time.time())
     else:
         # quota(429) 也重启：换出口地址 = 换一个有独立配额的新 IP
-        # （2026-11-09 主人证伪「账号级时间窗」理论，见 INCIDENTS.md INC-012 更正）。
+        # （2026-11-09 主人裁定：quota 一律按出口 IP 处理，见 INCIDENTS.md INC-012 更正）。
         # 但和 blocked 路径一样要问「换得到吗」：实测 2026-11-10 07:00 之后
         # 3 分钟 272 次重启、池内 152 条线**一条都没熔断**，重启换回来的全新
         # /128 首探照样 quota —— WARP 段被整体烧穿时，重启换不到配额，只换来
@@ -11387,8 +11387,8 @@ _PROBE_DIVERGENCE = []
 def _probe_line_before_rotate(tag, ip, fresh=False):
     """换线前实测「即将被换掉」的这条线还能不能服务。
 
-    9router 认定这条线吃 429 才让切线，但那只是它的观测：配额可能是会话级，
-    也可能是它判错了。切之前用 asip 自己的探测器（与生产同一份指纹、同一格
+    9router 认定这条线吃 429 才让切线，但那只是它的观测，可能是它判错了。
+    配额一律按出口判定。切之前用 asip 自己的探测器（与生产同一份指纹、同一格
     配额）实测一次。OK 就说明这条线还能用，换掉它等于白烧一条干净线。
 
     返回 None 表示没有结论（未启用 / 没有当前线 / 探测器缺失）。窗口内复用。
@@ -11926,11 +11926,15 @@ def cli_slots(argv=None):
 
 
 def _kick_background_repair(tag, ip, reason):
-    """把刚被报 429 的那条线所属的槽位，提前扔到后台做错误切换。
+    """把刚被报 429 的那条线所属的槽位，扔到后台做错误切换。
 
-    无论后面秒切成不成功、抢不抢得到锁，旧闸的错误切换都要跑 —— 所以放在
-    秒切之前启动，和同步换线并行。只动「selector 当前指向 tag」的那个槽位
-    （状态漂移时不认错）；已经在修整中的槽位不重复启动。
+    由 _rotate_once 在**回包定型之后**用 finally 启动：秒切、探测、同步兜底
+    都要读同一份槽位/线状态表，后台线程若在秒切之前就跑起来换线、探新线、
+    放回池子，秒切挑中的可能正好是后台刚标脏的那条，或者读到过时快照。
+    放在 finally 里既能保证串行，又不会被 coalesced / too_frequent 这些提前
+    return 漏掉。秒切失败分支不进这里：那次由 9router 前台重启接管。只动
+    「selector 当前指向 tag」的那个槽位（状态漂移时不认错）；已经在修整中的
+    槽位不重复启动。
     """
     if not tag:
         return
@@ -11989,11 +11993,13 @@ def _pick_healthy_slot(name, avoid_tags=None):
 def _fast_switch(reason):
     """把主出口立刻切到一条健康备用线上。只做同步的 selector 翻转 + 记账。
 
-    不做探测、不做后台错误切换 —— 那些已在 _kick_background_repair 里先行
+    不做探测、不做后台错误切换 —— 那些由 _kick_background_repair 在回包
+    定型之后启动，不与秒切并发。
     启动（无论本函数成败，旧闸的错误切换都会跑）。本函数只给调用方换一条
     能用的线，十几毫秒返回。
 
-    返回 {"tag", "egress"}；没有可用备用线时返回 None，调用方走同步换线。
+    返回 {"tag", "egress"}；没有可用备用线时返回 None，调用方回「无可用闸口」
+    并通知 9router 自重启，不再同步换线。
     调用方已用 _SWITCH_GUARD 非阻塞包住本函数 —— 拿不到锁直接回 coalesced。
     """
     cur = active_warp_tag()
@@ -12170,8 +12176,10 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                  egress_since: float | None = None) -> dict:
     """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
 
-    换线本体复用 _reconnect_warp_by_table：只读状态表、不现场探测、不重启、
-    不落池。那条路径本来就是为「主循环要换线」写的，语义与这里完全一致。
+    错误切换（rate429/abuse403）只做秒切：翻到一条已探通的健康备用槽。
+    秒切失败 = 没有可用闸口，直接回 restart_required 让 9router 自己重启，
+    不再同步探测、不再同步切线，也不起后台线程修旧闸。主动轮换 / transport
+    不是错误切换，仍复用 _reconnect_warp_by_table 正常换线。
 
     `egress_ip` 是调用方**吃到 429 的那个出口地址**（由上一次 /rotate 的
     `active_egress` 缓存而来，不是客户端自己探测的 —— 它探测的只会是直连地址，
@@ -12193,6 +12201,10 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         _api_stats["calls"] += 1
         current_tag = active_warp_tag()
         old_ip = _warp_line_ip(current_tag) or _ACTIVE_WARP_IP
+        # 后台要修的是「被 9router 判定失败的那条线」，不一定是当前线：429
+        # 迟到几十秒时当前线可能已经换过两轮。默认与当前线一致，回溯命中时
+        # 改成发出那一刻的线；那一刻停在轮换池则为 None（没有可修的线）。
+        offending_tag = current_tag
         # 最硬的一条判据：换线表里显示这个地址在**这条请求发出之后**被换掉了。
         # 那它打通的是一条已经下线的隧道，重连就能绕开 —— 再换一次线等于用旧
         # 证据烧掉一条干净的新线（实测 19:24~19:27 连续 8 次轮换里，多数是同一批
@@ -12229,6 +12241,7 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                 if hist_tag != current_tag:
                     # 那一刻不在当前这条线上。可能是另一条线（hist_tag 为线名），
                     # 也可能是轮换池（hist_tag 为 None）。
+                    offending_tag = hist_tag
                     old_ip = hist_ip
                 elif hist_ip and hist_ip != old_ip:
                     # 同一条线，但发出之后它被原地重连换过会话地址
@@ -12249,6 +12262,7 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         elif request_started_at is not None:
             log("  ⟲ 迟到回溯: request_started_at 非法，退回当前线")
         was_blocked = False
+        repair_started = False
         try:
             was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
         except Exception:
@@ -12256,104 +12270,109 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         # transport 只证明这条连接/链路悬挂，不是 IP 级封禁证据：换线但不记脏。
         if reason not in ("proactive", "transport") and old_ip:
             _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason)
-        # 合并窗放在记账**之后**：迟到的 429 常常同一批涌进来（实测客户端一次
-        # 并发几十条），若先合并再记账，第一条换线后其余全部命中合并窗，历史里
-        # 那条真正发出请求的线一条都标不到，下一批又原样选回来。合并不换线，
-        # 但证据必须照收。
-        if t0 - _last_rotate_ts < cfg["coalesce_ms"] / 1000.0:
-            _api_stats["coalesced"] += 1
-            return _with_active_line(
-                {"ok": True, "switched": False, "reason": "coalesced",
-                 "switched_at": _last_rotate_ts},
-                t0)
-        gap = _rotate_gap()
-        if (_last_rotate_ts and t0 - _last_rotate_ts < gap
-                and not was_blocked):
-            _api_stats["too_frequent"] += 1
-            return _with_active_line(
-                {"ok": False, "reason": "too_frequent",
-                 "switched_at": _last_rotate_ts},
-                t0)
-        # 异步先行：把刚被报 429 的那条线所属的槽位，提前扔到后台做错误切换
-        # （换线 + 探新线 + 标记）。无论下面秒切成不成功、抢不抢得到锁，旧闸
-        # 的错误切换都会跑 —— 9router 的 429 判定必须被 acted on，不能因为
-        # asip 探测说通就留着，否则备用池会堆满 9router 拒绝的线。
-        if reason in ("rate429", "abuse403"):
-            _kick_background_repair(current_tag, cur_ip, reason)
-        # 秒切：翻到一条已探通的备用线，十几毫秒。没有才走下面的同步换线。
-        quick = None
-        if reason in ("rate429", "abuse403"):
-            if not _SWITCH_GUARD.acquire(blocking=False):
-                # 已经有一次换闸在跑：这次的 429 多半来自同一批并发请求，
-                # 那条坏线正在被换走。不排队、不重复换，直接回 coalesced
-                # （调用方对这个 reason 的语义就是「别人刚换过，重连即可」）。
+        try:
+            # 合并窗放在记账**之后**：迟到的 429 常常同一批涌进来（实测客户端一次
+            # 并发几十条），若先合并再记账，第一条换线后其余全部命中合并窗，历史里
+            # 那条真正发出请求的线一条都标不到，下一批又原样选回来。合并不换线，
+            # 但证据必须照收。
+            if t0 - _last_rotate_ts < cfg["coalesce_ms"] / 1000.0:
                 _api_stats["coalesced"] += 1
-                log("· /rotate 换闸占用中，本次不换线（并发合并）")
-                # 刻意**不回** active_tag / active_egress：这一瞬间出口正在被
-                # 另一次切换改写，快照读到的是切换前的旧线。把它回过去，调用方
-                # 会用旧身份覆盖自己的账 —— 下一条 429 就会带着错误出口来。
-                # line_unknown 明确告诉调用方「这次不知道」：既不算「没切」，
-                # 也不更新本地记录。旧闸的错误切换已在上面先行启动，不依赖这里。
-                return {"ok": True, "switched": False, "reason": "coalesced",
-                        "switched_at": _last_rotate_ts, "line_unknown": True,
-                        "ms": int((time.time() - t0) * 1000)}
-            try:
-                quick = _fast_switch(reason)
-            finally:
-                _SWITCH_GUARD.release()
-        if quick:
-            _api_stats["switched"] += 1
-            _last_rotate_ts = t0
-            return _with_active_line(
-                {"ok": True, "switched": True, "tag": quick["tag"],
-                 "egress": quick["egress"], "closed": 0,
-                 "switched_at": t0},
-                t0, tag=quick["tag"], egress=quick["egress"])
-        # 只有 9router 声称「这条线失败」时才值得问：rate429/abuse403 是它对
-        # 出口的判定，而主动轮换（proactive）是它自己的节奏，实测只会白烧一格
-        # 配额、还会把正常轮换卡住。transport 是链路悬挂，探了也只会超时。
-        #
-        # 实测 OK 而 9router 报失败 = 同一出口上的两种结论不一致。这时换线只是
-        # 把一条还能用的线换掉，问题不会消失（下一个出口照样 429）—— 差异在
-        # 9router 的请求体，不在出口。所以不换线，把这组证据记进 _PROBE_DIVERGENCE。
-        if reason in ("rate429", "abuse403"):
-            probed = _probe_line_before_rotate(current_tag, cur_ip)
-            if probed and probed.get("verdict") == "OK":
-                _api_stats["line_ok"] += 1
-                _api_stats["divergence"] += 1
-                _PROBE_DIVERGENCE.append({
-                    "ts": time.time(), "reason": reason, "tag": current_tag,
-                    "ip": cur_ip, "probe_sec": probed.get("sec"),
-                    "elapsed": probed.get("elapsed"),
-                    "cached": bool(probed.get("cached"))})
-                del _PROBE_DIVERGENCE[:-50]
-                log(f"⚠ 探测分歧: 9router={reason} 但 asip 实测 {current_tag}"
-                    f" 出口={cur_ip} OK（{probed.get('sec')}s），不换线")
                 return _with_active_line(
-                    {"ok": True, "switched": False, "reason": "line_ok",
-                     "probe": probed},
+                    {"ok": True, "switched": False, "reason": "coalesced",
+                     "switched_at": _last_rotate_ts},
                     t0)
-        out: dict = {}
-        ok = _reconnect_warp_by_table(reason, interrupt=False, out=out)
-        if not ok:
-            _api_stats["no_standby"] += 1
+            gap = _rotate_gap()
+            if (_last_rotate_ts and t0 - _last_rotate_ts < gap
+                    and not was_blocked):
+                _api_stats["too_frequent"] += 1
+                return _with_active_line(
+                    {"ok": False, "reason": "too_frequent",
+                     "switched_at": _last_rotate_ts},
+                    t0)
+            # 秒切：翻到一条已探通的备用线，十几毫秒。没有才走下面的同步换线。
+            # 后台修整不再「异步先行」：它由本段末尾的 finally 在所有同步决策完成、
+            # 回包定型之后启动，避免后台换线/探新线与秒切挑线并发改同一份状态表。
+            quick = None
+            if reason in ("rate429", "abuse403"):
+                if not _SWITCH_GUARD.acquire(blocking=False):
+                    # 已经有一次换闸在跑：这次的 429 多半来自同一批并发请求，
+                    # 那条坏线正在被换走。不排队、不重复换，直接回 coalesced
+                    # （调用方对这个 reason 的语义就是「别人刚换过，重连即可」）。
+                    _api_stats["coalesced"] += 1
+                    log("· /rotate 换闸占用中，本次不换线（并发合并）")
+                    # 刻意**不回** active_tag / active_egress：这一瞬间出口正在被
+                    # 另一次切换改写，快照读到的是切换前的旧线。把它回过去，调用方
+                    # 会用旧身份覆盖自己的账 —— 下一条 429 就会带着错误出口来。
+                    # line_unknown 明确告诉调用方「这次不知道」：既不算「没切」，
+                    # 也不更新本地记录。旧闸的错误切换由 finally 在返回前启动。
+                    return {"ok": True, "switched": False, "reason": "coalesced",
+                            "switched_at": _last_rotate_ts, "line_unknown": True,
+                            "ms": int((time.time() - t0) * 1000)}
+                try:
+                    quick = _fast_switch(reason)
+                finally:
+                    _SWITCH_GUARD.release()
+            if quick:
+                _api_stats["switched"] += 1
+                _last_rotate_ts = t0
+                return _with_active_line(
+                    {"ok": True, "switched": True, "tag": quick["tag"],
+                     "egress": quick["egress"], "closed": 0,
+                     "switched_at": t0},
+                    t0, tag=quick["tag"], egress=quick["egress"])
+            # ── 秒切失败：错误切换主链路到此为止 ──────────────────────
+            # 旧第 10 步「换线前实测 / line_ok」与第 11 步「按状态表同步换线」
+            # 本质是「旧闸怎么修」，不是「本次请求怎么恢复」。两者已从
+            # rate429/abuse403 主链路整段删除：不再同步探测、不再同步切线。
+            #
+            # 切失败 = 此刻没有任何健康闸口能立刻接管。这时既不起后台线程
+            # 慢慢修旧闸（不是后台修），也不动主出口 selector（不切线）；
+            # 回包直接把「无可用闸口，自己重启」交给 9router —— 由它前台进程
+            # 重建连接池完成恢复。9router 侧 requestAsipSelfRestart 有 60s
+            # 节流，一批并发 429 不会变成重启风暴。
+            # line_unknown=True 让调用方不要拿旧出口身份覆盖自己的账。
+            if reason in ("rate429", "abuse403"):
+                repair_started = True
+                return {
+                    "ok": True, "switched": False,
+                    "reason": "no_healthy_slot",
+                    "switched_at": _last_rotate_ts,
+                    "line_unknown": True,
+                    "switch_to": None,
+                    "switch_to_url": None,
+                    "restart_required": True,
+                    "ms": int((time.time() - t0) * 1000),
+                }
+            # 主动轮换 / transport 不是错误切换，仍按状态表正常换线。
+            # 这条路径本来就是「主循环要换线」，与旧闸处置无关。
+            out: dict = {}
+            ok = _reconnect_warp_by_table(reason, interrupt=False, out=out)
+            if not ok:
+                _api_stats["no_standby"] += 1
+                return _with_active_line(
+                    {"ok": False, "reason": "no_warm_standby",
+                     "switched_at": _last_rotate_ts},
+                    t0)
+            _last_rotate_ts = float(out.get("switched_at") or t0)
+            _api_stats["switched"] += 1
+            new_tag = out.get("tag")
+            # 同步换线后主出口落在一条非槽位的线上（来自状态表），不再借任何槽位。
+            _MAIN_SLOT_NAME["name"] = None
             return _with_active_line(
-                {"ok": False, "reason": "no_warm_standby",
+                {"ok": True, "switched": True,
+                 "tag": new_tag, "egress": out.get("ip"),
+                 "closed": 0,
                  "switched_at": _last_rotate_ts},
-                t0)
-        _last_rotate_ts = float(out.get("switched_at") or t0)
-        _api_stats["switched"] += 1
-        new_tag = out.get("tag")
-        # 同步换线后主出口落在一条非槽位的线上（来自状态表），不再借任何槽位。
-        _MAIN_SLOT_NAME["name"] = None
-        # 用 out 里的 tag/ip 而不是快照：刚 PUT 完 selector 的半秒内快照可能还是
-        # 旧线，读成旧线会让调用方以为没换、继续骑在已经烧掉的隧道上。
-        return _with_active_line(
-            {"ok": True, "switched": True,
-             "tag": new_tag, "egress": out.get("ip"),
-             "closed": 0,
-             "switched_at": _last_rotate_ts},
-            t0, tag=new_tag or None, egress=out.get("ip"))
+                t0, tag=new_tag or None, egress=out.get("ip"))
+        finally:
+            # 回包定型之后才让后台线程动状态，避免后台换线/探新线与秒切挑线
+            # 并发改同一份状态表。秒切失败分支是唯一例外：那一次已把处置权
+            # 交给 9router 前台重启（repair_started 置位），不再起后台线程。
+            if reason in ("rate429", "abuse403") and not repair_started:
+                try:
+                    _kick_background_repair(offending_tag, old_ip, reason)
+                except Exception as e:
+                    log(f"✗ 后台修整启动失败: {e}")
 
 
 def _api_debug_state() -> dict:
@@ -12427,6 +12446,22 @@ def _note_client_gone(result: dict) -> None:
             f"（换线生效，只是没人收响应）")
 
 
+def _slot_all_gates_down():
+    """六条闸确实全废：没有一条 ok，且至少一条已经被判坏/正在修。
+
+    daemon 刚重启时六条都是 unknown（还没探过线），那不是闸坏了，只是状态
+    没初始化。这种窗口也就十几秒，却正好会撞上「无健康备槽」分支；不区分就
+    会让 9router 白重启一次，把刚接上的连接全打断。
+    """
+    slots = consumer_slots()
+    if not slots:
+        return False
+    statuses = [_slot_health(s["name"])["status"] for s in slots]
+    return (bool(statuses)
+            and all(st != "unknown" for st in statuses)
+            and not any(st == "ok" for st in statuses))
+
+
 def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
                            avoid_until=0.0):
     """构造槽位轮换回包：当前槽身份 + 立即重试目标 + 原端口冷却截止。"""
@@ -12445,6 +12480,14 @@ def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
     else:
         payload["switch_to"] = None
         payload["switch_to_url"] = None
+        if reason != "already_retired":
+            # 六条闸都不健康，没有端口能立刻接管这条请求。主链路不再同步
+            # 探线/换线兜底：被报槽由后台线程修好，调用方重启自己重建连接池，
+            # 等闸回来即可。already_retired 不在此列 —— 线已经换走了，原地
+            # 重连就够，重启反而把刚接上的连接全打断。
+            payload["line_unknown"] = True
+            if _slot_all_gates_down():
+                payload["restart_required"] = True
     return payload
 
 
@@ -12494,6 +12537,7 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None):
 
         last_attempt = float(h.get("last_rotate_ts") or 0.0)
         accepted = False
+        repair_thread = None
         if h["status"] == "repairing":
             _api_stats["coalesced"] += 1
             reason_out = "coalesced"
@@ -12506,8 +12550,12 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None):
             reason_out = "too_frequent"
         elif _slot_begin_repair(name, reason):
             h["last_rotate_ts"] = t0
-            threading.Thread(target=_repair_slot, args=(slot, reason),
-                             daemon=True, name="repair-" + name).start()
+            # 只造线程、不启动：后台换线/探新线/放回池子和下面的
+            # _pick_healthy_slot 读同一份状态表，先启动会让秒切挑中的端口
+            # 恰好是后台刚标脏的那条，或读到过时健康快照。
+            repair_thread = threading.Thread(
+                target=_repair_slot, args=(slot, reason),
+                daemon=True, name="repair-" + name)
             accepted = True
             reason_out = "ok"
         else:
@@ -12517,8 +12565,17 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None):
             reason_out = "coalesced"
         avoid_until = (t0 + float(cfg.get("slot_cooldown_sec", 15))
                        if accepted or h["status"] == "repairing" else 0.0)
-        out = _slot_redirect_payload(slot, cur_tag, cur_ip, reason_out,
-                                     switched_at, avoid_until)
+        # 回包定型（挑健康槽）之后再启动后台修整。用 finally 保证
+        # _slot_redirect_payload 万一抛异常，认领过的槽位不会永远卡在 repairing。
+        try:
+            out = _slot_redirect_payload(slot, cur_tag, cur_ip, reason_out,
+                                         switched_at, avoid_until)
+        finally:
+            if repair_thread is not None:
+                try:
+                    repair_thread.start()
+                except Exception as e:
+                    log(f"✗ {name} 后台修整启动失败: {e}")
         if accepted or h["status"] == "repairing":
             log("⇢ %s 报 %s（%s），重试改走 %s"
                 % (name, reason, reason_out,
@@ -12609,10 +12666,12 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                 log(f"✗ 槽位 /rotate 异常: {e}")
                 self._send(500, {"ok": False, "reason": "internal_error"})
                 return
-            # 没有健康备槽且当前槽还在修：出口身份暂时不可用。不能把空值当
-            # 「当前线」写回调用方，否则它会把本地记录覆盖成无代理。
-            if not payload.get("switch_to_url") and payload.get("reason") != "already_retired":
-                payload["line_unknown"] = True
+            # 信号由 _slot_redirect_payload 给：无健康备槽 -> restart_required，
+            # 9router 收到后自行重启重建连接池，等后台把被报槽修好。主链路
+            # 不做同步兜底，也不把空出口身份写回调用方。
+            if payload.get("restart_required"):
+                log("⇢ %s 报 %s（%s）无健康备槽，通知 9router 自重启"
+                    % (slot["name"], req.get("reason"), payload.get("reason")))
             self._send(200, payload)
             return
         try:
@@ -12630,6 +12689,10 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})
             return
+        # 主路径秒切失败：回包已经表达「无可用闸口，自己重启」，这里留一行
+        # 生产日志，免得只能从 9router 侧反推 asip 到底有没有发出信号。
+        if result.get("restart_required"):
+            log("⇢ 主路径无可用闸口，通知 9router 自重启")
         # 换线与回传分成两步：换线成功但客户端已超时断开时，记账为「回传超时」
         # 而不是异常。否则 except 里再补写一次 500 必然二次 Broken pipe。
         if not self._send(200, result):

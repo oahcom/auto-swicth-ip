@@ -294,10 +294,9 @@ def test_rotate_reports_the_new_line_after_switching(monkeypatch, _rotate_isolat
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-OLD")
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "old-egress")
-    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
-                        lambda reason, interrupt=False, out=None: (
-                            out.update({"tag": "WG-NEW", "ip": "1.2.3.4",
-                                        "switched_at": 1234.0}) or True))
+    # 错误切换主链路只做秒切：用秒切成功替身代替原来的同步换线替身。
+    monkeypatch.setattr(daemon, "_fast_switch",
+                        lambda reason: {"tag": "WG-NEW", "egress": "1.2.3.4"})
 
     out = daemon._rotate_once("rate429")
 
@@ -309,6 +308,27 @@ def test_rotate_reports_the_new_line_after_switching(monkeypatch, _rotate_isolat
         "换线成功后 active_egress 不是新地址 —— 调用方读到的身份可能是旧的"
     )
 
+
+def test_quick_switch_failure_reports_no_healthy_slot(monkeypatch, _rotate_isolated):
+    """秒切失败：回包说清「无可用闸口，直接重启」，不切线也不起后台修。"""
+    monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
+    monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-OLD")
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "old-egress")
+    calls = []
+    monkeypatch.setattr(daemon, "_fast_switch",
+                        lambda reason: calls.append("quick") or None)
+    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
+                        lambda *a, **k: calls.append("sync") or False)
+    monkeypatch.setattr(daemon, "_kick_background_repair",
+                        lambda tag, ip, reason: calls.append("repair"))
+
+    out = daemon._rotate_once("rate429")
+
+    assert out["switched"] is False and out["ok"] is True, out
+    assert out["reason"] == "no_healthy_slot", out
+    assert out["restart_required"] is True and out["line_unknown"] is True, out
+    assert out["switch_to_url"] is None, out
+    assert calls == ["quick"], calls
 
 def test_transport_rotation_does_not_blacklist_the_ip(monkeypatch, _rotate_isolated):
     """无首字节超时只换线，不把可能是健康 IP 的出口按 429/403 记脏。"""
@@ -442,10 +462,9 @@ def test_rotate_switches_when_the_switch_happened_before_the_request(
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-NEW")
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:NEW::9")
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
-    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
-                        lambda reason, interrupt=False, out=None: (
-                            out.update({"tag": "WG-X", "ip": "1.2.3.4",
-                                        "switched_at": 1234.0}) or True))
+    # 错误切换主链路只做秒切：用秒切成功替身代替原来的同步换线替身。
+    monkeypatch.setattr(daemon, "_fast_switch",
+                        lambda reason: {"tag": "WG-X", "egress": "1.2.3.4"})
 
     # 缓存里还是换线前的旧地址，但这次请求是在切换之后发出的。
     out = daemon._rotate_once("rate429", now, "2a09:bac5:OLD::1")
@@ -463,10 +482,9 @@ def test_rotate_switches_when_the_429_egress_is_still_current(
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-OLD")
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:AAAA::1")
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
-    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
-                        lambda reason, interrupt=False, out=None: (
-                            out.update({"tag": "WG-NEW", "ip": "1.2.3.4",
-                                        "switched_at": 1234.0}) or True))
+    # 错误切换主链路只做秒切：用秒切成功替身代替原来的同步换线替身。
+    monkeypatch.setattr(daemon, "_fast_switch",
+                        lambda reason: {"tag": "WG-NEW", "egress": "1.2.3.4"})
 
     out = daemon._rotate_once("rate429", time.time(), "2a09:bac5:AAAA::1")
 
@@ -480,10 +498,9 @@ def test_rotate_switches_when_the_egress_is_unknown(monkeypatch, _rotate_isolate
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: None)
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", None)
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
-    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
-                        lambda reason, interrupt=False, out=None: (
-                            out.update({"tag": "WG-NEW", "ip": "1.2.3.4",
-                                        "switched_at": 1234.0}) or True))
+    # 错误切换主链路只做秒切：用秒切成功替身代替原来的同步换线替身。
+    monkeypatch.setattr(daemon, "_fast_switch",
+                        lambda reason: {"tag": "WG-NEW", "egress": "1.2.3.4"})
 
     out = daemon._rotate_once("rate429", None, "2a09:bac5:DEAD::1")
 
@@ -516,10 +533,9 @@ def test_rotate_ignores_a_cache_that_postdates_the_request(monkeypatch, _rotate_
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-NEW")
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "2a09:bac5:NEW::9")
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
-    monkeypatch.setattr(daemon, "_reconnect_warp_by_table",
-                        lambda reason, interrupt=False, out=None: (
-                            out.update({"tag": "WG-X", "ip": "1.2.3.4",
-                                        "switched_at": 1234.0}) or True))
+    # 错误切换主链路只做秒切：用秒切成功替身代替原来的同步换线替身。
+    monkeypatch.setattr(daemon, "_fast_switch",
+                        lambda reason: {"tag": "WG-X", "egress": "1.2.3.4"})
 
     # 请求发出于 now-10，但客户端缓存说这个地址是 now-2 才接上的 —— 晚于请求。
     out = daemon._rotate_once("rate429", now - 10, "2a09:bac5:DEAD::1", now - 2)

@@ -54,7 +54,7 @@ FREEMODEL = "deepseek-v4.1-flash-free"
 URL = "https://opencode.ai/inference/v1/chat/completions"
 # 9router 运行期拼的 ENV_FINGERPRINT_PROMPT（open-sse/utils/opencodeFingerprint.js）。
 # 上游把这一整块当门控项，**缺 heading 行或任一行都回 429 FreeUsageLimitError**——
-# 那个 429 带 Retry-After 到 UTC 零点，看起来完全像「每日配额耗尽」，实测与出口 IP
+# 那个 429 带 Retry-After 到 UTC 零点，看起来像固定时间窗限流，实测与出口 IP
 # 无关。旧版本这里只抄了 4 行（漏掉 heading、git repo、Platform、Prefer tmp），于是
 # 每一条探测都被判 quota，19 条线全被打成坏线。
 # 值取 9router 服务进程的取值：platform = linux、tmp = os.tmpdir()/opencode。
@@ -63,7 +63,7 @@ URL = "https://opencode.ai/inference/v1/chat/completions"
 # opencodeFingerprint.js 的 OPENCODE_ENV_WORKING_DIR 默认 /home/user/project）。
 # 上游按这一行路径做门控，且是**精确字符串**判定：2026-11-10 实测同一隧道、
 # 同一分钟、同一 session，只把 Working directory 写成 /home/administrator/.9router
-# 就 429 FreeUsageLimitError（假装成「每日配额耗尽」，带 Retry-After 到次日），
+# 就 429 FreeUsageLimitError（伪装成固定时间窗限流，带 Retry-After 到次日），
 # 改成 /home/user/project 立刻 200；把同一个字符串加个后缀 .9router2 也 200 ——
 # 是本机这条路径被拉黑，不是用户名或配额。旧默认值取家目录推导，家目录在
 # /home/administrator 下的机器（本机、软路由）探测全被判 quota，台账一天烧掉
@@ -619,8 +619,8 @@ def probe(port: int, timeout: float) -> tuple[str, float, str, int | None]:
             if verdict != "quota":
                 return (verdict, round(time.time() - t0, 1), head.strip()[:100],
                         parse_retry_after(retry, head))
-            # quota 可能是会话级（9router 实测轮换 epoch 能恢复），换一代再试一次；
-            # 仍是 quota 才算出口级。对齐 opencode.js 的 rotateSession + 一次重试。
+            # quota 一律按出口判定；换一代会话只为排除上游对单次请求的门控，
+            # 重试仍 quota 即确认该出口不可用。对齐 opencode.js 的一次重试。
             session = _session_for(port, rotate=True)
             time.sleep(ROTATE_DELAY_SEC)
             status, head, retry, err = _bun_probe(bun, proxy_url, session, timeout)

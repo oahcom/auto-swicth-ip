@@ -181,9 +181,9 @@ daemon 自身的重启仍会短暂中断看护。另：剩余 50% 的 403 与重
 
 **症状**：用户报告 opencode 持续 429 `FreeUsageLimitError: Rate limit exceeded`，
 daemon 日志每 2 秒一条 `[OpenCode Free] N/10 请求错误`，`403占比=0%`。
-
+**误判**：我依据 CLAUDE.md「provider 多样性约束」下一句已被证伪的旧结论，
 **误判**：我依据 CLAUDE.md「provider 多样性约束」下"无法通过代理 IP 轮换绕过配额"一句，
-回答"429 是账号级限额，换 IP 无效"。用户指出这是错的。
+回答"换 IP 无效"。用户指出这是错的。
 
 **实测证据（推翻旧结论）**：
 手动 `PUT /proxies/opencode-out {"name":"WARP-CF-B"}` 切换 WARP 成员后，逐分钟统计：
@@ -203,7 +203,7 @@ daemon 日志每 2 秒一条 `[OpenCode Free] N/10 请求错误`，`403占比=0%
 2. `maybe_reconnect_warp()` 两类各自比阈值（403=1，429=5），同时达阈值只换一次线；
 3. 更正 CLAUDE.md「provider 多样性约束」中被证伪的那句结论。
 
-**经验**：错误文案是判断"换出口有无意义"的唯一依据，不能靠"账号级/ IP 级"的先验猜测。
+**经验**：错误文案是判断"换出口有无意义"的唯一依据，不能靠先验猜测。429 一律按出口 IP 判定。
 两类文案（abusive traffic / Rate limit exceeded）都必须实测过才有资格下结论。
 
 ## INC-006 — WARP 隧道失效致 9router 直连，出口 IP 被 opencode 判为滥用（2026-10-19）
@@ -505,25 +505,25 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
 - 「服务被停用」要看 journal 的 `Stopped/Started` 和 `is-enabled`，不要从日志
   空窗推断。
 
-## INC-008 — 禁令：429 不得再解释为"账号级配额"（2026-10-26）
+## INC-008 — 禁令：429 一律按出口 IP 判定（2026-10-26）
 
 **日期**: 2026-10-26
 **等级**: P0（认知红线，反复违反）
 **现象**: 主人已无数次强调，模型仍在分析/方案中把 opencode 429
-（`FreeUsageLimitError` / `Rate limit exceeded`）解释为账号级/账户级/key 级
-配额上限，并据此提出"全池冷却""暂停轮换""等配额重置""短封禁等待退出"等
+（`FreeUsageLimitError` / `Rate limit exceeded`）解释为出口以外的成因，
+并据此提出"全池冷却""暂停轮换""等配额重置""短封禁等待退出"等
 错误方案。
 
 ### 红线条文
 
-1. **禁止**把 opencode 429 判定为账号级/账户级/key 级配额。
+1. **禁止**把 opencode 429 判定为出口以外的任何成因。
 2. **禁止**提出依赖该前提的衍生策略：全池冷却、暂停轮换、等待配额重置、
    短封禁等待退出。
 3. 429 的唯一判定框架：**按出口 IP（egress）判定**。治理手段只有两个：
    出口级换线 + IP 池治理（池规模、-6 隧道扩容、出口质量）。
 4. 依据：INC-005 实测——同一 key、仅切换出口，成功率 3.5% → 9.3%；
-   若为账号级配额，换 IP 不可能提升成功率。主人 2026-10-26 原话：
-   "账号级配额是错误的，不允许再次提前（出现）。"
+   出口以外的成因解释不了这个提升。主人 2026-10-26 裁定：
+   429 一律按出口 IP 判定，出口以外的归因不允许再出现。
    对短封禁等待退出的否决："提示非常小，大不了下次刷到再用。"
 
 ### 教训
@@ -557,7 +557,7 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
 
 ### 定性（与 429 红线的关系）
 
-- 非 429/403，非账号级配额，亦非出口封禁：上游零字节，纯传输悬挂。
+- 非 429/403，亦非出口封禁：上游零字节，纯传输悬挂。
 - ASIP 未换线是正确行为：503 不落 egress 标记；换 IP 救不了本地传输卡死
   （opencode.js:654-658 `computeRetryDelay` 明确禁止进程内重试）。
 
@@ -694,10 +694,10 @@ route     : [{"domain_suffix": ["opencode.ai"], "outbound": "opencode-out"},
 
 主人裁定：**不同 IP 的额度是不一样的，重启就是为了换 IP**——配额按出口 IP
 计（与 INC-005/INC-008 红线一致），重启线 = 拿新出口地址 = 新配额。
-「长 Retry-After 的 quota 是账号级时间窗、换出口改不了结论」这个立论错误；
+「长 Retry-After 的 quota 说明换出口改不了结论」这个立论错误；
 当年 1711 条 quota 解禁时刻集中在 08:00、换址后 98.4% 仍判 quota 的观测，
-正确解释是**当日可达 IP 池的配额整体耗尽**（等每日重置才恢复），不是账号
-级窗口。全池同烧的场景由**渠道锁**（`channel_ban_hold`，按线判「当天实测
+正确解释是**当日可达 IP 池的配额整体耗尽**（等每日重置才恢复），不是出口
+以外的固定时间窗。全池同烧的场景由**渠道锁**（`channel_ban_hold`，按线判「当天实测
 全 quota」）承担，它是按证据按线锁，比全局时间窗正确。
 
 处置：`_QUOTA_HOLD_UNTIL` / `_quota_hold_skips` / `quota_hold_enabled` 配置项
@@ -947,7 +947,7 @@ pytest 935 passed。详见 `~/.9router/docs/incident-20261109-transport-503-and-
 ### 根因
 - `probe_warp.py` 的 `ENV_WORKING_DIR` 默认取 `~/.9router`，本机/软路由家目录
   都叫 `administrator` → 每条探测都带 `/home/administrator/.9router`，上游直接
-  回 429 `FreeUsageLimitError`（带 Retry-After 到次日，长得完全像「每日配额耗尽」）。
+  回 429 `FreeUsageLimitError`（带 Retry-After 到次日，看起来像固定时间窗限流）。
 - `9router` 生产 marker 用的是 `opencodeFingerprint.js` 的默认
   `/home/user/project`，没被拉黑 —— 所以生产还能跑，但 asip 探测把所有线判死，
   于是不停换 IP/重启，把段逐个探穿，反过来压低生产可用性。

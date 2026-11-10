@@ -264,3 +264,76 @@ def test_slot_health_returns_live_record(isolated):
     h = daemon._slot_health("slot-never-seen")
     h["last_rotate_ts"] = 123.0
     assert daemon._slot_health("slot-never-seen")["last_rotate_ts"] == 123.0
+
+
+def test_no_healthy_slot_asks_9router_to_restart(monkeypatch):
+    """六条闸都修着时主链路不兜底：明确让 9router 自重启等闸回来。"""
+    monkeypatch.setattr(daemon, "_pick_healthy_slot",
+                        lambda name, avoid_tags=None: (None, None, None))
+    monkeypatch.setattr(daemon, "_slot_all_gates_down", lambda: True)
+    slot = {"name": "slot-1", "selector": "opencode-out-1", "port": 7890}
+    out = daemon._slot_redirect_payload(slot, "WARP-A", "2606:a::1",
+                                        "rate429", 0.0)
+    assert out["switch_to_url"] is None
+    assert out["line_unknown"] is True
+    assert out["restart_required"] is True
+
+
+def test_already_retired_without_standby_does_not_restart(monkeypatch):
+    """线已在请求发出后换走：原地重连即可，不该把刚接上的连接重启掉。"""
+    monkeypatch.setattr(daemon, "_pick_healthy_slot",
+                        lambda name, avoid_tags=None: (None, None, None))
+    slot = {"name": "slot-1", "selector": "opencode-out-1", "port": 7890}
+    out = daemon._slot_redirect_payload(slot, "WARP-A", "2606:a::1",
+                                        "already_retired", 123.0)
+    assert out["switch_to_url"] is None
+    assert not out.get("restart_required")
+    assert not out.get("line_unknown")
+
+
+def test_slot_repair_thread_starts_only_after_payload_is_built(isolated, monkeypatch):
+    """秒切（挑健康槽）期间后台线程不许动状态表。"""
+    import types as _types
+    order = []
+    real_payload = daemon._slot_redirect_payload
+
+    class FakeThread:
+        def __init__(self, target=None, args=(), **kw):
+            self.target = target
+
+        def start(self):
+            order.append("start")
+
+    # 只替换 daemon 模块里的引用，不动全局 threading（pytest 自己要用）。
+    monkeypatch.setattr(daemon, "threading",
+                        _types.SimpleNamespace(Thread=FakeThread))
+
+    def spy_payload(*a, **kw):
+        order.append("payload")
+        return real_payload(*a, **kw)
+
+    monkeypatch.setattr(daemon, "_slot_redirect_payload", spy_payload)
+    daemon._rotate_slot_once(SLOTS[0], "rate429")
+    assert order == ["payload", "start"], order
+
+
+def test_startup_unknown_slots_do_not_trigger_restart(monkeypatch):
+    """刚重启六条闸都是 unknown 时不能让 9router 白重启。"""
+    monkeypatch.setattr(daemon, "consumer_slots",
+                        lambda: [{"name": "slot-1"}, {"name": "slot-2"}])
+    monkeypatch.setattr(daemon, "_slot_health",
+                        lambda name: {"status": "unknown"})
+    assert daemon._slot_all_gates_down() is False
+    # 有一条 bad 但其余还在初始化，同样不算「全废」。
+    monkeypatch.setattr(daemon, "_slot_health",
+                        lambda name: {"status": "bad"} if name == "slot-1"
+                        else {"status": "unknown"})
+    assert daemon._slot_all_gates_down() is False
+    monkeypatch.setattr(daemon, "_slot_health",
+                        lambda name: {"status": "repairing"})
+    assert daemon._slot_all_gates_down() is True
+    # 只要还有一条 ok，就算这次没挑中也不该重启（可能只是 tag 被 avoid 排除）。
+    monkeypatch.setattr(daemon, "_slot_health",
+                        lambda name: {"status": "ok"} if name == "slot-2"
+                        else {"status": "bad"})
+    assert daemon._slot_all_gates_down() is False

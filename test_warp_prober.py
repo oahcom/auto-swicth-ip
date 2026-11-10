@@ -231,8 +231,8 @@ def _stub_probe(monkeypatch, verdict="quota"):
 def test_quota_verdict_restarts_line_for_fresh_ip(monkeypatch):
     """quota(429) 照常重启该线：重启 = 换出口地址 = 新 IP 的独立配额。
 
-    2026-11-09 主人裁定：「长 Retry-After 的 quota 是账号级时间窗」是错误
-    理论 —— 不同 IP 的额度不一样，换 IP 永远有效。旧的全局额度闸
+    2026-11-09 主人裁定：quota 一律按出口 IP 判定 —— 不同 IP 的额度不一样，
+    换 IP 永远有效，长 Retry-After 也不例外。旧的全局额度闸
     （_QUOTA_HOLD，按 Retry-After 时长冻结所有线的重启）已删除；
     刷不出干净地址的线由渠道锁（当天实测全 quota）按线冷却。
     """

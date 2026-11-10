@@ -110,25 +110,40 @@ def test_too_frequent_rejected(monkeypatch):
     assert r['reason'] == 'too_frequent' and r['ok'] is False, r
 
 
-def test_no_warm_standby(monkeypatch):
+def test_quick_switch_failed_signals_restart(monkeypatch):
+    """秒切失败 = 无可用闸口：不切线、不后台修，直接让 9router 自重启。"""
     monkeypatch.setattr(d, "_last_rotate_ts", 0)
+    calls = []
+    monkeypatch.setattr(d, "_fast_switch",
+                        lambda reason: calls.append("quick") or None)
     monkeypatch.setattr(d, "_reconnect_warp_by_table",
-                        lambda reason, interrupt=True, out=None: False)
+                        lambda reason, interrupt=True, out=None:
+                        calls.append("sync") or False)
+    monkeypatch.setattr(d, "_kick_background_repair",
+                        lambda tag, ip, reason: calls.append("repair"))
     r = d._rotate_once('rate429')
-    assert r['reason'] == 'no_warm_standby', r
+    assert r['ok'] is True and r['switched'] is False, r
+    assert r['reason'] == 'no_healthy_slot', r
+    assert r['restart_required'] is True and r['line_unknown'] is True, r
+    assert r['switch_to_url'] is None and r.get('active_tag') is None, r
+    # 第 10/11 步已从错误切换主链路删除，切失败也不起后台修线程。
+    assert calls == ["quick"], calls
 
 
 # ---- 换下来的出口拉黑；主动轮换不拉黑 ----
 
 @pytest.mark.parametrize("reason", ['rate429', 'abuse403'])
-def test_switched_marks_old_egress(monkeypatch, marked, reason):
+def test_quick_switch_failed_still_marks_old_egress(monkeypatch, marked, reason):
+    """切失败不切线，但被报错的旧线证据照样要记脏。"""
     _set_line(monkeypatch, 'WARP-CF-1', lambda tag: '2a09::old')
-    monkeypatch.setattr(d, "_reconnect_warp_by_table", _fake_switch)
+    sync_calls = []
+    monkeypatch.setattr(d, "_reconnect_warp_by_table",
+                        lambda *a, **kw: sync_calls.append(1) or False)
     monkeypatch.setattr(d, "_last_rotate_ts", 0)
     r = d._rotate_once(reason)
-    assert r['ok'] and r['switched'], r
-    assert r['tag'] == 'WARP-CF-9' and r['egress'] == '2a09::new', r
-    assert r['switched_at'] == 12345.0 and d._last_rotate_ts == 12345.0, r
+    assert r['ok'] and r['switched'] is False, r
+    assert r['reason'] == 'no_healthy_slot' and r['restart_required'] is True, r
+    assert sync_calls == [], "错误切换主链路不得再走同步换线"
     assert marked == [('2a09::old', True, reason)], marked
 
 
@@ -412,17 +427,16 @@ def test_late_429_does_not_lift_rate_limit_on_current_line(monkeypatch):
     state = {"cur": "WARP-CF-1", "n": 0,
              "ips": {"WARP-CF-1": "2a09::cur", "WARP-CF-2": "2a09::old"}}
 
-    def _switch(reason, interrupt=True, out=None):
+    def _quick(reason):
         state["n"] += 1
         tag, ip = f"WARP-NEW{state['n']}", f"2a09::new{state['n']}"
         state["cur"] = tag
         state["ips"][tag] = ip
-        out.update(tag=tag, ip=ip, switched_at=time.time())
-        return True
+        return {"tag": tag, "egress": ip}
 
     monkeypatch.setattr(d, "active_warp_tag", lambda: state["cur"])
     monkeypatch.setattr(d, "_warp_line_ip", lambda tag: state["ips"].get(tag))
-    monkeypatch.setattr(d, "_reconnect_warp_by_table", _switch)
+    monkeypatch.setattr(d, "_fast_switch", _quick)
     monkeypatch.setattr(d, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(d, "_warp_line_invalidate", lambda *a, **k: None)
     monkeypatch.setattr(d, "_probe_cache_forget", lambda *a, **k: None)
@@ -594,7 +608,10 @@ def test_http_layer_forwards_request_started_at(monkeypatch, marked):
     status, payload = _post_rotate(
         monkeypatch, {"reason": "rate429", "request_started_at": 150.0})
 
-    assert status == 200 and payload["ok"] and payload["switched"], payload
+    assert status == 200 and payload["ok"], payload
+    assert payload["switched"] is False, payload
+    assert payload["reason"] == "no_healthy_slot", payload
+    assert payload["restart_required"] is True, payload
     # 发出时是 CF-1（150s），不是当前线 CF-9 —— key 没被读出来就会记成
     # CF-9 的地址。
     assert marked == [('2a09::old', True, 'rate429')], marked
@@ -626,3 +643,68 @@ def test_as_ts_rejects_oversized_integer():
     assert d._as_ts(float('nan')) is None
     assert d._as_ts('abc') is None
     assert d._as_ts(123.5) == 123.5
+
+
+def test_background_repair_starts_after_quick_switch(monkeypatch):
+    """秒切成功：后台修整必须在回包定型之后才启动，不与秒切并发。"""
+    order = []
+    monkeypatch.setattr(d, "_fast_switch",
+                        lambda reason: (order.append("quick") or
+                                        {"tag": "WARP-NEW", "egress": "2a09::new"}))
+    monkeypatch.setattr(d, "_kick_background_repair",
+                        lambda tag, ip, reason: order.append("repair"))
+    monkeypatch.setattr(d, "_reconnect_warp_by_table",
+                        lambda reason, interrupt=True, out=None:
+                        order.append("sync") or False)
+    d._last_rotate_ts = 0
+    d._rotate_once("rate429")
+    assert order == ["quick", "repair"], order
+
+
+def test_quick_switch_failure_does_not_start_background_repair(monkeypatch):
+    """切失败 = 无可用闸口：前台让 9router 重启，不再起后台修线程。"""
+    order = []
+    monkeypatch.setattr(d, "_fast_switch",
+                        lambda reason: order.append("quick") or None)
+    monkeypatch.setattr(d, "_kick_background_repair",
+                        lambda tag, ip, reason: order.append("repair"))
+    monkeypatch.setattr(d, "_probe_line_before_rotate",
+                        lambda tag, ip, fresh=False: order.append("probe") or None)
+    monkeypatch.setattr(d, "_reconnect_warp_by_table",
+                        lambda reason, interrupt=True, out=None:
+                        order.append("sync") or False)
+    d._last_rotate_ts = 0
+    r = d._rotate_once("rate429")
+    assert r["reason"] == "no_healthy_slot" and r["restart_required"] is True, r
+    assert order == ["quick"], order
+
+
+def test_background_repair_still_runs_on_early_return(monkeypatch):
+    """合并窗提前 return 也不能漏掉旧闸修整 —— finally 的意义就在这里。"""
+    order = []
+    monkeypatch.setattr(d, "_kick_background_repair",
+                        lambda tag, ip, reason: order.append("repair"))
+    d._last_rotate_ts = time.time()
+    d._rotate_once("rate429")
+    assert order == ["repair"], order
+
+
+def test_background_repair_gets_the_attributed_offending_line(monkeypatch):
+    """迟到 429 归因到旧线时，后台修的必须是旧线，不能是当前无辜线。"""
+    seen = []
+    monkeypatch.setattr(d, "active_warp_tag", lambda: "WARP-NEW")
+    monkeypatch.setattr(d, "_warp_line_ip", lambda tag: "2a09::new")
+    monkeypatch.setattr(d, "_warp_line_at",
+                        lambda ts: ("WARP-OLD", "2a09::old"))
+    monkeypatch.setattr(d, "_mark_warp_ip_used",
+                        lambda ip, now, blocked=False, kind=None, **kw: None)
+    monkeypatch.setattr(d, "_kick_background_repair",
+                        lambda tag, ip, reason: seen.append((tag, ip, reason)))
+    # 切失败分支不后台修，所以这里让秒切成功，验 finally 里的归因入参。
+    monkeypatch.setattr(d, "_fast_switch",
+                        lambda reason: {"tag": "WARP-NEW", "egress": "2a09::new"})
+    monkeypatch.setattr(d, "_probe_line_before_rotate",
+                        lambda tag, ip, fresh=False: None)
+    d._last_rotate_ts = 0
+    d._rotate_once("rate429", time.time() - 30, None, None)
+    assert seen == [("WARP-OLD", "2a09::old", "rate429")], seen

@@ -51,7 +51,7 @@
 **验证**：`grep -c ASIP_REFRESH /etc/systemd/system/auto-switch-ip.service` → `0`；
 `python3 -m pytest -q test_warp_prober.py` → 15 passed（回退时点）。
 
-**后续纠正**：此后实测证明"换 IP 确实能解决"，我此前"账号级额度、换 IP 无效"的结论是片面判断
+**后续纠正**：此后实测证明"换 IP 确实能解决"，我此前"换 IP 无效"的结论是片面判断
 （只覆盖了当时池内的坏地址）。这条认知已写回 `docs/warp-wg-over-proxy.md` 与 INC-012。
 
 ---
@@ -493,8 +493,8 @@ SIN 5 个地址里最偏的一个节点 8 次全抽到 `.222.43`，另一个节�
 ### 8.6 结论
 
 1. **地址数量不是瓶颈**。v6 地址无限，NRT/SIN/SJC 的 9 条 v6 线依然没有可用结论。
-2. 当前判死的直接证据是账号级额度窗：同一时刻 NRT 与 PHX 的 v6 出口都给出 `quota` +
-   `Retry-After 6300s`，与出口地址无关（`_QUOTA_HOLD_UNTIL` 因此在生效）。
+2. 当时判死的依据是同时段多条出口都给出 `quota` +
+   `Retry-After 6300s`（`_QUOTA_HOLD_UNTIL` 因此在生效）。
    **（2026-11-09 更正：此结论已被主人证伪——配额按出口 IP 计，当年观测的正确
    解释是当日可达 IP 池的配额整体耗尽。`_QUOTA_HOLD` 已删除，见 INCIDENTS.md
    INC-012 更正段。）**

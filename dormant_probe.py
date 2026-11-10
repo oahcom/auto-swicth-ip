@@ -520,10 +520,10 @@ def main() -> int:
 
     print(f"\n结果：通 {len(alive)} / {len(tags)}，探测故障 {errors} 条")
     if not alive and len(tags) >= 10:
-        # 一条都不通时，最可能是出口/链路整体有问题（账号额度窗、上游被墙），
+        # 一条都不通时，最可能是出口/链路整体有问题（上游被墙、整池出口不可用），
         # 而不是"这批节点刚好同时全死"。写盘归写盘（strikes 要连续两轮才降级），
         # 但这句必须留痕，否则日志里只有一堆 dead。
-        print("⚠ 本轮 0 条通 —— 留意是账号级额度窗还是节点整体失效", flush=True)
+        print("⚠ 本轮 0 条通 —— 优先核查出口/链路整体状态", flush=True)
     # 进出池的迁移单独打一行：原来只能靠逐条 ok/dead 反推谁进谁出
     up = [t for t, _o, n in transitions if n]
     down = [t for t, _o, n in transitions if not n]
