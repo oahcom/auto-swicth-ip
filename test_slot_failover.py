@@ -487,3 +487,66 @@ def test_probe_verdict_falls_back_to_pre_rotate_table(monkeypatch):
     daemon._PROBE_BEFORE_ROTATE["WARP-A|2606:a::1"] = {
         "verdict": "OK", "ts": time.time()}
     assert daemon._probe_verdict_for_ip("2606:a::1") == "OK"
+
+
+# --- 全链路修复：生产 429 长封禁 + 秒切按地址过滤 -------------------------
+
+def test_quarantine_recognizes_production_block(isolated, monkeypatch):
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked",
+                        lambda ip, now=None: ip == "2606:b::2")
+    assert daemon._slot_ip_is_quarantined("2606:b::2", 1000.0) is True
+    assert daemon._slot_ip_is_quarantined("2606:c::3", 1000.0) is False
+
+
+def test_quarantine_recognizes_probe_quota(isolated, monkeypatch):
+    monkeypatch.setattr(daemon, "_probe_verdict_for_ip",
+                        lambda ip, now=None: "quota" if ip == "2606:d::4" else None)
+    assert daemon._slot_ip_is_quarantined("2606:d::4", 1000.0) is True
+    assert daemon._slot_ip_is_quarantined("2606:e::5", 1000.0) is False
+
+
+def test_pick_healthy_slot_skips_quarantined_egress(isolated, monkeypatch):
+    blocked = {"2606:b::2", "2606:c::3"}
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked",
+                        lambda ip, now=None: ip in blocked)
+    monkeypatch.setattr(daemon, "_slot_serving_name", lambda: "slot-1")
+    # slot-1 自身排除，b/c 被隔离 → 轮询结果只能落在 d/e/f。
+    for _ in range(8):
+        s, tag, ip = daemon._pick_healthy_slot("slot-1")
+        assert s["name"] in {"slot-4", "slot-5", "slot-6"}
+        assert ip not in blocked
+
+
+def test_all_candidates_quarantined_returns_no_healthy_slot(isolated, monkeypatch):
+    monkeypatch.setattr(daemon, "_warp_ip_is_blocked", lambda ip, now=None: True)
+    payload = daemon._slot_redirect_payload(
+        SLOTS[0], "WARP-A", "2606:a::1", "rate429", 0.0)
+    assert payload["switch_to"] is None
+    assert payload["reason"] == "no_healthy_slot"
+    assert payload["line_unknown"] is True
+
+
+def test_ban_after_prefers_upstream_retry_after_ms():
+    assert daemon._rotate_ban_after_from_req({"retry_after_ms": 45000}) == 45.0
+    assert daemon._rotate_ban_after_from_req({"retry_after_ms": "3600000"}) == 3600.0
+
+
+def test_ban_after_falls_back_to_config_instead_of_60s():
+    secs = daemon._rotate_ban_after_from_req({})
+    cfg = float(daemon._api_cfg().get("production_429_ban_sec", 43200))
+    assert secs == cfg
+    assert secs >= 3600.0, "兜底不能退回到 rate429_guard_sec=60s"
+
+
+def test_slot_rotate_writes_ban_after_into_ledger(isolated, monkeypatch):
+    marks = []
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda *a, **k: marks.append((a, k)))
+    monkeypatch.setattr(daemon, "_probe_verdict_for_ip", lambda ip, now=None: None)
+    # 只验证「标脏时把 ban_after 传进台账」这一环；回包构造由既有用例覆盖。
+    try:
+        daemon._rotate_slot_once(SLOTS[0], "rate429", None, None, "req-x", 43200.0)
+    except Exception:
+        pass
+    assert marks, "生产 429 必须标脏"
+    assert marks[0][1].get("ban_after") == 43200.0

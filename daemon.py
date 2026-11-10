@@ -12011,6 +12011,32 @@ def _kick_background_repair(tag, ip, reason):
                          daemon=True, name="repair-line").start()
 
 
+def _slot_ip_is_quarantined(ip: str | None,
+                            now: float | None = None) -> bool:
+    """这个出口地址是否已判不可用（生产标脏 / 探针 quota / flagged）。
+
+    秒切选目标以前只看「槽位健康」，与地址额度无关 —— 21:22 撞 429 的那个
+    /128 在随后 6 分 47 秒里被复用 ≥4 次，就是这条缺口。额度封禁按地址计，
+    过滤也必须按地址做：生产 429 的标脏落在 _WARP_IP_USED（含 ban_until），
+    探针结论落在 _WARP_PROBE_SEEN / _PROBE_BEFORE_ROTATE，两个来源都要认。
+    只用于过滤，不改写探测台账，诊断字段「实测/标脏后」的语义保持不变。
+    """
+    if not ip:
+        return False
+    if now is None:
+        now = time.time()
+    try:
+        if _warp_ip_is_blocked(ip, now):
+            return True
+    except Exception:
+        pass
+    try:
+        v = _probe_verdict_for_ip(ip, now)
+        return v in ("quota", "flagged")
+    except Exception:
+        return False
+
+
 def _pick_healthy_slot(name, avoid_tags=None):
     """挑一台当前健康、且不是刚失败那台的 sing-box，返回 (slot, tag, ip)。
 
@@ -12026,6 +12052,7 @@ def _pick_healthy_slot(name, avoid_tags=None):
         return None, None, None
     avoid = set(avoid_tags or ())
     serving = _slot_serving_name()
+    t0 = time.time()
     n = len(slots)
     start = int(_SLOT_REDIRECT_RR.get("index", 0)) % n
     candidates = []
@@ -12037,6 +12064,10 @@ def _pick_healthy_slot(name, avoid_tags=None):
             continue
         tag, ip = _slot_current(s)
         if not tag or tag in avoid:
+            continue
+        if _slot_ip_is_quarantined(ip, t0):
+            log("· 秒切候选 %s 出口=%s 已隔离（生产标脏/quota），跳过"
+                % (s["name"], ip or "未知"))
             continue
         candidates.append((s, tag, ip))
     if not candidates:
@@ -12112,6 +12143,28 @@ def _ensure_api_token() -> str:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(tok)
     return tok
+
+
+def _rotate_ban_after_from_req(req) -> float | None:
+    """把 9router 透传的 Retry-After 毫秒转成 ban_after 秒。
+
+    9router 从上游 429 的响应头/正文解析（parseRetryAfterMs），有值以它为准；
+    上游不给时用 api.production_429_ban_sec 兜底（默认 12h，来自探针实测
+    11~13h），避免 rate429_guard_sec=60s 让刚封的地址立刻回池。
+    transport / proactive 不标脏，传了也不会产生任何写入。
+    """
+    raw = req.get("retry_after_ms") if isinstance(req, dict) else None
+    try:
+        ms = float(raw)
+        if ms > 0:
+            return min(ms / 1000.0, 86400.0)
+    except (TypeError, ValueError):
+        pass
+    try:
+        secs = float(_api_cfg().get("production_429_ban_sec", 43200))
+    except (TypeError, ValueError):
+        secs = 43200.0
+    return max(1.0, min(secs, 86400.0))
 
 
 def _normalize_rotate_reason(raw) -> str:
@@ -12230,7 +12283,8 @@ def _with_active_line(payload: dict, t0: float, tag: str | None = None,
 
 def _rotate_once(reason: str, request_started_at: float | None = None,
                  egress_ip: str | None = None,
-                 egress_since: float | None = None) -> dict:
+                 egress_since: float | None = None,
+                 ban_after: float | None = None) -> dict:
     """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
 
     错误切换（rate429/abuse403）只做秒切：翻到一条已探通的健康备用槽。
@@ -12325,7 +12379,8 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
             was_blocked = False
         # transport 只证明这条连接/链路悬挂，不是 IP 级封禁证据：换线但不记脏。
         if reason not in ("proactive", "transport") and old_ip:
-            _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason)
+            _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason,
+                               ban_after=ban_after)
         try:
             # 合并窗放在记账**之后**：迟到的 429 常常同一批涌进来（实测客户端一次
             # 并发几十条），若先合并再记账，第一条换线后其余全部命中合并窗，历史里
@@ -12568,7 +12623,7 @@ def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
 
 
 def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
-                      req_id=None):
+                      req_id=None, ban_after=None):
     """带防重的槽位 /rotate：迟到请求只重连，不为旧证据烧掉新线。
 
     与主路径一一对应：
@@ -12617,7 +12672,8 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         except Exception:
             was_blocked = False
         if reason not in ("proactive", "transport") and cur_ip:
-            _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason)
+            _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason,
+                               ban_after=ban_after)
             # 只观测：标脏后台账里还剩什么，留在 ⇢ 那一行做运行时证据。
             verdict_after = _probe_verdict_for_ip(cur_ip, t0)
 
@@ -12787,6 +12843,9 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         # 它，才能把「一条失败请求」和「哪台闸/哪条线/哪个出口」串成一条链。
         _rid = req.get("req_id")
         rid = str(_rid).strip()[:64] if _rid else None
+        # 生产 429 的封禁时长：9router 透传的真实 Retry-After 优先，
+        # 缺失时用 api.production_429_ban_sec 兜底（见函数注释）。
+        ban_after = _rotate_ban_after_from_req(req)
         # 多端口：带 egress_proxy_url 的请求按端口定位槽位，走独立 sing-box 路径。
         # 每台 sing-box 独立连接池，9router 轮询，429 时后台修那台，立即返回
         # 让 9router 重连到别的端口。不走下面的单主出口逻辑。
@@ -12800,7 +12859,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                     str(req.get("egress_ip")).strip()
                     if isinstance(req.get("egress_ip"), str)
                     and req.get("egress_ip").strip() else None,
-                    rid)
+                    rid, ban_after)
             except Exception as e:
                 log(f"✗ 槽位 /rotate 异常: {e}")
                 self._send(500, {"ok": False, "reason": "internal_error"})
@@ -12825,7 +12884,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                 _normalize_rotate_reason(req.get("reason")),
                 _as_ts(req.get("request_started_at")),
                 str(ip).strip() if isinstance(ip, str) and ip.strip() else None,
-                _as_ts(req.get("egress_since")))
+                _as_ts(req.get("egress_since")), ban_after)
         except Exception as e:
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})
