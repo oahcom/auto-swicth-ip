@@ -448,3 +448,42 @@ def test_rotate_trace_fields_uses_slot_egress_not_reported_ip(isolated, monkeypa
     empty = daemon._rotate_trace_fields({}, {"ok": True})
     assert empty["offending_egress"] is None
     assert empty["offending_verdict"] is None
+
+
+def test_rotate_slot_keeps_verdict_from_before_block_marking(isolated, monkeypatch):
+    """标脏会清实测台账；回包/日志必须留住事发前的结论，而不是事后重算。
+
+    isolated 把 _mark_warp_ip_used 换成了 no-op，这里只替身出它的
+    forget_probe 效果，精确复现生产时序，不碰落盘。
+    """
+    import time
+    lines = []
+    monkeypatch.setattr(daemon, "log", lambda msg: lines.append(msg))
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    monkeypatch.setitem(daemon._WARP_PROBE_SEEN,
+                        ("WARP-A", "2606:a::1"), ("OK", time.time()))
+
+    def fake_mark(ip, now, blocked=False, kind=None, **kw):
+        if blocked:
+            daemon._probe_cache_forget(ip)
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used", fake_mark)
+
+    out = daemon._rotate_slot_once(SLOTS[0], "rate429", req_id="REQ-VERDICT")
+    assert out["offending_verdict"] == "OK", out
+    # 回包补字段也不许把快照覆盖成事后读取的 None
+    fields = daemon._rotate_trace_fields({"egress_ip": "2606:a::1"}, out)
+    assert fields["offending_verdict"] == "OK", fields
+    hit = [s for s in lines if "REQ-VERDICT" in s]
+    assert hit and "实测=OK" in hit[0], hit
+    assert "标脏后=未探" in hit[0], "台账确实被清，观测字段要如实记录"
+    assert "目标出口=2606:b::2" in hit[0], hit[0]
+
+
+def test_probe_verdict_falls_back_to_pre_rotate_table(monkeypatch):
+    """两张台账要通：换线前实测写的结果也该被诊断反查读到。"""
+    import time
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
+    monkeypatch.setattr(daemon, "_PROBE_BEFORE_ROTATE", {})
+    daemon._PROBE_BEFORE_ROTATE["WARP-A|2606:a::1"] = {
+        "verdict": "OK", "ts": time.time()}
+    assert daemon._probe_verdict_for_ip("2606:a::1") == "OK"

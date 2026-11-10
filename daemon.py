@@ -1049,6 +1049,10 @@ def _probe_verdict_for_ip(ip: str | None,
     只认地址级结论：unreachable / err 说的是那条隧道当时没跑通，换条线同
     样的地址完全可能探通，拿来当这个地址的结论会误判。返回 None 表示
     「TTL 内没探过这个地址」，不是「这个地址没问题」。
+
+    「换线前实测」的结论写在 _PROBE_BEFORE_ROTATE（tag|ip），是同一台探测器
+    对同一地址的实测、只是另一张台账；主表没命中时回退查它，否则刚做过的
+    OK/quota 判定会被漏掉。
     """
     if not ip:
         return None
@@ -1064,7 +1068,26 @@ def _probe_verdict_for_ip(ip: str | None,
                 continue
             if best is None or ts2 > best[0]:
                 best = (ts2, v2)
-    return best[1] if best else None
+    if best is not None:
+        return best[1]
+    fallback: tuple[float, str] | None = None
+    try:
+        for key, rec in list(globals().get("_PROBE_BEFORE_ROTATE", {}).items()):
+            if not isinstance(key, str) or not key.endswith("|" + ip):
+                continue
+            if not isinstance(rec, dict):
+                continue
+            v = rec.get("verdict")
+            if v not in _WARP_PROBE_ADDRESS_SCOPED:
+                continue
+            ts = float(rec.get("ts") or 0)
+            if now - ts > _probe_ttl(v):
+                continue
+            if fallback is None or ts > fallback[0]:
+                fallback = (ts, v)
+    except Exception:
+        fallback = None
+    return fallback[1] if fallback else None
 
 
 def _probe_cache_put(tag: str, ip: str, verdict: str,
@@ -12562,6 +12585,11 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
     with _API_LOCK:
         _api_stats["calls"] += 1
         cur_tag, cur_ip = _slot_current(slot)
+        # 事发前先读一次该地址的实测结论。下面 _mark_warp_ip_used 会
+        # forget_probe 清台账，回包/日志以前在标脏之后才读，必然是「未探」。
+        verdict_before = (_probe_verdict_for_ip(cur_ip, t0)
+                          if cur_ip else None)
+        verdict_after = verdict_before
         h = _slot_health(name)
         switched_at = float(h.get("switched_at") or 0.0)
         retired = bool(request_started_at and request_started_at > 0
@@ -12576,8 +12604,10 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
                    cur_ip or "地址未知"))
             # 同一端口的新线已经就位；调用方清连接后原地重试即可。这里不再
             # 发起换线（有健康备槽时照样给出，让对端可以顺手合并连接）。
-            return _slot_redirect_payload(
+            out = _slot_redirect_payload(
                 slot, cur_tag, cur_ip, "already_retired", switched_at, 0.0)
+            out["offending_verdict"] = verdict_before
+            return out
 
         # 证据先记账，再判合并/限速：被拒掉的一次也不能把刚吃 429 的地址
         # 当干净地址放回候选。
@@ -12588,6 +12618,8 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
             was_blocked = False
         if reason not in ("proactive", "transport") and cur_ip:
             _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason)
+            # 只观测：标脏后台账里还剩什么，留在 ⇢ 那一行做运行时证据。
+            verdict_after = _probe_verdict_for_ip(cur_ip, t0)
 
         last_attempt = float(h.get("last_rotate_ts") or 0.0)
         accepted = False
@@ -12630,6 +12662,9 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
                     repair_thread.start()
                 except Exception as e:
                     log(f"✗ {name} 后台修整启动失败: {e}")
+        # 事发前读数钉进回包：_rotate_trace_fields 优先沿用，不在标脏
+        # （forget_probe 已清台账）之后重算成「未探」。
+        out["offending_verdict"] = verdict_before
         if accepted or h["status"] == "repairing":
             # 排查通道：把请求 id、这台闸绑定的线/IP、该地址的实测结论一起
             # 留下。少了这几项，出问题时只能拿时间戳去猜「哪条请求走了哪个
@@ -12638,11 +12673,16 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
             # 线/出口取 _slot_current 读出来的**一对**；调用方报来的 egress_ip
             # 是全局活动出口、对独立槽位不适用，单列「报障IP」备查，不拿来
             # 冒充这台闸的地址（实测不同线的槽位会报同一个 IP）。
-            log("⇢ %s 报 %s（%s）[req=%s] 线=%s 出口=%s 报障IP=%s 实测=%s，重试改走 %s"
+            # 「标脏后」只作观测：与「实测」并列即可看出台账是否被清过。
+            log("⇢ %s 报 %s（%s）[req=%s] 线=%s 出口=%s 报障IP=%s 实测=%s "
+                "标脏后=%s，重试改走 %s 目标线=%s 目标出口=%s 目标url=%s"
                 % (name, reason, reason_out, req_id or "-",
                    cur_tag or "未知", cur_ip or "未知", egress_ip or "-",
-                   _probe_verdict_for_ip(cur_ip) or "未探",
-                   out.get("switch_to") or "无健康备槽"))
+                   verdict_before or "未探", verdict_after or "未探",
+                   out.get("switch_to") or "无健康备槽",
+                   out.get("switch_to_tag") or "-",
+                   out.get("switch_to_egress") or "-",
+                   out.get("switch_to_url") or "-"))
         return out
 
 
@@ -12664,10 +12704,15 @@ def _rotate_trace_fields(req: dict, payload: dict) -> dict:
     ip = (payload.get("active_egress") or payload.get("egress")
           or reported or None)
     tag = payload.get("active_tag") or payload.get("tag") or None
-    try:
-        verdict = _probe_verdict_for_ip(ip)
-    except Exception:
-        verdict = None
+    # 槽位路径已在标脏前把结论快照进 payload（标脏会清台账，事后取必然
+    # 是 None）。主路径 result 没有这个键，仍按实时台账取。
+    if "offending_verdict" in payload:
+        verdict = payload["offending_verdict"]
+    else:
+        try:
+            verdict = _probe_verdict_for_ip(ip)
+        except Exception:
+            verdict = None
     return {"offending_tag": tag, "offending_egress": ip,
             "offending_verdict": verdict, "reported_egress": reported}
 
