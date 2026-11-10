@@ -3185,6 +3185,184 @@ _UNKNOWN_RESTART_STREAK = 10
 _DRAIN_BUSY_WINDOW_SEC = 30.0
 
 
+# ---------------------------------------------------------------------------
+# 排空后再回收（2026-11-11，主人裁定）。换线只翻 selector（既有），出口连接池
+# 由 9router 按端口精确失效（9router 6c4b2aba）；本段补齐第三环——刚被换下的
+# 线必须等它上面的存量请求走完才允许重启回收。三段缺一不可：缺 ② 排空等不到
+# 收敛，缺 ③ selector 留下的存量请求会被重启掐断（实测在用线重启后 30s 内
+# p50 9 个在途请求、报错率 4 倍于基线）。
+#
+# 判闲不按时间，按**字节流事实**（_warp_line_stats 的 conns / young / 字节
+# 增量，主人 2026-11-11 裁定：字节流是可探测的）：零连接立即回收；有年轻连接
+# （< _FIRST_BYTE_WAIT_MAX_SEC）立即判忙；只剩老连接则连续 drain_quiet_rounds
+# 轮字节零增长才回收。但探测有盲区（TTFT 长尾实测 max 532.7s），必须设上限：
+# 超过 drain_max_wait_sec 强制回收，H2 线延迟高一档、上限翻倍（主人裁定
+# 「预估翻个倍」）。所有判定**非阻塞**：不达标就拒绝，探针按 drain_poll_sec
+# 回来复查——探针并发 32，睡窗口会占死线程池。
+# ---------------------------------------------------------------------------
+
+_DRAIN_LOCK = threading.Lock()
+# tag -> 被翻下 selector 的时刻（_slot_note_switch 写入；回收后清除）
+_RETIRED_AT: dict[str, float] = {}
+# tag -> {rounds, last_bytes}：老连接字节静止轮数（_drain_gate 维护）
+_DRAIN_PENDING: dict[str, dict] = {}
+# tag -> 首次「判坏但仍在槽」的时刻：先等真实报障换线，超过
+# drain_force_retire_sec 仍没被换走才主动认领切槽（只翻 selector）
+_BAD_ON_SLOT: dict[str, float] = {}
+
+
+def _drain_max_wait_sec(member: dict) -> float:
+    """回收上限（秒）。H2 线延迟高一档（TTFT p90 52.6s / max 532.7s），翻倍。
+
+    基值对齐 _FIRST_BYTE_WAIT_MAX_SEC(120s)：上限绝不能在年轻连接窗口内
+    触发，否则等于绕开年轻连接保护。所以上限只逮「连接已老、字节增量连续
+    为零仍不静止」的病态长尾——改动前这类请求是跟着 2s 短窗线重启每
+    5~7s 被掐一次的。
+    """
+    base = float(_warp().get("drain_max_wait_sec", 120))
+    return base * 2.0 if member.get("kind") == "h2" else base
+
+
+def _lines_in_use() -> set[str]:
+    """此刻正挂在 selector 上服务流量的线：主出口 + 全部槽位当前指向的线。
+
+    优先读 _SLOT_HEALTH 的 tag 台账（纯内存；_slot_put → _slot_note_switch
+    是槽位 selector 唯一的变更入口，台账与真实 selector 同步）。daemon 重启
+    后的启动窗口里台账尚未建全（tag 为 None）而 sing-box 里的 selector 仍指
+    着真实在用的线——这正是最需要真实集合的时刻，回退 _slot_peers()（≤6 发
+    HTTP；_warp_line_restart 既有路径本就有 warp_line_busy 的 HTTP 查询，
+    不引入新的持锁 HTTP 类别）。
+    """
+    used: set[str] = set()
+    a = active_warp_tag()
+    if a:
+        used.add(a)
+    with _SLOT_STATE_LOCK:
+        tags = {h["tag"] for h in _SLOT_HEALTH.values() if h.get("tag")}
+        missing = any(not h.get("tag") for h in _SLOT_HEALTH.values())
+    if missing:
+        for s in consumer_slots():
+            t, _ip = _slot_current(s)
+            if t:
+                used.add(t)
+    else:
+        used |= tags
+    return used
+
+
+def _note_bad_maybe_retire(tag: str, now: float, reason: str = "") -> None:
+    """判坏但仍在槽：先记账等真实报障换线（只翻 selector），超时才主动认领。
+
+    探针结论只做线索，生产槽位以真实报障为准（文档第七/八节教训：不用 3KB
+    探针结论去切生产槽）。超过 drain_force_retire_sec 仍未被真实报障换走，
+    用 _slot_begin_repair 原子认领防并发双切；reason 用 proactive，不给
+    地址记脏（判坏结论来自探针，不是生产事实）。
+    """
+    with _DRAIN_LOCK:
+        first = _BAD_ON_SLOT.setdefault(tag, now)
+    if now - first < float(_warp().get("drain_force_retire_sec", 120)):
+        return
+    kicked = False
+    try:
+        owners = _slot_line_owners().get(tag, [])
+    except Exception:
+        owners = []
+    for name in owners:
+        slot = _slot_by_name(name)
+        if slot is None:
+            continue
+        try:
+            cur, _ip = _slot_current(slot)
+        except Exception:
+            continue
+        if cur != tag:
+            continue
+        if not _slot_begin_repair(name, "drain_force_retire"):
+            continue
+        threading.Thread(target=_repair_slot, args=(slot, "proactive"),
+                         daemon=True, name="retire-" + name).start()
+        kicked = True
+    if kicked:
+        with _DRAIN_LOCK:
+            _BAD_ON_SLOT.pop(tag, None)
+        if now - _NIGHT_LOG_TS.get("retire:" + tag, 0.0) > 300.0:
+            _NIGHT_LOG_TS["retire:" + tag] = now
+            log("  ⏏ %s 判坏但在槽超 %.0fs 未被真实报障换走 → "
+                "主动认领切槽（只翻 selector，%s）"
+                % (tag, now - first, reason))
+
+
+def _drain_gate(member: dict, now: float,
+                reason: str = "") -> tuple[bool, str]:
+    """回收闸：刚退役的线必须按字节流事实判空才允许重启。
+
+    返回 (allow, note)；allow=True 时本线排空状态已清理。本函数不做任何
+    阻塞等待、不写线状态——拒绝只由调用方推 next_probe_ts。
+
+    顺序：在槽拒绝（先摘流量）→ 上限（字节流探测有盲区，必须有界）→
+    零连接立即回收 → 年轻连接立即判忙 → 老连接数连续字节零增长轮数。
+    """
+    tag = member["tag"]
+    if not _warp().get("drain_before_recycle_enabled", True):
+        return True, "开关关闭"
+    if tag in _lines_in_use():
+        _note_bad_maybe_retire(tag, now, reason)
+        return False, "仍在槽上服务流量，先摘流量再回收"
+    with _DRAIN_LOCK:
+        retired = _RETIRED_AT.get(tag)
+        if retired is None:
+            # 台账没有退役记录 ≠ 它没服务过流量。账本由 _slot_note_switch
+            # 维护，主出口换线（_switch_warp/_fast_switch）、人工动
+            # sing-box、daemon 重启丢内存都会绕过它——静默放行等于重演
+            # 「在途被掐断」（fn_xxx 故障同根：账本说没有就放行）。字节流
+            # 事实优先：名下有连接 = 在或刚在服务流量 → 按「刚退役」起表
+            # 排空，同样受上限约束；零连接才真正放行。
+            stats0 = _warp_line_stats(tag)
+            if stats0 is None or stats0[2] == 0:
+                return True, "未经槽位服役且零连接（游离线）"
+            _RETIRED_AT[tag] = now
+            retired = now
+            if now - _NIGHT_LOG_TS.get("drainhole:" + tag, 0.0) > 300.0:
+                _NIGHT_LOG_TS["drainhole:" + tag] = now
+                log("  ⚠ %s 无退役记录却有 %d 条连接（台账洞：selector 变更"
+                    "未走 _slot_note_switch）→ 按刚退役起表排空"
+                    % (tag, stats0[2]))
+        elapsed = now - retired
+        cap = _drain_max_wait_sec(member)
+        if elapsed > cap:
+            _RETIRED_AT.pop(tag, None)
+            _DRAIN_PENDING.pop(tag, None)
+            note = "排空超上限 %.0fs → 强制回收" % cap
+            if member.get("kind") == "h2":
+                note = "排空超上限 %.0fs（H2x2）→ 强制回收" % cap
+            return True, note
+        stats = _warp_line_stats(tag)
+        if stats is None:
+            return False, "连接快照不可用，下轮复查"
+        bytes_, young, conns = stats
+        if conns == 0:
+            _RETIRED_AT.pop(tag, None)
+            _DRAIN_PENDING.pop(tag, None)
+            return True, "排空：零连接"
+        if young > 0:
+            _DRAIN_PENDING[tag] = {"rounds": 0, "last_bytes": bytes_}
+            return False, "有年轻连接（请求仍在生命周期内）"
+        pend = _DRAIN_PENDING.setdefault(tag, {"rounds": 0,
+                                               "last_bytes": bytes_})
+        if bytes_ != pend["last_bytes"]:
+            pend["rounds"] = 0
+            pend["last_bytes"] = bytes_
+            return False, "仍有字节流"
+        pend["rounds"] += 1
+        need = max(1, int(_warp().get("drain_quiet_rounds", 2)))
+        if pend["rounds"] >= need:
+            _RETIRED_AT.pop(tag, None)
+            _DRAIN_PENDING.pop(tag, None)
+            return True, "排空：连续 %d 轮无字节增长" % need
+        return False, ("等待字节流静止（%d/%d 轮，已等 %.0fs）"
+                       % (pend["rounds"], need, elapsed))
+
+
 def warp_line_busy(tag: str, window: float | None = None) -> bool | None:
     """该线此刻是否仍在服务请求；查不到返回 None（调用方保守处理）。
 
@@ -5693,6 +5871,22 @@ def _warp_line_restart(member: dict, reason: str,
             return False
     if not rebound and _night_block_restart(tag, reason, now):
         return False
+    # 排空闸（2026-11-11）：刚被换下的线必须按字节流事实判空才允许回收。
+    # 放在额度/夜间/渠道锁之后（策略层拒绝优先于排空），warming=True 之前
+    # （拒绝时绝不置 warming，否则这条线会被所有探测路径永久跳过）。不放
+    # 进 CV 锁：闸内 _lines_in_use / _warp_line_stats 在启动窗口含 HTTP。
+    allow, note = _drain_gate(member, now, reason)
+    if not allow:
+        try:
+            with _WARP_LINE_CV:
+                _warp_line_state_locked(tag)["next_probe_ts"] = (
+                    now + float(_warp().get("drain_poll_sec", 5)))
+        except Exception:
+            pass
+        if now - _NIGHT_LOG_TS.get("drain:" + tag, 0.0) > 300.0:
+            _NIGHT_LOG_TS["drain:" + tag] = now
+            log("  · %s 暂不回收：%s（%s）" % (tag, note, reason))
+        return False
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
         if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
@@ -6042,6 +6236,8 @@ def _probe_one_line(member: dict) -> None:
             if st.get("penalty_restart_streak") or st.get("ip_stuck_until"):
                 st["penalty_restart_streak"] = 0
                 st.pop("ip_stuck_until", None)
+        with _DRAIN_LOCK:
+            _BAD_ON_SLOT.pop(tag, None)
         return
     if tag == active:
         _reconnect_warp_now(f"探测失败 {verdict}", time.time())
@@ -11543,6 +11739,14 @@ def _slot_note_switch(slot, old_tag, old_ip, new_tag, new_ip, ts):
     h["switched_at"] = float(ts)
     if old_tag == new_tag and old_ip == new_ip:
         return
+    # 排空台账（2026-11-11）：旧线从此刻起「退役」，排空后才允许回收重启；
+    # 新入选的线撤销其退役时间戳；被换走即「判坏但在槽」等到的结局，清账。
+    with _DRAIN_LOCK:
+        if old_tag and old_tag != new_tag:
+            _RETIRED_AT[old_tag] = float(ts)
+            _DRAIN_PENDING.pop(old_tag, None)
+            _BAD_ON_SLOT.pop(old_tag, None)
+        _RETIRED_AT.pop(new_tag, None)
     with _SLOT_LEDGER_LOCK:
         rows = _SLOT_EXIT_LEDGER.setdefault(name, [])
         rows.append({"at": float(ts), "old": old_ip, "new": new_ip,
