@@ -153,6 +153,11 @@ CFG = {
         "startup_grace_sec": 10,  # 增加到 10s，给 sing-box 更多初始化时间
         "max_restart_attempts": 3,
         "mixed_port": 7890,
+        # 并行消费者槽位：每个槽位一个本机端口 + 一条独立 selector，与主出口
+        # 完全同一套逻辑（从同一个 WARP 池里挑 OK 的线、各自独立轮换）。
+        # 相当于把「一个消费者」变成 N 个，9router 在端口之间轮询。
+        # 端口从 7892 起，避开 mixed-in(7890) 与 LAN 口(7891)。
+        "consumer_slots": 6,
         # 局域网入站：0 = 不生成（默认关闭）。开启后另起一个 mixed 入站监听
         # 0.0.0.0，与环回口互不影响 —— 环回口给 9router/daemon，局域网口给
         # 手机/其他机器，前者永远不需要认证，后者必须有。
@@ -198,7 +203,13 @@ CFG = {
         # proxy → WARP 的三条回切依据（任一成立才回切）。WARP 恢复本身不是依据：
         # 只要代理池还能服务流量，就该让它服务完 —— 它是兜底资源，不是临时跳板。
         "proxy_fail_streak": 3,        # 连续 N 次池健康探测全失败
-        "proxy_blocked_threshold": 5,  # 落池后 opencode 仍被 403/429 拦截 ≥N 条
+        # 落池后 opencode 仍被 403/429 拦截 ≥N 条就回切 WARP。
+        # 原值 5 是按「WARP 单出口」的尺度定的，放到 100+ 节点的池上等于
+        # 立刻触发：2026-11-09 实测池上 3 条请求就有 1 条 429（机房 IP 共享，
+        # 节点级配额本来就紧），5 条 429 在十几条请求内必到 —— 落池后几分钟
+        # 就被拉回去，而回去的是一个还在全池惩罚期的 WARP。改成 50：要求
+        # 池真的持续在拦（约 150 条请求量级），而不是正常的 429 抖动。
+        "proxy_blocked_threshold": 50,
         "proxy_dead_ratio": 0.5,       # 池黑名单节点占比 ≥N
     },
     "thresholds": {
@@ -232,6 +243,14 @@ CFG = {
         # daemon 启动即退，systemd 无限 auto-restart）。
         "socket_path": os.path.join(PROJECT_DIR, "run", "rotate.sock"),
         "token_path": os.path.join(PROJECT_DIR, "run", "api-token"),
+        # 换线前实测：给当前这条线一次真实探测的机会。9router 报 429 只是它
+        # 自己的观测，实测 OK 就不该换掉一条还能用的线。
+        # 超时必须大于 probe_warp 的正常耗时（H2 线握手实测 1.5~3.1s，慢线更长），
+        # 否则结论只会是「4s 到点、无结论」，那和没探一样。9router 侧的
+        # ASIP_TIMEOUT_MS 要同步放宽，否则调用方先挂断。
+        "pre_rotate_probe": True,
+        "pre_rotate_probe_timeout_sec": 12,
+        "pre_rotate_probe_ttl_sec": 30,
         # 并发去重窗口：同一次故障的多发请求只切一次。
         "coalesce_ms": 800,
         # 限速按「上一次切到的线是否已验证」分档：
@@ -446,7 +465,23 @@ CFG = {
         "proxy_fallback_cooldown_sec": 10800,
         # 落池总开关。2026-10-26 关闭：池内 anytls 节点全部 connection reset，
         # 落池等于断流；关闭后 WARP 全不可用时只原地重连，不再把流量甩到死池。
-        "proxy_fallback_enabled": False,
+        #
+        # 2026-11-09 重新打开，理由与配套闸门（缺一不可）：
+        #   1. 池子已恢复：当晚 04:58 体检 183✓/3✗、池内有效样本 186/247；
+        #      06:20 把 `opencode-out` 切到 `proxy` 实测 3 条 opencode 请求
+        #      2×200（4.4s / 4.2s）、1×429 —— 池能承载 free lane 流量。
+        #   2. 关掉它的代价已经量化：21:00–23:00 全池被判 quota（新换的 IPv6
+        #      一律 Retry-After 10~11h），937 次换线只成功 4 次，同期 432 条
+        #      503（当晚 598 条里的 72%）。同一地址空间里换 IP 买不到配额，
+        #      能换的只有「地址空间」本身。
+        #   3. 不再裸落：`_fallback_to_proxy` 现在落池前必须
+        #      `_proxy_pool_healthy()` 为 True（随机抽 3 条实探），且
+        #      `_warp_exhaustion_escape` 要求连续 3 次「等不到备线」才触发。
+        "proxy_fallback_enabled": True,
+        # 连续多少次「等不到新鲜备线」才允许落池。备线判据是「120s 内出现过
+        # OK」，全池惩罚期里该条件永远无法满足（自锁）。单次无备线可能只是
+        # 一条线打嗝，留观 3 次再换地址空间。
+        "warp_exhaust_streak_min": 3,
         # 换线后多久刷新被换下的闲置线。太短会掐断仍在走它的在途请求
         # （upstream connection lost），太长则赶不上下一次换线（实测标记速度
         # 约 20~30s），届时同步守卫又要多等 7~9s。
@@ -578,6 +613,16 @@ CFG = {
         # （代码用 max(2,...)，0 仍会变 2，故用极大值 999999 禁用）。
         "restart_ip_stuck_fuse": _env_int("ASIP_RESTART_IP_STUCK_FUSE", 3),
         "restart_ip_stuck_hold_sec": _env_int("ASIP_RESTART_IP_STUCK_HOLD_SEC", 900),
+        # 「重启没换出地址」的踩刹车阈值 —— 与上面的配额熔断是**两回事**：
+        # 上面判的是地址好不好（上游配额结论，2026-11-09 已按主人裁定禁用，
+        # 因为夜里会把池子打空）；这里判的是**重启这个动作有没有效果**：
+        # 连续 N 次重启都拿不到任何出口地址（隧道起得来、端口通、却无出口），
+        # 说明问题在落地节点或链路，再重启只是每 5~15s 掐断一次在途连接。
+        # 刹车只推迟下次重启，不写 ip_stuck_until、不碰 stop_probe ——
+        # 线路照旧参与探测与选线。实测 2026-11-10 08:30 前后 12 分钟：263 次
+        # 重启里 194 次以「到点无响应」收场，47 条扫描线 fail_streak 涨到 188。
+        "restart_futile_limit": _env_int("ASIP_RESTART_FUTILE_LIMIT", 6),
+        "restart_futile_hold_sec": _env_int("ASIP_RESTART_FUTILE_HOLD_SEC", 900),
         # 同时在飞的重启数。每条 quota/blocked 线都要「重启换地址 → 等就绪 →
         # 重探」，这个闸才是现在的真正吞吐瓶颈：4 槽 × 一次 3~5s ≈ 20~40 条/分钟。
         # 12 是折中：16 条同时注册会撞 Cloudflare 的 ~9 台/窗口限流，吃 429 后
@@ -1057,3 +1102,21 @@ if _blk:
 # OPENCODE_FREE_PROVIDER: 9router providerStrategies 中的 key = "opencode"
 # provider 值在 requestDetails 表中也是 "opencode"
 OPENCODE_FREE_PROVIDER = "opencode"
+
+
+
+def consumer_slots() -> list[dict]:
+    """并行消费者槽位（端口 + 独立 selector）。0 个时返回空表。
+
+    槽位与主出口同构：一样的 WARP 成员池、一样由 daemon 挑线与轮换。
+    区别只是「谁在用」—— 主出口给 9router 的主链路，槽位给它的并行链路。
+    """
+    n = int((CFG.get("singbox") or {}).get("consumer_slots", 0) or 0)
+    sel = (CFG.get("warp") or {}).get("selector") or "opencode-out"
+    out = []
+    for i in range(n):
+        out.append({
+            "name": "slot-%d" % (i + 1),
+            "selector": "%s-%d" % (sel, i + 1),
+        })
+    return out

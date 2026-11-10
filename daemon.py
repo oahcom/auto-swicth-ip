@@ -3388,6 +3388,10 @@ _LINE_DEFAULTS = {
     # 最近几次重启换回来的出口地址。默认 None 不用 []：`_LINE_DEFAULTS` 是
     # 共享对象，`setdefault` 会让所有渠道拿到同一个 list（与 `ban_probes` 同一个坑）。
     "restart_ip_hist": None,
+    # 连续「重启后拿不到任何出口地址」的次数（见 `_restart_outcome_note`）。
+    # 与上面的配额熔断分开：那个判地址好坏（已按主人裁定禁用），这个判重启
+    # 这个动作有没有效果。同样必须进本表才活得过分号。
+    "futile_restart_streak": 0,
 }
 
 # 渠道锁到期还原的节流时刻（主循环每分钟对账一次）。
@@ -5492,6 +5496,49 @@ def _penalty_restart_fused(tag: str, now: float) -> bool:
         return float(st.get("ip_stuck_until") or 0.0) > now
 
 
+def _restart_outcome_note(tag: str, got_ip: bool, now: float,
+                          reason: str) -> bool:
+    """记一次隧道重启的结果；返回 True 表示「已给这条线踩下刹车」。
+
+    判据是**重启这个动作有没有效果**，不是地址好不好：
+      - 拿到出口地址 → 计数清零，说明重启是有用的动作；
+      - 连续 N 次都拿不到任何出口地址 → 问题在节点或链路，不在地址。再重启只是
+        每 5~15s 掐断一次在途连接。
+
+    WHY 必须与 `_penalty_restart_fuse` 分开记：那个判的是「重启后地址仍被判
+    quota/blocked」，属上游配额结论，2026-11-09 已按主人裁定禁用（夜里会把池子
+    打空）。这个判的是纯粹的本机事实 —— 隧道起得来、端口通、却拿不到出口 ——
+    跟配额无关，禁用配额熔断不该顺带把它一起关掉。
+
+    WHY 只推迟 `next_restart_ts`、不写 `ip_stuck_until`、不碰 `stop_probe`：
+    刹车不是判决。这条线照旧参与探测与选线，只是不再被打桩重启；等它自己恢复
+    （或轮回把它换到别的节点）就继续工作。
+
+    实测 2026-11-10 08:30 前后 12 分钟：263 次重启里 194 次以「到点无响应」
+    收场，47 条扫描线的 `fail_streak` 涨到 188 —— 同一个死节点被反复重启，
+    重启名额全被它们吃掉。
+    """
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        if got_ip:
+            st["futile_restart_streak"] = 0
+            return False
+        n = int(st.get("futile_restart_streak") or 0) + 1
+        limit = max(2, int(_warp().get("restart_futile_limit", 6)))
+        if n < limit:
+            st["futile_restart_streak"] = n
+            return False
+        hold = float(_warp().get("restart_futile_hold_sec", 900))
+        st["futile_restart_streak"] = 0
+        st["next_restart_ts"] = max(float(st.get("next_restart_ts") or 0.0),
+                                   now + hold)
+    _save_warp_line_state()
+    log(f"  ⏸ {tag} 连续 {limit} 次重启都没换出出口地址（{reason}）→ "
+        f"暂停重启至 {time.strftime('%H:%M', time.localtime(now + hold))}，"
+        f"交给轮回/换节点，探测照常")
+    return True
+
+
 def _warp_line_restart(member: dict, reason: str,
                        rebound: bool = False,
                        tunnel_dead: bool = False) -> bool:
@@ -5632,6 +5679,7 @@ def _warp_line_restart(member: dict, reason: str,
                     _warp().get("restart_cooldown_sec", 5))
                 st["next_probe_ts"] = st["next_restart_ts"]
             log(f"  ✗ {tag} 重启后未就绪（{reason}）")
+            _restart_outcome_note(tag, False, time.time(), reason)
             return False
         ip = _probe_refresh_egress(member["port"])
         now = time.time()
@@ -5713,6 +5761,7 @@ def _warp_line_restart(member: dict, reason: str,
             why = _egress_error_hint(member["port"])
         log(f"  {'✓' if ip else '✗'} {tag} 重启后出口="
             f"{ip or ('探测失败 / ' + why if why else '探测失败')}")
+        _restart_outcome_note(tag, bool(ip), time.time(), reason)
         return bool(ip)
     except Exception as e:
         with _WARP_LINE_CV:
@@ -11194,14 +11243,23 @@ def _probe_line_before_rotate(tag, ip, fresh=False):
     return out
 
 # ── 备用线槽位 ───────────────────────────────────────────────────
-# 9router 只认 7890，切换的全部工作在这里完成。槽位是 6 条「已经探通、随时
-# 可以顶上去」的备用线：主出口出问题时，一次 selector 翻转就能换上（十几
-# 毫秒），不需要现场探测、也不需要等隧道重建。
-# 被换下去的那条线不会丢：它的槽位在后台修 —— 先实测，能用就收回；不能用
-# 就换一条新线再实测，按结果标记 ok / bad。可用性来自「手里总有一条通着的
-# 备用线」，而不是让调用方等换隧道。
+# 9router 只连 7890（主出口 opencode-out）。6 条槽位是 asip 手里「已探通、
+# 随时能顶上去」的备用线。出错时的全部动作在这里完成：
+#
+#   1. 立刻把主出口切到另一条健康槽位的线（一次 selector PUT，十几毫秒），
+#      调用方马上拿到结果去重试，不等换隧道；
+#   2. 记下「刚才主出口用的是哪个槽位的线」—— 那个槽位转后台**自己修自己**：
+#      先复核自己的线（就是刚被换下的那条），能用就留着标回 ok；不能用就换
+#      一条新线、实测、重标。可用性来自「总有一条通着的备用线」，不靠客户端干等。
+#
+# 关键不变量：_MAIN_SLOT_NAME 永远指向「当前把线借给主出口的那个槽位」。
+# 它在被借期间不动（keeper 跳过它、_fast_switch 不会再选它）；它被换下那一刻
+# 才变成「原槽位」去修自己，同时 _MAIN_SLOT_NAME 改指新借出的槽位。
 
 _SLOT_HEALTH = {}
+# 当前服务主出口的槽位名。None = 主出口用的是主循环挑的线，不属于任何槽位
+# （此时被换下的线按游离线处理，由 _repair_line 复核）。
+_MAIN_SLOT_NAME = {"name": None}
 
 
 def _slot_by_name(name):
@@ -11229,7 +11287,7 @@ def _slot_put(slot, tag):
 
 
 def _slot_peers():
-    """已经被占用的线名：主出口 + 所有槽位。"""
+    """已被占用的线名：主出口 + 所有槽位当前指向的线。"""
     used = set()
     tag = active_warp_tag()
     if tag:
@@ -11268,11 +11326,22 @@ def _slot_mark(name, status, verdict=None):
                ("（%s）" % verdict) if verdict else ""))
 
 
+def _slot_serving_name():
+    """当前把线借给主出口的槽位名。"""
+    return _MAIN_SLOT_NAME["name"]
+
+
 def assign_consumer_slots(force=False):
-    """给每条槽位分配一条独立的线。已就位且未被封的不动。"""
+    """给每条槽位一条独立的线；新上线的线必须实测通过才标 ok。
+
+    跳过两类：(a) 正在服务主出口的槽位（_MAIN_SLOT_NAME）—— 它的线就是主出口
+    的线，动了等于在主出口脚下抽梯子；(b) repairing 的槽位 —— 原槽位正在后台
+    修自己，keeper 不该和它抢同一个 selector。
+    """
     slots = consumer_slots()
     if not slots:
         return
+    serving = _slot_serving_name()
     state = {s["name"]: _slot_current(s) for s in slots}
     used = set()
     if active_warp_tag():
@@ -11281,106 +11350,149 @@ def assign_consumer_slots(force=False):
         if tag:
             used.add(tag)
     for s in slots:
-        tag, ip = state[s["name"]]
-        h = _slot_health(s["name"])
-        # 只对「结论已经站得住」的槽位放行：ok 不动、unknown 首次入池标 ok。
-        # bad 必须重新补线并实测 —— 否则巡护每 15s 都会把刚测出 quota 的槽位
-        # 因为「线和地址都没变」原样标回 ok，等于自己骗自己。
+        name = s["name"]
+        if name == serving:
+            continue  # 它的线在服务主出口，别动
+        tag, ip = state[name]
+        h = _slot_health(name)
+        if h["status"] == "repairing":
+            continue  # 原槽位在后台修自己，别抢
         if (tag and ip and not force and not _warp_ip_is_blocked(ip)
                 and h["status"] in ("ok", "unknown")):
             if h["status"] == "unknown":
-                _slot_mark(s["name"], "ok")
+                _slot_mark(name, "ok")
             continue
         used.discard(tag or "")
         pick = _slot_pick(s, used)
         if not pick:
-            _slot_mark(s["name"], "bad", "no_candidate")
+            _slot_mark(name, "bad", "no_candidate")
             continue
-        if _slot_put(s, pick):
-            used.add(pick)
-            ip = _warp_line_ip(pick)
-            log("⇄ 槽位 %s → %s 出口=%s，实测确认中..." % (s["name"], pick, ip or "未知"))
-            # 分配就是一次「补线」：新上去的线必须实测确认，不能凭 PUT 成功
-            # 就标 ok —— selector 转过去不代表这条线真能出流量。
-            probed = _probe_line_before_rotate(pick, ip)
-            verdict = (probed or {}).get("verdict")
-            _slot_mark(s["name"], "ok" if verdict == "OK" else "bad", verdict)
-            log("⇄ 槽位 %s → %s：%s（%ss）"
-                % (s["name"], pick, verdict, (probed or {}).get("sec")))
-        else:
-            _slot_mark(s["name"], "bad", "put_failed")
+        if not _slot_put(s, pick):
+            _slot_mark(name, "bad", "put_failed")
+            continue
+        used.add(pick)
+        ip2 = _warp_line_ip(pick)
+        probed = _probe_line_for_slots(pick, ip2)
+        verdict = (probed or {}).get("verdict")
+        _slot_mark(name, "ok" if verdict == "OK" else "bad", verdict)
+        log("⇄ 槽位 %s → %s：%s（%ss）"
+            % (name, pick, verdict, (probed or {}).get("sec")))
+
+
+def _probe_line_for_slots(tag, ip, fresh=False):
+    """探测一条线，并把 OK 的结论用于补坏闸 / 同步闸状态。
+
+    探测是补闸的唯一引擎（没有轮询）：
+      - OK 且这条线不在任何闸内、也不在主出口 → 马上塞进一个坏闸（除非没有坏闸）
+      - OK 且在某个闸内 → 该闸状态跟着改 ok（状态变了才动）
+      - 非 OK 且在某个闸内 → 该闸状态跟着改 bad
+    修整中 (repairing) 和服务中 (serving) 的闸不在这改 —— 它们由 _repair_slot /
+    主出口自己管。
+    """
+    probed = _probe_line_before_rotate(tag, ip, fresh)
+    verdict = (probed or {}).get("verdict")
+    if not tag:
+        return probed
+    holder = None
+    for s in consumer_slots():
+        st, _si = _slot_current(s)
+        if st == tag:
+            holder = s
+            break
+    serving = _slot_serving_name()
+    # 状态同步：在闸内、非修整、非服务 → 跟探测结论改
+    if holder is not None and holder["name"] != serving:
+        h = _slot_health(holder["name"])
+        if h["status"] != "repairing":
+            want = "ok" if verdict == "OK" else "bad"
+            if h["status"] != want:
+                _slot_mark(holder["name"], want, verdict)
+    # 补闸：OK、不在任何闸内、不是主出口 → 塞进一个坏闸
+    if verdict == "OK" and holder is None and tag != active_warp_tag():
+        for s in consumer_slots():
+            if s["name"] == serving:
+                continue
+            if _slot_health(s["name"])["status"] != "bad":
+                continue
+            if _slot_put(s, tag):
+                _slot_mark(s["name"], "ok", "OK")
+                log("＋ 探测补闸：%s → %s" % (tag, s["name"]))
+                break
+    return probed
+
+
+def _repair_slot(slot, reason):
+    """错误轮换时原槽位修自己：换掉自己的线，探通才标 ok。
+
+    9router 已判 429 —— 不再「探一下通就留着」。换一条新线，探通才标 ok；
+    探不通就记脏这条、继续找下一条，直到探通或候选耗尽。这是错误轮换的
+    一部分（顺便把自己修好），其余场景闸口不主动动自己的线。
+    """
+    name = slot["name"]
+    tag, ip = _slot_current(slot)
+    if not tag:
+        _slot_mark(name, "bad", "no_line")
+        return
+    if reason not in ("proactive", "transport") and ip:
+        _mark_warp_ip_used(ip, time.time(), blocked=True, kind=reason)
+    avoid = _slot_peers()
+    avoid.discard(tag)
+    tried = 0
+    while True:
+        pick = _slot_pick(slot, avoid)
+        if not pick:
+            _slot_mark(name, "bad", "no_candidate" if tried == 0 else "all_tried")
+            log("✗ 槽位 %s 错误切换失败（试 %d 条都不通）" % (name, tried))
+            return
+        if not _slot_put(slot, pick):
+            avoid.add(pick)
+            tried += 1
+            continue
+        new_ip = _warp_line_ip(pick)
+        probed = _probe_line_for_slots(pick, new_ip)
+        verdict = (probed or {}).get("verdict")
+        if verdict == "OK":
+            _slot_mark(name, "ok", "OK")
+            log("↻ 槽位 %s 错误切换：%s → %s，实测 OK（%ss，试 %d 条）"
+                % (name, tag, pick, probed.get("sec"), tried + 1))
+            return
+        if reason not in ("proactive", "transport") and new_ip:
+            _mark_warp_ip_used(new_ip, time.time(), blocked=True, kind=reason)
+        avoid.add(pick)
+        tried += 1
+        log("· 槽位 %s 试线 %s 不通（%s），换下一条" % (name, pick, verdict))
 
 
 def _repair_line(tag, ip, reason):
-    """复核刚从主出口换下来的那条线：它不是任何槽位的线，是游离的。
-
-    按槽位找坏线是错的 —— 秒切之后那个槽位已经被补了新线，用「谁的 tag 等于
-    主出口」永远找不到，复核就永远不执行。直接拿线本身来判：
-      - 实测 OK  → 探测分歧（9router 判错），把这条线放回一条不健康的槽位
-      - 明确被拒 → 记脏，让巡护补新线
-      - 没结论   → 什么都不做，留给巡护重测
+    """复核游离线：主出口之前用的是主循环挑的线（_MAIN_SLOT_NAME 为 None），
+    被换下后不属于任何槽位。OK 的线由 _probe_line_for_slots 自动塞进坏闸；
+    被拒就记脏。这里只补「探测分歧」证据。
     """
-    with _SWITCH_GUARD:
-        if not tag:
-            return
-        probed = _probe_line_before_rotate(tag, ip)
-        verdict = (probed or {}).get("verdict")
-        if verdict == "OK":
-            _api_stats["divergence"] += 1
-            _PROBE_DIVERGENCE.append({
-                "ts": time.time(), "reason": reason, "tag": tag, "ip": ip,
-                "probe_sec": probed.get("sec"),
-                "elapsed": probed.get("elapsed"),
-                "cached": bool(probed.get("cached"))})
-            del _PROBE_DIVERGENCE[:-50]
-            log("⚠ 探测分歧: 9router=%s 但 asip 实测 %s 出口=%s OK（%ss），已换下"
-                % (reason, tag, ip or "未知", probed.get("sec")))
-            target = None
-            for s in consumer_slots():
-                if _slot_health(s["name"])["status"] != "ok":
-                    target = s
-                    break
-            if target is not None and _slot_put(target, tag):
-                _slot_mark(target["name"], "ok", "OK")
-                log("＋ 好线回收 %s → %s" % (tag, target["name"]))
-            return
-        if verdict in ("quota", "flagged") and ip:
-            _mark_warp_ip_used(ip, time.time(), blocked=True, kind=reason)
-        log("· 坏线复核 %s 出口=%s：%s" % (tag, ip or "未知", verdict))
-
-
-def _refill_slot(slot):
-    """槽位的线被主出口借走后，补一条新的并探通。"""
-    with _SWITCH_GUARD:
-        return _refill_slot_locked(slot)
-
-
-def _refill_slot_locked(slot):
-    tag, _ip = _slot_current(slot)
-    avoid = _slot_peers()
-    avoid.discard(tag or "")
-    pick = _slot_pick(slot, avoid)
-    if not pick or not _slot_put(slot, pick):
-        _slot_mark(slot["name"], "bad", "no_candidate")
+    if not tag:
         return
-    ip = _warp_line_ip(pick)
-    log("＋ 槽位补线 %s → %s 出口=%s，实测中..." % (slot["name"], pick, ip or "未知"))
-    probed = _probe_line_before_rotate(pick, ip)
+    probed = _probe_line_for_slots(tag, ip)
     verdict = (probed or {}).get("verdict")
-    _slot_mark(slot["name"], "ok" if verdict == "OK" else "bad", verdict)
-    log("＋ 槽位补线结果 %s → %s：%s（%ss）"
-        % (slot["name"], pick, verdict,
-           (probed or {}).get("sec")))
+    if verdict == "OK":
+        _api_stats["divergence"] += 1
+        _PROBE_DIVERGENCE.append({
+            "ts": time.time(), "reason": reason, "tag": tag, "ip": ip,
+            "probe_sec": probed.get("sec"),
+            "elapsed": probed.get("elapsed"),
+            "cached": bool(probed.get("cached"))})
+        del _PROBE_DIVERGENCE[:-50]
+        log("⚠ 探测分歧: 9router=%s 但 asip 实测 %s 出口=%s OK（%ss），已补闸"
+            % (reason, tag, ip or "未知", probed.get("sec")))
+        return
+    if verdict in ("quota", "flagged") and ip:
+        _mark_warp_ip_used(ip, time.time(), blocked=True, kind=reason)
+    log("· 坏线复核 %s 出口=%s：%s" % (tag, ip or "未知", verdict))
 
 
 def _slot_snapshot():
-    """槽位状态：谁在服务、指向哪条线、延迟、最近一次实测结论。
-
-    延迟取最近一次实测的耗时（_PROBE_BEFORE_ROTATE 里按 tag|ip 存），没有
-    实测过就是 None —— 不要拿「没测过」冒充「很快」。
-    """
+    """槽位状态：谁在服务、指向哪条线、延迟、最近一次实测结论。"""
     now = time.time()
     active = active_warp_tag()
+    serving = _slot_serving_name()
     out = []
     for s in consumer_slots():
         tag, ip = _slot_current(s)
@@ -11394,7 +11506,7 @@ def _slot_snapshot():
             "verdict": h.get("verdict"),
             "tag": tag,
             "egress": ip,
-            "serving": bool(tag) and tag == active,
+            "serving": s["name"] == serving,
             "probe_sec": (probe or {}).get("sec"),
             "probe_verdict": (probe or {}).get("verdict"),
             "probe_age_s": round(now - probe["ts"], 1) if probe else None,
@@ -11434,14 +11546,43 @@ def cli_slots(argv=None):
     return 0
 
 
-def _fast_switch(reason):
-    """把主出口立刻切到一条已探通的备用线上。
+def _kick_background_repair(tag, ip, reason):
+    """把刚被报 429 的那条线所属的槽位，提前扔到后台做错误切换。
 
-    返回 {"tag", "egress"}；没有可用备用线时返回 None，调用方走原来的
-    同步换线路径。
+    无论后面秒切成不成功、抢不抢得到锁，旧闸的错误切换都要跑 —— 所以放在
+    秒切之前启动，和同步换线并行。只动「selector 当前指向 tag」的那个槽位
+    （状态漂移时不认错）；已经在修整中的槽位不重复启动。
+    """
+    if not tag:
+        return
+    owner_name = _slot_serving_name()
+    owner = _slot_by_name(owner_name) if owner_name else None
+    if owner is not None:
+        ot, _oip = _slot_current(owner)
+        if ot != tag:
+            owner = None
+    if owner is not None:
+        if _slot_health(owner["name"])["status"] == "repairing":
+            return
+        _slot_mark(owner["name"], "repairing")
+        threading.Thread(target=_repair_slot, args=(owner, reason),
+                         daemon=True, name="repair-" + owner["name"]).start()
+    else:
+        threading.Thread(target=_repair_line, args=(tag, ip, reason),
+                         daemon=True, name="repair-line").start()
+
+
+def _fast_switch(reason):
+    """把主出口立刻切到一条健康备用线上。只做同步的 selector 翻转 + 记账。
+
+    不做探测、不做后台错误切换 —— 那些已在 _kick_background_repair 里先行
+    启动（无论本函数成败，旧闸的错误切换都会跑）。本函数只给调用方换一条
+    能用的线，十几毫秒返回。
+
+    返回 {"tag", "egress"}；没有可用备用线时返回 None，调用方走同步换线。
+    调用方已用 _SWITCH_GUARD 非阻塞包住本函数 —— 拿不到锁直接回 coalesced。
     """
     cur = active_warp_tag()
-    cur_ip = _warp_line_ip(cur) if cur else None
     for s in consumer_slots():
         if _slot_health(s["name"])["status"] != "ok":
             continue
@@ -11450,9 +11591,9 @@ def _fast_switch(reason):
             continue
         if not _switch_warp(tag, ip=ip):
             continue
-        # 与正常换线路径同一套落地记账，缺一条就会让迟到 429 认不出「这条
-        # 出口已经被换走」，于是再烧一条备用线。顺序也不能变：_switch_warp
-        # 内部的 exit_ledger 必须读到切换**前**的 _ACTIVE_WARP_IP。
+        # 与正常换线路径同一套落地记账，缺一条就会让迟到 429 认不出「这条出口
+        # 已经被换走」，于是再烧一条备用线。顺序不能变：_switch_warp 内部的
+        # exit_ledger 必须读到切换**前**的 _ACTIVE_WARP_IP。
         global _ACTIVE_WARP_IP, _proxy_dwell_since
         switched_at = time.time()
         _mark_warp_ip_used(ip, switched_at)
@@ -11461,16 +11602,18 @@ def _fast_switch(reason):
         _ACTIVE_WARP_IP = ip
         _begin_segment(switched_at)
         _proxy_dwell_since = 0
-        log("⚡ 秒切备用线：%s → %s（出口=%s，原因=%s）"
-            % (cur or "未知", tag, ip or "未知", reason))
-        # 借走线的槽位立刻补新线；被换下的那条线独立复核。
-        threading.Thread(target=_refill_slot, args=(s,), daemon=True,
-                         name="refill-" + s["name"]).start()
-        threading.Thread(target=_repair_line, args=(cur, cur_ip, reason),
-                         daemon=True, name="repair-line").start()
+        _MAIN_SLOT_NAME["name"] = s["name"]
+        # 断掉旧线上的 sidecar→sing-box 长连接。否则 selector 虽然翻了，
+        # 但 HTTP/2 连接池还连着旧 outbound，9router retry 走旧连接 → 旧线，
+        # 旧线已 429，retry 也 429 —— 秒切白切，6 条线打转。
+        # interrupt=True：旧线已被判 429，在途请求留着也是白等超时，断掉让
+        # retry 真正走新 selector。
+        if cur is not None:
+            _after_warp_switch(cur, interrupt=True, reason=reason)
+        log("⚡ 秒切备用线：%s → %s（出口=%s，槽位=%s，原因=%s）"
+            % (cur or "未知", tag, ip or "未知", s["name"], reason))
         return {"tag": tag, "egress": ip}
     return None
-
 
 # reason 白名单：调用方（9router）传的是自由文本，只认这四类；未知一律
 # 按 rate429 处理 —— 宁可多记一次限流，也不要把一个真被拦过的地址当干净地址。
@@ -11721,13 +11864,13 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                 {"ok": False, "reason": "too_frequent",
                  "switched_at": _last_rotate_ts},
                 t0)
-        # 换下来的出口必须记账：429/403 是出口 IP 级拦截，不标记就只是
-        # 「用过」，60s 冷却一过又能被选中 —— 实测会在两条撑过生产流量的
-        # 线上反复来回，另外十几条新鲜线永远轮不到。
-        # 切之前先问一句：这条线真的不能用了吗？
-        # 秒切：手里有已经探通的备用线，就直接翻 selector —— 一次 PUT 十几
-        # 毫秒，调用方不必等换隧道。被换下去的那条线交给它自己的槽位后台修，
-        # 修好再放回备用池。没有备用线时才落到下面的同步换线。
+        # 异步先行：把刚被报 429 的那条线所属的槽位，提前扔到后台做错误切换
+        # （换线 + 探新线 + 标记）。无论下面秒切成不成功、抢不抢得到锁，旧闸
+        # 的错误切换都会跑 —— 9router 的 429 判定必须被 acted on，不能因为
+        # asip 探测说通就留着，否则备用池会堆满 9router 拒绝的线。
+        if reason in ("rate429", "abuse403"):
+            _kick_background_repair(current_tag, cur_ip, reason)
+        # 秒切：翻到一条已探通的备用线，十几毫秒。没有才走下面的同步换线。
         quick = None
         if reason in ("rate429", "abuse403"):
             if not _SWITCH_GUARD.acquire(blocking=False):
@@ -11740,7 +11883,7 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                 # 另一次切换改写，快照读到的是切换前的旧线。把它回过去，调用方
                 # 会用旧身份覆盖自己的账 —— 下一条 429 就会带着错误出口来。
                 # line_unknown 明确告诉调用方「这次不知道」：既不算「没切」，
-                # 也不更新本地记录。
+                # 也不更新本地记录。旧闸的错误切换已在上面先行启动，不依赖这里。
                 return {"ok": True, "switched": False, "reason": "coalesced",
                         "switched_at": _last_rotate_ts, "line_unknown": True,
                         "ms": int((time.time() - t0) * 1000)}
@@ -11756,31 +11899,6 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                  "egress": quick["egress"], "closed": 0,
                  "switched_at": t0},
                 t0, tag=quick["tag"], egress=quick["egress"])
-        #
-        # 只有 9router 声称「这条线失败」时才值得问：rate429/abuse403 是它对
-        # 出口的判定，而主动轮换（proactive）是它自己的节奏，实测只会白烧一格
-        # 配额、还会把正常轮换卡住。transport 是链路悬挂，探了也只会超时。
-        #
-        # 实测 OK 而 9router 报失败 = 同一出口上的两种结论不一致。这时换线只是
-        # 把一条还能用的线换掉，问题不会消失（下一个出口照样 429）—— 差异在
-        # 9router 的请求体，不在出口。所以不换线，把这组证据记进 _PROBE_DIVERGENCE。
-        if reason in ("rate429", "abuse403"):
-            probed = _probe_line_before_rotate(current_tag, cur_ip)
-            if probed and probed.get("verdict") == "OK":
-                _api_stats["line_ok"] += 1
-                _api_stats["divergence"] += 1
-                _PROBE_DIVERGENCE.append({
-                    "ts": time.time(), "reason": reason, "tag": current_tag,
-                    "ip": cur_ip, "probe_sec": probed.get("sec"),
-                    "elapsed": probed.get("elapsed"),
-                    "cached": bool(probed.get("cached"))})
-                del _PROBE_DIVERGENCE[:-50]
-                log(f"⚠ 探测分歧: 9router={reason} 但 asip 实测 {current_tag}"
-                    f" 出口={cur_ip} OK（{probed.get('sec')}s），不换线")
-                return _with_active_line(
-                    {"ok": True, "switched": False, "reason": "line_ok",
-                     "probe": probed},
-                    t0)
         out: dict = {}
         ok = _reconnect_warp_by_table(reason, interrupt=False, out=out)
         if not ok:
@@ -11792,6 +11910,8 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         _last_rotate_ts = float(out.get("switched_at") or t0)
         _api_stats["switched"] += 1
         new_tag = out.get("tag")
+        # 同步换线后主出口落在一条非槽位的线上（来自状态表），不再借任何槽位。
+        _MAIN_SLOT_NAME["name"] = None
         # 用 out 里的 tag/ip 而不是快照：刚 PUT 完 selector 的半秒内快照可能还是
         # 旧线，读成旧线会让调用方以为没换、继续骑在已经烧掉的隧道上。
         return _with_active_line(
@@ -11964,29 +12084,41 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
 
 
 def _slot_keeper() -> None:
-    """槽位看护：一次没分配成功不算数，长期盯着。
+    """启动时补齐所有闸 —— 必须 6 条全 ok 才停。
 
-    启动时 sing-box 往往还没就绪（实测 06:39 那次重启，等了一轮也没拿到
-    可用的 selector，于是六条槽位一直是 unknown，秒切永远没有备用线可用）。
-    这里每 15s 巡一次：只要有不健康的槽位就补，补不上就下一轮再来。
+    补闸靠探测：给每个坏闸挑候选线、PUT、探测；探测到 OK 的线由
+    _probe_line_for_slots 自动塞进坏闸（或把持有闸标 ok）。挑不到/探不通
+    就下一轮再来，直到全 ok 或耗尽重试。
     """
-    log("✓ 槽位看护已启动（%d 条）" % len(consumer_slots()))
-    while True:
-        try:
-            time.sleep(15)
-            slots = consumer_slots()
-            if not slots:
+    for _ in range(40):
+        time.sleep(2)
+        if active_warp_tag():
+            break
+    else:
+        log("⚠ 槽位分配放弃：sing-box 在 80s 内未就绪")
+        return
+    for attempt in range(60):
+        slots = consumer_slots()
+        if not slots:
+            return
+        serving = _slot_serving_name()
+        bad = [s for s in slots
+               if s["name"] != serving
+               and _slot_health(s["name"])["status"] != "ok"]
+        if not bad:
+            log("✓ 所有槽位就绪")
+            return
+        for s in bad:
+            cur, _cip = _slot_current(s)
+            avoid = _slot_peers()
+            avoid.discard(cur or "")
+            pick = _slot_pick(s, avoid)
+            if not pick or not _slot_put(s, pick):
                 continue
-            if not active_warp_tag():
-                continue
-            bad = [s for s in slots
-                   if _slot_health(s["name"])["status"] != "ok"]
-            if bad:
-                log("· 槽位巡护：%d 条待补（%s）"
-                    % (len(bad), ",".join(s["name"] for s in bad)))
-                assign_consumer_slots()
-        except Exception as e:
-            log("⚠ 槽位巡护异常: %s" % e)
+            ip = _warp_line_ip(pick)
+            _probe_line_for_slots(pick, ip)  # 探测 + 自动补闸/同步
+        time.sleep(2)
+    log("⚠ 槽位启动未全部就绪，剩余坏闸将由 /rotate 路径继续修复")
 
 
 def _start_rotate_server() -> None:

@@ -377,6 +377,50 @@ def test_fuse_state_survives_daemon_restart():
     )
 
 
+def test_futile_restart_gets_braked(monkeypatch):
+    """连续重启都换不出地址 → 推迟下次重启，但不冻结线路。
+
+    判据是「重启这个动作有没有效果」，与配额无关（配额熔断已被 2026-11-09
+    裁定禁用，不能顺带把它也关掉）。实测 2026-11-10 08:30 前后 12 分钟：
+    263 次重启里 194 次以「到点无响应」收场，47 条扫描线的 fail_streak 涨到
+    188 —— 同一个死节点被反复重启，重启名额全被它们吃掉。
+    """
+    limit = max(2, int(daemon._warp().get("restart_futile_limit", 6)))
+    hold = float(daemon._warp().get("restart_futile_hold_sec", 900))
+    now = time.time()
+    _seed()
+    for i in range(limit - 1):
+        braked = daemon._restart_outcome_note("W2", False, now, "到点无响应")
+        assert braked is False, f"第 {i+1} 次就刹车 —— 阈值被提前触发"
+        assert daemon._warp_line_state("W2")["next_restart_ts"] == 0.0, (
+            "还没到阈值就推了 next_restart_ts"
+        )
+    assert daemon._restart_outcome_note("W2", False, now, "到点无响应") is True, (
+        f"连续 {limit} 次拿不到地址却没有刹车"
+    )
+    st = daemon._warp_line_state("W2")
+    assert st["next_restart_ts"] >= now + hold - 1, "刹车没写 next_restart_ts"
+    assert st["futile_restart_streak"] == 0, "刹车后计数没归零"
+    # 关键：刹车不是判决 —— 不写 ip_stuck_until，也不停探测
+    assert not st.get("ip_stuck_until"), (
+        "把无效重启当成了地址熔断，会冻住线路（用户明令禁止的那类冻结）"
+    )
+    assert not st.get("stop_probe"), "刹车顺手停了探测 —— 那就再也发现不了恢复"
+
+
+def test_restart_that_yields_ip_resets_futile_counter():
+    """重启换出地址就清零，别让偶发失败累积成刹车。"""
+    now = time.time()
+    _seed()
+    for _ in range(3):
+        daemon._restart_outcome_note("W2", False, now, "到点无响应")
+    assert daemon._warp_line_state("W2")["futile_restart_streak"] == 3
+    daemon._restart_outcome_note("W2", True, now, "出口处于惩罚期")
+    st = daemon._warp_line_state("W2")
+    assert st["futile_restart_streak"] == 0, "换出地址后计数没清零"
+    assert st["next_restart_ts"] == 0.0, "换出地址不该被刹车"
+
+
 def test_restart_cap_does_not_stop_probing(monkeypatch):
     """达重启上限后，探测必须照常放行 —— 压的是重启，不是观测。"""
     now = 1000.0
