@@ -1037,6 +1037,36 @@ def _probe_cache_verdict(tag: str | None, ip: str | None,
     return _probe_cache_get(tag, ip, now)
 
 
+def _probe_verdict_for_ip(ip: str | None,
+                          now: float | None = None) -> str | None:
+    """按出口 IP 反查最近一次**地址级**实测结论（quota / OK / ...）。
+
+    排查用：/rotate 拿到的只有「请求发出时那个出口 IP」，不知道它当时挂在
+    哪条线上；而 quota 是按 /128 记的、跨线复用（见 _probe_cache_lookup 的
+    地址级分支）。按 IP 反查才能直接回答「这条请求撞上的那个地址此前是否
+    已被实测判 quota」，不必拿事后的多线日志去凑时间戳。
+
+    只认地址级结论：unreachable / err 说的是那条隧道当时没跑通，换条线同
+    样的地址完全可能探通，拿来当这个地址的结论会误判。返回 None 表示
+    「TTL 内没探过这个地址」，不是「这个地址没问题」。
+    """
+    if not ip:
+        return None
+    if now is None:
+        now = time.time()
+    best: tuple[float, str] | None = None
+    with _WARP_REFRESH_LOCK:
+        # list() 是快照：探测线程会并发写这张表，直接迭代可能 RuntimeError。
+        for (_tag2, ip2), (v2, ts2) in list(_WARP_PROBE_SEEN.items()):
+            if ip2 != ip or v2 not in _WARP_PROBE_ADDRESS_SCOPED:
+                continue
+            if now - ts2 > _probe_ttl(v2):
+                continue
+            if best is None or ts2 > best[0]:
+                best = (ts2, v2)
+    return best[1] if best else None
+
+
 def _probe_cache_put(tag: str, ip: str, verdict: str,
                      now: float | None = None,
                      started_at: float | None = None) -> bool:
@@ -12601,14 +12631,45 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
                 except Exception as e:
                     log(f"✗ {name} 后台修整启动失败: {e}")
         if accepted or h["status"] == "repairing":
-            # 排查通道：把请求 id 和这台闸**此刻**绑定的线名、出口 IP 一起留下。
-            # 少了这三项，出问题时只能拿时间戳去猜「哪条请求走了哪个出口」——
-            # 槽位状态是内存态、事后还会被后台修整改写，无法回溯。
-            log("⇢ %s 报 %s（%s）[req=%s] 线=%s 出口=%s，重试改走 %s"
+            # 排查通道：把请求 id、这台闸绑定的线/IP、该地址的实测结论一起
+            # 留下。少了这几项，出问题时只能拿时间戳去猜「哪条请求走了哪个
+            # 出口、那个地址当时是不是已被判 quota」—— 槽位状态是内存态、
+            # 事后还会被后台修整改写，无法回溯。
+            # 线/出口取 _slot_current 读出来的**一对**；调用方报来的 egress_ip
+            # 是全局活动出口、对独立槽位不适用，单列「报障IP」备查，不拿来
+            # 冒充这台闸的地址（实测不同线的槽位会报同一个 IP）。
+            log("⇢ %s 报 %s（%s）[req=%s] 线=%s 出口=%s 报障IP=%s 实测=%s，重试改走 %s"
                 % (name, reason, reason_out, req_id or "-",
-                   cur_tag or "未知", cur_ip or "未知",
+                   cur_tag or "未知", cur_ip or "未知", egress_ip or "-",
+                   _probe_verdict_for_ip(cur_ip) or "未探",
                    out.get("switch_to") or "无健康备槽"))
         return out
+
+
+def _rotate_trace_fields(req: dict, payload: dict) -> dict:
+    """给 /rotate 回包补排查三元组：事发出口 IP、线名、该 IP 的实测结论。
+
+    之前 9router 侧只有 req + 端口，asip 侧只有「此刻」的线名和出口 IP，
+    而 quota 实测日志是后台探测打的、没有 req 上下文 —— 想证明「这条 req
+    当时那条 IP 已被封」只能拿时间戳硬凑。这里把三者钉在一次回包里。
+
+    线/IP 必须取槽位自己的 active_tag/active_egress（_slot_current 读出来的
+    一对，与请求实际打的那个端口对应）。**不能**拿调用方报来的 egress_ip
+    当事发地址：那是 9router 账本里的全局活动出口，六条独立槽位各自有
+    不同的线/IP，实测出现过「不同线的槽位全报同一个 IP」；主路径没有
+    active_egress 时才退回它。调用方报的值另存 reported_egress 备查。
+    """
+    raw = req.get("egress_ip")
+    reported = raw.strip() if isinstance(raw, str) and raw.strip() else None
+    ip = (payload.get("active_egress") or payload.get("egress")
+          or reported or None)
+    tag = payload.get("active_tag") or payload.get("tag") or None
+    try:
+        verdict = _probe_verdict_for_ip(ip)
+    except Exception:
+        verdict = None
+    return {"offending_tag": tag, "offending_egress": ip,
+            "offending_verdict": verdict, "reported_egress": reported}
 
 
 class _RotateHandler(http.server.BaseHTTPRequestHandler):
@@ -12706,6 +12767,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                 log("⇢ %s 报 %s（%s）[req=%s] 无健康备槽，通知 9router 自重启"
                     % (slot["name"], req.get("reason"), payload.get("reason"),
                        rid or "-"))
+            payload.update(_rotate_trace_fields(req, payload))
             self._send(200, payload)
             return
         try:
@@ -12725,6 +12787,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             return
         # 主路径秒切失败：回包已经表达「无可用闸口，自己重启」，这里留一行
         # 生产日志，免得只能从 9router 侧反推 asip 到底有没有发出信号。
+        result.update(_rotate_trace_fields(req, result))
         if result.get("restart_required"):
             log("⇢ 主路径无可用闸口[req=%s]，通知 9router 自重启" % (rid or "-"))
         # 换线与回传分成两步：换线成功但客户端已超时断开时，记账为「回传超时」

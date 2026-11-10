@@ -402,3 +402,49 @@ def test_startup_window_payload_does_not_ask_for_restart(monkeypatch):
     assert out["line_unknown"] is True
     assert out["switch_to_url"] is None
     assert "restart_required" not in out
+
+
+def test_probe_verdict_for_ip_is_address_scoped(isolated, monkeypatch):
+    """按出口 IP 反查实测结论：只认地址级，隧道级故障不许算在这个地址头上。"""
+    now = daemon.time.time()
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {
+        ("WARP-A", "2606:dead::1"): ("quota", now),
+        ("WARP-B", "2606:ok::2"): ("OK", now),
+        ("WARP-C", "2606:err::3"): ("unreachable", now),
+        ("WARP-D", "2606:old::4"): ("quota", now - 10 ** 6),
+    })
+    assert daemon._probe_verdict_for_ip("2606:dead::1") == "quota"
+    assert daemon._probe_verdict_for_ip("2606:ok::2") == "OK"
+    assert daemon._probe_verdict_for_ip("2606:err::3") is None
+    assert daemon._probe_verdict_for_ip("2606:old::4") is None
+    assert daemon._probe_verdict_for_ip("2606:none::9") is None
+    assert daemon._probe_verdict_for_ip(None) is None
+
+
+def test_rotate_trace_fields_uses_slot_egress_not_reported_ip(isolated, monkeypatch):
+    """回包排查三元组：线/IP 必须是这个槽自己的一对，不能拿全局出口顶替。"""
+    now = daemon.time.time()
+    monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {
+        ("WARP-OLD", "2606:dead::1"): ("quota", now),
+        ("WARP-NEW", "2606:new::2"): ("OK", now),
+    })
+    payload = {"ok": True, "active_tag": "WARP-NEW",
+               "active_egress": "2606:new::2"}
+    trace = daemon._rotate_trace_fields({"egress_ip": "2606:dead::1"}, payload)
+    assert trace["offending_egress"] == "2606:new::2", trace
+    assert trace["offending_tag"] == "WARP-NEW", trace
+    assert trace["offending_verdict"] == "OK", trace
+    assert trace["reported_egress"] == "2606:dead::1", trace
+
+    # 主路径回包没有 active_egress，才退回调用方报的地址。
+    main = daemon._rotate_trace_fields(
+        {"egress_ip": "2606:dead::1"},
+        {"ok": True, "reason": "no_healthy_slot", "line_unknown": True})
+    assert main["offending_egress"] == "2606:dead::1", main
+    assert main["offending_verdict"] == "quota", main
+    assert main["offending_tag"] is None, main
+
+    # 两边都没给地址时不能凭空编一个。
+    empty = daemon._rotate_trace_fields({}, {"ok": True})
+    assert empty["offending_egress"] is None
+    assert empty["offending_verdict"] is None
