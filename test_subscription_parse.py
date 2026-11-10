@@ -653,13 +653,18 @@ def test_drop_guard_yields_when_live_config_has_no_warp(monkeypatch, tmp_path):
 
     def fake_run(cmd, **k):
         out = cmd[cmd.index("--out") + 1]
+        body = {"outbounds": [
+            {"type": "socks", "tag": "WARP-CF", "server": "127.0.0.1",
+             "server_port": 1080, "version": "5"},
+            {"type": "selector", "tag": daemon.CFG["singbox"]["selector"],
+             "outbounds": ["WARP-CF", "direct"]},
+        ]}
         with open(out, "w") as f:
-            _json.dump({"outbounds": [
-                {"type": "socks", "tag": "WARP-CF", "server": "127.0.0.1",
-                 "server_port": 1080, "version": "5"},
-                {"type": "selector", "tag": daemon.CFG["singbox"]["selector"],
-                 "outbounds": ["WARP-CF", "direct"]},
-            ]}, f)
+            _json.dump(body, f)
+        # 起草期六份必须一起写：daemon 成组校验、成组提升，缺任一份整组拒绝。
+        for i in range(1, len(daemon.consumer_slots())):
+            with open(daemon.consumer_slot_config_path(out, i) + ".tmp", "w") as f:
+                _json.dump(body, f)
         # 生成侧总会写 stats；缺了会让 daemon 退回「数出站条数」并本轮不判定。
         with open(str(out) + ".stats.json", "w") as f:
             _json.dump({"sub_nodes": 1, "dormant_source_nodes": 0,
@@ -677,6 +682,13 @@ def test_drop_guard_yields_when_live_config_has_no_warp(monkeypatch, tmp_path):
     saved = _json.loads(cfg.read_text())
     assert any(o.get("type") == "socks" for o in saved["outbounds"]), \
         "带 WARP 的配置被骤降护栏拦下了"
+    # 成组提升：槽位配置一起上线，且不残留草稿 / 回滚副本。
+    for i in range(1, len(daemon.consumer_slots())):
+        slot_path = tmp_path / ("cfg.json-slot%d.json" % (i + 1))
+        assert slot_path.exists(), "槽位 %d 的配置没跟着提升" % (i + 1)
+        assert _json.loads(slot_path.read_text())["outbounds"], slot_path
+        assert not (tmp_path / (slot_path.name + ".tmp")).exists(), "残留草稿"
+    assert not list(tmp_path.glob("*.rollback")), "残留回滚副本"
 
 
 def test_drop_guard_still_blocks_repair_without_warp_gain(monkeypatch, tmp_path):

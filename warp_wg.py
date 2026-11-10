@@ -846,7 +846,18 @@ def rebind(i: int, probe: bool = False) -> str | None:
     if cur in rot:
         k = rot.index(cur)
         rot = rot[k + 1:] + rot[:k]
-    for tag in rot:
+    # 兄弟线占着的节点排到最后：rotation 是每条线一份**同一份全序**，批量换
+    # 节点（同块轮回一次处理整池）时所有线都会先撞排序第一的那个 —— 实测
+    # 2026-11-10 15 条线全被换到 bilibili-image-cdn.juhazf.cn:50011-any，
+    # 出口清一色 ORD，单节点故障就是 15 条一起死。占用集合每次现读、逐线
+    # 更新（write_json 已落盘），后面的线自然避开。池子真不够时才允许重复。
+    try:
+        busy = {n for t, n in line_nodes().items() if t != line_tag(i) and n}
+    except Exception:
+        busy = set()
+    ordered = ([t for t in rot if t not in busy]
+               + [t for t in rot if t in busy])
+    for tag in ordered:
         if tag == cur:
             continue
         if probe and not probe_node_tcp(pool[tag]):

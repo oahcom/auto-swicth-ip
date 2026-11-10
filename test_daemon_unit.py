@@ -856,6 +856,11 @@ def _warp_env(monkeypatch, members, max_attempts=3):
     # 测试里的 monkeypatch 早就撤了，只有这个桩能挡住它。实测不加时套件
     # 2/8 次里把 usque-warp.service 真的重启了一次。
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
+    # 落池前的池健康闸（2026-11-09 加）：真探会连外网。本文件测的是换线/落池的
+    # 记账与顺序，不是池探测本身 —— 默认按「池可用」打桩；要测闸门本身
+    # （探不通就不落池）的用例在用例内覆盖这个桩。
+    monkeypatch.setattr(daemon, "_proxy_pool_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_PROXY_HEALTH_CACHE", None)
 
 
 def test_warp_failover_not_gated_by_node_switch(monkeypatch):
@@ -1951,6 +1956,8 @@ def test_sync_path_refreshes_at_most_one_blocked_line(monkeypatch):
     monkeypatch.setitem(daemon.CFG, "warp",
                         {**daemon.CFG["warp"], "members": members})
     monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
+    monkeypatch.setattr(daemon, "_proxy_pool_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_PROXY_HEALTH_CACHE", None)
     for ip in ("burn-0", "burn-1", "burn-2", "burn-3"):
         daemon._WARP_IP_USED[ip] = {"ts": 990.0, "blocked": True,
                                     "blocked_kind": "rate429", "blocked_ts": 990.0,
@@ -1974,6 +1981,8 @@ def test_warp_failover_skips_target_when_refresh_keeps_stale_ip(monkeypatch):
     """刷新后仍是窗口内用过的地址 → 跳过该备线，改切轮换池 proxy。"""
     egress = _reuse_env(monkeypatch, {"1080": "ip-w1", "1081": "stale-ip"})
     monkeypatch.setitem(daemon.CFG["warp"], "proxy_fallback_enabled", True)
+    monkeypatch.setattr(daemon, "_proxy_pool_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_PROXY_HEALTH_CACHE", None)
     daemon._WARP_IP_USED["stale-ip"] = {"ts": 900.0, "blocked": False, "last_ok_ts": 900.0}
     monkeypatch.setattr(daemon, "_restart_service", lambda service, tag=None: True)
     switched = []
@@ -2870,6 +2879,8 @@ def test_fallback_stamps_actual_landing_time_not_stale_caller_now(monkeypatch):
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon, "_proxy_dwell_since", 0.0)
     monkeypatch.setattr(daemon.time, "time", lambda: 5_000_000.0)
+    monkeypatch.setattr(daemon, "_proxy_pool_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_PROXY_HEALTH_CACHE", None)
 
     daemon._fallback_to_proxy({"tag": "W1"}, "ip-1", now=1_000_000.0)
     assert daemon._proxy_dwell_since == 5_000_000.0, \

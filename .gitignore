@@ -11,6 +11,7 @@ __pycache__
 .egress_log.jsonl
 # 订阅刷新生成，含 Clash API secret + 节点凭据
 singbox-config.json
+singbox-config.json-slot*.json
 # 与上面同源的旁路文件：节点→订阅源归属，含订阅地址/标签
 singbox-config.json.sources.json
 # 订阅原文快照（base64 里就是 token），一次性链接取回后缓存
@@ -19,6 +20,8 @@ singbox-config.json.sources.json
 singbox-config.json.tmp
 *.json.tmp
 *.json.*.tmp
+# 成组提升时的回滚副本（promote 期间短暂存在，崩溃会残留；同样含凭据）
+*.json.rollback
 .bad_nodes.json.lock
 .warp/
 .warp_ip_used.json
@@ -65,3 +68,6 @@ backups/
 
 # 追加订阅源台账（`asip sub add` 写，含 token）
 .extra_subscriptions
+
+# 线上快照备份：体积大且含凭据，不进仓库
+deploy/daemon.py.*

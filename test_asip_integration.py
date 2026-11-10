@@ -384,6 +384,9 @@ def test_fallback_to_proxy_clears_the_process_wide_egress(monkeypatch):
     monkeypatch.setattr(daemon, "_schedule_idle_refresh", lambda m: None)
     monkeypatch.setattr(daemon, "_begin_segment", lambda ts: None)
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "stale-egress")
+    # 落池前的池健康闸（2026-11-09 加）：真探会连外网，这里按「池可用」打桩。
+    monkeypatch.setattr(daemon, "_proxy_pool_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(daemon, "_PROXY_HEALTH_CACHE", None)
 
     ok = daemon._fallback_to_proxy({"tag": "WG-7", "port": 1087}, "stale-egress",
                                    time.time())

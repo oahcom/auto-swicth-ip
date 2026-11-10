@@ -49,7 +49,7 @@ from typing import NamedTuple
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 从共享配置导入
-from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, REJECT_WINDOW, TRANSPORT_LOOKBACK_SEC, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret, consumer_slots
+from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, REJECT_WINDOW, TRANSPORT_LOOKBACK_SEC, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret, consumer_slots, consumer_slot_config_path
 from asip.atomic_io import append_line as _atomic_append_line
 from asip.atomic_io import write_json as _atomic_write_json
 from asip.atomic_io import update_json as _atomic_update_json
@@ -72,6 +72,57 @@ _PROJECT = os.path.dirname(os.path.abspath(__file__))
 # 测试与兄弟工具都以它为边界；内部实现统一到 asip，避免每个调用点各写一遍
 # 状态码/超时/JSON 解析。
 _CLASH = ClashClient(CFG["singbox"]["clash_api"], get_singbox_secret)
+
+# 每槽位独立 sing-box 的 Clash API 客户端缓存（按 clash_api_port 分桶）。
+_SLOT_CLASH: dict = {}
+
+def _slot_clash(slot) -> "ClashClient":
+    port = slot["clash_api_port"]
+    c = _SLOT_CLASH.get(port)
+    if c is None:
+        c = ClashClient("http://127.0.0.1:%d" % port, get_singbox_secret)
+        _SLOT_CLASH[port] = c
+    return c
+
+def slot_singbox_api(slot, path, method="GET", body=None, timeout=3, silent=False):
+    """调某个槽位 sing-box 的 Clash API（每台独立进程，独立端口）。"""
+    try:
+        status, data = _slot_clash(slot).request_json(method, path, body=body, timeout=timeout)
+    except Exception as e:
+        if not silent:
+            log("slot %s Clash API 异常: %s" % (slot["name"], e))
+        return 0, None
+    if status is None:
+        if not silent:
+            log("slot %s Clash API 连接失败" % slot["name"])
+        return 0, None
+    return status, data
+
+def _slot_by_proxy_url(url):
+    """按代理 URL 的端口定位槽位：7890、7892-7896 -> slot-1..6。
+
+    用 URL 解析而不是在整串里找第一个 `:数字`：带凭据的
+    `http://user:pass@127.0.0.1:7892` 会被旧正则误取成 `pass@127...` 之前
+    根本不存在的端口。只认环回主机，外部代理不存在「本机槽位」。
+    """
+    if not url or not isinstance(url, str):
+        return None
+    from urllib.parse import urlsplit
+    raw = url.strip()
+    try:
+        p = urlsplit(raw if "://" in raw else "//" + raw)
+        if (p.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
+            return None
+        port = p.port
+    except (ValueError, TypeError):
+        return None
+    if not port:
+        return None
+    for s in consumer_slots():
+        if s["port"] == port:
+            return s
+    return None
+
 
 # 全局复用连接 - 避免每次操作开/关 SQLite 连接
 _db_conn: sqlite3.Connection | None = None
@@ -9689,9 +9740,11 @@ def restart_singbox() -> bool:
         subprocess.run(_singbox_pkill_argv(), capture_output=True, timeout=10)
         time.sleep(2)
 
-        subprocess.run(
-            ["fuser", "-k", f"{MIXED_PORT}/tcp"],
-            capture_output=True, timeout=5)
+        _slot_ports = [s["port"] for s in consumer_slots()] or [MIXED_PORT]
+        for _sp in _slot_ports:
+            subprocess.run(
+                ["fuser", "-k", f"{_sp}/tcp"],
+                capture_output=True, timeout=5)
         time.sleep(1)
 
         config_file = CFG["singbox"]["config_file"]
@@ -9722,6 +9775,19 @@ def restart_singbox() -> bool:
                 [singbox_bin, "run", "-c", config_file],
                 stdout=log_file, stderr=subprocess.STDOUT,
                 start_new_session=True)
+            # 启动 slot-2..6 的独立 sing-box 进程（每台独立端口/连接池）
+            for _slot in consumer_slots()[1:]:
+                _slot_cfg = _slot.get("config_file") or consumer_slot_config_path(
+                    config_file, consumer_slots().index(_slot))
+                if not os.path.exists(_slot_cfg):
+                    log("  slot 配置缺失: %s" % _slot_cfg)
+                    continue
+                subprocess.Popen(
+                    [singbox_bin, "run", "-c", _slot_cfg],
+                    stdout=log_file, stderr=subprocess.STDOUT,
+                    start_new_session=True)
+                log("  启动 slot sing-box: %s port=%d clash=%d"
+                    % (_slot["name"], _slot["port"], _slot["clash_api_port"]))
         time.sleep(CFG["singbox"]["startup_grace_sec"])
 
         if is_singbox_alive():
@@ -9784,8 +9850,8 @@ def _clash_api() -> tuple[str, str] | None:
     return f"http://{addr}", str(ca.get("secret") or "")
 
 
-def reload_singbox_config(path: str | None = None) -> bool:
-    """用 Clash API 热重载配置：不杀进程、不关 7890、不禁用 outboundProxyUrl。
+def reload_singbox_config(path: str | None = None, slot: dict | None = None) -> bool:
+    """用 Clash API 热重载配置：不杀进程、不关端口、不禁用 outboundProxyUrl。
 
     实测 sing-box 1.13.0（本机，2026-11-09）：
       PUT /configs?force=true  → 204，耗时 0.01s，50ms 粒度探测 7890 全程 0 次失败。
@@ -9795,31 +9861,54 @@ def reload_singbox_config(path: str | None = None) -> bool:
 
     只在**确认进程活着**时用；进程死了必须走 restart_singbox（那才是看门狗的活）。
     """
-    api = _clash_api()
+    if slot is None:
+        api = _clash_api()
+    else:
+        api = ("http://127.0.0.1:%d" % int(slot["clash_api_port"]),
+               get_singbox_secret())
     if not api:
         return False
     base, secret = api
-    cfg_path = path or CFG["singbox"]["config_file"]
+    cfg_path = path or ((slot or {}).get("config_file")
+                        or CFG["singbox"]["config_file"])
     body = json.dumps({"path": os.path.abspath(cfg_path)}).encode()
     req = urllib.request.Request(
         f"{base}/configs?force=true", data=body, method="PUT",
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {secret}"})
+    tag = (slot or {}).get("name") or "主配置"
     t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             code = r.status
     except urllib.error.HTTPError as e:
-        log(f"  ✗ sing-box 热重载被拒 HTTP {e.code}；回退整进程重启")
+        log(f"  ✗ {tag} 热重载被拒 HTTP {e.code}；回退整进程重启")
         return False
     except Exception as e:
-        log(f"  ✗ sing-box 热重载失败 {type(e).__name__}: {e}；回退整进程重启")
+        log(f"  ✗ {tag} 热重载失败 {type(e).__name__}: {e}；回退整进程重启")
         return False
     if code not in (200, 204):
-        log(f"  ✗ sing-box 热重载返回 {code}；回退整进程重启")
+        log(f"  ✗ {tag} 热重载返回 {code}；回退整进程重启")
         return False
-    log(f"✓ sing-box 热重载完成（{int((time.time() - t0) * 1000)}ms，端口未中断）")
+    log(f"✓ {tag} 热重载完成（{int((time.time() - t0) * 1000)}ms，端口未中断）")
     return True
+
+
+def _reload_config_set(changed: list[tuple[str, str]]) -> bool:
+    """只热重载真正变化的配置；任一失败则交给整进程重启兜底。"""
+    slots = consumer_slots()
+    changed_finals = {f for f, _t in changed}
+    ok = True
+    for i, slot in enumerate(slots or []):
+        final = slot.get("config_file") or consumer_slot_config_path(
+            CFG["singbox"]["config_file"], i)
+        if final not in changed_finals:
+            continue
+        if not reload_singbox_config(path=final, slot=slot):
+            ok = False
+    if not slots and changed:
+        ok = reload_singbox_config(path=changed[0][0])
+    return ok
 
 
 def _dormant_tags() -> set[str]:
@@ -10071,6 +10160,84 @@ def _discard(path: str):
         os.unlink(path)
     except OSError:
         pass
+
+
+def _config_set_pairs(main_final: str) -> list[tuple[str, str]]:
+    """(最终路径, 草稿路径) 列表；第 0 项永远是主配置。"""
+    slots = consumer_slots()
+    if not slots:
+        return [(main_final, main_final + ".tmp")]
+    finals = []
+    for i, slot in enumerate(slots):
+        final = slot.get("config_file") or consumer_slot_config_path(main_final, i)
+        if i == 0:
+            final = main_final
+        finals.append(final)
+    return [(f, f + ".tmp") for f in finals]
+
+
+def _discard_config_set(main_final: str) -> None:
+    for _final, tmp in _config_set_pairs(main_final):
+        _discard(tmp)
+
+
+def _config_set_check_error(main_final: str) -> str:
+    """六份草稿全部过 sing-box check 才允许任何一份上线。"""
+    for final, tmp in _config_set_pairs(main_final):
+        if not os.path.exists(tmp):
+            return "缺少槽位草稿: %s" % os.path.basename(tmp)
+        err = _config_check_error(tmp)
+        if err:
+            return "%s: %s" % (os.path.basename(final), err)
+    return ""
+
+
+def _config_set_semantically_equal(main_final: str) -> bool:
+    for final, tmp in _config_set_pairs(main_final):
+        if not os.path.exists(final) or not _config_semantically_equal(final, tmp):
+            return False
+    return True
+
+
+def _promote_config_set(main_final: str) -> list[tuple[str, str]]:
+    """成组提升已校验的草稿；任一步失败则回滚已替换文件。
+
+    返回真正发生变化的 (final,tmp) 对，供热重载只重读变化的进程。
+    os.replace 跨文件无法做到真正的单事务，但六份都已先通过 check，且这里
+    保留旧文件副本，异常时按相反顺序回滚，不会出现「一半新一半旧」长期劈叉。
+    """
+    pairs = _config_set_pairs(main_final)
+    changed = [(f, t) for f, t in pairs
+               if not (os.path.exists(f) and _config_semantically_equal(f, t))]
+    backups = {}
+    replaced = []
+    try:
+        for final, _tmp in changed:
+            rb = final + ".rollback"
+            if os.path.exists(final):
+                shutil.copy2(final, rb)
+                backups[final] = rb
+        for final, tmp in changed:
+            os.replace(tmp, final)
+            replaced.append(final)
+    except Exception:
+        for final in reversed(replaced):
+            rb = backups.get(final)
+            try:
+                if rb and os.path.exists(rb):
+                    os.replace(rb, final)
+                elif not rb:
+                    os.unlink(final)
+            except OSError:
+                pass
+        raise
+    finally:
+        for rb in backups.values():
+            try:
+                os.unlink(rb)
+            except OSError:
+                pass
+    return changed
 
 def _stderr_reason(stderr: str) -> str:
     """从子进程 stderr 提取最有诊断价值的一行。
@@ -10566,7 +10733,7 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
                 pass
         if r.returncode != 0:
             log(f"✗ 订阅解析失败 (rc={r.returncode}): {_stderr_reason(r.stderr)}")
-            _discard(tmp_file)
+            _discard_config_set(config_file)
             return False
         # 生成侧的诊断都走 stderr，以前只转发带 ⚠ 的那几行 —— 于是
         # 「WARP 配置读取失败，跳过」这种**决定性**的一行被静默丢弃，
@@ -10624,13 +10791,13 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
             unjudgeable = True
         if new_n == 0:
             log("✗ 刷新产出 0 节点，保留现有配置")
-            _discard(tmp_file)
+            _discard_config_set(config_file)
             return False
         # 节点数骤降：old_n 为 0（配置缺失/损坏/编码异常）时护栏不可用，
         # 此时若旧配置本来存在，宁可拒绝也不要冒风险覆盖
         if not fallback and not unjudgeable and old_n == 0 and os.path.exists(config_file):
             log("✗ 现有配置不可读（0 节点），无法判断刷新是否合理，保留现有配置")
-            _discard(tmp_file)
+            _discard_config_set(config_file)
             return False
         if not fallback and not unjudgeable and old_n and new_n < old_n * 0.5:
             global _pool_reject_streak
@@ -10655,28 +10822,28 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
                     log(f"⚠ 已连续 {_pool_reject_streak} 次被骤降护栏拦住，基线 "
                         f"{old_n} 可能已过时。确认订阅确实缩水了，就删掉 "
                         f"{POOL_HISTORY} 里旧的样本，让它按新水位重建。")
-                _discard(tmp_file)
+                _discard_config_set(config_file)
                 return False
         _pool_reject_streak = 0
-        # 最后一道防线：promote 前用 sing-box 自身校验。单个坏节点
-        # （非法 pbk/sid、缺 password 等）会让整个配置 FATAL，而一旦覆盖，
-        # 好节点池就没了 —— 只能等下一小时刷新重装同一份毒配置。
-        err = _config_check_error(tmp_file)
+        # 最后一道防线：promote 前六份草稿全部用 sing-box 自身校验。单个坏节点
+        # （非法 pbk/sid、缺 password 等）会让整个配置 FATAL；只校验主配置时，
+        # 槽位 2..6 可能已经上线坏配置，出现主/槽版本与可用性劈叉。
+        err = _config_set_check_error(config_file)
         if err:
             log(f"✗ 新配置未通过 sing-box check，保留现有配置: {err}")
-            _discard(tmp_file)
+            _discard_config_set(config_file)
             return False
         # 池子一个字都没变时**什么都不做**：不覆盖、不重载、不重启。
         # 实测 09:00~14:55 九次刷新里八次是 169 → 169 的同一份内容，却每次都
         # 走 restart_singbox（13 秒出口空窗），9router 侧就是成批 ECONNREFUSED
         # → 503。用户要的「重启换 IP」针对的是出口地址，不是把配置重读一遍。
-        if _config_semantically_equal(config_file, tmp_file):
-            _discard(tmp_file)
+        if _config_set_semantically_equal(config_file):
+            _discard_config_set(config_file)
             if not fallback and not unjudgeable:
                 # 样本照记：这份配置确实在跑，基线窗口不该因为「没变化」断档。
                 _record_pool_sample(new_n)
             log(f"✓ 订阅刷新完毕（池子成员 {old_n} → {new_n}），"
-                f"配置无实质变化，跳过 sing-box 重载")
+                f"六份配置均无实质变化，跳过 sing-box 重载")
             _submit_once("autodiag", _run_autodiag)
             _submit_once("h2diag", _run_h2_probe)
             _submit_once("h2sync", _run_h2_sync)
@@ -10687,7 +10854,7 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
                 return restart_singbox()
             return True
         _log_pool_diff(config_file, tmp_file)
-        os.replace(tmp_file, config_file)
+        changed = _promote_config_set(config_file)
         _promote_sidecars(tmp_file, config_file)
         _drop_stats(tmp_file)
         if not fallback and not unjudgeable:
@@ -10695,7 +10862,7 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
             _record_pool_sample(new_n)
         _rebind_wg_lines_after_refresh()
         log(f"✓ 订阅刷新完毕（池子成员 {old_n} → {new_n}），"
-            f"热重载 sing-box 加载新配置...")
+            f"成组提升 {len(changed)} 份配置，热重载 sing-box...")
         # 新节点要测出 colo 才进得了块；放在重载之后异步跑，不拖慢刷新。
         # WG 与 H2 是两条独立承载，各测各的：只跑 WG 时 carrier=h2 永远不增加，
         # H2 渠道池就停在那一批老节点上（实测 etcloud 的 18 个活节点因此一直
@@ -10704,14 +10871,14 @@ def _refresh_subscription_locked(reason: str = "") -> bool:
         _submit_once("h2diag", _run_h2_probe)
         # 实测只更新 block-map；真正把新块变成线的是这条（自限 30min）。
         _submit_once("h2sync", _run_h2_sync)
-        # 配置真变了才需要让 sing-box 重读：优先 Clash API 热载（端口不断），
-        # 进程已经不在了才回退到整进程重启。
-        if reload_singbox_config():
+        # 只重载真正变化的进程：优先 Clash API 热载（端口不断），任一失败就
+        # 回退整进程重启（六台一起重建，保证版本一致）。
+        if _reload_config_set(changed):
             return True
         return restart_singbox()
     except Exception as e:
         log(f"✗ 订阅刷新失败: {e}")
-        _discard(config_file + ".tmp")   # 超时/异常时清除残留（含凭据）
+        _discard_config_set(config_file)   # 超时/异常时清除全部残留（含凭据）
         return False
 
 # ============= 降级逻辑 =============
@@ -11272,9 +11439,22 @@ def _probe_line_before_rotate(tag, ip, fresh=False):
 # 才变成「原槽位」去修自己，同时 _MAIN_SLOT_NAME 改指新借出的槽位。
 
 _SLOT_HEALTH = {}
+# 槽位状态表的读改写锁。RLock：_slot_begin_repair 持锁时还会调 _slot_mark。
+_SLOT_STATE_LOCK = threading.RLock()
 # 当前服务主出口的槽位名。None = 主出口用的是主循环挑的线，不属于任何槽位
 # （此时被换下的线按游离线处理，由 _repair_line 复核）。
 _MAIN_SLOT_NAME = {"name": None}
+
+# 每个槽位自己的出口变更台账。主路径用 _EXIT_LEDGER 判断「这条 429 追的地址
+# 是否已被换走」；槽位各有独立 selector，不能共用主出口的台账，否则 A 槽换线
+# 会把 B 槽同 IP 的迟到请求误判成已退休。条目与全局表同构（old/new/at）。
+_SLOT_EXIT_LEDGER = {}
+_SLOT_LEDGER_MAX = 32
+_SLOT_LEDGER_LOCK = threading.Lock()
+# 槽位重定向公平轮询。按 consumer_slots 顺序永远先选 slot-1，会把所有失败重试
+# 都压到主出口（实测 176/305 涌向 slot-1），形成报告越多、越容易被再次撞坏的
+# 级联。这里只记「上一次从哪个位置开始找」，不改槽位数组本身。
+_SLOT_REDIRECT_RR = {"index": 0}
 
 
 def _slot_by_name(name):
@@ -11285,19 +11465,82 @@ def _slot_by_name(name):
 
 
 def _slot_current(slot):
-    _, data = singbox_api("/proxies/" + slot["selector"], silent=True)
+    _, data = slot_singbox_api(slot, "/proxies/" + slot["selector"], silent=True)
     tag = (data or {}).get("now")
     if not tag or not _warp_member(tag):
         return None, None
     return tag, _warp_line_ip(tag)
 
 
+def _slot_note_switch(slot, old_tag, old_ip, new_tag, new_ip, ts):
+    """记一次槽位 selector 的**真实**变更，并维护迟到请求判断所需的台账。
+
+    同 tag 同 IP 的 PUT 不记：那只是重选当前线，没有切断任何请求；若把它当
+    「换线」，之后所有比它更早发出的 429 都会被误判成 already_retired，坏线
+    反而得不到修整。
+    """
+    name = slot["name"]
+    h = _slot_health(name)
+    h["tag"] = new_tag
+    h["egress"] = new_ip
+    h["switched_at"] = float(ts)
+    if old_tag == new_tag and old_ip == new_ip:
+        return
+    with _SLOT_LEDGER_LOCK:
+        rows = _SLOT_EXIT_LEDGER.setdefault(name, [])
+        rows.append({"at": float(ts), "old": old_ip, "new": new_ip,
+                     "tag": new_tag})
+        if len(rows) > _SLOT_LEDGER_MAX:
+            del rows[:-_SLOT_LEDGER_MAX]
+
+
+def _slot_ip_is_retired(name, ip, request_started_at):
+    """这条槽位的请求地址，是否在该请求发出之后被换走。"""
+    if not ip or not request_started_at or request_started_at <= 0:
+        return False
+    with _SLOT_LEDGER_LOCK:
+        return any(e["old"] == ip and e["at"] > request_started_at
+                   for e in _SLOT_EXIT_LEDGER.get(name, ()))
+
+
+def _is_main_slot(slot):
+    slots = consumer_slots()
+    return bool(slots) and slot.get("name") == slots[0].get("name")
+
+
+def _record_main_slot_switch(slot, old_tag, old_ip, new_tag, new_ip, ts):
+    """slot-1 就是主出口进程：它的 selector 变更必须补主路径的全套记账。
+
+    绕过这一层时，`_ACTIVE_WARP_IP` / 出口台账 / `_warp_line_selected` 都停在
+    旧线上，迟到 429 会认不出地址已退休，又去烧下一条。与 `_fast_switch` 保持
+    同一顺序：先给主台账记旧→新，再更新进程级当前出口。
+    """
+    global _ACTIVE_WARP_IP, _proxy_dwell_since
+    _exit_ledger_note(old_ip, new_ip, ts, new_tag)
+    _mark_warp_ip_used(new_ip, ts)
+    _warp_line_selected(new_tag, new_ip, ts)
+    _set_warp_line_ip(new_tag, new_ip)
+    _ACTIVE_WARP_IP = new_ip
+    _begin_segment(ts)
+    _proxy_dwell_since = 0
+    # 主进程自己换了线，主出口不再借用其他槽位。
+    _MAIN_SLOT_NAME["name"] = slot["name"]
+    log("⚡ 主槽位换线：%s → %s（出口=%s，槽位=%s）"
+        % (old_tag or "未知", new_tag, new_ip or "未知", slot["name"]))
+
+
 def _slot_put(slot, tag):
-    r, _ = singbox_api("/proxies/" + slot["selector"], method="PUT",
-                       body={"name": tag})
+    old_tag, old_ip = _slot_current(slot)
+    r, _ = slot_singbox_api(slot, "/proxies/" + slot["selector"], method="PUT",
+                            body={"name": tag})
     if r not in (200, 204):
         return False
     _publish_clash_snapshot(slot["selector"], {"now": tag})
+    new_ip = _warp_line_ip(tag)
+    switched_at = time.time()
+    _slot_note_switch(slot, old_tag, old_ip, tag, new_ip, switched_at)
+    if _is_main_slot(slot):
+        _record_main_slot_switch(slot, old_tag, old_ip, tag, new_ip, switched_at)
     return True
 
 
@@ -11314,6 +11557,41 @@ def _slot_peers():
     return used
 
 
+def _slot_line_owners():
+    """tag -> [槽位名]：用于发现两个槽位压同一条线。"""
+    owners = {}
+    for sl in consumer_slots():
+        tag, _ip = _slot_current(sl)
+        if tag:
+            owners.setdefault(tag, []).append(sl["name"])
+    return owners
+
+
+def _dedupe_slots():
+    """把重复指向同一条线的槽位（保留一个）标成 bad，交给补齐流程重挑。
+
+    重复的代价很直接：两个槽位压同一条线，等于少一个备份；那条线一坏，
+    两个闸口同时失效，秒切能去的地方少一个。服务中的槽位优先保留，修整中
+    的槽位不动（它正在换自己的线，动了会互相覆盖）。
+    """
+    owners = _slot_line_owners()
+    serving = _slot_serving_name()
+    dropped = []
+    for tag, names in owners.items():
+        if len(names) < 2:
+            continue
+        keep = serving if serving in names else names[0]
+        for n in names:
+            if n == keep:
+                continue
+            if _slot_health(n)["status"] == "repairing":
+                continue
+            _slot_mark(n, "bad", "duplicate")
+            log("⚠ 槽位 %s 与 %s 重复指向 %s，已标不可用待重挑" % (n, keep, tag))
+            dropped.append(n)
+    return dropped
+
+
 def _slot_pick(slot, avoid, now=None):
     """按主出口同一套判据挑线：新鲜、未被封、且不在 avoid 里。"""
     now = now or time.time()
@@ -11327,14 +11605,69 @@ def _slot_pick(slot, avoid, now=None):
     return None
 
 
+# 槽位选线串行锁：多个闸口同时被 429 触发修整时，各自在切换**前**算的
+# avoid 快照里看不到对方即将选中的线，会同时挑中同一条（实测 slot-3 与
+# slot-6 都落到 WARP-H2-SIN-5、同一个出口 IP，6 个备份实际只剩 5 个）。
+# 挑线和 PUT 必须在同一个临界区里，且每次都在锁内重算占用表。
+_SLOT_PICK_LOCK = threading.Lock()
+
+
+def _slot_claim(slot, extra_avoid=None):
+    """在锁内挑一条「此刻没被任何其他闸口/主出口占用」的线并切过去。
+
+    返回 (tag, ip)；没有候选或切换失败返回 (None, None)。
+    """
+    with _SLOT_PICK_LOCK:
+        cur, _ = _slot_current(slot)
+        # 只有「其他闸口占用表」里的当前线可以放行（允许原地重挑）；调用方
+        # extra_avoid 里的当前线往往是刚实测失败的线，绝不能跟着一起 discard。
+        # 旧写法先合并再 discard，会把 _repair_slot 已排除的失败线重新放回候选，
+        # 候选生成器又持续返回它时就会形成无边界 PUT/探测循环。
+        occupied = _slot_peers()
+        occupied.discard(cur or "")
+        avoid = set(extra_avoid or ()) | occupied
+        for _ in range(6):
+            pick = _slot_pick(slot, avoid)
+            if not pick:
+                return None, None
+            if _slot_put(slot, pick):
+                return pick, _warp_line_ip(pick)
+            avoid.add(pick)
+    return None, None
+
+
 def _slot_health(name):
-    return _SLOT_HEALTH.get(name) or {"status": "unknown", "verdict": None, "ts": 0.0}
+    # 必须返回表里的那一份，不能返回同等内容的临时 dict：调用方会往里写
+    # last_rotate_ts 之类的限速事实，写到临时对象上等于静默丢弃。
+    with _SLOT_STATE_LOCK:
+        return _SLOT_HEALTH.setdefault(
+            name, {"status": "unknown", "verdict": None, "ts": 0.0,
+                   "switched_at": 0.0, "tag": None, "egress": None})
+
+
+def _slot_begin_repair(name, reason=None):
+    """原子地把「非 repairing」标成 repairing；True 表示本次由我认领修复。
+
+    check-then-mark 拆成两步时，两条并发收敛（同一批重复槽位各修完一个）
+    会同时看到同一个坏槽是 bad，各起一条修整线程；后进 _slot_claim 的那条
+    会把前一条刚探通的线再换掉 —— 白烧一条线，还打断已就绪的连接池。
+    """
+    with _SLOT_STATE_LOCK:
+        if _slot_health(name)["status"] == "repairing":
+            return False
+        _slot_mark(name, "repairing", reason)
+        return True
 
 
 def _slot_mark(name, status, verdict=None):
-    prev = _SLOT_HEALTH.get(name, {}).get("status")
-    _SLOT_HEALTH[name] = {"status": status, "verdict": verdict,
-                          "ts": time.time()}
+    # 必须保留 switched_at/tag/egress：它们不是状态，是「这条请求发出后是否
+    # 已经换过线」的事实；每次 mark 都重建 dict 会把事实清空，于是迟到 429
+    # 再次变成无法识别，刚修好的线被反复记脏。
+    with _SLOT_STATE_LOCK:
+        h = _SLOT_HEALTH.setdefault(name, {"status": "unknown", "verdict": None,
+                                           "ts": 0.0})
+        prev = h.get("status")
+        h.update({"status": status, "verdict": verdict, "ts": time.time()})
     if prev != status:
         log("· 槽位 %s 状态 %s → %s%s"
             % (name, prev or "unknown", status,
@@ -11377,16 +11710,10 @@ def assign_consumer_slots(force=False):
             if h["status"] == "unknown":
                 _slot_mark(name, "ok")
             continue
-        used.discard(tag or "")
-        pick = _slot_pick(s, used)
+        pick, ip2 = _slot_claim(s)
         if not pick:
             _slot_mark(name, "bad", "no_candidate")
             continue
-        if not _slot_put(s, pick):
-            _slot_mark(name, "bad", "put_failed")
-            continue
-        used.add(pick)
-        ip2 = _warp_line_ip(pick)
         probed = _probe_line_for_slots(pick, ip2)
         verdict = (probed or {}).get("verdict")
         _slot_mark(name, "ok" if verdict == "OK" else "bad", verdict)
@@ -11429,14 +11756,51 @@ def _probe_line_for_slots(tag, ip, fresh=False):
                 continue
             if _slot_health(s["name"])["status"] != "bad":
                 continue
-            if _slot_put(s, tag):
-                _slot_mark(s["name"], "ok", "OK")
-                log("＋ 探测补闸：%s → %s" % (tag, s["name"]))
-                break
+            with _SLOT_PICK_LOCK:
+                # 锁内重查：这条线可能刚被别的闸口拿走，也可能主出口正在用。
+                busy = tag == active_warp_tag() or any(
+                    (_slot_current(x)[0] == tag)
+                    for x in consumer_slots() if x["name"] != s["name"])
+                if busy:
+                    break
+                if not _slot_put(s, tag):
+                    continue
+            _slot_mark(s["name"], "ok", "OK")
+            log("＋ 探测补闸：%s → %s" % (tag, s["name"]))
+            break
     return probed
 
 
+def _converge_duplicate_slots(exclude=None):
+    """一次修整结束后立刻收敛重复指向，不再依赖已删除的 15s 巡检。
+
+    只对 **这次修整之外** 的重复槽位启动一次后台修整，避免自己修完仍是重复
+    又无限自我重启；自己的重复状态留给下一轮探测或下次修整处理。
+    """
+    for name in _dedupe_slots():
+        if name == exclude:
+            continue
+        slot = _slot_by_name(name)
+        if slot is None or _slot_health(name)["status"] != "bad":
+            continue
+        if not _slot_begin_repair(name, "duplicate"):
+            continue
+        threading.Thread(target=_repair_slot, args=(slot, "duplicate"),
+                         daemon=True, name="repair-" + name).start()
+
+
 def _repair_slot(slot, reason):
+    """修整包装：真正换线后做一次事件驱动的重复槽位收敛。"""
+    try:
+        return _repair_slot_impl(slot, reason)
+    finally:
+        try:
+            _converge_duplicate_slots(exclude=slot.get("name"))
+        except Exception as e:
+            log("⚠ 槽位重复收敛失败: %s" % e)
+
+
+def _repair_slot_impl(slot, reason):
     """错误轮换时原槽位修自己：换掉自己的线，探通才标 ok。
 
     9router 已判 429 —— 不再「探一下通就留着」。换一条新线，探通才标 ok；
@@ -11450,20 +11814,17 @@ def _repair_slot(slot, reason):
         return
     if reason not in ("proactive", "transport") and ip:
         _mark_warp_ip_used(ip, time.time(), blocked=True, kind=reason)
-    avoid = _slot_peers()
-    avoid.discard(tag)
+    # 错误切换必须真的换线。不能只靠候选生成器隐式排除当前线：IP 未知时旧线
+    # 没被打上脏标记，生产里已经出现过「429 后错误切换 A → A」。把线名放进
+    # extra_avoid，它在整个重挑周期内都不会被 _slot_claim 放行。
+    avoid = {tag}
     tried = 0
     while True:
-        pick = _slot_pick(slot, avoid)
+        pick, new_ip = _slot_claim(slot, avoid)
         if not pick:
             _slot_mark(name, "bad", "no_candidate" if tried == 0 else "all_tried")
             log("✗ 槽位 %s 错误切换失败（试 %d 条都不通）" % (name, tried))
             return
-        if not _slot_put(slot, pick):
-            avoid.add(pick)
-            tried += 1
-            continue
-        new_ip = _warp_line_ip(pick)
         probed = _probe_line_for_slots(pick, new_ip)
         verdict = (probed or {}).get("verdict")
         if verdict == "OK":
@@ -11471,7 +11832,10 @@ def _repair_slot(slot, reason):
             log("↻ 槽位 %s 错误切换：%s → %s，实测 OK（%ss，试 %d 条）"
                 % (name, tag, pick, probed.get("sec"), tried + 1))
             return
-        if reason not in ("proactive", "transport") and new_ip:
+        # 只有上游明确拒绝（quota / flagged）才把这条线记脏。unreachable 是
+        # 「12 秒内没拿到结论」——慢线握手超时也会这样，记脏等于把好线也封了，
+        # 候选会被快速耗光。没结论就只在本轮排除，不进全局惩罚表。
+        if verdict in ("quota", "flagged") and new_ip:
             _mark_warp_ip_used(new_ip, time.time(), blocked=True, kind=reason)
         avoid.add(pick)
         tried += 1
@@ -11577,14 +11941,49 @@ def _kick_background_repair(tag, ip, reason):
         if ot != tag:
             owner = None
     if owner is not None:
-        if _slot_health(owner["name"])["status"] == "repairing":
+        if not _slot_begin_repair(owner["name"], reason):
             return
-        _slot_mark(owner["name"], "repairing")
         threading.Thread(target=_repair_slot, args=(owner, reason),
                          daemon=True, name="repair-" + owner["name"]).start()
     else:
         threading.Thread(target=_repair_line, args=(tag, ip, reason),
                          daemon=True, name="repair-line").start()
+
+
+def _pick_healthy_slot(name, avoid_tags=None):
+    """挑一台当前健康、且不是刚失败那台的 sing-box，返回 (slot, tag, ip)。
+
+    多端口架构下每台是独立进程、独立连接池，换端口不需要断连、不需要等
+    重建 —— 这一下就能回给调用方，比让它在坏端口上重试强得多。
+
+    健康槽按轮询游标选，而不是永远返回数组第一个。否则所有失败重试都会压到
+    slot-1/主出口，报告越多、越容易被再次撞坏。优先不选 serving 槽；只剩它
+    健康时仍返回它 —— 独立端口本身就是可用备份，没必要空着。
+    """
+    slots = consumer_slots()
+    if not slots:
+        return None, None, None
+    avoid = set(avoid_tags or ())
+    serving = _slot_serving_name()
+    n = len(slots)
+    start = int(_SLOT_REDIRECT_RR.get("index", 0)) % n
+    candidates = []
+    for off in range(n):
+        s = slots[(start + off) % n]
+        if s["name"] == name:
+            continue
+        if _slot_health(s["name"])["status"] != "ok":
+            continue
+        tag, ip = _slot_current(s)
+        if not tag or tag in avoid:
+            continue
+        candidates.append((s, tag, ip))
+    if not candidates:
+        return None, None, None
+    chosen = next((c for c in candidates if c[0]["name"] != serving), candidates[0])
+    idx = slots.index(chosen[0])
+    _SLOT_REDIRECT_RR["index"] = (idx + 1) % n
+    return chosen
 
 
 def _fast_switch(reason):
@@ -11598,14 +11997,10 @@ def _fast_switch(reason):
     调用方已用 _SWITCH_GUARD 非阻塞包住本函数 —— 拿不到锁直接回 coalesced。
     """
     cur = active_warp_tag()
-    for s in consumer_slots():
-        if _slot_health(s["name"])["status"] != "ok":
-            continue
-        tag, ip = _slot_current(s)
-        if not tag or tag == cur:
-            continue
-        if not _switch_warp(tag, ip=ip):
-            continue
+    # 只尝试一次公平选出的健康槽。旧实现按数组顺序逐个试，既偏袒 slot-1，
+    # 又会在多个 selector PUT 失败时把健康候选挨个烧一遍。
+    s, tag, ip = _pick_healthy_slot(None, {cur} if cur else None)
+    if s is not None and _switch_warp(tag, ip=ip):
         # 与正常换线路径同一套落地记账，缺一条就会让迟到 429 认不出「这条出口
         # 已经被换走」，于是再烧一条备用线。顺序不能变：_switch_warp 内部的
         # exit_ledger 必须读到切换**前**的 _ACTIVE_WARP_IP。
@@ -11914,6 +12309,30 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                  "egress": quick["egress"], "closed": 0,
                  "switched_at": t0},
                 t0, tag=quick["tag"], egress=quick["egress"])
+        # 只有 9router 声称「这条线失败」时才值得问：rate429/abuse403 是它对
+        # 出口的判定，而主动轮换（proactive）是它自己的节奏，实测只会白烧一格
+        # 配额、还会把正常轮换卡住。transport 是链路悬挂，探了也只会超时。
+        #
+        # 实测 OK 而 9router 报失败 = 同一出口上的两种结论不一致。这时换线只是
+        # 把一条还能用的线换掉，问题不会消失（下一个出口照样 429）—— 差异在
+        # 9router 的请求体，不在出口。所以不换线，把这组证据记进 _PROBE_DIVERGENCE。
+        if reason in ("rate429", "abuse403"):
+            probed = _probe_line_before_rotate(current_tag, cur_ip)
+            if probed and probed.get("verdict") == "OK":
+                _api_stats["line_ok"] += 1
+                _api_stats["divergence"] += 1
+                _PROBE_DIVERGENCE.append({
+                    "ts": time.time(), "reason": reason, "tag": current_tag,
+                    "ip": cur_ip, "probe_sec": probed.get("sec"),
+                    "elapsed": probed.get("elapsed"),
+                    "cached": bool(probed.get("cached"))})
+                del _PROBE_DIVERGENCE[:-50]
+                log(f"⚠ 探测分歧: 9router={reason} 但 asip 实测 {current_tag}"
+                    f" 出口={cur_ip} OK（{probed.get('sec')}s），不换线")
+                return _with_active_line(
+                    {"ok": True, "switched": False, "reason": "line_ok",
+                     "probe": probed},
+                    t0)
         out: dict = {}
         ok = _reconnect_warp_by_table(reason, interrupt=False, out=out)
         if not ok:
@@ -12008,6 +12427,105 @@ def _note_client_gone(result: dict) -> None:
             f"（换线生效，只是没人收响应）")
 
 
+def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
+                           avoid_until=0.0):
+    """构造槽位轮换回包：当前槽身份 + 立即重试目标 + 原端口冷却截止。"""
+    payload = {"ok": True, "switched": False, "reason": reason,
+               "switched_at": switched_at, "ms": 0,
+               "active_tag": cur_tag, "active_egress": cur_ip,
+               "avoid_port_until": avoid_until}
+    other, ttag, tip = _pick_healthy_slot(
+        slot["name"], {cur_tag} if cur_tag else None)
+    if other is not None:
+        payload["switched"] = True
+        payload["switch_to"] = other["name"]
+        payload["switch_to_url"] = "http://127.0.0.1:%d" % other["port"]
+        payload["switch_to_tag"] = ttag
+        payload["switch_to_egress"] = tip
+    else:
+        payload["switch_to"] = None
+        payload["switch_to_url"] = None
+    return payload
+
+
+def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None):
+    """带防重的槽位 /rotate：迟到请求只重连，不为旧证据烧掉新线。
+
+    与主路径一一对应：
+      - 槽位自己的 exit ledger 判 already_retired；
+      - 正在修整 = coalesced，重复 429 不重复起线程；
+      - 合并窗内的事故只记证据、不重复换线；
+      - 新线未进惩罚期时仍受 gap 限速，避免同一批风暴连续烧线。
+    与主路径不同的只有结果：不等后台修完，直接回一条健康槽的端口让调用方
+    立刻重试。
+    """
+    t0 = time.time()
+    cfg = _api_cfg()
+    name = slot["name"]
+    with _API_LOCK:
+        _api_stats["calls"] += 1
+        cur_tag, cur_ip = _slot_current(slot)
+        h = _slot_health(name)
+        switched_at = float(h.get("switched_at") or 0.0)
+        retired = bool(request_started_at and request_started_at > 0
+                       and switched_at > request_started_at)
+        if not retired and _slot_ip_is_retired(name, egress_ip,
+                                               request_started_at):
+            retired = True
+        if retired:
+            _api_stats["retired"] += 1
+            log("· %s: 请求地址 %s 在请求发出后被换走（当前 %s / %s），不换线"
+                % (name, egress_ip or "未知", cur_tag or "未知",
+                   cur_ip or "地址未知"))
+            # 同一端口的新线已经就位；调用方清连接后原地重试即可。这里不再
+            # 发起换线（有健康备槽时照样给出，让对端可以顺手合并连接）。
+            return _slot_redirect_payload(
+                slot, cur_tag, cur_ip, "already_retired", switched_at, 0.0)
+
+        # 证据先记账，再判合并/限速：被拒掉的一次也不能把刚吃 429 的地址
+        # 当干净地址放回候选。
+        was_blocked = False
+        try:
+            was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
+        except Exception:
+            was_blocked = False
+        if reason not in ("proactive", "transport") and cur_ip:
+            _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason)
+
+        last_attempt = float(h.get("last_rotate_ts") or 0.0)
+        accepted = False
+        if h["status"] == "repairing":
+            _api_stats["coalesced"] += 1
+            reason_out = "coalesced"
+        elif last_attempt and t0 - last_attempt < cfg.get("coalesce_ms", 800) / 1000.0:
+            _api_stats["coalesced"] += 1
+            reason_out = "coalesced"
+        elif (not was_blocked and last_attempt
+              and t0 - last_attempt < _rotate_gap()):
+            _api_stats["too_frequent"] += 1
+            reason_out = "too_frequent"
+        elif _slot_begin_repair(name, reason):
+            h["last_rotate_ts"] = t0
+            threading.Thread(target=_repair_slot, args=(slot, reason),
+                             daemon=True, name="repair-" + name).start()
+            accepted = True
+            reason_out = "ok"
+        else:
+            # 另一条线程刚好认领了这台槽位（重复收敛/秒切前置撞上）：等同合并，
+            # 不重复换线，但也别把调用方打回去原地重试坏端口。
+            _api_stats["coalesced"] += 1
+            reason_out = "coalesced"
+        avoid_until = (t0 + float(cfg.get("slot_cooldown_sec", 15))
+                       if accepted or h["status"] == "repairing" else 0.0)
+        out = _slot_redirect_payload(slot, cur_tag, cur_ip, reason_out,
+                                     switched_at, avoid_until)
+        if accepted or h["status"] == "repairing":
+            log("⇢ %s 报 %s（%s），重试改走 %s"
+                % (name, reason, reason_out,
+                   out.get("switch_to") or "无健康备槽"))
+        return out
+
+
 class _RotateHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "asip/1"
@@ -12074,6 +12592,29 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             req = json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             req = {}
+        # 多端口：带 egress_proxy_url 的请求按端口定位槽位，走独立 sing-box 路径。
+        # 每台 sing-box 独立连接池，9router 轮询，429 时后台修那台，立即返回
+        # 让 9router 重连到别的端口。不走下面的单主出口逻辑。
+        slot = _slot_by_proxy_url(req.get("egress_proxy_url"))
+        if slot is not None:
+            try:
+                payload = _rotate_slot_once(
+                    slot,
+                    _normalize_rotate_reason(req.get("reason")),
+                    _as_ts(req.get("request_started_at")),
+                    str(req.get("egress_ip")).strip()
+                    if isinstance(req.get("egress_ip"), str)
+                    and req.get("egress_ip").strip() else None)
+            except Exception as e:
+                log(f"✗ 槽位 /rotate 异常: {e}")
+                self._send(500, {"ok": False, "reason": "internal_error"})
+                return
+            # 没有健康备槽且当前槽还在修：出口身份暂时不可用。不能把空值当
+            # 「当前线」写回调用方，否则它会把本地记录覆盖成无代理。
+            if not payload.get("switch_to_url") and payload.get("reason") != "already_retired":
+                payload["line_unknown"] = True
+            self._send(200, payload)
+            return
         try:
             ip = req.get("egress_ip")
             # 必须先拿结果再回传。写成 _send(200, _rotate_once(...)) 时，下面
@@ -12113,6 +12654,7 @@ def _slot_keeper() -> None:
         log("⚠ 槽位分配放弃：sing-box 在 80s 内未就绪")
         return
     for attempt in range(60):
+        _dedupe_slots()
         slots = consumer_slots()
         if not slots:
             return
@@ -12124,13 +12666,9 @@ def _slot_keeper() -> None:
             log("✓ 所有槽位就绪")
             return
         for s in bad:
-            cur, _cip = _slot_current(s)
-            avoid = _slot_peers()
-            avoid.discard(cur or "")
-            pick = _slot_pick(s, avoid)
-            if not pick or not _slot_put(s, pick):
+            pick, ip = _slot_claim(s)
+            if not pick:
                 continue
-            ip = _warp_line_ip(pick)
             _probe_line_for_slots(pick, ip)  # 探测 + 自动补闸/同步
         time.sleep(2)
     log("⚠ 槽位启动未全部就绪，剩余坏闸将由 /rotate 路径继续修复")

@@ -48,13 +48,43 @@ def test_project_paths_resolve_inside_repo():
     assert Path(got["log_file"]).parent == PROJECT, got["log_file"]
 
 
+# 上游 marker 的通用占位目录（不是本机路径）：probe_warp.py 必须原样发这一串，
+# 改一个字符就会 429 FreeUsageLimitError。
+HOME_SCAN_ALLOWED = {"/home/user"}
+
+
+def _without_comments(text: str, name: str) -> str:
+    """注释抹成空格再扫，行号不变。
+
+    注释里会引用真实事故路径（如 /home/administrator/.9router 是上游精确拉黑值），
+    那是证据不是运行期依赖；只扫代码才能分清「写死的家目录」与「被引用的旧值」。
+    """
+    lines = text.splitlines()
+    if not name.endswith(".py"):
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("#"):
+                lines[i] = ""
+        return "\n".join(lines)
+    import io
+    import tokenize
+    keep = [list(line) for line in lines]
+    for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        if tok.type != tokenize.COMMENT:
+            continue
+        (sr, sc), (_er, ec) = tok.start, tok.end
+        keep[sr - 1][sc:ec] = " " * (ec - sc)
+    return "\n".join("".join(chars) for chars in keep)
+
+
 def test_no_hardcoded_home_in_runtime_files():
     """运行期文件里不该出现 /home/<某个用户>：换用户即失效。"""
     offenders = []
     for rel in RUNTIME_FILES:
-        text = (PROJECT / rel).read_text(encoding="utf-8")
-        for m in re.finditer(r"/home/[A-Za-z0-9_.-]+", text):
-            offenders.append(f"{rel}:{text[:m.start()].count(chr(10)) + 1} {m.group(0)}")
+        code = _without_comments((PROJECT / rel).read_text(encoding="utf-8"), rel)
+        for m in re.finditer(r"/home/[A-Za-z0-9_.-]+", code):
+            if m.group(0) in HOME_SCAN_ALLOWED:
+                continue
+            offenders.append(f"{rel}:{code[:m.start()].count(chr(10)) + 1} {m.group(0)}")
     assert not offenders, "硬编码家目录：" + "; ".join(offenders)
 
 

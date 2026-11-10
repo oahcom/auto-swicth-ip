@@ -150,7 +150,7 @@ CFG = {
         "selector": "proxy",
         "binary": _env_path("SINGBOX_BINARY", os.path.join(PROJECT_DIR, "sing-box")),
         "config_file": _env_path("SINGBOX_CONFIG", os.path.join(PROJECT_DIR, "singbox-config.json")),
-        "startup_grace_sec": 10,  # 增加到 10s，给 sing-box 更多初始化时间
+        "startup_grace_sec": 30,  # 30s：6 台 sing-box 依次拉起，给慢启动留足余量
         "max_restart_attempts": 3,
         "mixed_port": 7890,
         # 并行消费者槽位：每个槽位一个本机端口 + 一条独立 selector，与主出口
@@ -253,6 +253,9 @@ CFG = {
         "pre_rotate_probe_ttl_sec": 30,
         # 并发去重窗口：同一次故障的多发请求只切一次。
         "coalesce_ms": 800,
+        # 槽位报错后给 9router 的短冷却（秒）。后台修整通常 2~5s；这段时间
+        # 不把新请求继续轮到这个端口，避免每个新请求都来再报一次 429。
+        "slot_cooldown_sec": 15,
         # 限速按「上一次切到的线是否已验证」分档：
         #   - 已验证（缓存命中，可确信是优质出口）：8s。好线撑 8 秒绰绰有余，
         #     窗口内的 429 多半是瞬时限流而非配额耗尽，换线只会白扔一个好 IP。
@@ -1106,17 +1109,51 @@ OPENCODE_FREE_PROVIDER = "opencode"
 
 
 def consumer_slots() -> list[dict]:
-    """并行消费者槽位（端口 + 独立 selector）。0 个时返回空表。
+    """每槽位一台独立 sing-box 进程：独立端口、独立连接池。0 个时返回空表。
 
-    槽位与主出口同构：一样的 WARP 成员池、一样由 daemon 挑线与轮换。
-    区别只是「谁在用」—— 主出口给 9router 的主链路，槽位给它的并行链路。
+    9router 代理池放所有端口 round-robin。9router 连不同端口=不同 sing-box=
+    不同连接池=不同线，天然隔离，秒切靠轮询不需要翻转 selector。
     """
-    n = int((CFG.get("singbox") or {}).get("consumer_slots", 0) or 0)
+    sb = CFG.get("singbox") or {}
+    n = int(sb.get("consumer_slots", 0) or 0)
     sel = (CFG.get("warp") or {}).get("selector") or "opencode-out"
+    base_port = int(sb.get("mixed_port", 7890))
+    clash = sb.get("clash_api", "http://127.0.0.1:9090")
+    base_clash = int(clash.rsplit(":", 1)[-1]) if ":" in clash else 9090
     out = []
     for i in range(n):
+        clash_p = base_clash + i
+        # 9091 被 h2 线的 Clash API 占用，从这里起整体后移 1
+        if clash_p >= 9091:
+            clash_p += 1
+        port_p = base_port + i
+        # 7891 被 LAN 入站占用，从这里起整体后移 1
+        if port_p >= 7891:
+            port_p += 1
         out.append({
             "name": "slot-%d" % (i + 1),
-            "selector": "%s-%d" % (sel, i + 1),
+            "selector": sel,
+            "port": port_p,
+            "clash_api_port": clash_p,
+            # 配置路径由同一处命名规则产出。生产代码禁止再从 slot-1 的
+            # config_file 拼 "-slotN.json"：解析、启动、热重载三处各拼一次，
+            # 任一处改名就会静默拉起旧配置。
+            "config_file": consumer_slot_config_path(str(sb.get("config_file")
+                                                       or ""), i),
         })
     return out
+
+
+def consumer_slot_config_path(base_path: str, slot_index: int) -> str:
+    """第 slot_index 个槽位（0 基）的 sing-box 配置文件路径。
+
+    解析器可能从 `foo.json.tmp` 起草，此时槽位文件必须以去掉 `.tmp` 的最终
+    路径为基准，否则会写出 `foo.json.tmp-slot2.json` 这种既不被校验、也不会
+    被 promote 的孤儿文件。
+    """
+    base = str(base_path or "")
+    if base.endswith(".tmp"):
+        base = base[:-4]
+    if slot_index == 0:
+        return base
+    return "%s-slot%d.json" % (base, slot_index + 1)

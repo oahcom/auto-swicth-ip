@@ -919,7 +919,7 @@ def _pick_default(nodes: list[dict]) -> str:
     return pick[0] if pick else nodes[0]["tag"]
 
 
-def _build_inbounds(listen_port: int) -> list[dict]:
+def _build_inbounds(listen_port: int, include_lan: bool = True) -> list[dict]:
     """环回入站（必有）+ 局域网入站（配了端口且有认证时才建）。
 
     分成两个入站而非把一个入站改监听 0.0.0.0：环回口给 9router 与 daemon，
@@ -933,7 +933,7 @@ def _build_inbounds(listen_port: int) -> list[dict]:
         "listen_port": listen_port,
     }]
     lan_port = CFG["singbox"].get("lan_port", 0)
-    if not lan_port:
+    if not lan_port or not include_lan:
         return inbounds
     auth = get_lan_auth()
     if not auth:
@@ -975,7 +975,8 @@ def _build_lan_guard(inbounds: list[dict]) -> list[dict]:
 
 def make_config(nodes: list[dict], listen_port: int = 0,
                 clash_port: int = 0, clash_secret: str = "",
-                include_h2: bool = False, stats_out=None) -> dict:
+                include_h2: bool = False, stats_out=None,
+                slot_index: int = 0, include_lan: bool = True) -> dict:
     """生成 sing-box 配置：mixed port + selector + clash API
 
     include_h2: 是否包含 hysteria2 节点（WSL2 下 utls 不兼容，默认排除）
@@ -1047,7 +1048,7 @@ def make_config(nodes: list[dict], listen_port: int = 0,
     # 唯一可靠的数字（原来只有 stderr 那一行，成功刷新时会被 daemon 丢掉）。
     write_sub_stats(stats_out, len(nodes), len(dormant), len(pool_objs),
                     len(sleeping), fallback)
-    inbounds = _build_inbounds(listen_port)
+    inbounds = _build_inbounds(listen_port, include_lan=include_lan)
     # selector tag 与 daemon / CLI 共用 config 里的名字：改一处即可整体改名，
     # 不必再同步 grep 本文件里的字符串字面量。
     pool_selector = CFG["singbox"]["selector"]
@@ -1070,9 +1071,10 @@ def make_config(nodes: list[dict], listen_port: int = 0,
                 "type": "selector",
                 "tag": warp_selector,
                 "outbounds": [w["tag"] for w in warps] + [pool_selector],
-                "default": warps[0]["tag"],
+                "default": warps[slot_index % len(warps)]["tag"] if warps else "",
                 "interrupt_exist_connections": False,
             }] if warps else []),
+
         ],
         # opencode 域名独立解析：WSL2 下 /etc/resolv.conf 的 8.8.8.8 不可达，
         # 走阿里 DoH 本地解析后把 IP 交给节点（route 的 resolve 动作），
@@ -1275,13 +1277,28 @@ if __name__ == "__main__":
     # 带进配置会让 `sing-box check` 直接 FATAL，整轮刷新被护栏拒掉。
     for n in nodes:
         n.pop("_display", None)
-    cfg = make_config(nodes, args.port, args.clash_port, args.secret or get_singbox_secret(), include_h2=args.include_h2, stats_out=args.out)
-
-    # 调用方（daemon）传进来的 args.out 本身已是 <config>.tmp：它要在 promote
-    # 前做节点数/sing-box check 校验。write_json 先写同目录唯一临时文件再
-    # os.replace 到 args.out，既不截断写（崩溃不会留下半份 JSON），也不改变
-    # 调用方看到的路径契约。
-    write_json(args.out, cfg, mode=0o600, indent=2)
+    slots = config.consumer_slots()
+    # daemon 以 `<final>.tmp` 调用：六份配置都写到各自最终路径的 `.tmp`，由
+    # daemon 统一 check、统一 promote。不能像旧实现那样让 slot-2..6 直接写最终
+    # 路径 —— 主配置被护栏拒收时，槽位文件已经上线，主/槽版本当场劈叉。
+    drafting = str(args.out).endswith(".tmp")
+    cfg = None
+    if slots:
+        for i, slot in enumerate(slots):
+            final_path = config.consumer_slot_config_path(args.out, i)
+            out_path = final_path + ".tmp" if drafting else final_path
+            cfg = make_config(nodes, slot["port"], slot["clash_api_port"],
+                              args.secret or get_singbox_secret(),
+                              include_h2=args.include_h2,
+                              stats_out=(args.out if i == 0 else None),
+                              slot_index=i, include_lan=(i == 0))
+            write_json(out_path, cfg, mode=0o600, indent=2)
+    else:
+        out_path = args.out + ".tmp" if drafting else args.out
+        cfg = make_config(nodes, args.port, args.clash_port,
+                          args.secret or get_singbox_secret(),
+                          include_h2=args.include_h2, stats_out=args.out)
+        write_json(out_path, cfg, mode=0o600, indent=2)
 
     # 来源台账与配置同目录、同一生命周期：sing-box 不认这个字段，单独落盘
     # 才不会污染配置，也不会在 promote 校验时被当成未知键。

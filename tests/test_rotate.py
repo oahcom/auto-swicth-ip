@@ -41,6 +41,11 @@ def _isolate_history(monkeypatch):
     # 在 test_daemon_unit / test_warp_refresh 之后必红，单跑恒绿。
     monkeypatch.setattr(d, "_WARP_LINE_STATE", {})
     monkeypatch.setattr(d, "_CLASH_SNAP", {})
+    # 槽位表同样是进程级状态：test_slot_failover 会把 6 个槽都标 ok，若这里
+    # 不隔离，_fast_switch 会走真实的 slot 秒切，主路径用例记录的出口/地址
+    # 全变成槽位里的值（且会尝试连本机 Clash API）。
+    monkeypatch.setattr(d, "_SLOT_HEALTH", {})
+    monkeypatch.setattr(d, "_MAIN_SLOT_NAME", {"name": None})
     monkeypatch.setattr(d, "_reconnect_warp_by_table",
                         lambda reason, interrupt=True, out=None: False)
     yield
