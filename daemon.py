@@ -4733,7 +4733,22 @@ def _line_node_cannot_carry(tag: str) -> bool:
     """
     try:
         m = _warp_member(tag)
-        if m and m.get("kind") == "h2":
+        if not m:
+            # 扫描发现的隧道（`WARP-H2-SCAN-<idx>`，见 `_scan_running_tunnels`）
+            # **不在 `members` 声明里**，`_warp_member` 永远返回 None，函数就
+            # 直接落到下面的 `warp_wg` 台账查找 —— 那里也没有它（node=None）
+            # → 恒返回 False。于是这批线绕开了「从没出过口就别重启」这条判据，
+            # 被无限重启。
+            # 实测 2026-11-10 09:00 前后 15 分钟：322 次重启里 **226 次（70%）**
+            # 打在这 47 条线上。它们的状态完全一致：`ever_ip` 全 False、`ip` 全空、
+            # `last_ok_ts` 全 0、`last_verdict` 全 unknown、`fail_streak` 204~206
+            # —— 一次都没通过，重启只是把同一个死节点再拉一遍。
+            # 判据与被跳过的声明线分支同一口径：没出过口 + 探过 → 重启无意义。
+            st = _warp_line_state(tag)
+            if not bool(st.get("ever_ip")) and st.get("last_probe_ts"):
+                return True
+            return False
+        if m.get("kind") == "h2":
             # H2 的落地节点在共享 sing-box 的 selector 里，**不在 `warp_wg` 台账**
             # —— 查台账永远 `node=None`，下面整段对 H2 从来没生效过。实测
             # 2026-11-05 SLC-11/12/24 整池（4 个 bilibili 节点）TCP 全死、

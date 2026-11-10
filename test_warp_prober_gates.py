@@ -421,6 +421,35 @@ def test_restart_that_yields_ip_resets_futile_counter():
     assert st["next_restart_ts"] == 0.0, "换出地址不该被刹车"
 
 
+def test_scanned_tunnel_that_never_had_ip_is_judged_dead():
+    """扫描发现、但一次都没出过口的隧道，不许再重启。
+
+    `_scan_running_tunnels` 会把「在跑但没被声明」的单元补进探测集，其 tag 是
+    `WARP-H2-SCAN-<idx>`。这类 tag 不在 `members` 里，`_warp_member()` 返回
+    None，`_line_node_cannot_carry()` 于是直接落到 warp_wg 台账查找 —— 那里也
+    没有它（node=None）→ 恒返回 False，把「从没出过口就别重启」这条判据整个
+    绕过去了。
+
+    实测 2026-11-10 09:00 前后 15 分钟：322 次重启里 226 次（70%）打在这 47
+    条线上；它们 `ever_ip` 全 False、`ip` 全空、`last_ok_ts` 全 0、
+    `last_verdict` 全 unknown、`fail_streak` 204~206。
+    """
+    _seed(tag="WARP-H2-SCAN-17", ip=None, ever_ip=False,
+          last_probe_ts=1000.0, ip_ts=0.0, fail_streak=206)
+    assert daemon._line_node_cannot_carry("WARP-H2-SCAN-17") is True, (
+        "一次都没出过口的扫描线仍被判可重启 —— 70% 的重启名额继续被空转吃掉"
+    )
+
+
+def test_scanned_tunnel_that_once_had_ip_still_gets_restarted():
+    """出过口的扫描线相反：更可能是会话僵死，重启仍是唯一修法。"""
+    _seed(tag="WARP-H2-SCAN-18", ip=None, ever_ip=True,
+          last_probe_ts=1000.0, ip_ts=0.0, fail_streak=6)
+    assert daemon._line_node_cannot_carry("WARP-H2-SCAN-18") is False, (
+        "出过口的线被判死，连带把能救回来的也停掉了"
+    )
+
+
 def test_restart_cap_does_not_stop_probing(monkeypatch):
     """达重启上限后，探测必须照常放行 —— 压的是重启，不是观测。"""
     now = 1000.0
