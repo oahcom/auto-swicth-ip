@@ -310,7 +310,7 @@ def test_rotate_reports_the_new_line_after_switching(monkeypatch, _rotate_isolat
 
 
 def test_quick_switch_failure_reports_no_healthy_slot(monkeypatch, _rotate_isolated):
-    """秒切失败：回包说清「无可用闸口，直接重启」，不切线也不起后台修。"""
+    """秒切失败：回包说清「无可用闸口，直接重启」，不切线，旧闸仍后台修。"""
     monkeypatch.setattr(daemon, "_rotate_gap", lambda: 0.0)
     monkeypatch.setattr(daemon, "active_warp_tag", lambda: "WG-OLD")
     monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "old-egress")
@@ -328,7 +328,7 @@ def test_quick_switch_failure_reports_no_healthy_slot(monkeypatch, _rotate_isola
     assert out["reason"] == "no_healthy_slot", out
     assert out["restart_required"] is True and out["line_unknown"] is True, out
     assert out["switch_to_url"] is None, out
-    assert calls == ["quick"], calls
+    assert calls == ["quick", "repair"], calls
 
 def test_transport_rotation_does_not_blacklist_the_ip(monkeypatch, _rotate_isolated):
     """无首字节超时只换线，不把可能是健康 IP 的出口按 429/403 记脏。"""

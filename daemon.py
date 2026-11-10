@@ -11932,9 +11932,9 @@ def _kick_background_repair(tag, ip, reason):
     都要读同一份槽位/线状态表，后台线程若在秒切之前就跑起来换线、探新线、
     放回池子，秒切挑中的可能正好是后台刚标脏的那条，或者读到过时快照。
     放在 finally 里既能保证串行，又不会被 coalesced / too_frequent 这些提前
-    return 漏掉。秒切失败分支不进这里：那次由 9router 前台重启接管。只动
-    「selector 当前指向 tag」的那个槽位（状态漂移时不认错）；已经在修整中的
-    槽位不重复启动。
+    return 漏掉；秒切失败同样走这里，回包里的 restart_required 只负责让
+    9router 重建连接池，不代替修旧闸。只动「selector 当前指向 tag」的那个
+    槽位（状态漂移时不认错）；已经在修整中的槽位不重复启动。
     """
     if not tag:
         return
@@ -12262,7 +12262,6 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         elif request_started_at is not None:
             log("  ⟲ 迟到回溯: request_started_at 非法，退回当前线")
         was_blocked = False
-        repair_started = False
         try:
             was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
         except Exception:
@@ -12326,14 +12325,12 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
             # 本质是「旧闸怎么修」，不是「本次请求怎么恢复」。两者已从
             # rate429/abuse403 主链路整段删除：不再同步探测、不再同步切线。
             #
-            # 切失败 = 此刻没有任何健康闸口能立刻接管。这时既不起后台线程
-            # 慢慢修旧闸（不是后台修），也不动主出口 selector（不切线）；
-            # 回包直接把「无可用闸口，自己重启」交给 9router —— 由它前台进程
-            # 重建连接池完成恢复。9router 侧 requestAsipSelfRestart 有 60s
-            # 节流，一批并发 429 不会变成重启风暴。
+            # 切失败 = 此刻没有任何健康闸口能立刻接管。不动主出口 selector
+            # （不切线）；旧闸和其余分支一样，统一交给末尾 finally 在回包定型
+            # 之后后台修整。回包把「无可用闸口，自己重启」交给 9router 重建
+            # 连接池，60s 节流保证一批并发 429 不会变成重启风暴。
             # line_unknown=True 让调用方不要拿旧出口身份覆盖自己的账。
             if reason in ("rate429", "abuse403"):
-                repair_started = True
                 return {
                     "ok": True, "switched": False,
                     "reason": "no_healthy_slot",
@@ -12367,9 +12364,9 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                 t0, tag=new_tag or None, egress=out.get("ip"))
         finally:
             # 回包定型之后才让后台线程动状态，避免后台换线/探新线与秒切挑线
-            # 并发改同一份状态表。秒切失败分支是唯一例外：那一次已把处置权
-            # 交给 9router 前台重启（repair_started 置位），不再起后台线程。
-            if reason in ("rate429", "abuse403") and not repair_started:
+            # 并发改同一份状态表。所有分支一视同仁，切成功、切失败、合并窗、
+            # 限速都在这里修旧闸，不再分情况。
+            if reason in ("rate429", "abuse403"):
                 try:
                     _kick_background_repair(offending_tag, old_ip, reason)
                 except Exception as e:

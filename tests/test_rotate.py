@@ -111,7 +111,7 @@ def test_too_frequent_rejected(monkeypatch):
 
 
 def test_quick_switch_failed_signals_restart(monkeypatch):
-    """秒切失败 = 无可用闸口：不切线、不后台修，直接让 9router 自重启。"""
+    """秒切失败 = 无可用闸口：不切线，回包让 9router 自重启，旧闸照常后台修。"""
     monkeypatch.setattr(d, "_last_rotate_ts", 0)
     calls = []
     monkeypatch.setattr(d, "_fast_switch",
@@ -126,8 +126,8 @@ def test_quick_switch_failed_signals_restart(monkeypatch):
     assert r['reason'] == 'no_healthy_slot', r
     assert r['restart_required'] is True and r['line_unknown'] is True, r
     assert r['switch_to_url'] is None and r.get('active_tag') is None, r
-    # 第 10/11 步已从错误切换主链路删除，切失败也不起后台修线程。
-    assert calls == ["quick"], calls
+    # 第 10/11 步已从错误切换主链路删除；旧闸统一由 finally 后台修。
+    assert calls == ["quick", "repair"], calls
 
 
 # ---- 换下来的出口拉黑；主动轮换不拉黑 ----
@@ -661,8 +661,8 @@ def test_background_repair_starts_after_quick_switch(monkeypatch):
     assert order == ["quick", "repair"], order
 
 
-def test_quick_switch_failure_does_not_start_background_repair(monkeypatch):
-    """切失败 = 无可用闸口：前台让 9router 重启，不再起后台修线程。"""
+def test_quick_switch_failure_still_starts_background_repair(monkeypatch):
+    """切失败也在 finally 后台修旧闸：重启信号不代替修整。"""
     order = []
     monkeypatch.setattr(d, "_fast_switch",
                         lambda reason: order.append("quick") or None)
@@ -676,7 +676,7 @@ def test_quick_switch_failure_does_not_start_background_repair(monkeypatch):
     d._last_rotate_ts = 0
     r = d._rotate_once("rate429")
     assert r["reason"] == "no_healthy_slot" and r["restart_required"] is True, r
-    assert order == ["quick"], order
+    assert order == ["quick", "repair"], order
 
 
 def test_background_repair_still_runs_on_early_return(monkeypatch):
@@ -700,7 +700,7 @@ def test_background_repair_gets_the_attributed_offending_line(monkeypatch):
                         lambda ip, now, blocked=False, kind=None, **kw: None)
     monkeypatch.setattr(d, "_kick_background_repair",
                         lambda tag, ip, reason: seen.append((tag, ip, reason)))
-    # 切失败分支不后台修，所以这里让秒切成功，验 finally 里的归因入参。
+    # 验 finally 里的归因入参：切成功与切失败现在都走 finally。
     monkeypatch.setattr(d, "_fast_switch",
                         lambda reason: {"tag": "WARP-NEW", "egress": "2a09::new"})
     monkeypatch.setattr(d, "_probe_line_before_rotate",
