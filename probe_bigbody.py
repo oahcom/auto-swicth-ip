@@ -33,9 +33,27 @@ LEVELS = {
     "mid": (60, 400),       # ~27KB
     "big": (150, 1200),     # ~180KB：真实请求的中位长度
     "huge": (150, 3000),    # ~450KB：真实请求的上沿
+    "xl": (300, 3500),      # ~1.05MB：探测上游 body 上限
+    "xxl": (600, 3500),     # ~2.10MB：探测上游 body 上限
 }
 _FILLER = ("The quick brown fox jumps over the lazy dog while the agent reads "
            "the repository and edits files. ") * 200
+
+
+def _unbounded_script() -> str:
+    """复刻 probe_fetch.mjs，但去掉 AbortSignal.timeout —— 首字节不受限。
+
+    故意不改生产探针文件：官方 probe_warp.py 仍走原脚本、原 20s 超时。
+    """
+    with open(pw.BUN_SCRIPT, encoding="utf-8") as f:
+        text = f.read()
+    text = text.replace("signal: AbortSignal.timeout(job.timeoutMs || 20000),", "")
+    if "AbortSignal.timeout" in text:
+        raise RuntimeError("unexpected AbortSignal form in probe_fetch.mjs")
+    fd, path = tempfile.mkstemp(prefix="bigbody_fetch_", suffix=".mjs")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
 
 
 def make_body(n_msgs: int, fill: int) -> dict:
@@ -57,7 +75,8 @@ def make_body(n_msgs: int, fill: int) -> dict:
 
 
 def send(bun: str, proxy_url: str, body: dict, sid: str,
-         timeout: float) -> dict:
+         timeout: float, no_abort: bool = False,
+         hard_timeout: float = 0) -> dict:
     """Bun 里发一发，返回 (status, head, retry, error, 秒数, body 字节数)。"""
     raw = json.dumps(body, ensure_ascii=False)
     payload = {
@@ -68,12 +87,21 @@ def send(bun: str, proxy_url: str, body: dict, sid: str,
         "proxy": proxy_url,
         "timeoutMs": int(timeout * 1000),
     }
+    script = _unbounded_script() if no_abort else pw.BUN_SCRIPT
     fd, path = tempfile.mkstemp(prefix="bigbody_job_", suffix=".json")
     t0 = time.time()
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
-        r = run_proc([bun, pw.BUN_SCRIPT, path], timeout=timeout + 8)
+        try:
+            r = run_proc([bun, script, path],
+                         timeout=hard_timeout or (timeout + 8))
+        finally:
+            if no_abort:
+                try:
+                    os.remove(script)
+                except OSError:
+                    pass
         sec = round(time.time() - t0, 1)
         if r.error or r.timed_out:
             return {"secs": sec, "bytes": len(raw.encode()),
@@ -124,6 +152,10 @@ def main() -> int:
     ap.add_argument("--tags", required=True, help="逗号分隔的隧道 tag")
     ap.add_argument("--levels", default="small,mid,big")
     ap.add_argument("--timeout", type=float, default=25)
+    ap.add_argument("--no-abort", action="store_true",
+                    help="Bun 侧不设 AbortSignal 超时，首字节时间不受限")
+    ap.add_argument("--hard-timeout", type=float, default=180,
+                    help="--no-abort 时外层唯一硬保险（秒），默认 180")
     ap.add_argument("--gap", type=float, default=1.0, help="同线两发之间的间隔秒")
     ap.add_argument("--out", default="/tmp/bigbody_result.json")
     args = ap.parse_args()
@@ -163,10 +195,22 @@ def main() -> int:
                 # 每档一个全新会话：体量是唯一变量，也避免小请求先把这个
                 # session 的配额吃掉、让后面的大请求被动 429。
                 sid = pw._session_id()
-                res = send(bun, proxy_url, body, sid, args.timeout)
+                ts0 = time.strftime("%H:%M:%S")
+                ip0 = (pw.egress_ip(port, timeout=3.0)
+                       if args.no_abort else egress)
+                res = send(bun, proxy_url, body, sid, args.timeout,
+                           no_abort=args.no_abort,
+                           hard_timeout=args.hard_timeout)
+                ts1 = time.strftime("%H:%M:%S")
+                ip1 = (pw.egress_ip(port, timeout=3.0)
+                       if args.no_abort else egress)
                 v = verdict(res)
                 rows.append({"tag": tag, "port": port, "egress": egress,
-                             "level": lv, "verdict": v, **res})
+                             "level": lv, "verdict": v,
+                             "ts_start": ts0, "ts_end": ts1,
+                             "egress_before": ip0, "egress_after": ip1,
+                             "ip_changed": bool(ip0 and ip1 and ip0 != ip1),
+                             **res})
                 print(f"{tag:<18}{egress:<26}{lv:<7}{res['bytes']:>8}  "
                       f"{v:<14}{res['secs']:>6.1f}s  {(res.get('head') or res.get('error') or '')[:56]}")
                 time.sleep(args.gap)
@@ -175,7 +219,11 @@ def main() -> int:
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump({"at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                   "levels": levels, "rows": rows}, f,
+                   "levels": levels,
+                   "no_abort": args.no_abort,
+                   "timeout_ms": args.timeout * 1000,
+                   "hard_timeout": args.hard_timeout if args.no_abort else 0,
+                   "rows": rows}, f,
                   ensure_ascii=False, indent=1)
 
     print()
