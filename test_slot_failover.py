@@ -7,6 +7,7 @@
   - _repair_slot：错误切换 = 先换线、探新线、按新线结果标记（不再探旧线决定留不留）
   - assign_consumer_slots：跳过 serving 与 repairing
 """
+import time
 import types
 
 import pytest
@@ -550,3 +551,103 @@ def test_slot_rotate_writes_ban_after_into_ledger(isolated, monkeypatch):
         pass
     assert marks, "生产 429 必须标脏"
     assert marks[0][1].get("ban_after") == 43200.0
+
+
+# ── 选槽优先级：新鲜度第一，延迟第二 ────────────────────────────────
+
+def _set_probe(name, sec, age=0.0):
+    h = daemon._slot_health(name)
+    h["probe_sec"] = sec
+    h["probe_ts"] = time.time() - age
+
+
+def test_slot_note_probe_records_and_expires(isolated):
+    daemon._slot_note_probe("slot-2", {"sec": 1.25})
+    assert daemon._slot_probe_sec("slot-2") == 1.25
+    # 过期（超过 slot_probe_ttl_sec）等同无数据
+    daemon._slot_health("slot-2")["probe_ts"] = time.time() - 10 ** 6
+    assert daemon._slot_probe_sec("slot-2") is None
+    # 没有数值的探测结论不写
+    daemon._slot_note_probe("slot-3", {"verdict": "OK"})
+    assert "probe_sec" not in daemon._slot_health("slot-3")
+
+
+def test_pick_prefers_fresh_rank_over_low_latency(isolated, monkeypatch):
+    """新鲜度是主判据：刚验过 OK 的慢线，压过撑过生产流量的快线。"""
+    ranks = {"2606:b::2": (2, 0, 0.0), "2606:c::3": (1, 0, 5.0)}
+    monkeypatch.setattr(
+        daemon, "_warp_ip_rank",
+        lambda ip, now, window: ranks.get(ip, (3, 0, 0.0)))
+    _set_probe("slot-2", 0.1)   # 快，但档位低（只撑过生产流量）
+    _set_probe("slot-3", 3.0)   # 慢，但档位高（探针刚验过 OK）
+    for n in ("slot-4", "slot-5", "slot-6"):
+        daemon._slot_mark(n, "bad")
+
+    s, _tag, _ip = daemon._pick_healthy_slot("slot-1")
+    assert s["name"] == "slot-3", "新鲜度必须压过延迟"
+
+
+def test_pick_prefers_lower_latency_within_same_rank(isolated, monkeypatch):
+    """同档内才比延迟：0.4s 压过 3.2s。"""
+    monkeypatch.setattr(daemon, "_warp_ip_rank",
+                        lambda ip, now, window: (0, 0, 0.0))
+    _set_probe("slot-4", 3.2)
+    _set_probe("slot-5", 0.4)
+    for n in ("slot-2", "slot-3", "slot-6"):
+        daemon._slot_mark(n, "bad")
+
+    s, _tag, _ip = daemon._pick_healthy_slot("slot-1")
+    assert s["name"] == "slot-5"
+
+
+def test_pick_prefers_known_latency_over_unknown(isolated, monkeypatch):
+    """没延迟数据的不算最优：慢但已知，压过未知。"""
+    monkeypatch.setattr(daemon, "_warp_ip_rank",
+                        lambda ip, now, window: (0, 0, 0.0))
+    _set_probe("slot-6", 4.0)
+    for n in ("slot-2", "slot-3"):
+        daemon._slot_mark(n, "bad")
+
+    s, _tag, _ip = daemon._pick_healthy_slot("slot-1")
+    assert s["name"] == "slot-6", "已知慢 好过 未知"
+
+
+def test_pick_treats_stale_probe_as_unknown(isolated, monkeypatch):
+    """过期的快读数不能当成「快」——它等同于没有数据。"""
+    monkeypatch.setattr(daemon, "_warp_ip_rank",
+                        lambda ip, now, window: (0, 0, 0.0))
+    _set_probe("slot-4", 0.2, age=10 ** 6)   # 快，但读数过期
+    _set_probe("slot-5", 5.0)                # 慢，但有效
+    for n in ("slot-2", "slot-3", "slot-6"):
+        daemon._slot_mark(n, "bad")
+
+    s, _tag, _ip = daemon._pick_healthy_slot("slot-1")
+    assert s["name"] == "slot-5"
+
+
+def test_pick_keeps_serving_slot_as_last_resort(isolated, monkeypatch):
+    """serving 槽永远排最后，但只剩它健康时仍返回它（端口本身就是备份）。"""
+    monkeypatch.setattr(daemon, "_warp_ip_rank",
+                        lambda ip, now, window: (0, 0, 0.0))
+    for n in ("slot-2", "slot-3", "slot-4", "slot-5", "slot-6"):
+        daemon._slot_mark(n, "bad")
+    _set_probe("slot-1", 0.05)  # 就算它最快也不该被当成备槽
+
+    s, _tag, _ip = daemon._pick_healthy_slot(None)
+    assert s["name"] == "slot-1"
+
+
+def test_pick_same_key_still_rotates(isolated, monkeypatch):
+    """键完全相同的候选仍按游标轮换，不会永远压同一个槽位。"""
+    monkeypatch.setattr(daemon, "_warp_ip_rank",
+                        lambda ip, now, window: (0, 0, 0.0))
+    for n in ("slot-2", "slot-3"):
+        daemon._slot_mark(n, "bad")
+    for n in ("slot-4", "slot-5", "slot-6"):
+        _set_probe(n, 1.0)   # 同档同延迟 = 同键
+
+    picked = set()
+    for _ in range(6):
+        s, _tag, _ip = daemon._pick_healthy_slot("slot-1")
+        picked.add(s["name"])
+    assert len(picked) >= 2, "同分候选应轮换：%s" % picked

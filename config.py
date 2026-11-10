@@ -251,6 +251,10 @@ CFG = {
         "pre_rotate_probe": True,
         "pre_rotate_probe_timeout_sec": 12,
         "pre_rotate_probe_ttl_sec": 30,
+        # 选槽排序用的延迟数据有效期。延迟只在事件驱动探测时更新（不轮询
+        # ——探测打的是 opencode 接口，轮询会烧配额），15 分钟是「读数仍可
+        # 用于同档内比较」与「不拿陈旧读数当真」的折中。
+        "slot_probe_ttl_sec": 900,
         # 并发去重窗口：同一次故障的多发请求只切一次。
         "coalesce_ms": 800,
         # 槽位报错后给 9router 的短冷却（秒）。后台修整通常 2~5s；这段时间

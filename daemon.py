@@ -11764,8 +11764,25 @@ def assign_consumer_slots(force=False):
             continue  # 原槽位在后台修自己，别抢
         if (tag and ip and not force and not _warp_ip_is_blocked(ip)
                 and h["status"] in ("ok", "unknown")):
-            if h["status"] == "unknown":
-                _slot_mark(name, "ok")
+            if h["status"] == "unknown" or _slot_should_probe(name):
+                # 两件事一起做：确认这条线此刻真能服务，并把延迟读数写进状态表
+                # （选槽排序的第二判据）。命中 30s 探测缓存则不重复烧额度。
+                h["probe_try_ts"] = time.time()
+                probed = _probe_line_for_slots(tag, ip)
+                verdict = (probed or {}).get("verdict")
+                if verdict == "OK":
+                    _slot_mark(name, "ok")
+                    _slot_note_probe(name, probed)
+                    continue
+                if verdict in ("quota", "flagged"):
+                    # 上游明确拒绝：这条线此刻不可用，交给下面 claim 换一条。
+                    _slot_mark(name, "bad", verdict)
+                    continue
+                # unreachable：12s 内没拿到结论，慢线握手超时也会这样。不足以
+                # 判死，保留原状态，60s 后再试。
+                if h["status"] == "unknown":
+                    _slot_mark(name, "bad", verdict or "no_verdict")
+                continue
             continue
         pick, ip2 = _slot_claim(s)
         if not pick:
@@ -11774,6 +11791,8 @@ def assign_consumer_slots(force=False):
         probed = _probe_line_for_slots(pick, ip2)
         verdict = (probed or {}).get("verdict")
         _slot_mark(name, "ok" if verdict == "OK" else "bad", verdict)
+        if verdict == "OK":
+            _slot_note_probe(name, probed)
         log("⇄ 槽位 %s → %s：%s（%ss）"
             % (name, pick, verdict, (probed or {}).get("sec")))
 
@@ -11823,6 +11842,7 @@ def _probe_line_for_slots(tag, ip, fresh=False):
                 if not _slot_put(s, tag):
                     continue
             _slot_mark(s["name"], "ok", "OK")
+            _slot_note_probe(s["name"], probed)
             log("＋ 探测补闸：%s → %s" % (tag, s["name"]))
             break
     return probed
@@ -11886,6 +11906,7 @@ def _repair_slot_impl(slot, reason):
         verdict = (probed or {}).get("verdict")
         if verdict == "OK":
             _slot_mark(name, "ok", "OK")
+            _slot_note_probe(name, probed)
             log("↻ 槽位 %s 错误切换：%s → %s，实测 OK（%ss，试 %d 条）"
                 % (name, tag, pick, probed.get("sec"), tried + 1))
             return
@@ -12037,15 +12058,84 @@ def _slot_ip_is_quarantined(ip: str | None,
         return False
 
 
+def _slot_note_probe(name, probed):
+    """把这次探测的实际耗时记到槽位状态里，供下一次选槽按延迟排序。
+
+    用 probe_warp 量到的真实请求耗时（含 TLS 握手），不是 ICMP —— 与生产走
+    同一条代理路径，比 ping 更接近用户看到的延迟。
+    """
+    if not isinstance(probed, dict):
+        return
+    sec = probed.get("sec")
+    if not isinstance(sec, (int, float)) or sec <= 0:
+        return
+    with _SLOT_STATE_LOCK:
+        h = _slot_health(name)
+        h["probe_sec"] = float(sec)
+        h["probe_ts"] = time.time()
+
+
+def _slot_should_probe(name):
+    """该槽位是否值得补一次延迟读数（缺失或过期），60s 内不重复试探。
+
+    补测频率受两个因素约束：只有「没有读数」时才补（有读数就等它过期），
+    以及同一条线 60s 内最多试一次（失败也要等下轮，别把慢线打成死循环）。
+    """
+    h = _slot_health(name)
+    if time.time() - float(h.get("probe_try_ts") or 0) < 60:
+        return False
+    return _slot_probe_sec(name) is None
+
+
+def _slot_probe_sec(name):
+    """该槽位最近一次探测的耗时（秒）；过期或没数据返回 None。
+
+    延迟随节点负载漂：五分钟前的 200ms 不能代表此刻，所以超过
+    slot_probe_ttl_sec 就当没有。没有数据的候选排在「有数据」之后，不是排第一
+    —— 拿未知当最优会反复踩同一条没测过的线。
+    """
+    ttl = float(_api_cfg().get("slot_probe_ttl_sec", 300))
+    with _SLOT_STATE_LOCK:
+        h = _SLOT_HEALTH.get(name)
+        if not h:
+            return None
+        sec = h.get("probe_sec")
+        ts = float(h.get("probe_ts") or 0)
+    if not isinstance(sec, (int, float)) or sec <= 0:
+        return None
+    if time.time() - ts > ttl:
+        return None
+    return float(sec)
+
+
+def _slot_pick_key(slot, tag, ip, now, serving):
+    """选槽排序键（越小越优先）：新鲜度是主判据，延迟是次判据。
+
+    两层不是加权重求和，而是先分档、档内再比延迟 —— 延迟再低也不能把一条
+    没有任何成功记录的地址顶到刚验过 OK 的地址前面，那是拿稳定性换速度。
+    「占比」体现在层级：档位决定胜负，延迟只在同档内起作用。
+    """
+    rank = _warp_ip_rank(ip, now, _warp_guard_for_reason("rate429"))
+    delay = _slot_probe_sec(slot["name"])
+    return (
+        0 if slot["name"] != serving else 1,
+        rank[0],                                    # 新鲜度档位
+        rank[1],                                    # 同档内避开刚烧过的 /64
+        0 if delay is not None else 1,              # 有延迟数据的优先
+        delay if delay is not None else 0.0,        # 延迟低者优先
+        rank[2],                                    # 同档内越新越优先
+    )
+
+
 def _pick_healthy_slot(name, avoid_tags=None):
     """挑一台当前健康、且不是刚失败那台的 sing-box，返回 (slot, tag, ip)。
 
     多端口架构下每台是独立进程、独立连接池，换端口不需要断连、不需要等
     重建 —— 这一下就能回给调用方，比让它在坏端口上重试强得多。
 
-    健康槽按轮询游标选，而不是永远返回数组第一个。否则所有失败重试都会压到
-    slot-1/主出口，报告越多、越容易被再次撞坏。优先不选 serving 槽；只剩它
-    健康时仍返回它 —— 独立端口本身就是可用备份，没必要空着。
+    排序依据是 _slot_pick_key：新鲜度档位第一、探测延迟第二；serving 槽永远
+    排在最后（只剩它健康时仍返回它 —— 独立端口本身就是可用备份）。
+    候选按轮询游标顺序收集，稳定排序下同分者仍轮换，避免永远压 slot-1。
     """
     slots = consumer_slots()
     if not slots:
@@ -12072,7 +12162,18 @@ def _pick_healthy_slot(name, avoid_tags=None):
         candidates.append((s, tag, ip))
     if not candidates:
         return None, None, None
-    chosen = next((c for c in candidates if c[0]["name"] != serving), candidates[0])
+    # 排序而不是「跳过 serving 后取第一个」：新鲜度第一、延迟第二（见
+    # _slot_pick_key）。candidates 本身是轮询顺序，稳定排序下键完全相同的
+    # 候选仍按游标轮换 —— 不会永远压同一个槽位。
+    candidates.sort(key=lambda c: _slot_pick_key(c[0], c[1], c[2], t0, serving))
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        def _brief(c):
+            rank = _warp_ip_rank(c[2], t0, _warp_guard_for_reason("rate429"))
+            delay = _slot_probe_sec(c[0]["name"])
+            return "%s(档%d/%s)" % (c[0]["name"], rank[0],
+                                    ("%.1fs" % delay) if delay is not None else "延迟未知")
+        log("· 选槽排序：%s" % " > ".join(_brief(c) for c in candidates[:3]))
     idx = slots.index(chosen[0])
     _SLOT_REDIRECT_RR["index"] = (idx + 1) % n
     return chosen
