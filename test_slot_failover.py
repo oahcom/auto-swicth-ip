@@ -270,12 +270,13 @@ def test_no_healthy_slot_asks_9router_to_restart(monkeypatch):
     """六条闸都修着时主链路不兜底：明确让 9router 自重启等闸回来。"""
     monkeypatch.setattr(daemon, "_pick_healthy_slot",
                         lambda name, avoid_tags=None: (None, None, None))
-    monkeypatch.setattr(daemon, "_slot_all_gates_down", lambda: True)
+    monkeypatch.setattr(daemon, "_slot_no_usable_gate", lambda: True)
     slot = {"name": "slot-1", "selector": "opencode-out-1", "port": 7890}
     out = daemon._slot_redirect_payload(slot, "WARP-A", "2606:a::1",
                                         "rate429", 0.0)
     assert out["switch_to_url"] is None
     assert out["line_unknown"] is True
+    assert out["reason"] == "no_healthy_slot"
     assert out["restart_required"] is True
 
 
@@ -289,6 +290,7 @@ def test_already_retired_without_standby_does_not_restart(monkeypatch):
     assert out["switch_to_url"] is None
     assert not out.get("restart_required")
     assert not out.get("line_unknown")
+    assert out["reason"] == "already_retired"
 
 
 def test_slot_repair_thread_starts_only_after_payload_is_built(isolated, monkeypatch):
@@ -323,17 +325,37 @@ def test_startup_unknown_slots_do_not_trigger_restart(monkeypatch):
                         lambda: [{"name": "slot-1"}, {"name": "slot-2"}])
     monkeypatch.setattr(daemon, "_slot_health",
                         lambda name: {"status": "unknown"})
-    assert daemon._slot_all_gates_down() is False
-    # 有一条 bad 但其余还在初始化，同样不算「全废」。
+    assert daemon._slot_no_usable_gate() is False
+    # 只要有一条已经判过（哪怕其余还在 unknown），就不是纯启动窗口了。
     monkeypatch.setattr(daemon, "_slot_health",
                         lambda name: {"status": "bad"} if name == "slot-1"
                         else {"status": "unknown"})
-    assert daemon._slot_all_gates_down() is False
+    assert daemon._slot_no_usable_gate() is True
     monkeypatch.setattr(daemon, "_slot_health",
                         lambda name: {"status": "repairing"})
-    assert daemon._slot_all_gates_down() is True
-    # 只要还有一条 ok，就算这次没挑中也不该重启（可能只是 tag 被 avoid 排除）。
+    assert daemon._slot_no_usable_gate() is True
+    # 还有一条 ok 但 _pick_healthy_slot 没挑中（tag 被 avoid 排除 / 就是被报
+    # 槽自己）：这仍然是「无可用闸口」，旧判据在这里漏发重启信号，线上 18:41
+    # / 19:02 / 19:03 三次都因此既没切线也没重建连接池。
     monkeypatch.setattr(daemon, "_slot_health",
                         lambda name: {"status": "ok"} if name == "slot-2"
                         else {"status": "bad"})
-    assert daemon._slot_all_gates_down() is False
+    assert daemon._slot_no_usable_gate() is True
+
+
+def test_mixed_gate_states_still_signal_no_healthy_slot(monkeypatch):
+    """混态（在修 + 未探 + 仅剩一条 ok 但挑不中）必须给出重启信号。"""
+    monkeypatch.setattr(daemon, "_pick_healthy_slot",
+                        lambda name, avoid_tags=None: (None, None, None))
+    monkeypatch.setattr(daemon, "consumer_slots",
+                        lambda: [{"name": "slot-%d" % i} for i in range(1, 7)])
+    monkeypatch.setattr(daemon, "_slot_health",
+                        lambda name: {"status": "ok"} if name == "slot-2"
+                        else ({"status": "unknown"} if name == "slot-6"
+                              else {"status": "repairing"}))
+    slot = {"name": "slot-1", "selector": "opencode-out-1", "port": 7890}
+    out = daemon._slot_redirect_payload(slot, "WARP-A", "2606:a::1",
+                                        "rate429", 0.0)
+    assert out["reason"] == "no_healthy_slot"
+    assert out["restart_required"] is True
+    assert out["switch_to_url"] is None

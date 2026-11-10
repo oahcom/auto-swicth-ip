@@ -11928,7 +11928,7 @@ def cli_slots(argv=None):
 def _kick_background_repair(tag, ip, reason):
     """把刚被报 429 的那条线所属的槽位，扔到后台做错误切换。
 
-    由 _rotate_once 在**回包定型之后**用 finally 启动：秒切、探测、同步兜底
+    由 _rotate_once 在**回包定型之后**用 finally 启动：秒切挑线与后台换线
     都要读同一份槽位/线状态表，后台线程若在秒切之前就跑起来换线、探新线、
     放回池子，秒切挑中的可能正好是后台刚标脏的那条，或者读到过时快照。
     放在 finally 里既能保证串行，又不会被 coalesced / too_frequent 这些提前
@@ -12289,7 +12289,8 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                     {"ok": False, "reason": "too_frequent",
                      "switched_at": _last_rotate_ts},
                     t0)
-            # 秒切：翻到一条已探通的备用线，十几毫秒。没有才走下面的同步换线。
+            # 秒切：翻到一条已探通的备用线，十几毫秒。错误切换没有备线就直接
+            # 收口回「无可用闸口」，不再同步探测、不再同步切线。
             # 后台修整不再「异步先行」：它由本段末尾的 finally 在所有同步决策完成、
             # 回包定型之后启动，避免后台换线/探新线与秒切挑线并发改同一份状态表。
             quick = None
@@ -12446,20 +12447,24 @@ def _note_client_gone(result: dict) -> None:
             f"（换线生效，只是没人收响应）")
 
 
-def _slot_all_gates_down():
-    """六条闸确实全废：没有一条 ok，且至少一条已经被判坏/正在修。
+def _slot_no_usable_gate():
+    """「这次确实没有可用闸口」：只排除 daemon 刚重启、六条全 unknown 的窗口。
 
-    daemon 刚重启时六条都是 unknown（还没探过线），那不是闸坏了，只是状态
-    没初始化。这种窗口也就十几秒，却正好会撞上「无健康备槽」分支；不区分就
-    会让 9router 白重启一次，把刚接上的连接全打断。
+    _pick_healthy_slot 已经回答了「有没有能立刻接管的健康备槽」，这里只补一道
+    启动窗口保护：刚起来六条都是 unknown（还没探过线），不是闸坏了，让 9router
+    自重启只会白打断刚接上的连接。
+
+    旧实现要求「没有一条 ok 且没有一条 unknown」才算全废，把混态全漏了 ——
+    几条在修、几条还在探、甚至只剩被报槽自己 ok 但被 avoid 排除时，
+    _pick_healthy_slot 已经返回 None，这里却不肯发重启信号。线上 18:41 /
+    19:02 / 19:03 三次「重试改走 无健康备槽」都没有「通知 9router 自重启」，
+    调用方既不切线也不重建连接池，请求直接吃 429。
     """
     slots = consumer_slots()
     if not slots:
         return False
     statuses = [_slot_health(s["name"])["status"] for s in slots]
-    return (bool(statuses)
-            and all(st != "unknown" for st in statuses)
-            and not any(st == "ok" for st in statuses))
+    return not all(st == "unknown" for st in statuses)
 
 
 def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
@@ -12481,12 +12486,17 @@ def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
         payload["switch_to"] = None
         payload["switch_to_url"] = None
         if reason != "already_retired":
-            # 六条闸都不健康，没有端口能立刻接管这条请求。主链路不再同步
-            # 探线/换线兜底：被报槽由后台线程修好，调用方重启自己重建连接池，
-            # 等闸回来即可。already_retired 不在此列 —— 线已经换走了，原地
-            # 重连就够，重启反而把刚接上的连接全打断。
+            # 没有任何健康备槽能立刻接管这条请求。主链路不再同步探线/换线
+            # 兜底：被报槽由后台线程修好，调用方重启自己重建连接池，等闸回来。
+            # already_retired 不在此列 —— 线已经换走了，原地重连就够。
             payload["line_unknown"] = True
-            if _slot_all_gates_down():
+            # reason 必须改口。槽位路径传进来的 reason_out 是 ok/coalesced/
+            # too_frequent，9router 的 429 早退分支把这些词当「换过线了，
+            # 重连再试一次」—— 明明没有可用闸口，还会拿刚烧掉的原端口多打
+            # 一发，而 1s 后本进程就要重启。统一成 no_healthy_slot：不切线、
+            # 不重试，由 9router 前台重启接管。
+            payload["reason"] = "no_healthy_slot"
+            if _slot_no_usable_gate():
                 payload["restart_required"] = True
     return payload
 
