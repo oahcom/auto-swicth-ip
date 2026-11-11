@@ -2952,6 +2952,97 @@ def _line_enabled(member: dict) -> bool:
     """该成员在当前档位下是否应当运行。非 WG 成员永远为真。"""
     return member.get("tag") not in _TIER_DISABLED
 
+
+def _h2_channels_mtime() -> float:
+    try:
+        return os.stat(os.path.join(_PROJECT, ".warp", "h2", "channels.json")).st_mtime
+    except OSError:
+        return 0.0
+
+_H2_CHANNELS_MTIME: float = _h2_channels_mtime()
+
+def _h2_members_from_ledger() -> list[dict]:
+    """从渲染台账重建 H2 成员列表。读不到/形状不对返回空列表（调用方保持现状）。"""
+    try:
+        with open(os.path.join(_PROJECT, ".warp", "h2", "channels.json"),
+                  encoding="utf-8") as f:
+            rows = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    out: list[dict] = []
+    for r in rows:
+        try:
+            out.append({
+                "tag": r["member_tag"],
+                "port": int(r["socks_port"]),
+                "service": r["unit"],
+                "kind": "h2",
+                "index": int(r["index"]),
+                "colo": r.get("colo"),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+def _refresh_h2_members() -> bool:
+    """channels.json 变了就重建 CFG["warp"]["members"] 的 H2 段，返回「是否变了」。
+
+    WHY 必须热生效（2026-11-11 实测事故）：
+      `config._append_h2_members` 只在 import 期读一次台账，而
+      `_run_h2_sync` 会在运行中重渲染台账（deploy/render_h2_lines.py）。
+      重渲染会重排编号：实测 19:13 之后台账 112 条里有 56 条换成 112~167
+      的新编号，daemon 内存里却还是旧的 0~111 那批 tag。后果是双份的：
+        · `_warp_member(tag)` 查不到新 tag → 新线进不了换线候选、不会被
+          `_warp_line_restart` 按名重启，日志里永远不出现它们的名字；
+        · `_scan_running_tunnels` 的 declared 表也查不到 → 这些单元退回
+          `WARP-H2-SCAN-<idx>` 假身份被探测，结论写在假名下
+          （实测台账 103 条 SCAN 记录，其中 56 条正好对应新编号的真成员）。
+      「在跑、有流量、结论却记在一个换线永远查不到的名字上」—— 这就是
+      「blocked 之后不再被探测/重启」与「一直无样本」的共同成因。
+
+    WHY 读失败时保持现状：空列表会把整批 H2 线从名单抹掉，比不刷新更糟
+    （换线候选、探测目标、members[0] 兜底全都会跟着塌）。
+    """
+    global _H2_CHANNELS_MTIME, _TUNNEL_SCAN_TS
+    mt = _h2_channels_mtime()
+    if mt == _H2_CHANNELS_MTIME:
+        return False
+    _H2_CHANNELS_MTIME = mt
+    fresh = _h2_members_from_ledger()
+    if not fresh:
+        log("  ⚠ H2 台账已变更但读不出成员，名单保持不变")
+        return False
+    members = _warp()["members"]
+    before = sum(1 for m in members if m.get("kind") == "h2")
+    # 原地切片赋值：CFG["warp"]["members"] 是共享对象，各处持的都是这个引用，
+    # 换成 `members = fresh` 会让老引用全部指向旧列表。
+    members[:] = [m for m in members if m.get("kind") != "h2"] + fresh
+    dropped = _drop_orphan_scan_state()
+    # 扫描缓存按「端口→tag」缓存 60s，不清就会继续用旧 tag 探一轮。
+    _TUNNEL_SCAN_TS = 0.0
+    log(f"  · H2 台账变更：名单 {before} → {len(fresh)} 条"
+        + (f"，清理 {dropped} 条假身份结论" if dropped else ""))
+    return True
+
+def _drop_orphan_scan_state() -> int:
+    """单元已归到声明 tag 名下 → 丢掉同名 WARP-H2-SCAN-<idx> 的结论。
+
+    状态属于「这个端口上的隧道」；名字换了，旧名字下的结论不再指向任何东西，
+    留着只会让报表显示 OK 而候选池里没有它。`_load_warp_line_state` 里的同名
+    逻辑是启动时的一次性版本，这里是运行中的持续版本。
+    """
+    svc = {m.get("service") for m in (_warp().get("members") or [])
+           if m.get("service")}
+    with _WARP_LINE_CV:
+        dead = [t for t in list(_WARP_LINE_STATE)
+                if isinstance(t, str) and t.startswith("WARP-H2-SCAN-")
+                and f"usque-h2-{t.rsplit('-', 1)[-1]}.service" in svc]
+        for t in dead:
+            del _WARP_LINE_STATE[t]
+    return len(dead)
+
 def _unit_ctl(action: str, service: str) -> subprocess.CompletedProcess:
     """对系统级单元执行 action。
 
@@ -3518,6 +3609,10 @@ def _probe_refresh_egress(port: int) -> str | None:
     可用」这一步。单次大预算会让已坏的隧道白占线程一整个预算；轮询则每次只
     花 5s，任一跳变好立刻返回。上限沿用 `ready_timeout_sec` 的量级乘以本次
     最多尝试次数，避免真的无限等。
+
+    轮询间隔**恒为 0，不等待**（主人 2026-11-11 拍板）：两次探测之间不插任何
+    停顿，失败就立刻重探。禁止改成 `sleep(>0)`、禁止退避曲线、禁止把它做成
+    配置项 —— 见 `docs/established-facts.md` 第 13 条。
     """
     w = _warp()
     per_try = w["refresh_probe_timeout_sec"]
@@ -3528,7 +3623,9 @@ def _probe_refresh_egress(port: int) -> str | None:
             return ip
         if time.time() >= deadline:
             return None
-        time.sleep(1)
+        # 间隔 0：不等待，直接重探。sleep(0) 只让出 GIL、并保留假时钟的推进点，
+        # 它本身不是等待 —— 任何 >0 的间隔都是被人改回来的，不是设计。
+        time.sleep(0)
 
 
 def _record_line_ip_drift(tag: str, old_ip: str | None, new_ip: str) -> None:
@@ -3636,6 +3733,20 @@ _LINE_DEFAULTS = {
     # 默认 None 不能用 []：_LINE_DEFAULTS 是共享对象，setdefault 会让所有渠道
     # 拿到同一个 list，于是一条线的样本会记进另一条线的窗口（自检抓到的）。
     "ban_probes": None,
+    # 「惩罚期短路」观测：[(起, 止, 条数, 结论)]，游程形状同 `ban_probes`。
+    # WHY 必须声明进本表：`_load_warp_line_state` **只恢复本表声明过的键**
+    # （`st.update({k: v for k, v in raw.items() if k in _LINE_DEFAULTS})`），
+    # 漏声明 = 写进盘上、读不回来 —— 实测 2026-11-11：磁盘上 156 个 tag，
+    # 带 `blocked_notes` 的是 0 个，报表永远看不到这些观测。
+    # 与上面 `penalty_restart_streak` 是同一个坑（那里的注释已专门警告过）。
+    # WHY 不写进 `ban_probes`：`ban_probes` 是**渠道锁**的判据样本，
+    # `_channel_ban_hold_hit` 要求当天样本**全部**判 quota 才锁线。把
+    # blocked 混进去会让线永远锁不上 —— blocked 不是「渠道被烧穿」，
+    # 是「这一个地址在惩罚期、换个地址就好」。所以它是独立字段、独立
+    # trim、只供报表展示「这条线确实被探过、结论是 blocked」。
+    # 默认 None 不用 []：同一个共享对象坑（`setdefault` 会让所有渠道
+    # 拿到同一个 list）。
+    "blocked_notes": None,
     # 连续探测不到出口地址的起点（0 = 当前能拿到地址）。连续
     # channel_noaddr_hold_sec(5h) 拿不到地址就锁渠道：隧道/节点已经死了，
     # 重启换地址也买不到任何东西。
@@ -3730,6 +3841,28 @@ def _save_warp_line_state(force: bool = False) -> None:
                 return
         except OSError:
             pass
+    else:
+        # **条数保护**：盘上已有 N 条、这次要写 M 条且 M < N —— 拒绝覆盖。
+        # WHY 需要：`_save_warp_line_state` 落的是整个内存状态表。如果此刻
+        # 内存里的表还没加载盘上数据（例如启动早期、或某个清理函数在
+        # `_load_warp_line_state()` 之前被调用），落盘的就是"只剩被清理的
+        # 那一条" —— 实测 2026-11-11：3 条假数据被覆盖成 1 条，其余整条
+        # 丢失，且没有任何日志。
+        # 这条保护是**兜底**：它挡的不是某一个具体调用点，而是"整表覆盖"
+        # 这类危险写法的**所有**未来变体。
+        try:
+            if os.path.getsize(path) > 2:
+                with open(path, "r", encoding="utf-8") as f:
+                    old = json.load(f)
+                old_lines = old.get("lines", old) if isinstance(old, dict) else {}
+                if isinstance(old_lines, dict) and len(old_lines) > len(payload["lines"]):
+                    log(f"  ⚠ 拒绝覆盖状态表 {path}：盘上 {len(old_lines)} 条 > "
+                        f"内存 {len(payload['lines'])} 条（疑似状态表未加载就落盘）")
+                    return
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            pass
     _write_json_atomic(path, payload)
 
 
@@ -3788,6 +3921,14 @@ def _load_warp_line_state() -> None:
             # 这条线从此永不探测也永不复活 —— 必须夹成布尔。
             if not isinstance(st.get("stop_probe"), bool):
                 st["stop_probe"] = False
+            # `blocked_notes` 类型净化：盘上被写成别的形状时，报表的
+            # `_expand_ban_probes` 展开会抛异常，把整个报表打挂。
+            # WHY 与 `ban_probes` 分开处理：`ban_probes` 下面有一段会把它
+            # 归 `[]` 并 trim（那是它原本的语义）；`blocked_notes` 没有那段，
+            # 这里归 `None` —— 与 `_LINE_DEFAULTS` 的默认值一致，且写入点
+            # （`_channel_blocked_note`）自己会判 isinstance 再重建。
+            if not isinstance(st.get("blocked_notes"), list):
+                st["blocked_notes"] = None
             if (st.get("last_ok_ip") != st.get("ip")
                     or now - float(st.get("last_ok_ts") or 0) > fresh):
                 st["last_ok_ts"] = 0.0
@@ -5355,7 +5496,10 @@ def _line_unknown_retry() -> float:
 
 
 def _line_probe_cadence() -> float:
-    return float(_warp().get("line_probe_cadence_sec", 60))
+    # 缺配置时的兜底也必须是 0（探完立刻重新排队），不能是历史值 60：
+    # 曾经 36 条线 × 60s 把吞吐锁死在 36 条/分钟。主人 2026-11-11 定标：探测
+    # 不设等待时间，`config.line_probe_cadence_sec` 也不许被改成 >0。
+    return float(_warp().get("line_probe_cadence_sec", 0))
 
 
 def _line_block_remaining(ip: str | None, now: float) -> float:
@@ -5386,7 +5530,8 @@ def _warp_line_ok_fresh(tag: str, now: float | None = None,
 
 
 def _line_probe_cadence() -> float:
-    return float(_warp().get("line_probe_cadence_sec", 60))
+    # 与文件前面那处同值（历史遗留的重复定义，未合并）：兜底 0，不等待。
+    return float(_warp().get("line_probe_cadence_sec", 0))
 
 
 # ── 夜间刷新锁 ──────────────────────────────────────────────
@@ -7624,6 +7769,9 @@ def _dirty_line_janitor() -> None:
             # 别等到下次重启才生效（此前改档位对运行中的 daemon 完全无效）。
             if _refresh_tier_disabled():
                 _tier_reconcile()
+            # H2 台账同理：render_h2_lines.py 会在运行中重排编号，名单不跟着
+            # 换就会出现「线在跑、结论却记在 SCAN 假名下」。
+            _refresh_h2_members()
         except Exception as e:
             log(f"✗ 档位热更新异常: {e}")
         try:
@@ -10583,6 +10731,24 @@ _H2_STATE = os.path.join(_PROJECT, ".warp", "h2_probe_state.json")
 _AUTODIAG_MIN_GAP = 900
 
 
+def _h2_fail_fresh(rec: dict) -> bool:
+    """这条失败结论是不是「最近才落的」—— 是则本轮不重测。
+
+    `tested and not ok` 曾被当成永久属性：节点恢复后也永不复测，于是 H2 供给
+    只减不增。实测反证：`ddixx-1dd1.dankenet.help:3526-any` 11-05 判失败、
+    11-11 实测可用（出口 104.28.211.32），却因「永久失败」永不重测。
+    TTL 来自 `warp.h2_probe_fail_ttl_sec`（默认 6h）。
+    """
+    ts = rec.get("ts")
+    if ts is None:
+        return False                     # 没有时间戳：当作从未测过，放进队列
+    try:
+        ttl = float(_warp().get("h2_probe_fail_ttl_sec") or 21600)
+    except (TypeError, ValueError):
+        ttl = 21600.0
+    return (time.time() - float(ts)) < ttl
+
+
 def _pending_probe_nodes(limit: int = 12,
                          state_path: str | None = None) -> list[dict]:
     """待实测的节点，按源比例取 N 个。
@@ -10629,9 +10795,12 @@ def _pending_probe_nodes(limit: int = 12,
         if state_path:
             st = probed.get(tag) or {}
             if st.get("tested"):
-                # 测过且**失败**：不重测。承载能力是节点的长期属性，重测只是
-                # 再烧一台设备换同一个结论。
-                if not st.get("ok"):
+                # 测过且**失败**：不立刻重测 —— 再烧一台设备换同一个结论是
+                # 浪费。但**不是永久跳过**：失败结论有 TTL（`h2_probe_fail_ttl_sec`），
+                # 过期后重新测。承载能力不是节点的永久属性，机场换机、端口重开
+                # 都会让昨天挂的节点今天复活；此前永久跳过让 158 个失败节点
+                # （157 个超过 24h）永不复测，H2 供给只减不增。
+                if not st.get("ok") and _h2_fail_fresh(st):
                     continue
                 # 测过且成功：**只有已落进块映射才跳过**。
                 # 原来只跳 `tested and not ok`，于是成功过但 merge 丢了的节点
@@ -13385,6 +13554,55 @@ _TIER_STALE_KEYS = ("ip_ts", "last_ok_ts", "last_probe_ts", "quota_until",
                     "next_restart_ts", "rebind_ts")
 
 
+def _clear_conclusions_on_tier_stop(tag: str) -> None:
+    """一条线被档位停用：清掉「描述上一个会话」的结论类字段。
+
+    WHY 需要这个（对称补齐）：`_reset_stale_after_tier` 只挂在**解禁侧**
+    （`_tier_reconcile` 的解禁分支）。设计者知道"停用期冻住的观测会污染
+    解禁后的第一轮探测"，写了清理函数，却**只在一个方向接线**。
+
+    停用侧不清理的直接后果（实测 2026-11-11）：30 条 WG 线的
+    `last_verdict` 冻结在 27~33 小时前（blocked 9 条 / port_closed 8 条 /
+    OK 6 条 / unknown 3 条），`ip` 早已是 None 而结论还指着"上一个会话
+    的地址"。报表只能显示"档位停用 单元停用（线没跑）"，**把"这是档位
+    切换前的旧值"显示成"运维停用"** —— 这正是"档位停用但状态台账里还有
+    22 条"这条自检告警的根因。
+
+    WHY 只清「结论类」字段、**保留 `ban_probes`**：
+    - 必须清：`last_verdict` / `ip` / `last_ok_ip` / `fail_streak` /
+      `next_probe_ts` / `next_restart_ts` / `last_probe_ts` —— 这些描述的
+      是上一个会话的地址与结论，留着就是假信息。
+    - 必须保留：`ban_probes` —— 它是**当天的历史证据**（今天这条线被判过
+      多少次 quota），是渠道锁判据的原料。停用时清掉等于抹掉当天的账。
+      而且它按"当天"自动过期（`_channel_ban_trim` 按 `time.localtime(ts)`
+      过滤），不需要额外清理。
+    - 同理保留：`ban_hold_until` / `stop_probe`（渠道锁状态，与档位无关，
+      锁该到期就到期）；`penalty_restart_streak` / `futile_restart_streak`
+      （重启次数是这条线的事实，不该因为档位切换被抹掉）。
+
+    与解禁侧 `_reset_stale_after_tier` 的区别：解禁侧清得更狠（连
+    `ban_probes` 一起清），因为线要回池子，旧样本会让它**回池即炸**；
+    停用侧线根本不跑，没有"回池即炸"的风险，抹掉当天的账反而是丢失信息。
+    """
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        st["last_verdict"] = ""
+        st["fail_streak"] = 0
+        st["ip"] = None
+        st["last_ok_ip"] = None
+        st["last_probe_ts"] = 0.0
+        st["last_ok_ts"] = 0.0
+        st["ip_ts"] = 0.0
+        st["next_probe_ts"] = 0.0
+        st["next_restart_ts"] = 0.0
+        st["restart_ts"] = 0.0
+        # `blocked_notes` 是"惩罚期短路"观测，与 `ban_probes` 同性质 ——
+        # 保留（它是当天证据）。但如果盘上被写成脏形状，这里顺带归位。
+        if not isinstance(st.get("blocked_notes"), list):
+            st["blocked_notes"] = None
+    _save_warp_line_state(force=True)
+
+
 def _reset_stale_after_tier(tag: str) -> None:
     """一条线从档位停用里被拉起：清掉停用期间冻住的观测。
 
@@ -13442,6 +13660,13 @@ def _tier_reconcile() -> None:
             if st == "active":
                 _unit_ctl("stop", svc)
                 stopped += 1
+            # 停用侧对称清理（2026-11-11 补齐）：原来只停单元、不清观测，
+            # 导致状态表里留着一堆"档位切换前的旧结论"。详见
+            # `_clear_conclusions_on_tier_stop` 的 WHY。
+            # 注意：单元本来就没在跑时（st != "active"）也要清 —— 那正是
+            # 这次问题的现场（22 条 WG 线单元全是 inactive，结论却冻了
+            # 26~33 小时）。
+            _clear_conclusions_on_tier_stop(tag)
             continue
         if st == "active":
             continue
@@ -13537,6 +13762,40 @@ def _scan_unit_still_on_disk(tag: str) -> bool:
 
 
 def _config_consistency_check(now: float | None = None) -> dict:
+    """跨源一致性自检的**异常隔离壳**（外层）。
+
+    WHY 外面要包一层：这个自检是纯观测 —— 它只读五个真相源、只打日志、
+    不改任何配置。按理说它是最安全的代码，但它**跑在 daemon 的启动关键
+    路径上**（`main()` 里启动时调一次，之后每 30 分钟调一次）。
+
+    实测事故（2026-11-11 17:22:31~17:27:21）：自检内部一个未定义的名字
+    `PROJECT` 抛 NameError，异常一路冒泡到 `main()` → 进程退出 →
+    systemd `Restart=always` + `RestartSec=10` 反复拉起 → **restart counter
+    打到 23**，整个守护进程瘫了 5 分钟。
+
+    WHY 必须隔离而不是"小心别写错"：这段代码要被反复修改（每次自检发现
+    新的不一致就要加分类），而**一个观测函数不该有能力掀翻服务**。这里
+    把故障模式从"崩溃循环"降级为"少一条告警"—— 告警照样写进日志，只是不
+    再冒泡。异常本身要落日志，否则静默降级会变成静默失明。
+
+    返回空报告（problems=0）表示"自检没跑成"，调用方据此能分辨
+    "一切正常" 与 "我没查成"。后者在日志里是显式的。
+    """
+    try:
+        return _config_consistency_check_impl(now)
+    except Exception as e:                      # noqa: BLE001 —— 这里要兜住一切
+        # 观测失败不能是致命错误，但必须留痕：否则「自检没跑成」和
+        # 「自检跑成了没问题」在日志里长得一模一样。
+        try:
+            import traceback
+            log(f"  ⚠ 配置自检本身出错（已忽略，不影响服务）：{e}")
+            log("    " + traceback.format_exc().strip().replace("\n", "\n    "))
+        except Exception:
+            pass
+        return {"problems": 0, "error": str(e), "selfcheck_failed": True}
+
+
+def _config_consistency_check_impl(now: float | None = None) -> dict:
     """跨源一致性自检：把「配置分裂」当场变成一条明确的日志。
 
     WHY 需要这个：线路的真相分散在 5 个地方 —— `config.CFG["warp"]["members"]`
@@ -13580,8 +13839,23 @@ def _config_consistency_check(now: float | None = None) -> dict:
     missing_out = sorted(t for t in members if t not in outs)
     # 分类三：探测名单里有、但档位停用的线。档位停用是对的（省资源），
     # 但它意味着这些线**不该有状态**；有状态说明档位切换时没清干净。
-    tier_off_with_state = sorted(t for t in members
-                                 if t in tier_off and t in state_tags)
+    # 分类三（问题）：档位停用的线，状态台账里却还留着**结论**。
+    #   档位停用是对的（省资源），但它意味着这些线**不该有结论**；
+    #   有结论说明档位切换时没清干净。
+    #
+    # WHY 判据是「有结论类字段」而不是「有台账条目」（2026-11-11 修正）：
+    #   台账里**保留条目本身是对的** —— `ban_probes` 是当天的历史样本
+    #   （渠道锁判据的原料），停用侧刻意不清它。所以「档位停用的线在台账
+    #   里有条目」是**正常状态**，不是问题。
+    #   真正的问题是「还留着结论」—— last_verdict / ip / last_probe_ts
+    #   这些描述上一个会话的字段没被清掉，报表会把旧值显示成当前状态。
+    #   旧判据导致每次启动都报 22 条假问题（清理已生效却仍在报警）——
+    #   这类噪声会让真问题被淹没。
+    tier_off_with_state = sorted(
+        t for t in members
+        if t in tier_off and t in state_tags
+        and any(((_WARP_LINE_STATE.get(t) or {}).get(k)
+                 for k in ("last_verdict", "ip", "last_probe_ts"))))
     # 分类四：状态台账里有、且是 WG、但不在 members 里的补位线（23+）。
     # 这些线是**闲置补位池**，与档位无关，本来就不该被探测 —— 单独归类，
     # 不与「真孤儿」混在一起报，否则真问题被淹没。
@@ -13692,7 +13966,16 @@ def main():
     _SLOT_BOOT_TS = time.time()
     # 必须在拉起任何线之前对账：否则档位外的线会先跑起来再被停，白白换一次
     # WARP 会话（每次 start 都是一次 CF 注册动作）。
-    _tier_reconcile()
+    #
+    # WHY 对账要排在 `_load_warp_line_state()` **之后**（而不是像原来那样
+    # 排在它前面）：`_tier_reconcile` 的解禁侧会调 `_reset_stale_after_tier`
+    # → `_save_warp_line_state(force=True)`，而后者落的是**整个内存状态表**。
+    # 如果此刻内存表还没加载盘上数据，落盘的就是"只剩被清理的那一条" ——
+    # 实测 2026-11-11（/tmp 用 3 条假数据复现）：磁盘从 3 条被覆盖成 1 条，
+    # 其余整条丢失，且**没有任何日志**。
+    # 状态表加载只是读一个 JSON（156 条，微秒级），不碰任何单元，所以把
+    # 对账挪到它之后，**不影响"先对账再拉线"的原意**。
+    # 另有一道兜底：`_save_warp_line_state` 现在会拒绝"条数变少"的覆盖。
 
     all_nodes = get_all_proxy_nodes()
     _log_startup_banner(all_nodes)
@@ -13712,10 +13995,20 @@ def main():
     _load_warp_ip_cycles()
     _load_warp_line_state()
     _load_node_ip_used()
-    # 跨源一致性自检：启动时先把「配置分裂」摆到日志里。
-    # WHY 在状态加载之后：自检要对比状态台账与探测名单，状态没加载就比不出来。
-    # 只报告不修 —— 改配置是人的决定，daemon 擅自改会重排生产出口。
-    _config_consistency_check()
+    # 档位对账：放在状态表加载**之后**。
+    # WHY 这个顺序（2026-11-11 修正）：档位对账的解禁侧会清观测状态并落盘，
+    # 而落盘写的是整个内存状态表。状态表没加载就落盘 = 把 156 条覆盖成
+    # 1 条（实测复现过）。详见上面 `_SLOT_BOOT_TS` 处的注释。
+    # 对账本身仍赶在拉线之前：`_tier_reconcile` 只在拉线前做单元层面的
+    # 启停，此刻状态表已就绪，对账的清理动作落在真实数据上。
+    _tier_reconcile()
+    # 跨源一致性自检：**不在这里跑**。
+    # WHY 挪走：这段自检是纯观测，但它跑在 `main()` 的启动关键路径上。
+    # 2026-11-11 17:22 实测事故 —— 自检内部一个未定义名字抛 NameError，
+    # 异常冒泡到 main() → 进程退出 → systemd Restart=always 反复拉起，
+    # restart counter 打到 23，服务瘫了 5 分钟。观测代码不该有能力掀翻服务。
+    # 现在自检移到 `_start_warp_prober()` 之后（探测线程起得来之后），
+    # 并且自身还有一层异常隔离壳（`_config_consistency_check`）。
     # 单实例探测器接管所有线路的探测/状态写入；旧守护仅在回滚开关下启动。
     # 同块轮回与换线/探测是两件事，两条路径下都要跑：它只看落地节点通不通。
     _start_node_rotation()
@@ -13728,6 +14021,12 @@ def main():
             _start_line_workers()
         if not _line_worker_owns_scheduling():
             _start_dirty_line_janitor()
+    # 跨源一致性自检：挪到这里（探测线程起得来之后）。
+    # WHY 这个位置：① 状态表已加载（自检要对比状态台账与探测名单，状态没
+    # 加载就比不出来）；② 探测线程已经在跑 —— 自检挂掉不再影响服务可用性；
+    # ③ 它本身还有异常隔离壳（`_config_consistency_check`），双保险。
+    # 只报告不修 —— 改配置是人的决定，daemon 擅自改会重排生产出口。
+    _config_consistency_check()
     # 日志标签用的当前 WARP 出口 IP：启动时探一次，之后由换线路径更新
     global _ACTIVE_WARP_IP, _last_warp_switch_ok_ts
     _m = _warp_member(active_warp_tag())

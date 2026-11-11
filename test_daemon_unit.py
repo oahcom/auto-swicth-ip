@@ -4358,6 +4358,48 @@ def test_probe_refresh_egress_gives_up_after_deadline(monkeypatch):
     assert 2 <= len(calls) <= 6, f"轮询次数应受截止时间约束，实际 {len(calls)}"
 
 
+def test_probe_refresh_egress_never_waits_between_polls(monkeypatch):
+    """轮询间隔恒为 0：两次探测之间**不许有任何等待**（主人 2026-11-11 定标）。
+
+    这是红线用例：任何把间隔改成 >0 的"优化"（sleep(1)、退避曲线、配置项）
+    都会让这里转红。失败就立刻重探，上限只由 deadline 约束。
+    """
+    gaps = []
+    calls = []
+
+    def fake(port, timeout_sec=20.0):
+        calls.append(timeout_sec)
+        return "2a09:bac5::1" if len(calls) >= 3 else None
+
+    class _Clock:
+        """记下每次 sleep 的实参；仍推进时钟，保证循环能被 deadline 收住。"""
+
+        def __init__(self):
+            self.current = 0.0
+
+        def time(self):
+            return self.current
+
+        def sleep(self, seconds):
+            gaps.append(seconds)
+            self.current += 8.0
+
+    monkeypatch.setattr(daemon, "warp_egress_ip", fake)
+    monkeypatch.setattr(daemon, "time", _Clock())
+    monkeypatch.setattr(daemon, "_warp", lambda: {"refresh_probe_timeout_sec": 7,
+                                                  "ready_timeout_sec": 12,
+                                                  "max_attempts": 3})
+
+    assert daemon._probe_refresh_egress(1080) == "2a09:bac5::1"
+    assert gaps == [0, 0], f"探测轮询间隔必须是 0（不等待），实际 {gaps}"
+
+
+def test_line_probe_cadence_defaults_to_zero(monkeypatch):
+    """缺配置时探测节奏的兜底也是 0 —— 不允许退回历史值 60s。"""
+    monkeypatch.setattr(daemon, "_warp", lambda: {})
+    assert daemon._line_probe_cadence() == 0.0
+
+
 def test_probe_refresh_egress_skips_retry_on_success(monkeypatch):
     """首探就成功时不得再探 —— 每次探测都走一次出口，白探会多烧配额。"""
     calls = []

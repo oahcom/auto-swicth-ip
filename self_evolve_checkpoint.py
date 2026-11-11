@@ -162,6 +162,10 @@ DEFAULT_CHECKS = [
     {"name": "upstream_failure_rate", "enabled": True, "interval": 5},
     {"name": "repeat_failure_nodes", "enabled": True, "interval": 5},
     {"name": "egress_error_attribution", "enabled": True, "interval": 5},
+    # 跨源一致性（5 个真相源互相对账）。间隔 3 轮 = 约 30 分钟，
+    # 与 daemon 内部自检同频；但这条是**旁路**：daemon 崩了、代码炸了，
+    # 本检查照样跑（理由见 run_check 里 cross_source_consistency 的注释）。
+    {"name": "cross_source_consistency", "enabled": True, "interval": 3},
 ]
 
 # Anomaly patterns that trigger new check activation.
@@ -334,6 +338,50 @@ def run_check(name, context, state=None):
             if bad:
                 _write_bad_nodes(bad)
             return len(bad) == 0, len(bad), f"bad_egress={dict({n: round(r,3) for n,(_,_,r) in bad.items()})}"
+
+        elif name == "cross_source_consistency":
+            """核对 5 个真相源，报出「线在跑却没人探」「名单里有却没出口」这类半开状态。
+
+            WHY 这条必须在这里、而不是只放在 daemon 启动路径里：
+              2026-11-11 17:22 那次事故就是活教材 —— daemon 因为自检函数
+              内部一个 `NameError` 反复崩溃 23 次、瘫了 5 分钟，而那正是
+              **最该报警的时刻**，观测却随着被观测对象一起失声。
+              放在 daemon 里的观测，在 daemon 坏掉时必然一起失效，这是
+              结构性的。而 selftest 由 systemd timer 独立拉起，daemon
+              死了它还活。
+
+            WHY 用 tools/asip_audit.py 而不是在这里重写一遍：
+              它是纯只读的独立工具，可以单独手工跑、可以 --json 给机器看。
+              两处各写一份判据必然漂移 —— 实测已经踩过：最初的 56 条
+              「没有出口」全是判据写错（拿 H2 的 tag 去主配置翻，而 H2
+              根本不在主配置里）。判据只有一份才不会两边不一致。
+
+            WHY 用子进程而不是 import：
+              asip_audit 会读 .env 并 reload config 来算 members。在
+              selftest 进程里做这件事会污染本进程已加载的 config
+              （实测让 test_portability 从 9 条 CF 变成 13 条）。
+              子进程隔离，副作用出不去。
+            """
+            tool = PROJECT_DIR / "tools" / "asip_audit.py"
+            if not tool.exists():
+                return False, None, f"unavailable: 缺少 {tool}"
+            out = proc.run(
+                [sys.executable, str(tool), "--json", "--project", str(PROJECT_DIR)],
+                timeout=120,
+            )
+            raw = (out.stdout or "").strip()
+            if not raw:
+                return False, None, f"unavailable: audit 无输出（stderr={(out.stderr or '')[:120]}）"
+            try:
+                rep = json.loads(raw)
+            except ValueError as e:
+                return False, None, f"unavailable: audit 输出不是 JSON（{e}）"
+            problems = rep.get("problems") or {}
+            total = sum(len(v) for v in problems.values() if isinstance(v, list))
+            parts = [f"{k}={len(v)}" for k, v in problems.items()
+                     if isinstance(v, list) and v]
+            return total == 0, total, ("一致" if total == 0
+                                       else f"不一致 {total} 处: " + " ".join(parts))
 
     except Exception as e:
         return False, None, f"check_error: {e}"

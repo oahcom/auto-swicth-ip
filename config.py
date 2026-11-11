@@ -561,6 +561,14 @@ CFG = {
         # 这条地址 6 小时内不再被观测 —— 而那正是最该持续看的对象。
         # 重复探测的代价已被入口的惩罚期短路挡住（判脏地址根本不探）。
         "probe_persistent_ttl_sec": 600,
+        # **H2 承载实测的失败结论有效期**（秒）。
+        # 此前失败是**永久**结论：`probe_h2_nodes.py` 与
+        # `daemon._pending_probe_nodes` 都只判 `tested and not ok` 就跳过，
+        # 于是 158 个失败节点（最早 11-05）永不复测 —— 节点恢复后也进不了
+        # 池，H2 供给只减不增。反证：`ddixx-1dd1.dankenet.help:3526-any`
+        # 11-05 判失败、11-11 实测可用（出口 104.28.211.32），却因「永久
+        # 失败」永不重测。6h 与生产 403 惩罚期同量级，够挡住真死节点。
+        "h2_probe_fail_ttl_sec": 21600,
         # 单实例探测器：所有线路的出口/模型探测都由唯一后台线程写入状态表，
         # 换线只读表 + 条件变量等待，不再在 reconnect_warp 里同步探测。
         # prober_enabled=False 只用于回滚到旧路径（测试默认不会启动探测器）。
@@ -801,16 +809,19 @@ CFG = {
                 # 不重叠的段、单线唯一 IP 576/天 —— 池子质量差 10 倍。
                 # 缺设备由 render_h2_lines.py 自动注册（用户规则），不要靠砍条数。
                 {"colo": "NRT", "loc": "东京",     "carrier": "proxy",  "ban_rate": 1.0,
+                 "channels": 13},
+                {"colo": "PHX", "loc": "凤凰城",   "carrier": "proxy",  "ban_rate": 0.792,
+                 "channels": 6},
+                {"colo": "LAX", "loc": "洛杉矶",   "carrier": "both",   "ban_rate": 0.266,
+                 "channels": 8},
+                {"colo": "SJC", "loc": "圣何塞",   "carrier": "both",   "ban_rate": 0.25,
                  "channels": 3},
-                {"colo": "PHX", "loc": "凤凰城",   "carrier": "proxy",  "ban_rate": 0.792},
-                {"colo": "LAX", "loc": "洛杉矶",   "carrier": "both",   "ban_rate": 0.266},
-                {"colo": "SJC", "loc": "圣何塞",   "carrier": "both",   "ban_rate": 0.25},
                 {"colo": "SIN", "loc": "新加坡",   "carrier": "both",   "ban_rate": 0.152,
-                 "channels": 5},
+                 "channels": 21},
                 {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None,
-                 "channels": 4},
+                 "channels": 8},
                 {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None,
-                 "channels": 5},
+                 "channels": 18},
                 {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None,
                  "channels": 1},
                 # 2026-11-02 H2 实测新增（dormant 65 节点里首次出现）。
@@ -818,9 +829,9 @@ CFG = {
                 # 传输层（TCP/HTTP2 vs UDP/WireGuard），不改变块的归类。
                 # ban_rate=None：段池从没在生产台账里出现过，夜间必须保留。
                 {"colo": "ICN", "loc": "首尔",     "carrier": "proxy",  "ban_rate": None,
-                 "channels": 3},
+                 "channels": 4},
                 {"colo": "SLC", "loc": "盐湖城",   "carrier": "proxy",  "ban_rate": None,
-                 "channels": 2},
+                 "channels": 3},
                 {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None,
                  # PIT 没有自己的节点：唯一落到过 PIT 的是 ORD 那条
                  # `us.bing.com:443~6-any`（5 轮里 ORD 7 / PIT 3 / SIN 1）。

@@ -6,8 +6,10 @@
   ② 「无样本」不标成因 —— 从没探过 / 探过但惩罚期短路 / 探过但没入账 /
      取不到地址，四种完全不同的故障长得一模一样。
 """
+import importlib
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,12 +28,75 @@ def _mod():
     return mod
 
 
+def _load_env_file() -> dict:
+    """读项目根的 .env，返回 KEY=VALUE（不写 os.environ）。
+
+    WHY 这里必须读 .env：`config.CFG["warp"]["members"]` 里的 WG 线是
+    **按环境变量拼出来的**（WARP_WG_FAMILIES / WARP_WG_NODES）。
+    不注入就得到 WG=0 条，于是 `summarize` 的 `in_members` 把每一条 WG
+    线都判成「不在探测名单」——「从未探测」这个更准确的成因被盖住，
+    测试也会因此失败。真实 daemon 由 systemd 的 EnvironmentFile 注入，
+    线上不会误判；只有裸跑的测试进程会。
+    """
+    env = {}
+    path = PROJECT / ".env"
+    if not path.exists():
+        return env
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        env[k.strip()] = v
+    return env
+
+
 @pytest.fixture
 def mod(monkeypatch, tmp_path):
+    """按**生产条件**加载 channel_report：先注入 .env，再 reload config。
+
+    WHY 必须 reload config（不只是注入环境）：
+      `channel_report` 在模块级 `from config import CFG`，而 config 的
+      members 是在 **config 被 import 的那一刻**按环境变量拼好的。
+      pytest 同进程里 config 早就被别的测试 import 过了（那时没有 .env），
+      CFG 里一条 WG 线都没有 —— 于是每条 WG 线都被判成「不在探测名单」，
+      「从未探测」这个更准确的成因被盖住。
+
+    WHY reload 之后要再 reload 回来、且不摘 sys.modules：
+      实测踩过两次：① 摘掉 sys.modules["config"] 会让已持有旧引用的
+      test_subscription_parse / test_warp_wg 拿到两个不同的 config
+      对象，13 项连锁失败；② reload 后不还原，config.CFG 停在「带 .env」
+      形态，别的测试期望「不带 .env」的形态，又红一片。
+      所以：进出各 reload 一次，环境由 monkeypatch 自动还原。
+    """
+    import config as _cfg_mod
+
+    saved_env = {k: os.environ.get(k) for k in ("WARP_WG_FAMILIES",
+                                                "WARP_WG_NODES",
+                                                "WARP_WG_COUNT")}
+    for k, v in _load_env_file().items():
+        if not os.environ.get(k):
+            monkeypatch.setenv(k, v)
+    importlib.reload(_cfg_mod)          # 让 CFG 按带 .env 的环境重算
+
     m = _mod()
     monkeypatch.setenv("WARP_IP_HISTORY_FILE_PATH", str(tmp_path / "hist.jsonl"))
     monkeypatch.setattr(m, "sub_url_map", lambda: {})
-    return m
+    yield m
+
+    # 还原环境后重新 reload，让 config.CFG 回到别的测试期望的形态。
+    for k, v in saved_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    try:
+        importlib.reload(_cfg_mod)
+    except Exception:
+        pass
 
 
 def _chans(*tags):

@@ -246,6 +246,34 @@ opencode 限流"，不是"隧道不通"。结果 22 条线全被判死，包括�
 
 ---
 
+### 12b. 探测轮询的间隔**恒为 0**：不等待，且禁止设置等待时间
+
+**看起来像**：探测循环里 `time.sleep(0)` 是死代码/没意义的写法，加上 `sleep(1)`
+"更稳、不烧 CPU"，或者顺手做成 `probe_poll_sec` 配置项。
+
+**实际是**：**主人 2026-11-11 明令：探测的轮询间隔就是 0，不等待，禁止设置
+任何等待时间。** `sleep(0)` 是**故意的**：它只让出 GIL、并给假时钟留一个推进点，
+本身不是等待。
+
+**为什么这么定**：慢的那一步是「隧道还没可用」，不是「本地还差那 1 秒」。
+`_probe_refresh_egress` 每次探测自己就有 `refresh_probe_timeout_sec`（7s）的
+阻塞预算，两次之间再插 1s 纯属白等 —— 36 条线各等 1s/轮，等于把换线时延钉在
+探测次数 × 1s 上。同一口径的还有 `line_probe_cadence_sec = 0`（探完立刻重新
+排队）与 `probe_max_per_min = 0`（不限频）。
+
+**上限仍在**：循环由 `ready_timeout_sec × max_attempts`（默认 12×3=36s）收住，
+到点返回 `None` 交调用方重启。所以"不等待"不等于"无限等"。
+
+**不要动**：
+- 不许把 `time.sleep(0)` 改成 `sleep(>0)`、退避曲线、指数间隔；
+- 不许新增任何"探测轮询间隔"配置项（`probe_poll_sec` / `poll_gap_sec` 之类）；
+- 不许把 `_line_probe_cadence()` 的兜底改回 60。
+
+红线用例：`test_probe_refresh_egress_never_waits_between_polls`（断言 sleep 实参
+只能是 0）、`test_line_probe_cadence_defaults_to_zero`。改上述任一处这两条就转红。
+
+---
+
 ## 四、链路与架构
 
 ### 13. H2（MASQUE over HTTP/2）必须满足三个硬条件

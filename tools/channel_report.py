@@ -484,6 +484,8 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
     # 与渲染产物（sing-box outbound，不依赖环境变量）。
     # **不能用 `svc_of`** —— 那是「推出来的单元名」，包含从 tag 猜的，
     # 拿它判「在不在名单」会把所有 WG 线都算成在名单里。
+    # **也不能用 `chans` 的键** —— 它是「报表要看的全部已知线」，
+    # 包含补位池（WG-23+）与缩容遗留，那些本来就**不该**被探测。
     online_tags = set(declared_of) | _singbox_outbound_tags()
     rows = []
     for tag, meta in chans.items():

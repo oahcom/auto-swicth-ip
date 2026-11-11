@@ -98,6 +98,19 @@ fail=0
 # 单元 ExecStart 指向包装脚本：它不可执行时 20 条隧道全部起不来。
 [ -x "$DIR/deploy/usque-launch.sh" ] \
     || { echo "✗ $DIR/deploy/usque-launch.sh 不存在或不可执行（单元 ExecStart 依赖它）" >&2; fail=1; }
+# **未定义名字检查**：`ast.parse` 只查语法不查名字。`PROJECT` 写成 `_PROJECT`
+# 是合法语法但运行时抛 NameError —— daemon 被 systemd `Restart=always` 托管，
+# 那会变成「启动 → 崩溃 → 重启 → 崩溃」的重启风暴。
+# 实测 2026-11-11 17:22:31：自检函数里一个未定义名字让 daemon 连崩 5 分钟，
+# restart counter 打到 23。
+# WHY 这里必须加：`h2-install.sh` 里也有一道同样的关卡，但那是**H2 线路
+# 安装**脚本，跟 daemon.py 这个主进程的部署毫无关系，而 install.sh 从不
+# 调用它 —— 关卡挂在了不经过的路径上，等于没有。daemon.py 的真实部署
+# 路径是「直接改工作区文件 + systemctl restart」，所以关卡必须接在这里。
+if [ -f "$DIR/tools/check_undefined_names.py" ]; then
+    "$PYBIN" "$DIR/tools/check_undefined_names.py" "$DIR/daemon.py" \
+        || { echo "✗ daemon.py 有未定义名字，拒绝安装" >&2; fail=1; }
+fi
 [ "$fail" = 0 ] || exit 1
 
 # ---- bun：probe_warp 的探测器 ----

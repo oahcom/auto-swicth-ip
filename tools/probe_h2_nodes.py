@@ -208,6 +208,31 @@ def _register_probe_device(d: Path) -> Path | None:
     return d
 
 
+def _fail_ttl() -> float:
+    """失败结论的有效期（秒）。配置项 `warp.h2_probe_fail_ttl_sec`。"""
+    try:
+        sys.path.insert(0, str(PROJECT))
+        from config import CFG
+        return float(CFG["warp"].get("h2_probe_fail_ttl_sec") or 21600)
+    except Exception:
+        return 21600.0
+
+
+def _failed_recently(rec: dict, now: float, ttl: float) -> bool:
+    """这条记录是不是「最近才判失败」—— 最近判失败才跳过复测。
+
+    `tested and not ok` 是旧判据，它把失败当成永久属性。这里加时间窗：
+    判失败在 ttl 之内 → 跳过（避免重测风暴）；超过 ttl → 重新测。
+    """
+    if not rec.get("tested") or rec.get("ok"):
+        return False
+    ts = rec.get("ts")
+    if ts is None:
+        # 没有时间戳的旧记录：按「从未测过」处理，放进复测队列。
+        return False
+    return (now - float(ts)) < ttl
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="H2/MASQUE 承载实测（独立探测设备）")
     ap.add_argument("--tags", nargs="*", help="要测的节点 tag")
@@ -256,10 +281,15 @@ def main() -> int:
         m = warp_blocks.load_map()
         # **只跳过「测过且失败」的**（同 warp_diag）：测成功但还没合并的节点
         # 不该被当成已处理，否则它们的 colo 只留在 --out 里，永远进不了块。
+        # **失败结论有 TTL**：过期就重新测。承载能力不是节点的永久属性 ——
+        # 机场换机、端口重开都会让一个昨天挂的节点今天复活。此前「测过且失败
+        # 就永久跳过」让 158 个失败节点（157 个超过 24h，最早 11-05）永远不再
+        # 复测，于是节点恢复也进不了池，H2 供给只减不增。
+        fail_ttl = float(_fail_ttl())
+        now = time.time()
         tags = [t for t in nodes
                 if not (m.get(t) or {}).get("colo")
-                and not ((state["nodes"].get(t) or {}).get("tested")
-                         and not (state["nodes"].get(t) or {}).get("ok"))]
+                and not _failed_recently(state["nodes"].get(t) or {}, now, fail_ttl)]
     else:
         tags = args.tags or list(nodes)
     missing = [t for t in tags if t not in nodes]

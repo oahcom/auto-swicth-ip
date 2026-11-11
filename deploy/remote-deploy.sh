@@ -103,6 +103,18 @@ git fetch --depth=1 origin main
 git reset --hard origin/main
 chmod +x deploy/*.sh tools/*.sh 2>/dev/null || true
 python3 -m py_compile config.py daemon.py warp_wg.py warp_blocks.py
+# **未定义名字检查**：`py_compile` 只查**语法**，不查名字。`PROJECT` 写成
+# `_PROJECT` 是语法完全合法的 Python，但运行时才抛 NameError —— 而远端
+# daemon 是被 systemd `Restart=always` 托管的，那会变成「启动 → 崩溃 →
+# 重启 → 崩溃」的重启风暴。
+# 实测 2026-11-11 17:22:31~17:27:21：本机因此连崩 5 分钟，restart counter
+# 打到 23，服务瘫了 5 分钟。
+# WHY 放在这里：`git reset --hard` 之后（第 103 行）—— 检查的是**远端实际
+# 将要运行的代码**；且必须在第 431 行 `systemctl restart` **之前**。
+if [ -f tools/check_undefined_names.py ]; then
+    python3 tools/check_undefined_names.py daemon.py \
+        || { echo "✗ 远端 daemon.py 有未定义名字，拒绝部署" >&2; exit 1; }
+fi
 echo \"  已同步到 \$(git rev-parse --short HEAD) \$(git log -1 --format=%s)\""
 
 # ---------------------------------------------------------------- 2. 拓扑参数
