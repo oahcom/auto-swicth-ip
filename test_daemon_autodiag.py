@@ -8,10 +8,13 @@
 import ast
 import json
 import sys
+import time
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent
-NAMES = ("_pending_probe_nodes", "_ensure_spare_devices")
+# _h2_fail_fresh 是 _pending_probe_nodes 的同模块依赖（失败结论 TTL）：
+# AST 沙箱不 import 整个 daemon，helper 不列进来就会 NameError。
+NAMES = ("_pending_probe_nodes", "_ensure_spare_devices", "_h2_fail_fresh")
 
 
 def _func():
@@ -24,8 +27,11 @@ def _func():
         pass
 
     module_cfg = {"singbox": {"config_file": ""}}
+    # helper 用到的模块级名字（真 daemon 里是全局），沙箱里补齐：
+    # time 用真时钟（ts 由用例写成相对当前时刻），_warp 给一份最小配置。
     box: dict = {"json": json, "CFG": module_cfg, "warp_blocks": None,
-                 "log": lambda *a, **k: None}
+                 "log": lambda *a, **k: None, "time": time,
+                 "_warp": lambda: {"h2_probe_fail_ttl_sec": 21600}}
     exec(compile(ast.Module(body=picked, type_ignores=[]), "daemon.py", "exec"),
          box)
     return box, module_cfg
@@ -229,7 +235,8 @@ def test_h2_probe_uses_its_own_ledger_not_wg_colo(tmp_path):
                  ledger={o["tag"]: {"sub": "s"} for o in outs})
     h2state = tmp_path / "h2_state.json"
     h2state.write_text(json.dumps({"nodes": {
-        "b:443-any": {"tested": True, "ok": False},      # H2 测过且失败 → 跳过
+        # ts 必须是「最近」：失败结论有 6h TTL，过期的要重新测（见下一条用例）。
+        "b:443-any": {"tested": True, "ok": False, "ts": time.time()},
     }}))
 
     box, module_cfg = _func()
@@ -246,6 +253,32 @@ def test_h2_probe_uses_its_own_ledger_not_wg_colo(tmp_path):
     assert "a:443-any" in h2, "有 WG colo 不等于测过 H2"
     assert "b:443-any" not in h2, "H2 测过且失败的不该重测"
     assert "c:443-any" in h2
+
+
+def test_h2_failed_node_retested_after_ttl(tmp_path):
+    """失败结论不是永久属性：TTL 过期 / 没有时间戳的都要重新排队。
+
+    实测 11-05 判失败、11-11 复活的节点曾因「永久跳过」永不复测，
+    H2 供给只减不增（158 条失败节点里 157 条超过 24h）。
+    """
+    import warp_blocks
+
+    outs = [_out("a:443-any"), _out("b:443-any"), _out("c:443-any")]
+    cfg = _setup(tmp_path, outs=outs, mapped={},
+                 ledger={o["tag"]: {"sub": "s"} for o in outs})
+    h2state = tmp_path / "h2_state.json"
+    h2state.write_text(json.dumps({"nodes": {
+        "a:443-any": {"tested": True, "ok": False, "ts": time.time()},  # 最近的失败
+        "b:443-any": {"tested": True, "ok": False, "ts": time.time() - 21601},
+        "c:443-any": {"tested": True, "ok": False},                     # 旧记录无 ts
+    }}))
+    box, module_cfg = _func()
+    module_cfg["singbox"]["config_file"] = cfg
+    box["warp_blocks"] = warp_blocks
+
+    got = {x["tag"] for x in box["_pending_probe_nodes"](state_path=str(h2state))}
+    assert "a:443-any" not in got, "TTL 内的失败不该立刻重测"
+    assert {"b:443-any", "c:443-any"} <= got, "过期/无时间戳的失败必须重测"
 
 
 def test_h2_probe_retests_nodes_that_passed_but_never_merged(tmp_path):

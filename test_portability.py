@@ -402,10 +402,16 @@ def test_asip_cli_reads_everything_from_generated_settings(tmp_path):
     shutil.copytree(PROJECT / "deploy", here / "deploy")
     shutil.copy2(PROJECT / "config.py", here / "config.py")
     out_env = tmp_path / "cli.env"
+    # 解释器必须给中性路径：用 venv 跑 pytest 时 sys.executable 就是源仓库的
+    # venv python，把它喂给 PYTHON 再断言「源仓库路径不出现」等于自伤 ——
+    # ASIP_PY 会原样带进设置，用例在 venv 里必红、系统 python 下必绿。
+    # 符号链接到同一解释器即可：脚本只需要它跑通 config.py（纯标准库）。
+    neutral_py = tmp_path / "python3"
+    neutral_py.symlink_to(sys.executable)
     out = subprocess.run(["bash", str(here / "deploy/asip-cli-conf.sh")], text=True,
                          capture_output=True, timeout=60,
                          env={**os.environ, "ASIP_CLI_ENV": str(out_env),
-                              "PYTHON": sys.executable})
+                              "PYTHON": str(neutral_py)})
     assert out.returncode == 0, out.stderr[-400:]
     text = out_env.read_text(encoding="utf-8")
     assert str(here) in text, "设置未随 clone 目录变化"

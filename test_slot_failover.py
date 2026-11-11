@@ -88,6 +88,12 @@ def isolated(monkeypatch):
 
     daemon._SLOT_HEALTH.clear()
     daemon._SLOT_EXIT_LEDGER.clear()
+    # 出口短冷却也是跨用例的模块级状态：_rotate_slot_once 会给事发地址打
+    # 90s 冷却（_mark_egress_cooling），不清的话上一条用例冷却过的地址会把
+    # 下一条用例的选槽结果整个改写（实测：repairing 用例冷却了 b::2，
+    # 后面的 rotate 用例就只能选 c::3；log 用例冷却了 a::1，
+    # serving 兜底用例直接挑不到任何槽）。
+    daemon._EGRESS_COOLING.clear()
     daemon._SLOT_REDIRECT_RR["index"] = 0
     for s in SLOTS:
         daemon._slot_mark(s["name"], "ok")
@@ -270,7 +276,7 @@ def test_slot_health_returns_live_record(isolated):
 def test_no_healthy_slot_asks_9router_to_restart(monkeypatch):
     """六条闸都修着时主链路不兜底：明确让 9router 自重启等闸回来。"""
     monkeypatch.setattr(daemon, "_pick_healthy_slot",
-                        lambda name, avoid_tags=None: (None, None, None))
+                        lambda name, avoid_tags=None, avoid_ips=None: (None, None, None))
     monkeypatch.setattr(daemon, "_slot_no_usable_gate", lambda: True)
     slot = {"name": "slot-1", "selector": "opencode-out-1", "port": 7890}
     out = daemon._slot_redirect_payload(slot, "WARP-A", "2606:a::1",
@@ -284,7 +290,7 @@ def test_no_healthy_slot_asks_9router_to_restart(monkeypatch):
 def test_already_retired_without_standby_does_not_restart(monkeypatch):
     """线已在请求发出后换走：原地重连即可，不该把刚接上的连接重启掉。"""
     monkeypatch.setattr(daemon, "_pick_healthy_slot",
-                        lambda name, avoid_tags=None: (None, None, None))
+                        lambda name, avoid_tags=None, avoid_ips=None: (None, None, None))
     slot = {"name": "slot-1", "selector": "opencode-out-1", "port": 7890}
     out = daemon._slot_redirect_payload(slot, "WARP-A", "2606:a::1",
                                         "already_retired", 123.0)
@@ -371,7 +377,7 @@ def test_mixed_gate_states_still_signal_no_healthy_slot(monkeypatch):
     # 那类稳态漏发又带回来。
     monkeypatch.setattr(daemon, "_SLOT_BOOT_TS", 0.0)
     monkeypatch.setattr(daemon, "_pick_healthy_slot",
-                        lambda name, avoid_tags=None: (None, None, None))
+                        lambda name, avoid_tags=None, avoid_ips=None: (None, None, None))
     monkeypatch.setattr(daemon, "consumer_slots",
                         lambda: [{"name": "slot-%d" % i} for i in range(1, 7)])
     monkeypatch.setattr(daemon, "_slot_health",
@@ -390,7 +396,7 @@ def test_startup_window_payload_does_not_ask_for_restart(monkeypatch):
     """启动窗口内同样「无健康备槽」，但不该让 9router 重启。"""
     monkeypatch.setattr(daemon, "_SLOT_BOOT_TS", daemon.time.time())
     monkeypatch.setattr(daemon, "_pick_healthy_slot",
-                        lambda name, avoid_tags=None: (None, None, None))
+                        lambda name, avoid_tags=None, avoid_ips=None: (None, None, None))
     monkeypatch.setattr(daemon, "consumer_slots",
                         lambda: [{"name": "slot-%d" % i} for i in range(1, 7)])
     monkeypatch.setattr(daemon, "_slot_health",
