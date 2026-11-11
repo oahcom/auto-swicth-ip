@@ -2911,8 +2911,14 @@ def _load_tier_disabled() -> set[str]:
                 if m.get("kind") == "wg"}
     if not declared:
         # 声明为空多半个 `.env` 没读进来（`WARP_WG_FAMILIES` 缺失时
-        # `_append_wg_members` 直接 return）。此时按「没有档位」处理并留痕：
-        # 静默返回空集合会让 22 条线在无人察觉的情况下全部解禁。
+        # `_append_wg_members` 直接 return）。运行期遇到这种瞬态必须**保持
+        # 现有停用集合**：返回空集 = 把 30 条停用的 WG 线全部解禁。
+        # 只有 import 期（_TIER_DISABLED 尚未绑定）才退回「没有档位」。
+        kept = globals().get("_TIER_DISABLED")
+        if isinstance(kept, set):
+            log("  ⚠ 档位失效：members 里没有 WG 线声明，保持现有停用集合"
+                "（检查 .env 的 WARP_WG_FAMILIES / WARP_WG_NODES）")
+            return set(kept)
         log("  ⚠ 档位失效：members 里没有 WG 线声明"
             "（检查 .env 的 WARP_WG_FAMILIES / WARP_WG_NODES），WG 全部按启用处理")
         return set()
@@ -2943,8 +2949,20 @@ def _refresh_tier_disabled() -> bool:
     mt = _tier_mtime()
     if mt == _TIER_MTIME:
         return False
-    _TIER_MTIME = mt
-    _TIER_DISABLED = _load_tier_disabled()
+    # 台账读不到 / 形状不对时既不推进 mtime 也不重算集合。旧版先写 mtime
+    # 再读，一次瞬态失败就把这次变更永久吞掉；而 _load_tier_disabled 的
+    # 降级语义是「空集合 = 全部启用」，会把 30 条停用 WG 单元批量拉起来。
+    try:
+        _, spec = warp_blocks.tier_spec()
+    except Exception as e:
+        log(f"  ⚠ 档位台账读取异常，保持现有停用集合：{e}")
+        return False
+    if mt == 0.0 or spec is None:
+        log("  ⚠ 档位台账读不到/形状不对，保持现有停用集合（不批量解禁）")
+        return False
+    fresh = _load_tier_disabled()
+    _TIER_MTIME = mt                 # 读成功之后再推进
+    _TIER_DISABLED = fresh
     log(f"  · 档位变更：停用 {len(_TIER_DISABLED)} 条 WG 线")
     return True
 
@@ -3009,11 +3027,13 @@ def _refresh_h2_members() -> bool:
     mt = _h2_channels_mtime()
     if mt == _H2_CHANNELS_MTIME:
         return False
-    _H2_CHANNELS_MTIME = mt
     fresh = _h2_members_from_ledger()
     if not fresh:
-        log("  ⚠ H2 台账已变更但读不出成员，名单保持不变")
+        # **不推进 mtime**：台账正在被重渲染时读到半截内容是瞬态，下个 tick
+        # 还得再试。旧版先写 mtime 再读，一次失败就把这次重排永久吞掉。
+        log("  ⚠ H2 台账已变更但读不出成员，名单保持不变（下轮重试）")
         return False
+    _H2_CHANNELS_MTIME = mt
     members = _warp()["members"]
     before = sum(1 for m in members if m.get("kind") == "h2")
     # 原地切片赋值：CFG["warp"]["members"] 是共享对象，各处持的都是这个引用，
@@ -3612,7 +3632,7 @@ def _probe_refresh_egress(port: int) -> str | None:
 
     轮询间隔**恒为 0，不等待**（主人 2026-11-11 拍板）：两次探测之间不插任何
     停顿，失败就立刻重探。禁止改成 `sleep(>0)`、禁止退避曲线、禁止把它做成
-    配置项 —— 见 `docs/established-facts.md` 第 13 条。
+    配置项 —— 见 `docs/established-facts.md` 12b 条（第 13 条讲的是 H2 三条件）。
     """
     w = _warp()
     per_try = w["refresh_probe_timeout_sec"]
@@ -5492,7 +5512,9 @@ def _node_rotation_pass(now: float | None = None) -> None:
 
 
 def _line_unknown_retry() -> float:
-    return float(_warp().get("probe_unknown_retry_sec", 5))
+    # 兜底也必须是 0：探不到结论就立刻重新排队，不插入任何等待。
+    # 主人 2026-11-11 定标，见 docs/established-facts.md 12b。
+    return float(_warp().get("probe_unknown_retry_sec", 0))
 
 
 def _line_probe_cadence() -> float:
@@ -5529,9 +5551,9 @@ def _warp_line_ok_fresh(tag: str, now: float | None = None,
         return now - float(st.get("last_ok_ts") or 0.0) <= fresh_sec
 
 
-def _line_probe_cadence() -> float:
-    # 与文件前面那处同值（历史遗留的重复定义，未合并）：兜底 0，不等待。
-    return float(_warp().get("line_probe_cadence_sec", 0))
+# 这里曾有第二份 `_line_probe_cadence`（历史遗留的重复定义，后者覆盖前者）。
+# 2026-11-11 审查后合并：两份定义会让「改了前面那份其实没生效」，
+# 正好削弱红线的防篡改能力。唯一定义在文件前段，静态用例守住它。
 
 
 # ── 夜间刷新锁 ──────────────────────────────────────────────
@@ -5723,6 +5745,10 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             # 的依据（见 `_line_node_cannot_carry`）。
             st["ever_ip"] = True
         st["last_verdict"] = verdict
+        # 这条结论属于哪个地址：闸口不再自己探测，改为读这里的结论
+        # （见 _channel_verdict_snapshot）。没有这层对齐，线重启换了地址之后
+        # 旧地址的判决会被当成新地址的判决用。
+        st["last_verdict_ip"] = st.get("ip")
         st["last_probe_ts"] = ts
         if verdict == "OK":
             st["fail_streak"] = 0
@@ -6399,6 +6425,10 @@ def _probe_one_line(member: dict) -> None:
     if not _warp_line_record_observation(tag, ip, verdict,
                                          time.time(), started_at):
         return
+    # 探测耗时落渠道级：闸口不再自己打探测（见 _channel_verdict_snapshot），
+    # 选槽排序的延迟判据从这里取。带地址对齐，换出口即失效。
+    _warp_line_update(tag, last_probe_sec=round(time.time() - started_at, 3),
+                      last_probe_sec_ip=ip, last_probe_sec_ts=time.time())
     # 渠道锁的样本只认地址级持久结论（quota/flagged），与台账同一口径。
     # OK 也入账：它是「这条渠道还能出 OK」的唯一证据，而当天样本只要出现一条
     # 非 quota 就不再锁（`_channel_ban_hold_hit`）。
@@ -7754,6 +7784,159 @@ def _reclaim_dirty_pass() -> None:
             _WARP_PROBING.add(m["tag"])
         threading.Thread(target=_reclaim_dirty_warp_worker, args=(m,),
                          daemon=True, name=f"warp-reclaim-{m['tag']}").start()
+
+
+# ---- 沉睡池体检调度（并入 daemon 主循环，不另开 systemd unit / cron）----
+# WHY（2026-11-11 实测事故，见 DESIGN-2026-11-11.md 第 12 部分）：
+#   dormant_probe.py 是 `.dormant_state.json` 的唯一生产者，
+#   parse_subscription._load_dormant_state() 是唯一消费者，但部署里从来
+#   没有任何调用方（无 timer / 无 cron / 部署脚本也没接）。状态文件从未
+#   生成过，于是每轮配置刷新都打印"沉睡池状态读不到，本轮全部节点进池子"，
+#   判死的节点反复回流到 selector —— 整套降级机制从部署起就没生效过。
+#   消费者在 daemon 的配置刷新链路里，所以生产者也挂在同一条链路上，
+#   不需要第二个服务；daemon 不在线时配置也不会刷新，跑体检没有意义。
+# 不引入第二套配置：周期、单轮预算、续跑退出码全部直接取脚本的常量。
+# dormant_probe 顶层只有常量与函数定义，import 它不会起进程、不会读配置。
+from dormant_probe import POOL_RECHECK_HOURS, DEFAULT_MAX_SECONDS, RC_MORE
+
+_DORMANT_PROBE_RUNNING = False
+_DORMANT_PROBE_NEXT_TS = 0.0
+_DORMANT_PROBE_PERIOD_SEC = POOL_RECHECK_HOURS * 3600
+# 主人 2026-11-11 定标：探测不等待、禁止设置等待时间。失败与「未完待续」
+# 一律立即重试（NEXT_TS=0），不设任何退避窗口；防刷屏靠日志节流与脚本
+# 自身的运行耗时，不靠 sleep。
+_DORMANT_PROBE_RETRY_SEC = 0
+_DORMANT_PROBE_BUDGET_SEC = DEFAULT_MAX_SECONDS
+# 兜底：脚本会按 --max-seconds 自己正常退出，这个 timeout 只防它彻底卡死。
+_DORMANT_PROBE_TIMEOUT_SEC = DEFAULT_MAX_SECONDS + 300
+_DORMANT_PROBE_ATTEMPT_FILE = ".dormant_probe_attempt"
+_DORMANT_PROBE_LOG_FILE = ".dormant_probe.log"
+_DORMANT_PROBE_FAIL_STREAK = 0
+
+
+def _dormant_probe_attempt_ts() -> float:
+    """上次**发起**体检的时间，只用于诊断与重启后的观测，不做调度闸门。
+
+    WHY 不再是闸门：主人定标「探测不等待、禁止设置等待时间」。以前这里用
+    30 分钟窗口挡重跑，结果连 RC_MORE（分批续跑，进度已存盘）都要等半小时，
+    247 条节点要拖好几个小时。现在改由脚本的 pending 断点续跑 + 状态文件
+    updated=0 表达「没跑完」，调度器下一 tick 直接继续，不引入任何等待。
+    """
+    try:
+        with open(os.path.join(_PROJECT, _DORMANT_PROBE_ATTEMPT_FILE),
+                  encoding="utf-8") as f:
+            return float((f.read() or "0").strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _mark_dormant_probe_attempt() -> None:
+    try:
+        with open(os.path.join(_PROJECT, _DORMANT_PROBE_ATTEMPT_FILE),
+                  "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
+
+
+def _dormant_state_updated() -> float:
+    """状态文件里上一次成功落盘的时间；读不到/没生成过返回 0。
+
+    用文件里的 updated 而不是进程内变量：daemon 重启不该再触发一次全量体检，
+    而状态文件真丢了（误删 / 新机首装）必须立刻重跑。
+    """
+    try:
+        with open(os.path.join(_PROJECT, ".dormant_state.json"), encoding="utf-8") as f:
+            return float((json.load(f) or {}).get("updated") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0.0
+
+
+def _maybe_run_dormant_probe() -> None:
+    """主循环每 tick 调一次；到点才在后台线程里跑一次体检。
+
+    子进程隔离是必须的：dormant_probe.py 会 import config、另起一个 sing-box
+    临时实例，塞进 daemon 进程会污染 CFG 并把主服务拖住。脚本自身还有 flock，
+    与这里的运行标志构成双保险。
+    """
+    global _DORMANT_PROBE_RUNNING, _DORMANT_PROBE_NEXT_TS
+    if _DORMANT_PROBE_RUNNING:
+        return
+    now = time.time()
+    if now < _DORMANT_PROBE_NEXT_TS:
+        return
+    updated = _dormant_state_updated()
+    if updated > 0 and now - updated < _DORMANT_PROBE_PERIOD_SEC:
+        # 状态还在有效期内：把下次到期时间钉在"上次成功 + 6h"，之后每 tick
+        # 只比一个浮点数，不再反复读文件。
+        _DORMANT_PROBE_NEXT_TS = updated + _DORMANT_PROBE_PERIOD_SEC
+        return
+    # updated=0 有两种含义：状态文件不存在，或本轮只存了进度（未完成）。
+    # 两者都必须立刻跑 —— 后者的 pending 断点保证不会重复全量。
+    _mark_dormant_probe_attempt()
+    _DORMANT_PROBE_RUNNING = True
+
+    def _run():
+        global _DORMANT_PROBE_RUNNING, _DORMANT_PROBE_NEXT_TS, _DORMANT_PROBE_FAIL_STREAK
+        try:
+            r = subprocess.run(
+                [sys.executable, os.path.join(_PROJECT, "dormant_probe.py"),
+                 "--max-seconds", str(_DORMANT_PROBE_BUDGET_SEC)],
+                cwd=_PROJECT, capture_output=True, text=True,
+                timeout=_DORMANT_PROBE_TIMEOUT_SEC)
+            # 完整输出必须落盘。实测第一次自动体检 225/247 条 error，
+            # 但日志只留了最后 4 行，首条故障原因、实例什么时候垮的
+            # 全都查不到 —— 只报告摘要等于把证据丢掉。
+            try:
+                with open(os.path.join(_PROJECT, _DORMANT_PROBE_LOG_FILE),
+                          "w", encoding="utf-8") as f:
+                    f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"exit={r.returncode}\n")
+                    f.write(r.stdout or "")
+                    if r.stderr:
+                        f.write("\n--- stderr ---\n" + r.stderr)
+            except OSError:
+                pass
+            tail = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()][-4:]
+            if r.returncode == 0:
+                log("  · 沉睡池体检完成：" + " | ".join(tail)
+                    + f"（完整输出：{_DORMANT_PROBE_LOG_FILE}）")
+                _DORMANT_PROBE_NEXT_TS = time.time() + _DORMANT_PROBE_PERIOD_SEC
+                _DORMANT_PROBE_FAIL_STREAK = 0
+            elif r.returncode == RC_MORE:
+                # 预算用尽、进度已存盘：这不是失败，是分批。立刻续跑剩下的，
+                # 绝不能套失败退避，否则 247 条要拖好几个小时。
+                log("  · 沉睡池体检分批续跑：" + " | ".join(tail[-2:])
+                    + "（进度已存，立即继续，不等待）")
+                _DORMANT_PROBE_NEXT_TS = 0.0
+                _DORMANT_PROBE_FAIL_STREAK = 0
+            else:
+                _DORMANT_PROBE_FAIL_STREAK += 1
+                if _DORMANT_PROBE_FAIL_STREAK == 1 or _DORMANT_PROBE_FAIL_STREAK % 10 == 0:
+                    err = [x.strip() for x in (r.stderr or "").splitlines()
+                           if x.strip()][-2:]
+                    log(f"  ⚠ 沉睡池体检失败 exit={r.returncode}"
+                        f"（连续 {_DORMANT_PROBE_FAIL_STREAK} 次）："
+                        + " | ".join(tail + err)
+                        + f"（立即重试，不等待；完整输出：{_DORMANT_PROBE_LOG_FILE}）")
+                _DORMANT_PROBE_NEXT_TS = 0.0
+        except subprocess.TimeoutExpired:
+            log(f"  ⚠ 沉睡池体检超时（{_DORMANT_PROBE_TIMEOUT_SEC}s），进度已在脚本侧落盘；"
+                "遗留临时实例由脚本下次的 kill_orphans 清理")
+            _DORMANT_PROBE_NEXT_TS = 0.0
+        except Exception as e:
+            log(f"  ⚠ 沉睡池体检异常：{e}")
+            _DORMANT_PROBE_NEXT_TS = 0.0
+        finally:
+            _DORMANT_PROBE_RUNNING = False
+
+    try:
+        threading.Thread(target=_run, daemon=True, name="dormant-probe").start()
+    except Exception as e:
+        # 线程没起来必须把运行标志复位，否则调度永久卡死（没有第二个地方清它）
+        _DORMANT_PROBE_RUNNING = False
+        _DORMANT_PROBE_NEXT_TS = 0.0
+        log(f"  ⚠ 沉睡池体检线程启动失败：{e}")
 
 
 def _dirty_line_janitor() -> None:
@@ -12203,6 +12386,37 @@ def assign_consumer_slots(force=False):
             % (name, pick, verdict, (probed or {}).get("sec")))
 
 
+def _channel_verdict_snapshot(tag: str, ip: str | None) -> dict:
+    """读渠道级已有结论，代替闸口切换时的一次实测。
+
+    WHY 不在这里打请求：闸口的调用点在 `_slot_put` 之后（`_slot_claim`
+    内部已完成 selector PUT），探测晚于切换生效 —— 既否决不了这次选择，也
+    回滚不了，只能事后补一个状态标签。而候选在进闸口前已由
+    `_warp_line_fresh_candidates` 要求「当前地址有新鲜 OK」，prober 又按同一
+    判据跳过这条线（`_warp_line_needs_probe`）。再打一次，等于把两个组件
+    都判定「不必再测」的那一对重测一遍，代价是一格配额。
+
+    返回结构与 `_probe_line_before_rotate` 对齐（verdict/sec/cached），
+    调用方的 `_slot_mark` / `_slot_note_probe` 无需改动。没有结论时给
+    unknown，与实测超时同义：不判死，下一轮再看。
+    """
+    st = _warp_line_state(tag) if tag else {}
+    sec = st.get("last_probe_sec")
+    if not isinstance(sec, (int, float)) or sec <= 0:
+        sec = None
+    if ip and st.get("ip") == ip:
+        last_ok = float(st.get("last_ok_ts") or 0.0)
+        if (st.get("last_ok_ip") == ip
+                and time.time() - last_ok <= _line_fresh_sec()):
+            return {"tag": tag, "ip": ip, "verdict": "OK", "sec": sec,
+                    "cached": True, "source": "channel"}
+        if st.get("last_verdict_ip") == ip and st.get("last_verdict"):
+            return {"tag": tag, "ip": ip, "verdict": st["last_verdict"],
+                    "sec": sec, "cached": True, "source": "channel"}
+    return {"tag": tag, "ip": ip, "verdict": "unknown", "sec": sec,
+            "cached": True, "source": "channel"}
+
+
 def _probe_line_for_slots(tag, ip, fresh=False):
     """探测一条线，并把 OK 的结论用于补坏闸 / 同步闸状态。
 
@@ -12213,7 +12427,12 @@ def _probe_line_for_slots(tag, ip, fresh=False):
     修整中 (repairing) 和服务中 (serving) 的闸不在这改 —— 它们由 _repair_slot /
     主出口自己管。
     """
-    probed = _probe_line_before_rotate(tag, ip, fresh)
+    cfg = _api_cfg()
+    if cfg.get("slot_switch_probe", False):
+        # 旧行为：闸口切换时实测一次。保留开关，便于对照与回退。
+        probed = _probe_line_before_rotate(tag, ip, fresh)
+    else:
+        probed = _channel_verdict_snapshot(tag, ip)
     verdict = (probed or {}).get("verdict")
     if not tag:
         return probed
@@ -13554,7 +13773,7 @@ _TIER_STALE_KEYS = ("ip_ts", "last_ok_ts", "last_probe_ts", "quota_until",
                     "next_restart_ts", "rebind_ts")
 
 
-def _clear_conclusions_on_tier_stop(tag: str) -> None:
+def _clear_conclusions_on_tier_stop(tag: str, save: bool = True) -> None:
     """一条线被档位停用：清掉「描述上一个会话」的结论类字段。
 
     WHY 需要这个（对称补齐）：`_reset_stale_after_tier` 只挂在**解禁侧**
@@ -13600,7 +13819,10 @@ def _clear_conclusions_on_tier_stop(tag: str) -> None:
         # 保留（它是当天证据）。但如果盘上被写成脏形状，这里顺带归位。
         if not isinstance(st.get("blocked_notes"), list):
             st["blocked_notes"] = None
-    _save_warp_line_state(force=True)
+    # 批量清理（台账外残留可能几十条）时传 save=False，由调用方最后统一落盘，
+    # 避免每条都 fsync 一次全表。
+    if save:
+        _save_warp_line_state(force=True)
 
 
 def _reset_stale_after_tier(tag: str) -> None:
@@ -13636,6 +13858,23 @@ def _tier_reconcile() -> None:
     只碰**档位明确管到**的、且 members 里声明过的线：补位池（line23+）与
     档位无关。停用不 disable、不删单元，`systemctl start` 随时回来。
     """
+    # 台账外单元（补位池 23+ / 缩容遗留）压根不出现在 members 里，下面的
+    # 对账循环永远遍历不到它们，于是状态台账能留着 31~36 小时前的
+    # OK/blocked 假结论（2026-11-11 审计实测 WARP-WG-23..30）。这些线不会
+    # 被探测，结论永远冻结，报表只能把旧值显示成「运维停用」。
+    # 清「结论类」字段、保留 ban_probes，与停用侧同一套口径。
+    declared_wg = {m.get("tag") for m in (_warp().get("members") or [])
+                   if m.get("kind") == "wg" and m.get("tag")}
+    with _WARP_LINE_CV:
+        orphan_wg = [t for t in list(_WARP_LINE_STATE)
+                     if isinstance(t, str) and t.startswith("WARP-WG-")
+                     and t not in declared_wg]
+    if orphan_wg:
+        for t in orphan_wg:
+            _clear_conclusions_on_tier_stop(t, save=False)
+        _save_warp_line_state(force=True)
+        log(f"  · 档位对账：清掉 {len(orphan_wg)} 条台账外 WG 线的冻结结论")
+
     _, spec = warp_blocks.tier_spec()
     if spec is None:
         return                    # 没有档位文件 = 全开，不主动动单元
@@ -14335,6 +14574,14 @@ def main():
             if now - last_sub_refresh > CFG["intervals"]["subscription_refresh_sec"]:
                 _io_pool.submit(refresh_subscription)
                 last_sub_refresh = now
+
+            # ---- 6b. 沉睡池体检 (6h；状态文件不存在则立即跑) ----
+            # 与 6 同属配置刷新链路：这里生产 .dormant_state.json，下一次
+            # make_config 才会读到实测判死名单。不另开 timer / cron。
+            try:
+                _maybe_run_dormant_probe()
+            except Exception as e:
+                log(f"  ⚠ 沉睡池体检调度异常：{e}")
 
             # ---- 7. Sing-box watchdog ----
             if now - last_singbox_check > CFG["intervals"]["singbox_watchdog_sec"]:

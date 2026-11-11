@@ -107,9 +107,16 @@ fail=0
 # 安装**脚本，跟 daemon.py 这个主进程的部署毫无关系，而 install.sh 从不
 # 调用它 —— 关卡挂在了不经过的路径上，等于没有。daemon.py 的真实部署
 # 路径是「直接改工作区文件 + systemctl restart」，所以关卡必须接在这里。
-if [ -f "$DIR/tools/check_undefined_names.py" ]; then
-    "$PYBIN" "$DIR/tools/check_undefined_names.py" "$DIR/daemon.py" \
-        || { echo "✗ daemon.py 有未定义名字，拒绝安装" >&2; fail=1; }
+# 关卡脚本本身缺失时**必须拒绝安装**：旧版用 `if [ -f ... ]` 静默跳过，
+# 等于「关卡没装也照样部署」。检查范围也扩到所有核心模块 —— 只查
+# daemon.py 时，dormant_probe.py / config.py 里的未定义名照样能掀翻服务。
+CHECK_NAMES="daemon.py dormant_probe.py config.py warp_wg.py warp_blocks.py parse_subscription.py"
+if [ ! -f "$DIR/tools/check_undefined_names.py" ]; then
+    echo "✗ 静态名字关卡脚本缺失：tools/check_undefined_names.py" >&2
+    fail=1
+else
+    (cd "$DIR" && "$PYBIN" tools/check_undefined_names.py $CHECK_NAMES) \
+        || { echo "✗ 核心模块有未定义名字，拒绝安装" >&2; fail=1; }
 fi
 [ "$fail" = 0 ] || exit 1
 
@@ -271,6 +278,24 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# 部署前关卡随单元一起下发。旧版只在本机手工放过 drop-in，远端装完新代码
+# 却没有 ExecStartPre —— 而「直接改工作区文件 + systemctl restart」恰恰是
+# 最常见的部署方式，关卡挂不到这条路上等于没有。
+DROPIN_DIR="$UNIT_DIR/auto-switch-ip.service.d"
+if [ -f "$DIR/deploy/auto-switch-ip-precheck.conf" ]; then
+    mkdir -p "$DROPIN_DIR" 2>/dev/null || need_root mkdir -p "$DROPIN_DIR"
+    if [ -w "$DROPIN_DIR" ]; then
+        install -m 0644 "$DIR/deploy/auto-switch-ip-precheck.conf" \
+            "$DROPIN_DIR/10-precheck.conf"
+    else
+        need_root install -m 0644 "$DIR/deploy/auto-switch-ip-precheck.conf" \
+            "$DROPIN_DIR/10-precheck.conf"
+    fi
+else
+    echo "✗ 缺少 deploy/auto-switch-ip-precheck.conf，拒绝生成无关卡的单元" >&2
+    exit 1
+fi
 
 cat > "$UNIT_DIR/asi-selfcheck.service" <<EOF
 [Unit]

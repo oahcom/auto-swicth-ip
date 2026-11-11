@@ -108,6 +108,18 @@ def h2_singbox(node: dict, inbound_port: int) -> dict:
     }
 
 
+
+def _clean_env() -> dict:
+    """剔除代理变量的环境。
+
+    usque 走 Go 的 ProxyFromEnvironment：调用方 shell 里的 HTTP(S)_PROXY/ALL_PROXY
+    会被用于内层 TLS，MITM 代理换证后触发「remote endpoint has a different public
+    key」→ 全部节点误判失败。systemd 单元环境干净，所以生产中招不了；探测必须
+    自己保证干净，否则整批结论都是假的。
+    """
+    return {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+
+
 def probe(node: dict, device: Path, timeout: float = 25.0) -> dict:
     """起 sing-box + usque，拿一次 warp=on 的 trace。"""
     inbound_port, socks_port = free_port(), free_port()
@@ -124,7 +136,8 @@ def probe(node: dict, device: Path, timeout: float = 25.0) -> dict:
 
     procs = []
     try:
-        p = subprocess.Popen([SINGBOX, "run", "-c", str(sb_cfg)],
+        env = _clean_env()
+        p = subprocess.Popen([SINGBOX, "run", "-c", str(sb_cfg)], env=env,
                              stdout=subprocess.DEVNULL,
                              stderr=open(sb_log, "w"), start_new_session=True)
         procs.append(p)
@@ -136,8 +149,8 @@ def probe(node: dict, device: Path, timeout: float = 25.0) -> dict:
             [str(device / "usque"), "-c", str(conf), "socks", "--http2",
              "-s", "", "-P", str(inbound_port),
              "-b", "127.0.0.1", "-p", str(socks_port)],
-            cwd=str(device), stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True)
+            cwd=str(device), env=env, stdout=subprocess.DEVNULL,
+            stderr=open(td / "usque.log", "w"), start_new_session=True)
         procs.append(u)
         if not wait_port(socks_port, 12):
             return {"ok": False, "stage": "port"}
@@ -233,6 +246,30 @@ def _failed_recently(rec: dict, now: float, ttl: float) -> bool:
     return (now - float(ts)) < ttl
 
 
+def _canary_tag(nodes: dict) -> str | None:
+    """挑一条生产线正在使用的节点当金丝雀。"""
+    try:
+        rows = json.loads((PROJECT / ".warp/h2/channels.json").read_text())
+    except (OSError, ValueError):
+        return None
+    for r in rows:
+        t = r.get("node")
+        if t and t in nodes:
+            return t
+    return None
+
+
+def _canary_round(node: dict, dev: Path, rounds: int = 2) -> tuple[bool, str]:
+    """用金丝雀节点验证探测链路本身。返回 (是否通过, 最后一轮错误)。"""
+    last = ""
+    for _ in range(rounds):
+        rec = probe(node, dev)
+        if rec.get("ok"):
+            return True, ""
+        last = f"{rec.get('stage')} {rec.get('err', '')}".strip()
+    return False, last
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="H2/MASQUE 承载实测（独立探测设备）")
     ap.add_argument("--tags", nargs="*", help="要测的节点 tag")
@@ -249,6 +286,8 @@ def main() -> int:
                     help="测过的结论台账；--new-only 据此跳过已测节点")
     ap.add_argument("--retest", action="store_true",
                     help="忽略台账，强制重测（节点换策略或换中继后用）")
+    ap.add_argument("--skip-canary", action="store_true",
+                    help="跳过金丝雀护栏（仅在你确信探测链路健康时用）")
     args = ap.parse_args()
 
     devs = [Path(d) for d in args.devices if (Path(d) / "config.json").exists()]
@@ -265,6 +304,21 @@ def main() -> int:
             raise SystemExit("✗ 没有可用的探测设备，且自动注册失败")
 
     nodes = load_nodes(args.config)
+    # **金丝雀护栏**：先用一条「生产线正在用」的节点验证探测链路本身。
+    # 链路（usque→本地 sing-box→节点→CF MASQUE 端点）会因 CF 端点证书轮换、
+    # 边缘异常等原因整体失效，此时**所有**节点都会被判失败；失败结论一旦写进
+    # 台账就把好节点永久拉黑（历史上 158 个节点卡死即此）。金丝雀不过 = 本轮
+    # 结论不可信，直接放弃，台账一字不动。
+    if not args.skip_canary:
+        canary = _canary_tag(nodes)
+        if canary:
+            cok, cerr = _canary_round(nodes[canary], devs[0])
+            if not cok:
+                print(f"✗ 探测链路自身不可用（金丝雀 {canary} 失败：{cerr}）"
+                      f"——本轮不写任何失败结论，台账保持不变", flush=True)
+                return 3
+            print(f"· 金丝雀通过：{canary}", flush=True)
+
     # 已测台账：只跳过**测过且失败**的节点。成功的已经入块了，`new-only`
     # 的 colo 判据本来就会跳过它们；不记失败的话，82 个不能承载的节点每天
     # 都会被重测一遍（串行 + 每台 20s，等于空转半小时）。

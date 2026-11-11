@@ -43,6 +43,7 @@ import argparse
 import json
 import os
 import secrets
+import random
 import socket
 import subprocess
 import sys
@@ -60,6 +61,13 @@ NODE_TYPES = {"vless", "vmess", "trojan", "anytls", "shadowsocks", "hysteria2"}
 OK, DEAD, ERROR = "ok", "dead", "error"
 DEMOTE_AFTER = 2       # 连续几轮不通才降级（给抖动一次机会）
 POOL_RECHECK_HOURS = 6  # 池内节点多久复测一次（防止"进池即失联"）
+# 首跑全量有 247 条节点（实测），单节点 7s、判死还要 14s 复测，整轮可能
+# 超过 daemon 给的子进程预算。被 SIGKILL 时 finally 不跑、状态不落盘，下一轮
+# 又从全量开始 —— 永远写不出 .dormant_state.json。所以按预算主动收尾：
+# 每 CHECKPOINT_EVERY 条存一次进度，预算用尽就正常退出 RC_MORE（未完待续）。
+CHECKPOINT_EVERY = 10
+DEFAULT_MAX_SECONDS = 1800
+RC_MORE = 8            # 进度已存、还有剩余，调度器必须立即续跑（不等待）
 
 
 def selector_tag() -> str:
@@ -99,15 +107,23 @@ def load_state() -> dict:
         with open(STATE) as f:
             d = json.load(f)
         if isinstance(d.get("nodes"), dict):
+            d.setdefault("pending", [])
             return d
     except (OSError, ValueError):
         pass
-    return {"nodes": {}}
+    return {"nodes": {}, "pending": []}
 
 
-def save_state(st: dict) -> None:
-    """原子写：唯一临时名 + fsync + 0600，崩溃也不会留下空文件。"""
-    st["updated"] = time.time()
+def save_state(st: dict, final: bool = True) -> None:
+    """原子写：唯一临时名 + fsync + 0600，崩溃也不会留下空文件。
+
+    `final=False` 是**进度存盘**：`updated` 写 0、`complete` 写 False。
+    绝不能把进度存盘写成 updated=now —— daemon 会以为本轮体检完成，把剩下
+    两百条压到 6 小时后才测。写 0 的效果是「这轮没跑完，立刻续跑」，
+    正好符合主人定标的「探测不等待」。
+    """
+    st["updated"] = time.time() if final else 0.0
+    st["complete"] = bool(final)
     fd, tmp = tempfile.mkstemp(dir=str(ROOT), prefix=".dormant_state.", suffix=".tmp")
     try:
         os.fchmod(fd, 0o600)
@@ -132,12 +148,68 @@ def save_state(st: dict) -> None:
         raise
 
 
-def free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+def _ephemeral_range() -> tuple[int, int]:
+    """内核把出站连接的**源端口**也从这个范围里分。读不到就按 Linux 缺省。"""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            lo, hi = (int(x) for x in f.read().split())
+        return lo, hi
+    except (OSError, ValueError):
+        return 32768, 60999
+
+
+def free_port(exclude=None) -> int:
+    """抽一个此刻确实能 bind、且**不在内核临时端口段内**的端口。
+
+    WHY 不能再用 bind(0)（2026-11-11 实测）：
+      本机 ip_local_port_range = 43255..47350，只有 4096 个；112 条 WARP 线
+      加上大量探测出站把这段占得很满。`bind(0)` 返回的往往是段内的
+      "孤立空隙"，而旧 build_tmp_cfg 把第二个入站端口硬推成 `mixed+1`
+      —— 实测连抽 20 组，`mixed+1` 有 16 组已被占用（80%）。于是临时
+      sing-box 每次都 FATAL 在 mixed-lan，探测永远写不出状态文件。
+      换一组端口重试没用：换掉的只有基址，`+1` 照撞。
+
+    避开的第二个好处：出站源端口永远不会落到探测实例监听的端口上，
+    真正的 TOCTOU 只剩"另一个进程恰好也挑了这段保留端口"，概率极低，
+    main() 里保留的两次重试足够兜住。
+    """
+    blocked = set(exclude or ())
+    lo, hi = _ephemeral_range()
+    # 临时段之外的两段保留区；本机的 H2 direct 入站占着 228xx，所以必须
+    # 逐个真 bind 校验，不能挑了就用。
+    # 审查修正（2026-11-11）：旧版 low 从 20000 起、high 到 60000 止，
+    # 内核 lo<20000 时 low 为空、hi>=60000 时 high 为空 —— 两段同时为空
+    # 就退回 bind(0)，正好回到这次要修掉的老缺陷。两端放宽到协议合法边界，
+    # 反正每个候选都会真 bind 校验。
+    low = range(1024, min(lo, 32000))
+    high = range(max(hi + 1, 48000), 65535)
+    candidates = list(low) + list(high)
+    random.shuffle(candidates)
+    # 上限只防极端占满时遍历上万个端口；正常第一个候选就返回。
+    for port in candidates[:4096]:
+        if port in blocked:
+            continue
+        sk = socket.socket()
+        try:
+            sk.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            sk.close()
+    # 保留段全被占（异常）才退回内核分配；仍做排除检查，最多试 256 次。
+    for _ in range(256):
+        sk = socket.socket()
+        try:
+            sk.bind(("127.0.0.1", 0))
+            port = sk.getsockname()[1]
+        except OSError:
+            continue
+        finally:
+            sk.close()
+        if port not in blocked:
+            return port
+    raise RuntimeError("找不到空闲端口（保留段与内核临时段都被占满）")
 
 
 def kill_orphans() -> int:
@@ -200,15 +272,18 @@ def targets(all_nodes: bool) -> list[str]:
 
 def build_tmp_cfg(secret: str, mixed: int, clash: int, cfg=None) -> str:
     cfg = cfg if cfg is not None else json.load(open(LIVE))
-    port = mixed
-    used = {clash}
-    for inb in cfg.get("inbounds", []):
-        while port in used:          # 别和 clash API 或其它入站撞端口
-            port += 1
+    used = {mixed, clash}
+    for idx, inb in enumerate(cfg.get("inbounds", [])):
+        if idx == 0:
+            port = mixed                 # curl 用的代理端口，由 main 传入
+        else:
+            # 每个入站各自抽一个**实测空闲**的端口。旧代码是 `port += 1`
+            # 硬推，而基址是临时段里的孤立空隙，+1 实测 80% 已被出站连接
+            # 占用 → 临时实例次次 FATAL（详见 free_port 的注释）。
+            port = free_port(used)
         inb["listen"] = "127.0.0.1"      # 显式环回，缺省是 0.0.0.0
         inb["listen_port"] = port
         used.add(port)
-        port += 1
     cfg["experimental"]["clash_api"].update(
         {"external_controller": f"127.0.0.1:{clash}", "secret": secret})
 
@@ -254,20 +329,24 @@ def port_open(port: int) -> bool:
 
 
 _LAST_HTTP: dict = {}      # tag → 这次探到的 HTTP 码（或 "port-closed"）
+_LAST_ERROR: str = ""      # 最近一次 ERROR 的具体原因（首条故障会打进日志）
 
 
 def probe_one(tag: str, secret: str, clash: int, mixed: int, timeout: int) -> str:
+    global _LAST_ERROR
     _LAST_HTTP.pop(tag, None)      # 提前 return 时别留上一轮的码
     try:
         api(f"/proxies/{selector_tag()}", secret, clash, {"name": tag})
-    except Exception:
+    except Exception as e:
+        _LAST_ERROR = f"clash API 切换失败：{type(e).__name__}: {e}"
         return ERROR
     try:
         r = subprocess.run(
             ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
              "--max-time", str(timeout), "-x", f"http://127.0.0.1:{mixed}", TEST_URL],
             capture_output=True, text=True)
-    except Exception:
+    except Exception as e:
+        _LAST_ERROR = f"curl 执行失败：{type(e).__name__}: {e}"
         return ERROR
     _LAST_HTTP[tag] = (r.stdout or "").strip() or "?"
     if r.stdout.strip() in ("204", "200"):
@@ -276,6 +355,8 @@ def probe_one(tag: str, secret: str, clash: int, mixed: int, timeout: int) -> st
     # 把 000 一律当故障会让"整批垮掉"这件事永远看不见；反过来一律当死，
     # 代理端口没了也会被记成节点死。用本地端口在不在来区分。
     if not port_open(mixed):
+        _LAST_ERROR = (f"临时代理端口 {mixed} 已关闭"
+                       "（临时 sing-box 实例可能中途崩了）")
         _LAST_HTTP[tag] = "port-closed"
         return ERROR
     return DEAD
@@ -322,15 +403,19 @@ def main() -> int:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            # 必须返回非 0：调度器按退出码决定"6h 后再来"还是"30 分钟后重试"。
+            # 以前这里 return 0，等于把"并发跳过"伪装成体检成功。
             print("另一个探测实例正在跑，本次退出（不写状态）")
             os.close(lock_fd)
-            return 0
+            return 7
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--timeout", type=int, default=7)
+    ap.add_argument("--max-seconds", type=int, default=DEFAULT_MAX_SECONDS,
+                    help="本轮体检的时间预算；用尽就存进度并退出 RC_MORE，绝不硬扛到被 kill")
     args = ap.parse_args()
 
     st = load_state()
@@ -341,7 +426,16 @@ def main() -> int:
         print("状态文件为空 → 自动转全量体检（否则会静默什么都不测）", flush=True)
         all_nodes = True
 
-    tags = targets(all_nodes)
+    resumed = [t for t in st.get("pending", []) if isinstance(t, str) and t]
+    if resumed and not args.all:
+        # 上一轮预算用尽：只测剩下的，不重新全量。断点续跑靠落盘的 pending，
+        # 不能靠 targets() —— 它对「池外节点」每轮都返回，永远不会收敛。
+        tags = resumed
+        print(f"续跑上次未完成的体检：剩 {len(tags)} 条", flush=True)
+    else:
+        tags = targets(all_nodes)
+        if not args.dry_run:
+            st["pending"] = list(tags)
     if args.limit:
         tags = tags[: args.limit]
     if not tags:
@@ -372,19 +466,17 @@ def main() -> int:
     # 换一组端口通常就好了。
     for attempt in (1, 2):
         secret = secrets.token_urlsafe(18)
-        mixed, clash = free_port(), free_port()
-        for _tries in range(6):
-            if clash != mixed:
-                break
-            # build_tmp_cfg 的 used={clash} 会把 mixed 入站顶到 mixed+1，而探测仍然
-            # curl {mixed}（那是 clash API）→ 整批失败、整池被判死并落盘。撞号概率
-            # 约 1/3000，但代价是"整池归零"，必须挡。重抽也限次：真被内核反复
-            # 发同一个端口时，宁可这轮跳过，也别无日志地卡到 TimeoutStartSec。
-            mixed = free_port()
-        else:
-            print("✗ 端口分配反复撞号，本轮跳过（不写状态）", flush=True)
+        # clash API 绝不能和 mixed 同号：探测 curl {mixed} 会打到 clash API，
+        # 整批失败并把整池判死落盘。现在由 exclude 直接保证，不再靠重抽。
+        mixed = free_port()
+        clash = free_port({mixed})
+        # 最多试两次。剩下的偶发风险只有 TOCTOU（端口在 sing-box bind 之前
+        # 被别的进程抢走），换一组端口通常就好。
+        try:
+            cfg_path = build_tmp_cfg(secret, mixed, clash, cfg=cfg_now)
+        except RuntimeError as e:
+            print(f"✗ 临时实例端口分配失败：{e}，本轮跳过（不写状态）", flush=True)
             return 5
-        cfg_path = build_tmp_cfg(secret, mixed, clash, cfg=cfg_now)
         errf = open(os.path.join(tempfile.gettempdir(),
                                  f"dormant-probe-{os.getpid()}-{attempt}.log"), "w+")
         os.chmod(errf.name, 0o600)
@@ -450,10 +542,19 @@ def main() -> int:
     alive: list[str] = []
     errors = 0
     transitions: list[tuple[str, bool, bool]] = []   # (tag, 之前, 现在)
+    started = time.time()
+
+    def _mark_done(t: str) -> None:
+        st["pending"] = [x for x in st.get("pending", []) if x != t]
 
     try:
         known = set(st["nodes"])
         for i, tag in enumerate(tags, 1):
+            if tag not in fps:
+                # 续跑期间订阅换过、这个 tag 已不在现役配置里：直接销账，
+                # 别让幽灵 tag 计入 errors 把整轮误判成「探测链路坏」。
+                _mark_done(tag)
+                continue
             res = probe_one(tag, secret, clash, mixed, args.timeout)
             if res == DEAD and tag not in known:
                 # 完全没历史的节点，单次 7s 超时就判死太狠（它可能只是慢）：
@@ -462,6 +563,11 @@ def main() -> int:
             if res == OK:
                 alive.append(tag)
             elif res == ERROR:
+                if errors == 0:
+                    # 首条故障的原因最值钱：225/247 全 error 时，光看
+                    # "探测故障" 分不清是实例崩了、API 挂了还是端口没了。
+                    print(f"  ⚠ 首条探测故障原因：{_LAST_ERROR or '未知'}",
+                          flush=True)
                 errors += 1
             code = _LAST_HTTP.get(tag, "")
             print(f"  [{i}/{len(tags)}] {res:<5} {tag[:48]}"
@@ -474,6 +580,7 @@ def main() -> int:
                 old_e = st["nodes"].get(tag)
                 if isinstance(old_e, dict):
                     old_e["result"] = "error"
+                _mark_done(tag)
                 continue
             old = st["nodes"].get(tag)
             # tag 是订阅到达顺序分配的，可能换指另一个物理节点。指纹不符就把旧
@@ -495,6 +602,18 @@ def main() -> int:
             st["nodes"][tag] = {"alive": alive_now, "checked": time.time(),
                                 "reason": "probe", "strikes": strikes,
                                 "result": res, "fp": fps.get(tag, "")}
+            _mark_done(tag)
+            truncated = (args.max_seconds > 0 and
+                         time.time() - started >= args.max_seconds)
+            if not args.dry_run and (i % CHECKPOINT_EVERY == 0 or truncated):
+                save_state(st, final=False)
+            if truncated:
+                # 正常 return（不是被 SIGKILL）：外层 finally 会清掉临时实例，
+                # 状态已落盘且 updated=0 → daemon 下一 tick 立刻续跑剩下的。
+                print(f"⏱ 本轮体检预算 {args.max_seconds}s 用尽：进度已存，"
+                      f"剩 {len(st.get('pending') or [])} 条立即续跑（不等待）",
+                      flush=True)
+                return RC_MORE
     finally:
         if proc is not None:
             proc.terminate()
@@ -559,6 +678,7 @@ def main() -> int:
     if args.dry_run:
         print("（--dry-run，未写状态）")
         return 0
+    st["pending"] = []
     save_state(st)
     dead = sum(1 for v in st["nodes"].values() if v.get("alive") is False)
     tail = ("：" + ", ".join(t[:32] for t in stale[:6])) if stale else ""

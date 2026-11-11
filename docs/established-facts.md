@@ -264,13 +264,29 @@ opencode 限流"，不是"隧道不通"。结果 22 条线全被判死，包括�
 **上限仍在**：循环由 `ready_timeout_sec × max_attempts`（默认 12×3=36s）收住，
 到点返回 `None` 交调用方重启。所以"不等待"不等于"无限等"。
 
+**同一口径的三处（2026-11-11 第二轮审查补齐）**：
+- `line_probe_cadence_sec = 0`：探完立刻重新排队；
+- `probe_unknown_retry_sec = 0`：探不到结论立刻重排，旧值 5s 已归零；
+- `probe_max_per_min = 0`：不限频。
+另外 `_DORMANT_PROBE_RETRY_SEC = 0`：沉睡池体检失败或分批续跑一律立即重试，
+不设 30 分钟退避窗口。
+
+**边界（不属红线，别顺手归零）**：`prober_idle_wait_sec`（探测器**全都闲着**
+时条件变量的等待超时，有 due 立刻唤醒，归零只会让主循环空转烧 CPU）、
+`idle_wait_sec` / `fallback_idle_wait_sec`（换线时等旧连接字节流排空）、
+`ip_refresh_retry_sec`（补刷路径的整体上限）。这些不是「两次探测之间的间隔」。
+
 **不要动**：
 - 不许把 `time.sleep(0)` 改成 `sleep(>0)`、退避曲线、指数间隔；
 - 不许新增任何"探测轮询间隔"配置项（`probe_poll_sec` / `poll_gap_sec` 之类）；
-- 不许把 `_line_probe_cadence()` 的兜底改回 60。
+- 不许把 `_line_probe_cadence()` 的兜底改回 60，或把
+  `_line_unknown_retry()` 的兜底改回 5；
+- 不许恢复 `_line_probe_cadence()` 的第二份定义（后者会静默覆盖前者）。
 
 红线用例：`test_probe_refresh_egress_never_waits_between_polls`（断言 sleep 实参
-只能是 0）、`test_line_probe_cadence_defaults_to_zero`。改上述任一处这两条就转红。
+只能是 0）、`test_line_probe_cadence_defaults_to_zero`、
+`test_unknown_retry_never_waits`、
+`test_probe_wait_rules_have_no_duplicate_or_stale_reference`。改上述任一处就转红。
 
 ---
 

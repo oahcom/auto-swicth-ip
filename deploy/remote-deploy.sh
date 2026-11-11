@@ -111,9 +111,20 @@ python3 -m py_compile config.py daemon.py warp_wg.py warp_blocks.py
 # 打到 23，服务瘫了 5 分钟。
 # WHY 放在这里：`git reset --hard` 之后（第 103 行）—— 检查的是**远端实际
 # 将要运行的代码**；且必须在第 431 行 `systemctl restart` **之前**。
-if [ -f tools/check_undefined_names.py ]; then
-    python3 tools/check_undefined_names.py daemon.py \
-        || { echo "✗ 远端 daemon.py 有未定义名字，拒绝部署" >&2; exit 1; }
+if [ ! -f tools/check_undefined_names.py ]; then
+    echo \"✗ 远端缺少静态名字关卡脚本，拒绝部署\" >&2; exit 1
+fi
+python3 tools/check_undefined_names.py daemon.py dormant_probe.py config.py warp_wg.py warp_blocks.py parse_subscription.py \\
+    || { echo \"✗ 远端核心模块有未定义名字，拒绝部署\" >&2; exit 1; }
+# 关卡 drop-in 随代码下发：旧版只在本机手工放过，远端「改文件 + restart」
+# 这条最常见的路径没有 ExecStartPre。只有单元自带 WorkingDirectory 才能下，
+# 因为关卡用的是相对路径 + WorkingDirectory（见 conf 里的 WSL 命名空间注释）。
+if systemctl cat auto-switch-ip.service 2>/dev/null | grep -q '^WorkingDirectory='; then
+    sudo mkdir -p /etc/systemd/system/auto-switch-ip.service.d
+    sudo cp deploy/auto-switch-ip-precheck.conf /etc/systemd/system/auto-switch-ip.service.d/10-precheck.conf
+    sudo systemctl daemon-reload
+else
+    echo \"⚠ 远端单元没有 WorkingDirectory，跳过 drop-in\" >&2
 fi
 echo \"  已同步到 \$(git rev-parse --short HEAD) \$(git log -1 --format=%s)\""
 

@@ -121,7 +121,9 @@ def test_probe_unknown_ip_does_not_restart(monkeypatch):
     daemon._probe_one_line(m)
     st = daemon._warp_line_state("W2")
     assert st["last_verdict"] == "unknown"
-    assert st["next_probe_ts"] > time.time()
+    # 定标 12b：探不到结论立刻重新排队，两次探测之间不插等待。
+    # 旧断言 `> time.time()` 是 `probe_unknown_retry_sec=5` 时代的语义。
+    assert st["next_probe_ts"] <= time.time() + 0.01
     assert restarted == []
 
 

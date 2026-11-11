@@ -369,3 +369,80 @@ def test_consistency_check_not_on_pre_probe_startup_path():
     i_check = main_body.index("_config_consistency_check()")
     assert i_check > i_probe, \
         "启动自检必须排在探测线程启动之后 —— 观测代码不该在关键路径上"
+
+
+# ------------------------------- ④ 审查第二轮：台账外残留 / 热载 mtime 顺序
+
+
+def test_tier_reconcile_clears_orphan_wg_conclusions(monkeypatch, tmp_path):
+    """台账外 WG 线（补位池 23+ / 缩容遗留）的冻结结论必须被清掉。
+
+    实测现场（2026-11-11 审计 + .warp_line_state.json）：WARP-WG-23..30
+    的 last_verdict 停在 31~36 小时前，报表把旧值显示成「运维停用」。
+    旧 `_tier_reconcile` 只遍历 members，这些线永远遍历不到 —— 停用侧
+    清理函数写得再对也覆盖不到它们。
+    """
+    mod, state_path = _load_daemon(monkeypatch, tmp_path, state_lines={
+        "WARP-WG-23": {"last_verdict": "OK", "last_probe_ts": 100.0,
+                       "ip": "1.2.3.4", "ban_probes": [[time.time(), "quota"]]},
+        "WARP-WG-26": {"last_verdict": "blocked", "last_probe_ts": 200.0,
+                       "ip": None},
+        "WARP-WG-1": {"last_verdict": "OK", "last_probe_ts": 300.0},
+    })
+    mod._load_warp_line_state()
+    monkeypatch.setattr(mod, "log", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_warp", lambda: {"members": [
+        {"tag": "WARP-WG-1", "kind": "wg",
+         "service": "warp-wg-1.service", "index": 1}]})
+    # 无档位文件 → 对账循环直接 return，只验证「台账外清理」这一段
+    monkeypatch.setattr(mod.warp_blocks, "tier_spec", lambda: (None, None))
+
+    mod._tier_reconcile()
+
+    for tag in ("WARP-WG-23", "WARP-WG-26"):
+        st = mod._warp_line_state_locked(tag)
+        assert st["last_verdict"] == ""
+        assert st["last_probe_ts"] == 0.0
+        assert st["ip"] is None
+    assert len(mod._warp_line_state_locked("WARP-WG-23")["ban_probes"]) == 1, \
+        "当天的历史证据不许一起抹掉"
+    assert mod._warp_line_state_locked("WARP-WG-1")["last_verdict"] == "OK", \
+        "在册的线不该被误清"
+    disk = json.loads(state_path.read_text(encoding="utf-8"))
+    assert disk["lines"]["WARP-WG-23"]["last_verdict"] == "", \
+        "清理必须落盘，不能只在内存里生效"
+
+
+def test_h2_reload_does_not_advance_mtime_on_read_failure(monkeypatch, tmp_path):
+    """读台账失败必须下轮重试：旧版先推进 mtime，一次瞬态把变更永久吞掉。"""
+    mod, _ = _load_daemon(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod, "log", lambda *a, **k: None)
+    mod._H2_CHANNELS_MTIME = 1.0
+    monkeypatch.setattr(mod, "_h2_channels_mtime", lambda: 2.0)
+    monkeypatch.setattr(mod, "_h2_members_from_ledger", lambda: [])
+
+    assert mod._refresh_h2_members() is False
+    assert mod._H2_CHANNELS_MTIME == 1.0, "读失败不许推进 mtime"
+
+    monkeypatch.setattr(mod, "_h2_members_from_ledger", lambda: [
+        {"tag": "WARP-H2-NRT-1", "kind": "h2", "port": 40001,
+         "service": "usque-h2-1.service", "index": 1}])
+    monkeypatch.setattr(mod, "_warp", lambda: {"members": []})
+    monkeypatch.setattr(mod, "_drop_orphan_scan_state", lambda: 0)
+    assert mod._refresh_h2_members() is True, "下轮必须能重试成功"
+    assert mod._H2_CHANNELS_MTIME == 2.0
+
+
+def test_tier_reload_keeps_state_on_bad_ledger(monkeypatch, tmp_path):
+    """档位台账读不出来时保持现状：空集合 = 把 30 条停用线全部解禁。"""
+    mod, _ = _load_daemon(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod, "log", lambda *a, **k: None)
+    mod._TIER_MTIME = 1.0
+    mod._TIER_DISABLED = {"WARP-WG-9"}
+    monkeypatch.setattr(mod, "_tier_mtime", lambda: 2.0)
+    monkeypatch.setattr(mod.warp_blocks, "tier_spec", lambda: (None, None))
+
+    assert mod._refresh_tier_disabled() is False
+    assert mod._TIER_MTIME == 1.0
+    assert mod._TIER_DISABLED == {"WARP-WG-9"}, \
+        "坏台账不许把停用线批量解禁"

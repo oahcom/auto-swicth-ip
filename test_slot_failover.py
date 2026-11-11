@@ -83,6 +83,14 @@ def isolated(monkeypatch):
         return {"verdict": "OK", "sec": 2.0, "detail": "", "retry_after": None,
                 "elapsed": 2.0, "ts": 0.0}
     monkeypatch.setattr(daemon, "_probe_line_before_rotate", probe)
+    # `_probe_line_for_slots` 现在默认读渠道级缓存结论（`_channel_verdict_snapshot`），
+    # 只有 slot_switch_probe=True 才走上面的实测桩。测试沙箱里没有真实状态台账，
+    # 缓存路径会返回 unknown → 槽位被标 bad。让快照转发到当前实测桩，
+    # 这样「按探测结果标记」的断言在两种开关下都成立，且后面用例改写
+    # `_probe_line_before_rotate` 时也能连带生效。
+    def cached_snapshot(tag, ip):
+        return daemon._probe_line_before_rotate(tag, ip)
+    monkeypatch.setattr(daemon, "_channel_verdict_snapshot", cached_snapshot)
 
     monkeypatch.setattr(daemon, "log", lambda *a, **k: None)
 

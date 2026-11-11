@@ -4400,6 +4400,22 @@ def test_line_probe_cadence_defaults_to_zero(monkeypatch):
     assert daemon._line_probe_cadence() == 0.0
 
 
+def test_unknown_retry_never_waits(monkeypatch):
+    """探不到结论就立刻重排：旧值 5s 是探测等待，与 12b 定标冲突。"""
+    monkeypatch.setattr(daemon, "_warp", lambda: {})
+    assert daemon._line_unknown_retry() == 0.0
+
+
+def test_probe_wait_rules_have_no_duplicate_or_stale_reference():
+    """红线防篡改：节奏函数只能有一份，文档引用必须指向 12b。"""
+    with open(daemon.__file__, encoding="utf-8") as f:
+        src = f.read()
+    assert src.count("def _line_probe_cadence") == 1, \
+        "重复定义会让改前面那份不生效，削弱红线的防篡改能力"
+    assert "established-facts.md` 12b 条" in src
+    assert 'return float(_warp().get("probe_unknown_retry_sec", 0))' in src
+
+
 def test_probe_refresh_egress_skips_retry_on_success(monkeypatch):
     """首探就成功时不得再探 —— 每次探测都走一次出口，白探会多烧配额。"""
     calls = []

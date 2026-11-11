@@ -201,6 +201,11 @@ def test_install_refuses_to_retarget_live_units(tmp_path):
     here = tmp_path / "this-clone"
     shutil.copytree(PROJECT / "deploy", here / "deploy")
     shutil.copytree(PROJECT / "asip", here / "asip")
+    # install.sh 现在把「静态名字关卡脚本缺失」当硬失败（不再静默跳过），
+    # 演练用的 clone 必须把 tools/ 里的关卡一起带上。
+    (here / "tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PROJECT / "tools/check_undefined_names.py",
+                 here / "tools/check_undefined_names.py")
     for f in ("config.py", "requirements.txt"):
         shutil.copy2(PROJECT / f, here / f)
     shutil.copy2(PROJECT / "sing-box", here / "sing-box")
@@ -340,7 +345,14 @@ def test_install_renders_units_on_fresh_host(tmp_path):
     here = tmp_path / "clone"
     shutil.copytree(PROJECT / "deploy", here / "deploy")
     shutil.copytree(PROJECT / "asip", here / "asip")
-    for f in ("config.py", "requirements.txt", "sing-box"):
+    # install.sh 现在把「静态名字关卡脚本缺失」当硬失败（不再静默跳过），
+    # 演练用的 clone 必须把 tools/ 里的关卡一起带上。
+    (here / "tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PROJECT / "tools/check_undefined_names.py",
+                 here / "tools/check_undefined_names.py")
+    for f in ("config.py", "daemon.py", "dormant_probe.py", "warp_wg.py",
+              "warp_blocks.py", "parse_subscription.py",
+              "requirements.txt", "sing-box"):
         shutil.copy2(PROJECT / f, here / f)
     unit_dir = tmp_path / "units"
     fake_home = tmp_path / "home"
@@ -357,7 +369,11 @@ def test_install_renders_units_on_fresh_host(tmp_path):
     # install.sh 只负责 usque 线：WG/H2 单元的渲染器各自独立（见 members.py 注释）。
     usque = [m for m in config.CFG["warp"]["members"]
              if m.get("kind") not in ("wg", "h2")]
-    assert len(list(unit_dir.iterdir())) == len(usque) + 3
+    # 只数文件：部署前关卡的 drop-in 是 `auto-switch-ip.service.d/` 目录，
+    # 它也是这次部署的合法产物，但不能混进「单元文件条数」里。
+    assert len([p for p in unit_dir.iterdir() if p.is_file()]) == len(usque) + 3
+    assert (unit_dir / "auto-switch-ip.service.d/10-precheck.conf").exists(), \
+        "部署前关卡必须随单元一起下发，否则远端 restart 路径没有 ExecStartPre"
     # 部署必须顺带产出 asip 设置与入口：CLI 不含任何站点设置，缺了它整条运维
     # 命令链（日志/换线/隧道）都不可用，而这些正是部署后第一个要用的东西。
     assert (tmp_path / "home/.config/asip/cli.env").exists(), "未生成 asip 设置"
@@ -374,7 +390,14 @@ def test_rehearsal_settings_point_at_the_rehearsal_units(tmp_path):
     here = tmp_path / "clone"
     shutil.copytree(PROJECT / "deploy", here / "deploy")
     shutil.copytree(PROJECT / "asip", here / "asip")
-    for f in ("config.py", "requirements.txt", "sing-box"):
+    # install.sh 现在把「静态名字关卡脚本缺失」当硬失败（不再静默跳过），
+    # 演练用的 clone 必须把 tools/ 里的关卡一起带上。
+    (here / "tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PROJECT / "tools/check_undefined_names.py",
+                 here / "tools/check_undefined_names.py")
+    for f in ("config.py", "daemon.py", "dormant_probe.py", "warp_wg.py",
+              "warp_blocks.py", "parse_subscription.py",
+              "requirements.txt", "sing-box"):
         shutil.copy2(PROJECT / f, here / f)
     unit_dir = tmp_path / "rehearsal-units"
     fake_home = tmp_path / "home"
