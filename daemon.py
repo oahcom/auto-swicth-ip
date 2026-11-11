@@ -13515,8 +13515,11 @@ def _scan_unit_still_on_disk(tag: str) -> bool:
         idx = m2.group(1)
         # 当前台账里已有同编号的线 → 单元文件在磁盘上是正常的（编号不回收）
         try:
-            rows = json.loads(
-                (PROJECT / ".warp" / "h2" / "channels.json").read_text())
+            # 用 os.path 而非 pathlib：daemon.py 顶部**没有** import pathlib，
+            # 引入它就得改 import 块。跟随本文件既有惯例（全部用 os.path.join）。
+            rows = json.loads(open(
+                os.path.join(_PROJECT, ".warp", "h2", "channels.json"),
+                encoding="utf-8").read())
             for r in rows if isinstance(rows, list) else []:
                 if isinstance(r, dict) and str(r.get("index")) == idx:
                     return False

@@ -71,6 +71,14 @@ fi
 [ "$RENDER_ONLY" = 1 ] && exit 0
 
 echo "== 2/4 静态校验 =="
+# **未定义名字检查**：ast.parse 只查语法不查名字。`PROJECT` 写成 `_PROJECT`
+# 是合法语法但运行时抛 NameError —— daemon 被 systemd Restart=always 托管，
+# 那会变成「启动 -> 崩溃 -> 重启 -> 崩溃」的重启风暴（2026-11-11 实测 4 次
+# 重启才起来）。所以部署前必须有一道不启动进程就能发现它的关卡。
+if [ -f "$DIR/tools/check_undefined_names.py" ]; then
+    "$PYBIN" "$DIR/tools/check_undefined_names.py" "$DIR/daemon.py" \
+        || { echo "✗ daemon.py 有未定义名字，拒绝安装" >&2; exit 1; }
+fi
 "$PYBIN" "$DIR/deploy/verify_h2_render.py" || exit 1
 # sing-box check 是唯一能抓「规则语义写错」的检查：缺 action 的规则在 1.13 被当
 # reject，验证器已经查了，但 override 端口之类只有真解析才暴露。
