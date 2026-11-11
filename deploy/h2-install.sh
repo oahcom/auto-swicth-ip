@@ -11,6 +11,12 @@
 # 这个脚本负责落进 /etc/systemd/system，并先 reload 再启动 sing-box、最后 usque。
 #
 # 幂等：单元内容没变就不重启；usque 各线互不影响（一条挂了不重启其余）。
+#
+# **对账剪除**：台账外的 usque-h2-* 单元会被停用并从 systemd 移除（见步骤
+# 0/4）。默认只报告不执行 —— 剪除要写 /etc/systemd/system 且会停进程，
+# 属生产动作，用 `H2_PRUNE=1` 显式开启。渲染器本身只增不减，这是全仓
+# 第一处剪除实现：没有它，缩容留下的单元会永久留在磁盘上（实测 2026-10-28
+# 缩容留下 47 条，enabled 状态也没清，开机自启、空转占用 CPU 与内存）。
 # 换节点**不需要跑这个脚本**：daemon 直接 PUT 共享 sing-box 里那条线的 selector。
 # 只有改候选池（新节点进池）才要重装，那时只重启 asip-h2-singbox，不动 usque。
 set -euo pipefail
@@ -34,7 +40,26 @@ for arg in "$@"; do
     esac
 done
 
-echo "== 1/3 渲染 =="
+# == 0/4 对账剪除（必须在渲染之前）==
+# WHY 顺序不能反：`render_h2_lines.py` 的 `free_devices()` 按「设备是否被
+# active 单元持有」判空闲。台账外的僵尸单元在停掉之前是 active 的 ——
+# 它的设备会被判为「已被占用」，扩容时白白少一台可用设备。反过来（先分配
+# 后剪除）则会先把「马上要停的僵尸单元的设备」发给新线，剪除失败时两条线
+# 就同台设备、互抢 CF 会话身份。
+#
+# 剪除是唯一会**删除生产资源**的动作，所以带三道闸门（台账不在其中 /
+# 当前不 active / 不在保护名单），默认只报告；`H2_PRUNE=1` 才真执行。
+# 详见 deploy/reconcile_h2_units.py 的 docstring。
+if [ "${H2_PRUNE:-0}" = "1" ]; then
+    echo "== 0/4 对账剪除（执行）=="
+    "$PYBIN" "$DIR/deploy/reconcile_h2_units.py" --apply --unit-dir "$UNIT_DIR" \
+        || { echo "✗ 对账剪除失败，终止安装（不渲染、不启单元）" >&2; exit 1; }
+else
+    echo "== 0/4 对账剪除（报告；H2_PRUNE=1 才执行）=="
+    "$PYBIN" "$DIR/deploy/reconcile_h2_units.py" --unit-dir "$UNIT_DIR" || true
+fi
+
+echo "== 1/4 渲染 =="
 SB="$DIR/.warp/h2/singbox.json"
 SB_BEFORE="$(md5sum "$SB" 2>/dev/null | cut -d' ' -f1 || true)"
 if [ "$NO_RENDER" = 1 ]; then
@@ -45,14 +70,14 @@ else
 fi
 [ "$RENDER_ONLY" = 1 ] && exit 0
 
-echo "== 2/3 静态校验 =="
+echo "== 2/4 静态校验 =="
 "$PYBIN" "$DIR/deploy/verify_h2_render.py" || exit 1
 # sing-box check 是唯一能抓「规则语义写错」的检查：缺 action 的规则在 1.13 被当
 # reject，验证器已经查了，但 override 端口之类只有真解析才暴露。
 "$DIR/sing-box" check -c "$DIR/.warp/h2/singbox.json" \
     || { echo "✗ sing-box check 失败：.warp/h2/singbox.json" >&2; exit 1; }
 
-echo "== 3/3 安装单元 =="
+echo "== 3/4 安装单元 =="
 # 演练目录（SYSTEMD_DIR 非 /etc）不装 sudoers/asip-unit：那是系统级的路径。
 case "$UNIT_DIR" in
     /etc/systemd/*|/usr/lib/systemd/*)

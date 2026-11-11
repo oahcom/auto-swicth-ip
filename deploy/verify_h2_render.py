@@ -7,6 +7,8 @@
   3. 每条渠道的节点定义能从 dormant-outbounds.json 找到
   4. 设备目录有 config.json 且没被 active 单元占用
   5. 单元引用的脚本存在且可执行
+  6. 设备**争用**检查：一台设备被多个 active 单元持有 = 两线共用一个 CF
+     会话身份，会互相顶掉对方的 H2 会话
 
 用法: python3 deploy/verify_h2_render.py
 """
@@ -185,6 +187,24 @@ def check_devices(ledger: list[dict]) -> None:
         held = owner.get(r["device"])
         if held and held != r["unit"]:
             err(f"{r['unit']}: 设备 {r['device']} 已被 {held} 占用")
+
+    # **设备争用**：一台设备被多个 active 单元持有 = 两个 usque 进程共用
+    # 一个 CF 会话身份 → 它们会互相顶掉对方的 H2 会话。
+    #
+    # WHY 旧实现看不到：`device_owner()` 是覆盖式赋值，一台设备只留**最后
+    # 一个**持有者，于是「多持有」这个事实被彻底吞掉 —— 既不报错、也不告警。
+    # 实测 2026-11-11：6 台设备被 `usque-h2-*` 与 `usque-warp-*` 同时持有
+    # （usque3/5/6/7/8/9），其中 4 台是 H2 线与 CF 线互抢。症状像「配额不够」，
+    # 实际是自相残杀。
+    #
+    # 这里报**全部**持有者，不猜谁该让谁：让 CF 线迁走还是让 H2 线退让，
+    # 是人的决定。校验器的职责是把事实摆出来。
+    holders = rd.device_holders()
+    for dev, hs in sorted(holders.items()):
+        if len(hs) > 1:
+            err(f"设备 {dev} 被 {len(hs)} 个 active 单元同时持有: "
+                f"{', '.join(sorted(hs))} —— 它们共用同一个 CF 会话身份，"
+                f"会互相顶掉对方的 H2 会话")
 
 
 def check_units(ledger: list[dict]) -> None:

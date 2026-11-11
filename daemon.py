@@ -3888,6 +3888,33 @@ def _channel_ban_expand(samples: list) -> list:
     return out
 
 
+def _channel_blocked_note(tag: str, now: float) -> None:
+    """记一次「探测拿到地址、但该地址已在台账惩罚期」的观测。
+
+    WHY 单独记、不写进 `ban_probes`：`ban_probes` 是**渠道锁**的判据样本，
+    `_channel_ban_hold_hit` 要求当天样本**全部**判 quota 才锁线（出现任何
+    非 quota 结论就否决）。把 blocked 混进去会让这条线永远锁不上 ——
+    blocked 不是「渠道被烧穿」，是「这一个地址在惩罚期，换个地址就好」。
+
+    WHY 又必须记：`_probe_one_line` 拿到地址后先查台账（`_warp_ip_is_blocked`），
+    命中就直接 return，**根本不走到模型层实测**。于是这条线的状态是
+    「判了 blocked、`last_verdict` 写着 blocked、但 `ban_probes` 是空的」——
+    报表只能印「无样本」，读起来像「什么都没发生过」。实测 2026-11-11：
+    27 条 blocked 线里 12 条零样本，冻结 26 小时没人知道原因。
+
+    落盘形状沿用 `ban_probes` 的游程 `[起, 止, 条数, 结论]`，同结论相邻段
+    合并 —— 这条路径每分钟可触发数次，不压缩会让状态文件无界增长。
+    """
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        notes = st.get("blocked_notes")
+        if not isinstance(notes, list):
+            notes = st["blocked_notes"] = []
+        notes.append([now, now, 1, "blocked"])
+        _channel_ban_trim(notes, now)
+    _save_warp_line_state()
+
+
 def _channel_ban_hold_hit(samples: list, now: float) -> bool:
     """当天最近 N 条模型层实测是否**全部**判 quota。
 
@@ -6180,6 +6207,12 @@ def _probe_one_line(member: dict) -> None:
         return
     if _warp_ip_is_blocked(ip, now):
         _warp_line_record_observation(tag, ip, "blocked", time.time(), started_at)
+        # 这条路径**不写** `ban_probes`（那是渠道锁的判据样本，blocked 混进去
+        # 会让线永远锁不上），但必须留下痕迹：早退分支根本走不到模型层实测，
+        # 于是状态是「判了 blocked、`last_verdict` 写着 blocked、样本却是空的」。
+        # 报表看到零样本就会印「无样本」，把「这个地址在惩罚期、换地址就好」
+        # 读成「什么都没发生过」。见 `_channel_blocked_note` 的 WHY。
+        _channel_blocked_note(tag, now)
         if tag == active:
             _reconnect_warp_now("探测发现当前出口处于惩罚期", time.time())
         elif _line_node_cannot_carry(tag):
@@ -13429,6 +13462,224 @@ def _tier_reconcile() -> None:
         log(f"  · 档位对账：拉起 {started} 条 WG 线，并清空停用期陈旧观测")
 
 
+def _singbox_outbound_tags() -> set[str]:
+    """当前 sing-box 配置里带 tag 的 outbound 集合（读不到就返回空集）。
+
+    WHY 读不到时返回空集而不是报错：这份文件由订阅刷新流程原子替换，读到
+    半截 JSON 是真实可能（实测刷新时先写 .tmp 再 os.replace，中间有窗口）。
+    空集会被调用方当成「一个 outbound 都没有」，从而报出一堆假的「配置裂了」。
+    """
+    path = CFG["singbox"]["config_file"]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    out = data.get("outbounds") if isinstance(data, dict) else None
+    if not isinstance(out, list):
+        return set()
+    return {str(o.get("tag")) for o in out
+            if isinstance(o, dict) and o.get("tag")}
+
+
+def _scan_unit_still_on_disk(tag: str) -> bool:
+    """这条线的 systemd 单元文件此刻是否还在磁盘上。
+
+    WHY 需要查文件而不是查状态：单元**还在但已停** = 缩容残骸（渲染器
+    没删文件）→ 要剪；单元**不在了** = 只剩状态表的陈旧记录 → 不算问题。
+
+    「已停」不等于「没问题」：`h2-install.sh` 遍历的是渲染产物目录
+    `.warp/h2/units/`，那里的台账外单元文件会被 `install` 回 systemd 并
+    `enable` —— 单元文件还在磁盘上，就是僵尸复活的来源。
+
+    **两种 tag 形态都要覆盖**：
+      `WARP-H2-SCAN-<N>`  —— 探测时编造的假身份，编号直接对应单元编号。
+      `WARP-H2-<COLO>-<N>` —— 旧编号体系的线（当前台账用别的 colo）。
+                             它的单元编号是末尾的 N，但**当前台账里可能
+                             已经有同编号的线**（编号是端口契约，不回收）——
+                             这种情况下单元文件在磁盘上是**正常的**，不是残骸。
+                             所以对普通 H2 tag 必须额外确认「这个编号在
+                             当前台账里没有对应的线」。
+
+    查 `systemctl list-unit-files` 而不是遍历目录：前者是 systemd 自己的
+    账本，看到的才是真正会被加载的单元。
+    """
+    import re as _re
+    m = _re.fullmatch(r"WARP-H2-SCAN-(\d+)", tag)
+    if m:
+        name = f"usque-h2-{m.group(1)}.service"
+    else:
+        m2 = _re.fullmatch(r"WARP-H2-(?:[A-Z]+)-(\d+)", tag)
+        if not m2:
+            return False
+        idx = m2.group(1)
+        # 当前台账里已有同编号的线 → 单元文件在磁盘上是正常的（编号不回收）
+        try:
+            rows = json.loads(
+                (PROJECT / ".warp" / "h2" / "channels.json").read_text())
+            for r in rows if isinstance(rows, list) else []:
+                if isinstance(r, dict) and str(r.get("index")) == idx:
+                    return False
+        except (OSError, ValueError):
+            pass
+        name = f"usque-h2-{idx}.service"
+    try:
+        r = subprocess.run(["systemctl", "list-unit-files", "--type=service",
+                            "--no-legend", "--no-pager"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return any(line.split()[0] == name for line in (r.stdout or "").splitlines()
+               if line.split())
+
+
+def _config_consistency_check(now: float | None = None) -> dict:
+    """跨源一致性自检：把「配置分裂」当场变成一条明确的日志。
+
+    WHY 需要这个：线路的真相分散在 5 个地方 —— `config.CFG["warp"]["members"]`
+    （探测名单）、sing-box 配置的 outbounds（渲染产物）、systemd 单元（进程
+    事实）、`.warp_line_state.json`（状态台账）、`.warp/tiers.json`（档位）。
+    没有任何一处会校验其余几处，于是出现**半开状态**：文件里有线、daemon
+    看不见。实测 2026-11-11：`.warp_line_state.json` 里 156 条 tag，只有 87
+    条在 members 里；12 条 WG 线冻在 `last_verdict=blocked` 上 26 小时没动，
+    因为它们的 systemd 单元是 `disabled` —— 探测循环连碰都不碰它们，
+    报表上只印「档位停用 单元停用（线没跑）」，把「配置裂了」显示成「运维停用」。
+
+    这里只**报告**，不修：改配置属于人的决定。自检的价值是让人不必等到
+    25 小时后从报表里反推「为什么这条线没结论」。
+
+    返回各类问题的条数，调用方据此决定要不要打日志。
+    """
+    members = {m.get("tag"): m for m in (_warp().get("members") or [])
+               if m.get("tag")}
+    now = time.time() if now is None else now
+    declared_wg = {t for t, m in members.items() if m.get("kind") == "wg"}
+    outs = _singbox_outbound_tags()
+    # WHY 这里要兜底加载：`_config_consistency_check()` 是**只读**的自检，
+    # 手工调用（排查、测试）时状态表可能还没加载 —— 那时 state_tags 会是空集，
+    # 整个自检就退化成「什么都不���」并报 problems=0，形成**假阴性**：
+    # 明明有 47 条残骸，却报「一切正常」。
+    # 生产路径上启动自检在 `_load_warp_line_state()` 之后，不受此影响；
+    # 这里补一手是为了让「手工调用」与「生产调用」结论一致。
+    if not _WARP_LINE_STATE:
+        try:
+            _load_warp_line_state()
+        except Exception:
+            pass
+    state_tags = set(_WARP_LINE_STATE.keys())
+    tier_off = set(_TIER_DISABLED)
+
+    # 分类一：状态台账里有、探测名单里没有的线。这些线 daemon 永远不会去探，
+    # 状态会一直冻在最后一次观测上 —— 报表却把它们当「有结论」显示。
+    orphan_state = sorted(state_tags - set(members))
+    # 分类二：探测名单里有、但渲染产物里没有 outbound。探测会照探，但线
+    # 根本不在 sing-box 里，换线时 selector 翻不到它。
+    missing_out = sorted(t for t in members if t not in outs)
+    # 分类三：探测名单里有、但档位停用的线。档位停用是对的（省资源），
+    # 但它意味着这些线**不该有状态**；有状态说明档位切换时没清干净。
+    tier_off_with_state = sorted(t for t in members
+                                 if t in tier_off and t in state_tags)
+    # 分类四：状态台账里有、且是 WG、但不在 members 里的补位线（23+）。
+    # 这些线是**闲置补位池**，与档位无关，本来就不该被探测 —— 单独归类，
+    # 不与「真孤儿」混在一起报，否则真问题被淹没。
+    spare_wg = sorted(t for t in orphan_state
+                      if t.startswith("WARP-WG-") and t not in declared_wg)
+    # 分类五：扫描发现的隧道线（`WARP-H2-SCAN-<N>`）。它们**没有渲染产物**
+    # —— 单元在跑但 `channels.json` 里没有它的 tag。但「在跑」必须**查单元
+    # 状态**，不能靠 tag 前缀推断：实测 47 条 SCAN 线里对应的单元全是
+    # `inactive`（缩容时停掉的），只有曾经扫描到过而已。按前缀推断会把
+    # 47 条死线报成「单元在跑却没人探」—— 那是假警报，会盖住真问题。
+    #
+    # 2026-11-11 补充：SCAN 残骸再分两档 ——
+    #   单元还在磁盘（unit-files 里有）→ **台账外单元残骸**，是渲染器
+    #     只增不减的直接证据，是真问题（可以用 reconcile 剪除）。
+    #   单元文件已不在磁盘 → 只是状态表里的陈旧记录，不算问题。
+    # 真的「在跑却没人探」要看 `_scan_running_tunnels` 的结果。
+    scan_running = {tag for tag, _svc in _scan_running_tunnels(now).values()}
+    scan_unprobed = sorted(t for t in orphan_state
+                           if t.startswith("WARP-H2-SCAN-")
+                           and t in scan_running)
+    # 分类六：既不在渲染产物（channels.json）里、也不在补位池里的孤儿。
+    # 这些是**缩容遗留** —— 单元删了、渲染产物也清了，只剩状态表里的残骸。
+    # 它们不算故障，但状态表该清理，否则报表永远印着一堆「无样本」。
+    # **台账外单元残骸**：状态表里有、探测名单里没有、且对应的 systemd
+    # 单元文件**仍在磁盘上**。
+    #
+    # WHY 要按「单元文件是否还在磁盘」再分一档：状态表里的孤儿有四种截然
+    # 不同的来源（实测 100 条）：
+    #   47 条 `WARP-H2-SCAN-*` —— 缩容留下的单元残骸，单元文件仍在磁盘。
+    #                             这才是「渲染器只增不减」的直接证据。
+    #   14 条 `WARP-H2-LAX-*`  —— 旧编号体系的线（当前用 NRT/其他 colo）。
+    #                             单元文件早没了，只剩状态记录。
+    #   30 条 `WARP-WG-*`      —— 设计上的闲置补位池，本来就不该被探测。
+    #    9 条 `WARP-CF-*`      —— CF 直连线的成员，属于另一套命名体系。
+    # 后三类都不是故障。把它们混在一起报，会让「61 处不一致」这个数字
+    # 既不准确、也不可信 —— 收到告警的人第一反应就是「又是老账」，然后
+    # 真问题就被彻底埋掉了。**告警的精度决定它有没有人看。**
+    retired = sorted(t for t in orphan_state
+                     if t not in spare_wg and t not in scan_unprobed
+                     and _scan_unit_still_on_disk(t))
+
+    report = {
+        "members": len(members),
+        "outbounds": len(outs),
+        "state": len(state_tags),
+        "orphan_state": orphan_state,
+        "missing_out": missing_out,
+        "tier_off_with_state": tier_off_with_state,
+        "spare_wg": spare_wg,
+        "scan_unprobed": scan_unprobed,
+        "retired": retired,
+    }
+    # 「问题」= 需要人来处理的不一致。三类都是：
+    #   scan_unprobed  —— 单元在跑却不在探测名单（线在服务流量但没人探它）
+    #   missing_out    —— 名单里有但 sing-box 没有 outbound（探测照探，selector 翻不到）
+    #   tier_off_with_state —— 档位停用却留有状态（档位切换没清干净）
+    #
+    # **缩容遗留（`retired`）也算问题** —— 2026-11-11 修正。此前它被刻意
+    # 排除在 problems 之外，理由是「61 条遗留会把真正要修的那几条淹掉」。
+    # 但那个判断是错的：`retired` 不是「61 条陈旧记录」这么无害的东西，
+    # 它是**单元文件仍在磁盘、状态表仍有残骸、而渲染器从不清理**的
+    # 直接证据 —— 也就是下一次缩容会原样重演的根因。
+    #
+    # 当时实测：47 条 `WARP-H2-SCAN-*` 残骸（对应编号 3 与 16–61 的台账外
+    # 单元），单元已停但状态表里永远冻结在最后一次观测值。报表把它们当作
+    # 「有结论的线」显示，把「配置裂了」显示成「运维停用」。
+    #
+    # 「会淹掉真问题」的顾虑的正确解法是**分开报、分级报**，不是不报：
+    # 遗留条数与真不一致条数分别给出，真问题在前、遗留在后，真问题不会被
+    # 淹没。仍然排除的只有 `spare_wg`（WG 补位池）—— 它是设计上的闲置池，
+    # 本来就不该被探测，不是问题。
+    problems = (len(scan_unprobed) + len(missing_out)
+                + len(tier_off_with_state) + len(retired))
+    report["problems"] = problems
+    if problems:
+        detail = []
+        if scan_unprobed:
+            detail.append(f"扫描到的隧道单元在跑却不在探测名单 "
+                          f"{len(scan_unprobed)} 条"
+                          f"（{', '.join(scan_unprobed[:5])}）")
+        if missing_out:
+            detail.append(f"探测名单里有但 sing-box 没有 outbound "
+                          f"{len(missing_out)} 条（{', '.join(missing_out[:5])}）")
+        if tier_off_with_state:
+            detail.append(f"档位停用但状态台账里还有 {len(tier_off_with_state)} 条"
+                          f"（{', '.join(tier_off_with_state[:5])}）")
+        if retired:
+            detail.append(f"缩容遗留 {len(retired)} 条（单元已删、只剩状态残骸）")
+        log(f"  ⚠ 配置自检：{problems} 处跨源不一致 —— " + "；".join(detail))
+        log(f"    · 真相源：members {len(members)} 条 / sing-box outbounds "
+            f"{len(outs)} 条 / 状态台账 {len(state_tags)} 条")
+        if retired:
+            log(f"    · 缩容遗留 {len(retired)} 条的单元文件仍在 systemd "
+                f"（渲染器只增不减）：跑 deploy/reconcile_h2_units.py --apply "
+                f"可剪除")
+        if spare_wg:
+            log(f"    · 另有 {len(spare_wg)} 条 WG 补位线（23+）不在探测名单，"
+                f"属闲置池，不计入不一致")
+    return report
+
+
 def main():
     _acquire_single_instance_lock()
     # Log first, then fetch (avoid hanging before any output)
@@ -13458,6 +13709,10 @@ def main():
     _load_warp_ip_cycles()
     _load_warp_line_state()
     _load_node_ip_used()
+    # 跨源一致性自检：启动时先把「配置分裂」摆到日志里。
+    # WHY 在状态加载之后：自检要对比状态台账与探测名单，状态没加载就比不出来。
+    # 只报告不修 —— 改配置是人的决定，daemon 擅自改会重排生产出口。
+    _config_consistency_check()
     # 单实例探测器接管所有线路的探测/状态写入；旧守护仅在回滚开关下启动。
     # 同块轮回与换线/探测是两件事，两条路径下都要跑：它只看落地节点通不通。
     _start_node_rotation()
@@ -13498,6 +13753,7 @@ def main():
     last_proxy_check = 0
     last_summary_ts = 0
     last_proactive_rotate = 0
+    last_config_check = 0.0
 
     global _RESTART_COUNT, _NODE_CALL_RESET_TS, _last_wal_checkpoint, _strategy_mode
     global _pool_delay_last
@@ -13724,6 +13980,15 @@ def main():
             if now - last_node_info_cleanup > 600:
                 last_node_info_cleanup = now
                 _submit_once("node-info-cleanup", _cleanup_node_info, cached_all_nodes)
+
+            # ---- 3b2. 跨源一致性自检 (每 30 分钟) ----
+            # 配置是运行期会变的：订阅刷新改 sing-box 配置、档位切换改
+            # tiers.json、单元启停改 systemd。任一处变了都可能让「名单」与
+            # 「事实」再次错位。自检只在**发现不一致时**打日志，正常时静默 ——
+            # 每 30 分钟一条「一切正常」会把真正的告警淹掉。
+            if now - last_config_check > 1800:
+                last_config_check = now
+                _submit_once("config-consistency-check", _config_consistency_check)
 
             # ---- 3c0. 双向兜底的反向：停在 proxy 上时池挂了才切回 ----
             # 内部要探测整池健康（最慢 15s），丢后台。

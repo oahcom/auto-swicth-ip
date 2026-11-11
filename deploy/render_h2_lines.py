@@ -233,8 +233,36 @@ def _reachable_order(pool: list[str], live: dict[str, dict], probe: bool,
 
 
 def device_owner(unit_dir: str | Path = "/etc/systemd/system") -> dict[str, str]:
-    """设备目录名 → 占用它的 active 单元名（没被占用就不在表里）。"""
-    owner: dict[str, str] = {}
+    """设备目录名 → 占用它的 active 单元名（没被占用就不在表里）。
+
+    兼容旧契约：一台设备被多个 active 单元持有时，**只保留最后一个**。
+    这正是本函数过去会吞掉信息的根因 —— 争用（两台 usque 抢同一个 CF 会话
+    身份）就发生在这个「最后一个覆盖前一个」的动作里，调用方永远看不到
+    「这台设备有两个持有者」。新逻辑请用 `device_holders()`。
+
+    保留本函数是因为 `verify_h2_render.py` 按「设备被别的组占用」报错，
+    它的语义是「这台设备是不是别人的」，单个持有者就够了。
+    """
+    return {dev: holders[-1] for dev, holders in device_holders(unit_dir).items()}
+
+
+def device_holders(unit_dir: str | Path = "/etc/systemd/system") -> dict[str, list[str]]:
+    """设备目录名 → 占用它的**全部** active 单元名。
+
+    WHY 需要「全部」而不是一个：每台设备目录里只有一份 `config.json`，
+    里面是**一个 CF 注册身份**（设备凭据）。两个 usque 进程共用一个设备目录
+    = 共用同一个 CF 会话身份 = 它们会互相顶掉对方的 H2 会话。表现是两条线
+    轮流可用、频繁重连、出口地址互抢 —— 症状像「配额不够」，实际是自相残杀。
+
+    旧实现用 `owner[dev] = svc.name` 覆盖式赋值，一台设备只留最后一个持有者，
+    于是「多持有」这个事实被彻底吞掉：既看不到、也拦不住、也无法告警。
+    实测 2026-11-11：6 台设备被 `usque-h2-*` 与 `usque-warp-*` 同时持有
+    （usque3/5/6/7/8/9），其中 4 台是 H2 线与 CF 线互抢。
+
+    这里只**如实记录**，不做处置：谁该让谁，是人的决定（可能是 CF 线该
+    迁走，而不是 H2 线该退让）。判据交给调用方。
+    """
+    holders: dict[str, list[str]] = {}
     units = Path(unit_dir)
     for svc in list(units.glob("usque-warp*.service")) + \
             list(units.glob("usque-h2-*.service")):
@@ -247,8 +275,9 @@ def device_owner(unit_dir: str | Path = "/etc/systemd/system") -> dict[str, str]
             continue
         for line in svc.read_text(errors="ignore").splitlines():
             if line.startswith("WorkingDirectory="):
-                owner[Path(line.split("=", 1)[1].strip()).name] = svc.name
-    return owner
+                dev = Path(line.split("=", 1)[1].strip()).name
+                holders.setdefault(dev, []).append(svc.name)
+    return holders
 
 
 def free_devices(unit_dir: str | Path = "/etc/systemd/system") -> list[str]:
@@ -297,6 +326,19 @@ def free_devices(unit_dir: str | Path = "/etc/systemd/system") -> list[str]:
             except OSError:
                 continue
         all_dev.append(p.name)
+    # **多持有者 = 身份已被争用，不可分配**。
+    # WHY：`device_holders()` 才能看出「这台设备被两个 active 单元持有」。
+    # 只用「设备被 active 单元持有」做判据，会把一台正被两线互抢的设备当成
+    # 「已被占用、不可用」——这一层 `used` 已经拦住了它。但反向也成立：
+    # 一台**只被一个 active 单元持有**的设备是安全的；而一台被多个持有的
+    # 设备即使当前不参与扩容，也必须从候选池里剔除，否则新线绑上去就是
+    # 三方混战。
+    #
+    # 这里判据是「持有者数 > 1」而不是「设备是否在 used 里」：前者只剔除
+    # 已经坏掉的那几台，不会误伤正常设备；后者会把所有在役设备都剔掉
+    # （那正是 `used` 的职责）。两个集合取并集才是完整的「不可分配」。
+    contended = {d for d, hs in device_holders(units).items() if len(hs) > 1}
+    used = used | contended
     return [d for d in all_dev
             if d not in used and not d.startswith("usque-probe")]
 

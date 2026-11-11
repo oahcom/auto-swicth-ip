@@ -64,6 +64,36 @@ COLO_FALLBACK = {
 PSEUDO_COLO = {"CF": "CF 直连", "CFB": "CF 直连", "OLD": "旧批次", "UNKNOWN": "未知"}
 
 
+def _service_of_tag(tag: str) -> str:
+    """从 tag 推出 systemd 单元名（与 daemon 的端口/单元契约一致）。
+
+    WHY 需要它：`config.CFG["warp"]["members"]` 里的 WG 线是**按环境变量
+    拼出来的**。报表进程若没继承 daemon 的环境（手工跑、cron 里跑），这
+    22 条声明就整体缺失 —— 于是它们的单元状态无从查起，`unit_ok` 只能
+    默认 True，报表就**不会**印「单元停用（线没跑）」，把「线早就不跑了」
+    显示成「一切正常」。
+
+    tag 的命名契约（见 `config.py` 的端口契约）：
+      WARP-WG-<N>    → warp-wg-<N>.service
+      WARP-H2-<...>  → usque-h2-<N>.service（N 从末尾数字取）
+      WARP-CF-<x>    → usque-warp-<x>.service
+    推不出的一律返回空串 —— 查不到单元名就按「无从查起」处理，不猜。
+    """
+    m = re.fullmatch(r"WARP-WG-(\d+)", tag)
+    if m:
+        return f"warp-wg-{m.group(1)}.service"
+    m = re.fullmatch(r"WARP-H2-(?:[A-Z]+)-(\d+)", tag)
+    if m:
+        return f"usque-h2-{m.group(1)}.service"
+    m = re.fullmatch(r"WARP-H2-SCAN-(\d+)", tag)
+    if m:
+        return f"usque-h2-{m.group(1)}.service"
+    m = re.fullmatch(r"WARP-CF-([A-Za-z0-9]+)", tag)
+    if m:
+        return f"usque-warp-{m.group(1).lower()}.service"
+    return ""
+
+
 def _unit_states(tags: dict[str, str]) -> dict[str, bool]:
     """成员 tag → 对应 systemd 单元此刻是否在跑（与 daemon 同一口径）。
 
@@ -404,6 +434,27 @@ def _expand_ban_probes(samples) -> list[tuple[float, str]]:
     return out
 
 
+def _singbox_outbound_tags() -> set[str]:
+    """当前 sing-box 配置里带 tag 的 outbound 集合（读不到返回空集）。
+
+    WHY 需要第二个真相源：`CFG["warp"]["members"]` 里的 WG 线是**按环境变量
+    拼出来的**（`config._append_wg_members` 读 `WARP_WG_FAMILIES` /
+    `WARP_WG_NODES`）。报表进程若没继承 daemon 的环境（手工跑、
+    cron 里跑、systemd 里 `EnvironmentFile` 没带上），这 22 条声明就整体
+    缺失 —— 于是**每一条 WG 线都会被误判成「不在探测名单」**。
+
+    sing-box 配置是渲染产物，不依赖环境变量。它里有这条线的 outbound
+    就说明这条线**确实在线上**。两个源取并集，判定才不会因为环境缺失而失真。
+    """
+    path = CFG["singbox"]["config_file"]
+    data = _read_json(Path(path)) or {}
+    outs = data.get("outbounds") if isinstance(data, dict) else None
+    if not isinstance(outs, list):
+        return set()
+    return {str(o.get("tag")) for o in outs
+            if isinstance(o, dict) and o.get("tag")}
+
+
 def summarize(state: dict, chans: dict, sources: dict, hours: float,
               now: float | None = None, dormant: set[str] | None = None,
               segments: dict[str, dict] | None = None) -> list[dict]:
@@ -418,14 +469,33 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
     idx = source_index(sources)
     colos = colo_ban_rates(hours * 3600, now)
     segs = segments or {}
-    svc_of = {m.get("tag"): m.get("service")
-              for m in CFG["warp"]["members"] if m.get("tag")}
+    declared_of = {m.get("tag"): m.get("service")
+                   for m in CFG["warp"]["members"] if m.get("tag")}
+    # 声明里没有的线，从 tag 推出单元名补上 —— 否则环境变量缺失时，
+    # WG 线既查不到单元状态，`unit_ok` 又默认 True，会被显示成「一切正常」。
+    svc_of = dict(declared_of)
+    for t in chans:
+        if not svc_of.get(t):
+            guess = _service_of_tag(t)
+            if guess:
+                svc_of[t] = guess
     units = _unit_states(svc_of)
+    # 「在不在线上」的两个真相源取并集：声明（members，受环境变量影响）
+    # 与渲染产物（sing-box outbound，不依赖环境变量）。
+    # **不能用 `svc_of`** —— 那是「推出来的单元名」，包含从 tag 猜的，
+    # 拿它判「在不在名单」会把所有 WG 线都算成在名单里。
+    online_tags = set(declared_of) | _singbox_outbound_tags()
     rows = []
     for tag, meta in chans.items():
         st = state.get(tag) or {}
         samples = [s for s in _expand_ban_probes(st.get("ban_probes"))
                    if s[0] >= cutoff]
+        # 「惩罚期短路」观测：daemon 拿到地址后发现该地址已在台账惩罚期，
+        # 于是在模型层实测**之前**就 return 了。这些不是 `ban_probes` 的
+        # 判据样本（混进去会让渠道永远锁不上），但它们证明这条线**确实
+        # 被探过**且结论是 blocked —— 不读它，报表只能印「无样本」。
+        blocked_notes = [s for s in _expand_ban_probes(st.get("blocked_notes"))
+                         if s[0] >= cutoff]
         ok = sum(1 for _, v in samples if v == "OK")
         ban = sum(1 for _, v in samples if v in BAN_VERDICTS)
         err = len(samples) - ok - ban
@@ -501,6 +571,23 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             # 单元此刻在不在跑。为 False 时上面那些 quota/无地址/取址失败一律
             # 是停用前冻住的旧值，两个视图都只印这一条。
             "unit_ok": units.get(svc_of.get(tag), True),
+            # 「无样本」的成因要分得开。三种完全不同的故障长得一模一样：
+            #   ① 从没探过      —— last_probe_ts == 0
+            #   ② 探过但没入账 —— last_probe_ts > 0 而窗口内无样本
+            #   ③ 探过但取不到地址 —— no_addr_since 有值
+            # 不分开的话，处置动作完全不同：① 要去查探测名单，② 是入账漏记
+            # 的 bug，③ 查隧道与落地节点。
+            "last_probe_ts": st.get("last_probe_ts") or 0,
+            # 窗口内「惩罚期短路」次数。>0 表示这条线**探过**且结论是
+            # blocked，只是没走到模型层实测 —— 与「没探过」是两回事。
+            "blocked_notes": len(blocked_notes),
+            # 这条线在不在 daemon 的探测名单。判定用两个源的并集：声明
+            # （members）与渲染产物（sing-box outbound）。只用 members 会
+            # 在环境变量缺失时把全部 WG 线误判成「不在名单」。
+            "in_members": tag in online_tags,
+            # 报表的基准时刻。窗口外的样本由它裁掉，冻结时长也按它算 ——
+            # 用 `time.time()` 自己取会与窗口口径不一致。
+            "now": now,
             "window_from": cutoff,
         })
     rows.sort(key=lambda r: (r["carrier"] or "", r["colo"], r["tag"]))
@@ -752,6 +839,70 @@ def _pad(s: str, width: int, left: bool = True) -> str:
     return out + " " * (width - used) if left else " " * (width - used) + out
 
 
+def _probe_age(ts: float, now: float | None = None) -> str:
+    """上次探测距今多久（人类可读）。没有探测记录返回 `从未`.
+
+    WHY 要传 `now`：报表的窗口是**调用方给定的**（`summarize(..., now)`），
+    单元测试与离线渲染都用固定时刻。拿 `time.time()` 自己算会得到负数
+    （测试里的 now 在未来），印出「-5612757秒前探过」这种垃圾。
+    """
+    if not ts:
+        return "从未"
+    now = time.time() if now is None else now
+    d = now - ts
+    if d < 90:
+        return f"{int(d)}秒前"
+    if d < 5400:
+        return f"{int(d / 60)}分钟前"
+    if d < 172800:
+        return f"{int(d / 3600)}小时前"
+    return f"{int(d / 86400)}天前"
+
+
+def _no_sample_reason(r: dict) -> str:
+    """「无样本」的成因标签。四种故障长得一模一样，处置完全不同。
+
+    - `不在探测名单` —— 线根本不在 daemon 的 `members` 里，daemon 不会去
+      探它；状态会永远冻在最后一次观测上。这是**配置问题**。
+    - `从未探测` —— 在名单里，但从来没探到过（单元没装/没跑/档位停用）。
+    - `惩罚期短路` —— **探过**，拿到地址后发现该地址在台账惩罚期，在模型层
+      实测之前就返回了，所以没有判据样本。这是正常的换址逻辑，不是故障。
+    - `探测未入账` —— 探过、判了结论，但结论没进 `ban_probes`。这是**入账
+      漏记**的 bug。
+    - `取不到地址` —— 探过，隧道取不到出口地址，没有可入账的结论。
+    """
+    last_probe = float(r.get("last_probe_ts") or 0)
+    now = r.get("now")
+    if not last_probe:
+        if not r.get("in_members", True):
+            return "无样本·不在探测名单"
+        return "无样本·从未探测"
+    n = int(r.get("blocked_notes") or 0)
+    if n > 0:
+        return f"无样本·惩罚期短路（{_probe_age(last_probe, now)}探过）"
+    if r.get("no_addr_since"):
+        return f"无样本·取不到地址（{_probe_age(last_probe, now)}探过）"
+    if not r.get("in_members", True):
+        return f"无样本·不在探测名单（{_probe_age(last_probe, now)}探过）"
+    return f"无样本·探测未入账（{_probe_age(last_probe, now)}探过）"
+
+
+def _frozen_verdict_label(r: dict) -> str:
+    """单元没在跑时，把「冻住的结论」和「冻结多久」一起印出来。
+
+    WHY 必须印：状态台账里的 `last_verdict` 是**最后一次观测**的结论。
+    单元停了之后它再也不会更新，报表若不标明，读者会把几小时前的结论
+    当成「现在的状态」。实测 2026-11-11：12 条 WG 线单元 disabled，
+    `last_verdict=blocked` 冻了 26 小时 —— 印出来才看得出这是**冻结值**
+    而不是刚刚发生的故障。
+    """
+    v = r.get("last_verdict") or "-"
+    age = _probe_age(float(r.get("last_probe_ts") or 0), r.get("now"))
+    if v == "-":
+        return "（无历史结论）"
+    return f"（{v}·{age}冻结）"
+
+
 def print_table(rows: list[dict], hours: float) -> None:
     if not rows:
         print("（没有渠道数据）")
@@ -776,7 +927,19 @@ def print_table(rows: list[dict], hours: float) -> None:
         if not r.get("unit_ok", True):
             # 主因，且**独占**：单元没在跑时，状态表里的 quota / 无地址 /
             # 取址失败全是停用前冻住的旧值，同时印出来会让人以为是配额问题。
+            #
+            # 但**必须同时印出 last_verdict**：这条线判过什么、冻结了多久，
+            # 是「配置裂了」和「线坏了」的唯一区别。实测 2026-11-11：12 条
+            # WG 线的单元是 disabled，状态冻在 `blocked` 上 26 小时，
+            # 报表只印「档位停用 单元停用（线没跑）」—— 把「没人探它」
+            # 显示成「它坏了」，正是主人说的「原因标错」。
             flags.append("单元停用（线没跑）")
+            flags.append(_frozen_verdict_label(r))
+            if not r["samples"]:
+                # 「单元停用」说的是线不跑了；成因标签说的是**为什么没人探它**
+                # （不在探测名单 / 从未探测 / 惩罚期短路 / 未入账）。两回事，
+                # 都得印 —— 只印前者会把「配置裂了」读成「线坏了」。
+                flags.append(_no_sample_reason(r))
         elif r["held"]:
             flags.append(f"锁定至{_fmt_ts(r['hold_until'])}")
         elif r["quota_until"] > time.time():
@@ -791,8 +954,13 @@ def print_table(rows: list[dict], hours: float) -> None:
             # 就删了（`is-enabled` 返回 not-found），prober 早已用
             # `_warp_member_unit_running` 过滤掉，状态表里那句 `unknown`
             # 是删单元当天冻住的 23 万次失败留下的。照印会读成「现在探测失败」。
+            #
+            # 「无样本」不是一种故障，是三种，分开标：
+            #   从没探过      → 查探测名单（线根本不在名单里）
+            #   探过但没入账  → 入账漏记的 bug（判了 blocked 却没进 ban_probes）
+            #   探过但无地址  → 隧道取不到出口
             if not r["samples"]:
-                flags.append("无样本")
+                flags.append(_no_sample_reason(r))
             else:
                 flags.append(f"{r['last_verdict']}（旧地址）" if r["verdict_stale"]
                              else r["last_verdict"])
@@ -952,7 +1120,17 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
     for r in rows:
         pills = []
         if not r.get("unit_ok", True):
+            # 与 CLI 表同一口径：单元没在跑时，`last_verdict` 是**冻结值**，
+            # 必须连同冻结时长一起印出来，否则读者会把几小时前的结论当成
+            # 现在的状态（实测 12 条 WG 线的 blocked 冻了 26 小时）。
+            # 零样本时还要再标一次成因 —— 「单元停用」说的是线不跑了，
+            # 「无样本·不在探测名单」说的是**为什么没人探它**，两回事。
             pills.append('<span class="pill hold">单元停用（线没跑）</span>')
+            pills.append('<span class="pill">'
+                         f'{html.escape(_frozen_verdict_label(r))}</span>')
+            if not r["samples"]:
+                pills.append('<span class="pill">'
+                             f'{html.escape(_no_sample_reason(r))}</span>')
         elif r["held"]:
             pills.append(f'<span class="pill hold">锁定至 {_fmt_ts(r["hold_until"])}</span>')
         elif r["quota_until"] > time.time():
@@ -963,8 +1141,11 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
             # 与 CLI 表同一口径（见 `print_table`）：窗口内没有样本时
             # `last_verdict` 是**旧值**，不能当成当前结论印出来。HTML 之前
             # 漏了这层保护，同一份数据两个视图给出不同结论。
+            # 「无样本」进一步拆成三种成因（见 `_no_sample_reason`）。
+            txt = (r["last_verdict"] if r["samples"]
+                   else _no_sample_reason(r))
             pills.append(f'<span class="pill">'
-                         f'{html.escape(r["last_verdict"] if r["samples"] else "无样本")}'
+                         f'{html.escape(txt)}'
                          f'</span>')
         cls = ' class="held"' if r["held"] else ""
         body.append(
