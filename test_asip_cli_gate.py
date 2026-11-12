@@ -25,6 +25,12 @@ SAMPLE_LOG = """\
 """
 
 
+GATE_LOG_SAMPLE = """\
+[2026-11-13 02:10:01] ⇢ slot-7 报 rate429（ok）[req=separate] 池节点=nX，重试改走 slot-7
+[2026-11-13 02:10:02] ↻ 第七闸口池内轮换：nX → nY（独立账本专有行）
+"""
+
+
 @pytest.fixture
 def fake_env(tmp_path):
     """最小合法 cli.env：脚本开头的清单白名单校验必须能过。"""
@@ -101,6 +107,16 @@ def test_gate_regex_is_single_source():
     assert "_RE_GATE_EVENT='第七闸口|秒切兜底'" in src
 
 
+def test_status_merges_gate_log_with_main_log_history():
+    """拆文件过渡期：近 1h 统计不能只读 gate.log，否则重启前的账凭空消失。"""
+    src = CLI.read_text(encoding="utf-8")
+    assert 'ASIP_LOG_PATH="$GATE_LOG" ASIP_MAIN_LOG="$LOG"' in src
+    assert "if row in seen:" in src       # mirror 模式同落两份要去重
+    assert "rows.sort()" in src
+    assert "_follow \"$_RE_GATE\" \"$n\" \"$GATE_LOG\"" in src
+    assert 'grep -E "$_RE_GATE_EVENT" "$GATE_LOG"' in src
+
+
 def test_events_excludes_high_frequency_429_reports(fake_env):
     r = run_cli(fake_env, "gate", "events", "10")
     assert r.returncode == 0, r.stderr
@@ -110,6 +126,32 @@ def test_events_excludes_high_frequency_429_reports(fake_env):
     assert "slot-7 报" not in r.stdout          # 高频报障行被滤掉
     assert "重试改走 slot-7" not in r.stdout
     assert "普通健康行" not in r.stdout
+
+
+def test_events_reads_separate_gate_log(fake_env, tmp_path):
+    """设置里给了 ASIP_GATE_LOG，events 就只读独立账本，不再扫 daemon.log。"""
+    gate = tmp_path / "gate.log"
+    gate.write_text(GATE_LOG_SAMPLE, encoding="utf-8")
+    conf = Path(fake_env["ASIP_CLI_ENV"])
+    conf.write_text(conf.read_text(encoding="utf-8")
+                    + "ASIP_GATE_LOG=%s\n" % gate, encoding="utf-8")
+    r = run_cli(fake_env, "gate", "events", "10")
+    assert r.returncode == 0, r.stderr
+    assert "独立账本专有行" in r.stdout
+    assert "n1 → n2" not in r.stdout          # 主日志里的池内轮换不该混进来
+    assert "slot-7 报" not in r.stdout         # 高频报障仍被 events 滤掉
+
+
+def test_events_falls_back_to_main_log_when_gate_log_missing(fake_env, tmp_path):
+    """服务还没重启 / gate.log 未生成时，命令不能空转。"""
+    conf = Path(fake_env["ASIP_CLI_ENV"])
+    conf.write_text(conf.read_text(encoding="utf-8")
+                    + "ASIP_GATE_LOG=%s\n" % (tmp_path / "not-created.log"),
+                    encoding="utf-8")
+    r = run_cli(fake_env, "gate", "events", "10")
+    assert r.returncode == 0, r.stderr
+    assert "第七闸口池内轮换" in r.stdout
+    assert "独立账本专有行" not in r.stdout
 
 
 def test_bad_line_count_is_rejected(fake_env):

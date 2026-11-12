@@ -167,21 +167,28 @@ P2C+预检判据），绝不进 `_repair_slot` 换 WARP 线；若此刻有任何
 promote）；首次上线后下一轮小时刷新会自动落盘 slot-7 配置并拉起进程
 （热重载对不存在进程必然失败 → 回退整组重启，正好把它带起来）。
 
-**日志与命令（`asip gate`）**：证据分散在三处，只看一处会误判 ——
-`daemon.log`（选它 / 报障 / 池内轮换：`第七闸口`、`秒切兜底`、`slot-7`）、
-9router journal（`[ASIP] rotate ... to=slot-7 ... to_url=…:7897` 与
-`[EGRESS] retry ... accounted on …:7897`；**asip 回了 `to=slot-7` 不等于请求真重放**）、
-`/slots`（健康 / 当前池节点 / 常规闸口还剩几个可选）。
+**日志与命令（`asip gate`）**：池闸日志有**独立账本 `gate.log`**（项目根目录，
+5MB×5 轮转、0600），由 `daemon.py` 的 `_GateLineFilter` 按 `_GATE_LOG_RE`
+从 `log()` 分流；`daemon.log` 默认**不再收池闸行**（`slot-7 报 429` 实测约
+50 行/min，会把换线告警冲走），`stdout`/journal 仍全量。
+`ASIP_GATE_LOG_FILE` 可改路径，`ASIP_GATE_LOG_MIRROR=1` 恢复双写到主日志。
+证据仍分散在三处，只看一处会误判 —— `gate.log`（选它 / 报障 / 池内轮换：
+`第七闸口`、`秒切兜底`、`slot-7`）、9router journal（`[ASIP] rotate ...
+to=slot-7 ... to_url=…:7897` 与 `[EGRESS] retry ... accounted on …:7897`；
+**asip 回了 `to=slot-7` 不等于请求真重放**）、`/slots`（健康 / 当前池节点 /
+常规闸口还剩几个可选）。
 
 | 命令 | 用途 |
 |---|---|
 | `asip gate` / `asip gate st [N]` | 状态快照 + 两侧最近日志（默认 12 行），含近 1h 池内轮换 / 秒切兜底 / 指向池闸次数 |
-| `asip gate log [N]` | 跟随 asip 侧全部池闸日志（默认回看 200 行，Ctrl-C 退出） |
+| `asip gate log [N]` | 跟随 `gate.log`（默认回看 200 行，Ctrl-C 退出） |
 | `asip gate events [N]` | 只看守护 / 秒切 / 池内轮换事件，滤掉高频 `slot-7 报 429`（实测约 50 行/min） |
 | `asip gate 9r [N]` / `asip gate 9r -f` | 9router 侧切线与重放日志（默认 30 行；`-f` 跟随） |
 
 别名 `asip slot7` / `asip g7`；`ASIP_ROUTER_SERVICE` 可覆盖 9router 单元名（默认
-`9router.service`）。全部只读，端口从 `/slots` 读，脚本不写死站点值。等价手工查法：
+`9router.service`），`ASIP_GATE_LOG` 可覆盖独立日志路径（由 `asip-cli-conf.sh`
+写入设置；文件未生成时自动回退 `daemon.log`）。全部只读，端口从 `/slots` 读，
+脚本不写死站点值。等价手工查法：`tail -F gate.log`、
 `journalctl -u auto-switch-ip.service --since "30 min ago" | grep -E '第七闸口|秒切兜底|slot-7'`、
 `journalctl -u 9router.service --since "30 min ago" | grep -E 'to=slot-7|7897'`、
 `curl --unix-socket run/rotate.sock -H "X-Asip-Token: $(cat run/api-token)" http://localhost/slots`。
@@ -737,6 +744,8 @@ singbox.lan_cidrs: [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12]  # 局域网入�
 singbox.proxy_gate: True                       # 第七闸口（代理池兜底 slot-7，见上节）
 intervals.proxy_gate_check_sec: 60             # 池闸维护节奏（健康结论/死节点/在役轮换）
 intervals.proxy_gate_serving_window_sec: 300   # 池闸「最近被指为重试目标」算在役的窗口
+gate_log_file: gate.log                        # 第七闸口独立账本（ASIP_GATE_LOG_FILE 可覆盖）
+gate_log_mirror: False                         # 1=池闸行同时写回 daemon.log（ASIP_GATE_LOG_MIRROR）
 bad_nodes.ttl_sec: 300                         # bad node TTL (5min)
 
 # warp（换线核心）—— **完整配置说明见 docs/reference/config.md**

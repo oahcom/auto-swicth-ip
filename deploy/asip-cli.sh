@@ -14,12 +14,16 @@ fi
 . "$ASIP_CLI_ENV"
 # 内嵌 Python 用的是 os.environ（不解析 shell 变量），必须导出一份：
 # 台账路径和日志路径都由设置文件提供，漏导会让 warp ip / cycles 直接 KeyError。
-export ASIP_IP_USED_FILE ASIP_CYCLES_FILE ASIP_LOG ASIP_CLASH_API ASIP_PY
+export ASIP_IP_USED_FILE ASIP_CYCLES_FILE ASIP_LOG ASIP_GATE_LOG ASIP_CLASH_API ASIP_PY
 export ASIP_LINE_STATE_FILE
 # 隧道探测走 xargs 起的子 shell，主机名必须导出才能在单引号脚本里取到。
 export ASIP_SOCKS_HOST
 
 LOG=$ASIP_LOG
+# 第七闸口单独一份账本。旧设置文件（没跑过 asip-cli-conf.sh）按项目目录推导；
+# 服务还没重启 / gate.log 还没生成时回退主日志，命令不会空转。
+GATE_LOG=${ASIP_GATE_LOG:-${ASIP_DIR:-$(dirname "$LOG")}/gate.log}
+[ -r "$GATE_LOG" ] || GATE_LOG=$LOG
 SECRET_FILE=$ASIP_SECRET_FILE
 # 隧道清单由部署期设置提供（`tag port service` 每行一条，源自 config.py 的
 # warp.members），本脚本不再解析 config.py —— 那样等于在脚本里维护第二份清单。
@@ -95,7 +99,7 @@ asip — auto-switch-ip 日志与出口诊断
 
 第七闸口（代理池兜底 slot-7）
   asip gate            状态快照 + asip / 9router 两侧最近日志
-  asip gate log [N]    跟随第七闸口全部日志（默认回看 200 行）
+  asip gate log [N]    跟随独立账本 gate.log（默认回看 200 行；daemon.log 不再收池闸行）
   asip gate events [N] 只看守护/秒切/池内轮换事件，滤掉高频 429 报障
   asip gate 9r [N]     9router 侧切线与重放日志（默认 30 行，-f 跟随）
   asip gate -h         本子命令帮助
@@ -150,13 +154,14 @@ EOF
 # daemon 用 RotatingFileHandler 轮转（5MB×5），tail -f 过轮转点后就停在旧 inode 无限空转，
 # 必须用 -F 按文件名重开；先打一段历史，否则跟随前长时间只见空白。
 _follow() {
-  local re=$1 scan=${2:-50}
+  local re=$1 scan=${2:-50} log=${3:-$LOG}
   echo "── 回看最近 $scan 行，之后 live（Ctrl-C 退出）──" >&2
   if [ -n "$re" ]; then
     # 匹配率低（近 300 行里换线行 128、错误行个位数），至少回看 2000 行才不显空。
-    tail -F -n $scan "$LOG" 2>/dev/null | grep --line-buffered -E "$re"
+    # gate.log 是池闸专属文件，行行都命中，不用按主日志的稀疏比例回看。
+    tail -F -n $scan "$log" 2>/dev/null | grep --line-buffered -E "$re"
   else
-    tail -F -n $scan "$LOG" 2>/dev/null
+    tail -F -n $scan "$log" 2>/dev/null
   fi
 }
 
@@ -169,7 +174,8 @@ _RE_ERR='^\[[^]]*\] +(✗|⚠|⇄)|Traceback|ERROR|不可达|异常:'
 _RE_NOISE='Tunnel idle|Detected outbound activity|l4-socks|SOCKS client .* closed during negotiation'
 # 第七闸口：全量口径含高频「slot-7 报 429 / 重试改走 slot-7」（实测约 50 行/min）。
 # events 窄口径只留守护、秒切、池内轮换，用来回答「闸口本身有没有在动」。
-_RE_GATE='第七闸口|秒切兜底|slot-7|池闸|代理池兜底'
+# 与 daemon.py 的 _GATE_LOG_RE 保持同一份口径（有单测盯着，别改一边）。
+_RE_GATE='第七闸口|秒切兜底|slot-7|池闸|代理池兜底|池内轮换'
 _RE_GATE_EVENT='第七闸口|秒切兜底'
 
 _singbox() {
@@ -233,12 +239,14 @@ asip gate — 第七闸口（代理池兜底 slot-7）日志与状态
 
   asip gate            状态快照 + asip / 9router 两侧最近日志
   asip gate st [N]     同上，asip 侧最近 N 行（默认 12）
-  asip gate log [N]    跟随 asip 侧全部第七闸口日志（默认回看 200 行）
+  asip gate log [N]    跟随第七闸口专属日志 gate.log（默认回看 200 行）
   asip gate events [N] 只看守护/秒切/池内轮换事件（默认 30 行，不跟随）
   asip gate 9r [N]     9router 侧切线/重放日志（默认 30 行；-f 跟随）
   asip gate -h         本帮助
 
   ASIP_ROUTER_SERVICE 可覆盖 9router 的 systemd 单元名（默认 9router.service）。
+  ASIP_GATE_LOG 可覆盖独立日志路径（由 asip-cli-conf.sh 写入设置）；文件不存在时
+  自动回退 daemon.log。daemon.log 默认不再收池闸行，journalctl 仍是全量账本。
   池闸只在六个常规闸口都不可选时才会被选中；全部命令只读。
 EOF
 }
@@ -282,10 +290,11 @@ _gate_router_log() {  # $1=行数  $2=1 跟随  $3=池闸端口
 }
 
 _gate_status() {  # $1=/slots JSON  $2=asip 侧日志行数
-  ASIP_LOG_PATH="$LOG" GATE_LINES="$2" GATE_HOST="${ASIP_SOCKS_HOST:-localhost}" \
+  ASIP_LOG_PATH="$GATE_LOG" ASIP_MAIN_LOG="$LOG" \
+  GATE_LOG_NAME="$(basename "$GATE_LOG")" \
+  GATE_LINES="$2" GATE_HOST="${ASIP_SOCKS_HOST:-localhost}" \
   GATE_RE="$_RE_GATE" "$ASIP_PY" - "$1" "$ASIP_SERVICE" <<'PY'
 import json, os, re, socket, sys, time
-from collections import deque
 path, svc = sys.argv[1], sys.argv[2]
 try:
     d = json.load(open(path, encoding="utf-8"))
@@ -314,33 +323,46 @@ print(f"  常规闸口可选: {len(ok)}/{len(warps)}  → "
       + ("池闸应待命，严格兜底成立" if ok else "全部不可选，池闸是唯一兜底"))
 print(f"  主出口: {d.get('active_tag') or '-'}")
 print(f"  服务:  {os.environ.get('GATE_SVC_STATE', '?')}  {svc}")
-# 近 1h 统计按日志时间戳：daemon.log 会轮转，旧账不能算进当前窗口。
-log = os.environ.get("ASIP_LOG_PATH", "")
-n = int(os.environ.get("GATE_LINES", "12") or 12)
+# 近 1h 统计：独立账本 + 主日志的历史行。拆文件那一刻之前的池闸行还在
+# daemon.log 里，只读 gate.log 会让重启后一小时内的数字凭空缩水。
+# mirror 模式同一行会落两份：按整行去重，再按行首时间戳排序。
 rx = re.compile(os.environ["GATE_RE"])   # 与 bash 侧 _RE_GATE 共用一份口径
+logs = [os.environ.get("ASIP_LOG_PATH", ""), os.environ.get("ASIP_MAIN_LOG", "")]
+n = int(os.environ.get("GATE_LINES", "12") or 12)
 since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 3600))
 cnt = {"rotate": 0, "fallback": 0, "redirect": 0}
-recent = deque(maxlen=max(n, 1))
-try:
-    with open(log, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if not rx.search(line):
-                continue
-            recent.append(line.rstrip())
-            if line < "[" + since:      # 时间戳在行首，字典序即时间序
-                continue
-            if "池内轮换" in line:
-                cnt["rotate"] += 1
-            if "秒切兜底" in line:
-                cnt["fallback"] += 1
-            if "重试改走" in line and ("slot-7" in line or str(port) in line):
-                cnt["redirect"] += 1
-except OSError:
-    pass
+seen, rows = set(), []
+for path in logs:
+    if not path:
+        continue
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not rx.search(line):
+                    continue
+                row = line.rstrip()
+                if row in seen:
+                    continue
+                seen.add(row)
+                rows.append(row)
+    except OSError:
+        pass
+rows.sort()
+for line in rows:
+    if line < "[" + since:      # 时间戳在行首，字典序即时间序
+        continue
+    if "池内轮换" in line:
+        cnt["rotate"] += 1
+    if "秒切兜底" in line:
+        cnt["fallback"] += 1
+    if "重试改走" in line and ("slot-7" in line or str(port) in line):
+        cnt["redirect"] += 1
+recent = rows[-n:] if n else []
 print(f"  近1h: 池内轮换 {cnt['rotate']} 次 / 秒切兜底 {cnt['fallback']} 次 / "
       f"指向池闸 {cnt['redirect']} 次")
 if n and recent:
-    print(f"\n── asip 侧最近 {len(recent)} 行（gate log 跟随 / gate events 只看事件）──")
+    print(f"\n── 池闸日志最近 {len(recent)} 行（{os.environ.get('GATE_LOG_NAME', 'asip 侧')}"
+          f"；gate log 跟随 / gate events 只看事件）──")
     for line in recent:
         print("  " + line)
 PY
@@ -353,10 +375,10 @@ cmd_gate() {
     -h|--help|help) _gate_usage ;;
     log|follow|f)
       n=${1:-200}; _gate_num "$n" || return 1
-      _follow "$_RE_GATE" "$n" ;;
+      _follow "$_RE_GATE" "$n" "$GATE_LOG" ;;
     events|event|ev)
       n=${1:-30}; _gate_num "$n" || return 1
-      grep -E "$_RE_GATE_EVENT" "$LOG" 2>/dev/null | tail -n "$n" ;;
+      grep -E "$_RE_GATE_EVENT" "$GATE_LOG" 2>/dev/null | tail -n "$n" ;;
     st|status|'')
       n=${1:-12}; _gate_num "$n" || return 1
       tmp=$(mktemp) || return 1

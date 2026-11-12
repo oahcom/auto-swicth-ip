@@ -67,6 +67,8 @@ for key, val in (
     ("ASIP_DIR", repo),
     ("ASIP_PY", pybin),
     ("ASIP_LOG", c["log_file"]),
+    # 第七闸口独立账本：asip gate 默认读它，不再和 daemon.log 的换线日志混看。
+    ("ASIP_GATE_LOG", c["gate_log_file"]),
     ("ASIP_SECRET_FILE", config.SECRET_FILE),
     ("ASIP_CLASH_API", c["singbox"]["clash_api"]),
     ("ASIP_WARP_SELECTOR", c["warp"]["selector"]),

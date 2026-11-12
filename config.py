@@ -930,6 +930,13 @@ CFG = {
         },
     },
     "log_file": _env_path("ASIP_LOG_FILE", os.path.join(PROJECT_DIR, "daemon.log")),
+    # 第七闸口（代理池兜底）独立账本。slot-7 报 429 实测约 50 行/min，混在
+    # daemon.log 里会把换线/告警冲走；默认独占：主文件不再收池闸行，
+    # stdout/journal 仍全量（journalctl 是统一排障账本，不能因为拆文件就断）。
+    # ASIP_GATE_LOG_MIRROR=1 恢复双写，兼容按 daemon.log grep 的旧习惯。
+    "gate_log_file": _env_path("ASIP_GATE_LOG_FILE",
+                               os.path.join(PROJECT_DIR, "gate.log")),
+    "gate_log_mirror": _env_bool("ASIP_GATE_LOG_MIRROR", False),
     "log_format": "%Y-%m-%d %H:%M:%S",
 }
 

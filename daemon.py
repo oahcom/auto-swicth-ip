@@ -1439,6 +1439,33 @@ _log_lock = threading.RLock()
 _LOG_MAX_BYTES = 5 * 1024 * 1024  # 5MB 轮转
 _LOG_BACKUP_COUNT = 5              # 保留 5 个备份
 
+# ── 第七闸口独立日志 ──────────────────────────────────────────────────────
+# 口径与 deploy/asip-cli.sh 的 _RE_GATE 一致：这里命中哪些行，gate.log 就收
+# 哪些行，「单独开来」才有意义。含 slot-7 的动态行（"⇢ slot-7 报…"、
+# "…重试改走 slot-7…"）同样会命中 —— 这些是频率最高的一批。
+_GATE_LOG_RE = _re.compile(r"第七闸口|秒切兜底|slot-7|池闸|代理池兜底|池内轮换")
+_GATE_LOG_MAX_BYTES = 5 * 1024 * 1024
+_GATE_LOG_BACKUP_COUNT = 5
+
+
+class _GateLineFilter(logging.Filter):
+    """只放行池闸行：挂在 gate.log 的 handler 上。"""
+
+    def filter(self, record):
+        return bool(_GATE_LOG_RE.search(record.getMessage()))
+
+
+class _MainLineFilter(logging.Filter):
+    """独占模式下主 daemon.log 排除池闸行；mirror 模式不挂。"""
+
+    def filter(self, record):
+        return not _GATE_LOG_RE.search(record.getMessage())
+
+
+def _is_gate_handler(h) -> bool:
+    return isinstance(h, RotatingFileHandler) and getattr(h, "_asip_gate", False)
+
+
 def _side_effects_off() -> bool:
     """本进程是不是"不该留下痕迹"的那种。
 
@@ -1464,9 +1491,49 @@ _logger_retry_ts = 0.0             # 上次尝试建文件 handler 的时间
 def _logger_has_file() -> bool:
     try:
         import logging.handlers as _lh
-        return any(isinstance(h, _lh.RotatingFileHandler) for h in _logger.handlers)
+        return any(isinstance(h, _lh.RotatingFileHandler)
+                   and not getattr(h, "_asip_gate", False)
+                   for h in _logger.handlers)
     except Exception:
         return False
+
+
+def _logger_has_gate_file() -> bool:
+    try:
+        import logging.handlers as _lh
+        return any(isinstance(h, _lh.RotatingFileHandler)
+                   and getattr(h, "_asip_gate", False)
+                   for h in _logger.handlers)
+    except Exception:
+        return False
+
+
+def _init_gate_log_handler():
+    """给 _logger 挂上 gate.log 的专属 handler（只收池闸行）。
+
+    与主文件 handler 完全独立：gate.log 打不开/被 root 改了属主，最多损失
+    这一份副本，主 daemon.log 与 journal 照常。同样只有 systemd 拉起的进程
+    才建文件 handler —— pytest / 手工 import 不许往生产 gate.log 写假事件。
+    """
+    if _logger is None or _side_effects_off() or not CFG.get("gate_log_file"):
+        return
+    try:
+        gh = RotatingFileHandler(CFG["gate_log_file"],
+                                 maxBytes=_GATE_LOG_MAX_BYTES,
+                                 backupCount=_GATE_LOG_BACKUP_COUNT)
+        gh._asip_gate = True        # _logger_has_file() 靠它区分主/池闸 handler
+        gh.setLevel(logging.DEBUG)
+        gh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s",
+                                          datefmt=LOG_FORMAT))
+        gh.addFilter(_GateLineFilter())
+        try:
+            os.chmod(CFG["gate_log_file"], 0o600)
+        except OSError:
+            pass
+        _logger.addHandler(gh)
+    except Exception as e:
+        print(f"⚠ 第七闸口日志打不开（{e}），池闸行仍写 stdout/journal",
+              file=sys.stderr)
 
 
 def _init_logger():
@@ -1506,12 +1573,16 @@ def _init_logger():
     if fh is not None:
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt=LOG_FORMAT))
+        if not CFG.get("gate_log_mirror"):
+            fh.addFilter(_MainLineFilter())   # 独占：池闸行只进 gate.log
         _logger.addHandler(fh)
-    # stdout handler
+    # stdout handler：journal 必须保持全量，不挂任何 filter —— 拆文件不能
+    # 把 journalctl 的统一排障链路弄断。
     sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(logging.DEBUG)
     sh.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt=LOG_FORMAT))
     _logger.addHandler(sh)
+    _init_gate_log_handler()
 
 _LOG_LINE_BREAKS = _re.compile(r"[\r\n\u2028\u2029\x85\v\f]+")
 # 上游错误体/节点名可能带 ANSI 转义或其它 C0 控制符，能操纵终端显示或让
@@ -1551,13 +1622,19 @@ def log(msg: str):
     # 为了把账本修回来，结果每修一次就撕一页。
     with _log_lock:
         try:
+            # 文件 handler 还在、但文件被人删了：fd 还指着已删除的
+            # inode，日志静默写进虚空，直到进程重启。这种情况
+            # _logger_has_file() 看不出来，得看路径还在不在。
+            # gate.log 同样要查：两份账本要么都在、要么一起重建，别让
+            # 其中一份静默丢行（池闸日志恰恰是排 429 时最需要的那份）。
+            gate_ok = (not CFG.get("gate_log_file")
+                       or (_logger_has_gate_file()
+                           and os.path.exists(CFG["gate_log_file"])))
             stale = (_logger is not None and not _side_effects_off()
                      and time.time() - _logger_retry_ts > 300
                      and (not _logger_has_file()
-                          # 文件 handler 还在、但文件被人删了：fd 还指着已删除的
-                          # inode，日志静默写进虚空，直到进程重启。这种情况
-                          # _logger_has_file() 看不出来，得看路径还在不在。
-                          or not os.path.exists(CFG["log_file"])))
+                          or not os.path.exists(CFG["log_file"])
+                          or not gate_ok))
             if stale:
                 for h in list(_logger.handlers):
                     try:
@@ -12053,7 +12130,8 @@ _SWITCH_GUARD = threading.Lock()
 _API_TOKEN = ""
 _last_rotate_ts: float = 0.0
 _api_stats = {"calls": 0, "switched": 0, "coalesced": 0, "retired": 0,
-              "too_frequent": 0, "no_standby": 0, "failed": 0, "line_ok": 0, "divergence": 0}
+              "too_frequent": 0, "no_standby": 0, "failed": 0, "line_ok": 0,
+              "divergence": 0, "borrowed": 0}
 
 # 换线前实测台账：tag|ip -> 结论。9router 一次 429 风暴会连着打几十个 /rotate，
 # 每个都实测会把换线拖到几分钟，而同一地址同一时刻的结论不会变。
@@ -13781,7 +13859,7 @@ def _rotate_proxy_gate_once(slot, reason, request_started_at=None,
 
 
 def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
-                      req_id=None, ban_after=None):
+                      req_id=None, ban_after=None, borrowed=False):
     """带防重的槽位 /rotate：迟到请求只重连，不为旧证据烧掉新线。
 
     与主路径一一对应：
@@ -13845,8 +13923,16 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         if cur_ip and reason == "transport":
             _cool_egress_after_recheck(cur_ip, cur_tag)
         elif cur_ip and reason in ("rate429", "abuse403"):
-            _mark_egress_cooling(cur_ip, t0)
-        if reason not in ("proactive", "transport") and cur_ip:
+            if borrowed:
+                # 借道（9router 把别的线的请求改投到本端口）失败：这一发不是
+                # 本槽发起的，body/session 全是原线的，单发 429 不足以证明本槽
+                # 出口额度耗尽。与 transport 同规格：先复测，复测仍 quota 才
+                # 冷却，且**不写 24h 标脏**（_egress_recheck_run 只打短冷却）。
+                _cool_egress_after_recheck(cur_ip, cur_tag)
+            else:
+                _mark_egress_cooling(cur_ip, t0)
+        if (reason not in ("proactive", "transport") and cur_ip
+                and not borrowed):
             _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason,
                                ban_after=ban_after)
             # 只观测：标脏后台账里还剩什么，留在 ⇢ 那一行做运行时证据。
@@ -13855,7 +13941,12 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         last_attempt = float(h.get("last_rotate_ts") or 0.0)
         accepted = False
         repair_thread = None
-        if h["status"] == "repairing":
+        if borrowed:
+            # 借道失败不动被借线：它没坏，换掉等于白烧一条线。仍然回下一个
+            # 健康备槽，让 9router 把这条请求继续递下去。
+            _api_stats["borrowed"] += 1
+            reason_out = "borrowed_skip"
+        elif h["status"] == "repairing":
             _api_stats["coalesced"] += 1
             reason_out = "coalesced"
         elif last_attempt and t0 - last_attempt < cfg.get("coalesce_ms", 800) / 1000.0:
@@ -13897,7 +13988,9 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         # 事发前读数钉进回包：_rotate_trace_fields 优先沿用，不在标脏
         # （forget_probe 已清台账）之后重算成「未探」。
         out["offending_verdict"] = verdict_before
-        if accepted or h["status"] == "repairing":
+        # borrowed 也打：借道不认领修整，accepted 恒 False，不加这一条就
+        # 完全看不见「哪条健康线被谁借去打了一发」—— 正是不可观测的复发点。
+        if accepted or h["status"] == "repairing" or borrowed:
             # 排查通道：把请求 id、这台闸绑定的线/IP、该地址的实测结论一起
             # 留下。少了这几项，出问题时只能拿时间戳去猜「哪条请求走了哪个
             # 出口、那个地址当时是不是已被判 quota」—— 槽位状态是内存态、
@@ -13906,9 +13999,11 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
             # 是全局活动出口、对独立槽位不适用，单列「报障IP」备查，不拿来
             # 冒充这台闸的地址（实测不同线的槽位会报同一个 IP）。
             # 「标脏后」只作观测：与「实测」并列即可看出台账是否被清过。
-            log("⇢ %s 报 %s（%s）[req=%s] 线=%s 出口=%s 报障IP=%s 实测=%s "
+            log("⇢ %s 报 %s（%s）%s[req=%s] 线=%s 出口=%s 报障IP=%s 实测=%s "
                 "标脏后=%s，重试改走 %s 目标线=%s 目标出口=%s 目标url=%s"
-                % (name, reason, reason_out, req_id or "-",
+                % (name, reason, reason_out,
+                   "（借道，不判死本线）" if borrowed else "",
+                   req_id or "-",
                    cur_tag or "未知", cur_ip or "未知", egress_ip or "-",
                    verdict_before or "未探", verdict_after or "未探",
                    out.get("switch_to") or "无健康备槽",
@@ -14035,7 +14130,8 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                     str(req.get("egress_ip")).strip()
                     if isinstance(req.get("egress_ip"), str)
                     and req.get("egress_ip").strip() else None,
-                    rid, ban_after)
+                    rid, ban_after,
+                    borrowed=bool(req.get("borrowed")))
             except Exception as e:
                 log(f"✗ 槽位 /rotate 异常: {e}")
                 self._send(500, {"ok": False, "reason": "internal_error"})
