@@ -93,6 +93,13 @@ asip — auto-switch-ip 日志与出口诊断
   asip s               跟随换线全过程：触发/选线/兜底（回看 2000 行）
   asip e               跟随错误与异常（回看 2000 行）
 
+第七闸口（代理池兜底 slot-7）
+  asip gate            状态快照 + asip / 9router 两侧最近日志
+  asip gate log [N]    跟随第七闸口全部日志（默认回看 200 行）
+  asip gate events [N] 只看守护/秒切/池内轮换事件，滤掉高频 429 报障
+  asip gate 9r [N]     9router 侧切线与重放日志（默认 30 行，-f 跟随）
+  asip gate -h         本子命令帮助
+
 诊断
   asip st              状态快照：出口模式 / 当前节点 / 近 1h 切换次数
   asip warp status     各隧道状态 + 各自出口 IP + 当前出口
@@ -160,6 +167,10 @@ _RE_SW='切代理|切到|❄|WARP|轮换池|选线|会话已刷新|脏 ?IP|补�
 _RE_ERR='^\[[^]]*\] +(✗|⚠|⇄)|Traceback|ERROR|不可达|异常:'
 # usque 每 20s 一条的固有噪声：空闲/重连心跳、TCP-only 提示、探测连接主动断开。
 _RE_NOISE='Tunnel idle|Detected outbound activity|l4-socks|SOCKS client .* closed during negotiation'
+# 第七闸口：全量口径含高频「slot-7 报 429 / 重试改走 slot-7」（实测约 50 行/min）。
+# events 窄口径只留守护、秒切、池内轮换，用来回答「闸口本身有没有在动」。
+_RE_GATE='第七闸口|秒切兜底|slot-7|池闸|代理池兜底'
+_RE_GATE_EVENT='第七闸口|秒切兜底'
 
 _singbox() {
   local method=$1 path=$2 body=${3:-}
@@ -183,6 +194,201 @@ _singbox() {
 _exit_now() {
   local now=$(_singbox GET "/proxies/$ASIP_WARP_SELECTOR" | grep -oP '"now"\s*:\s*"\K[^"]+')
   echo "${now:-查询失败}"
+}
+
+# ── 第七闸口（代理池兜底）：只读诊断 ──────────────────────────────────────
+# 证据分散在三处，单看任何一处都会得出错误结论：
+#   daemon.log      选它 / 报障 / 池内轮换
+#   9router journal 是否真把请求重放到池闸（asip 写了 to=slot-7 ≠ 重放成功）
+#   /slots          进程健康、当前池节点、常规闸口还剩几个可选
+# 全部只读，不 PUT、不触发刷新。
+_asip_uds_get() {  # $1=path；走 rotate.sock + token
+  local tok path=$1
+  tok=$(cat "$ASIP_DIR/run/api-token" 2>/dev/null) || return 1
+  "$ASIP_PY" - "$ASIP_DIR" "$tok" "$path" <<'PY'
+import http.client, socket, sys
+repo, tok, path = sys.argv[1], sys.argv[2], sys.argv[3]
+class C(http.client.HTTPConnection):
+    def __init__(self):
+        super().__init__("localhost", timeout=8)
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(8)
+        self.sock.connect(f"{repo}/run/rotate.sock")
+try:
+    c = C()
+    c.request("GET", path, headers={"X-Asip-Token": tok})
+    r = c.getresponse()
+    sys.stdout.write(r.read().decode("utf-8", "replace"))
+    sys.exit(0 if 200 <= r.status < 300 else 1)
+except (OSError, ValueError) as e:
+    print(f"✗ 读 {path} 失败: {e}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+_gate_usage() {
+  cat <<'EOF'
+asip gate — 第七闸口（代理池兜底 slot-7）日志与状态
+
+  asip gate            状态快照 + asip / 9router 两侧最近日志
+  asip gate st [N]     同上，asip 侧最近 N 行（默认 12）
+  asip gate log [N]    跟随 asip 侧全部第七闸口日志（默认回看 200 行）
+  asip gate events [N] 只看守护/秒切/池内轮换事件（默认 30 行，不跟随）
+  asip gate 9r [N]     9router 侧切线/重放日志（默认 30 行；-f 跟随）
+  asip gate -h         本帮助
+
+  ASIP_ROUTER_SERVICE 可覆盖 9router 的 systemd 单元名（默认 9router.service）。
+  池闸只在六个常规闸口都不可选时才会被选中；全部命令只读。
+EOF
+}
+
+# 别把 abc 塞给 tail/journalctl 后让人去猜那句英文报错。
+_gate_num() {
+  case "${1:-}" in
+    ''|*[!0-9]*) echo "✗ 行数需为正整数，收到 '${1:-}'" >&2; return 1 ;;
+  esac
+}
+
+_gate_slots() {  # $1=目标文件
+  _asip_uds_get /slots >"$1" 2>/dev/null && [ -s "$1" ]
+}
+
+_gate_port_from_file() {  # $1=/slots JSON；端口从运行时读，不写死
+  "$ASIP_PY" - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(next((s.get("port") or "" for s in d.get("slots", [])
+                if s.get("kind") == "proxy"), ""))
+except (OSError, ValueError):
+    pass
+PY
+}
+
+# 9router 侧：以 slot-7 端口号动态拼正则，换端口不用改脚本。
+_gate_router_log() {  # $1=行数  $2=1 跟随  $3=池闸端口
+  local n=$1 follow=$2 port=$3 svc=${ASIP_ROUTER_SERVICE:-9router.service}
+  local re="to=slot-7"
+  [ -n "$port" ] && re="$re|:$port"
+  if [ "$follow" = 1 ]; then
+    echo "── 9router 侧第七闸口日志，之后 live（Ctrl-C 退出）──" >&2
+    _jctl -u "$svc" -f --since '-5 min' --no-pager -q 2>/dev/null \
+      | grep --line-buffered -E "$re"
+  else
+    _jctl -u "$svc" --since '-30 min' --no-pager -q 2>/dev/null \
+      | grep -E "$re" | tail -n "$n"
+  fi
+}
+
+_gate_status() {  # $1=/slots JSON  $2=asip 侧日志行数
+  ASIP_LOG_PATH="$LOG" GATE_LINES="$2" GATE_HOST="${ASIP_SOCKS_HOST:-localhost}" \
+  GATE_RE="$_RE_GATE" "$ASIP_PY" - "$1" "$ASIP_SERVICE" <<'PY'
+import json, os, re, socket, sys, time
+from collections import deque
+path, svc = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(path, encoding="utf-8"))
+except (OSError, ValueError) as e:
+    raise SystemExit(f"✗ /slots 不是合法 JSON: {e}")
+slots = d.get("slots") or []
+gate = next((s for s in slots if s.get("kind") == "proxy"), None)
+warps = [s for s in slots if s.get("kind") != "proxy"]
+ok = [s for s in warps if s.get("status") == "ok"]
+if gate is None:
+    raise SystemExit("✗ /slots 里没有 kind=proxy 的槽位（第七闸口未启用？看 singbox.proxy_gate）")
+name, port = gate.get("name", "?"), gate.get("port")
+listen = "✗ 未监听"
+try:
+    with socket.create_connection((os.environ.get("GATE_HOST", "localhost"),
+                                  int(port)), 0.4):
+        listen = "✓ 监听中"
+except (OSError, ValueError, TypeError):
+    pass
+print(f"第七闸口（代理池兜底）  {name}  port={port}  {listen}")
+print(f"  健康:  {gate.get('status', '?')}  verdict={gate.get('verdict') or '-'}  "
+      f"持续 {gate.get('status_age_s', '?')}s")
+print(f"  当前池节点: {gate.get('tag') or '-'}")
+print(f"  在役:  {'是' if gate.get('serving') else '否（待命）'}")
+print(f"  常规闸口可选: {len(ok)}/{len(warps)}  → "
+      + ("池闸应待命，严格兜底成立" if ok else "全部不可选，池闸是唯一兜底"))
+print(f"  主出口: {d.get('active_tag') or '-'}")
+print(f"  服务:  {os.environ.get('GATE_SVC_STATE', '?')}  {svc}")
+# 近 1h 统计按日志时间戳：daemon.log 会轮转，旧账不能算进当前窗口。
+log = os.environ.get("ASIP_LOG_PATH", "")
+n = int(os.environ.get("GATE_LINES", "12") or 12)
+rx = re.compile(os.environ["GATE_RE"])   # 与 bash 侧 _RE_GATE 共用一份口径
+since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 3600))
+cnt = {"rotate": 0, "fallback": 0, "redirect": 0}
+recent = deque(maxlen=max(n, 1))
+try:
+    with open(log, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not rx.search(line):
+                continue
+            recent.append(line.rstrip())
+            if line < "[" + since:      # 时间戳在行首，字典序即时间序
+                continue
+            if "池内轮换" in line:
+                cnt["rotate"] += 1
+            if "秒切兜底" in line:
+                cnt["fallback"] += 1
+            if "重试改走" in line and ("slot-7" in line or str(port) in line):
+                cnt["redirect"] += 1
+except OSError:
+    pass
+print(f"  近1h: 池内轮换 {cnt['rotate']} 次 / 秒切兜底 {cnt['fallback']} 次 / "
+      f"指向池闸 {cnt['redirect']} 次")
+if n and recent:
+    print(f"\n── asip 侧最近 {len(recent)} 行（gate log 跟随 / gate events 只看事件）──")
+    for line in recent:
+        print("  " + line)
+PY
+}
+
+cmd_gate() {
+  local sub=${1:-st} n=30 follow=0 tmp port rc
+  shift || true
+  case "$sub" in
+    -h|--help|help) _gate_usage ;;
+    log|follow|f)
+      n=${1:-200}; _gate_num "$n" || return 1
+      _follow "$_RE_GATE" "$n" ;;
+    events|event|ev)
+      n=${1:-30}; _gate_num "$n" || return 1
+      grep -E "$_RE_GATE_EVENT" "$LOG" 2>/dev/null | tail -n "$n" ;;
+    st|status|'')
+      n=${1:-12}; _gate_num "$n" || return 1
+      tmp=$(mktemp) || return 1
+      if ! _gate_slots "$tmp"; then
+        rm -f "$tmp"
+        echo "✗ 读不到 /slots（daemon 未起 / rotate.sock 或 api-token 缺失）" >&2
+        echo "  日志仍可查：asip gate log / asip gate 9r" >&2
+        return 1
+      fi
+      port=$(_gate_port_from_file "$tmp")
+      GATE_SVC_STATE="$(_sctl is-active "$ASIP_SERVICE" 2>/dev/null)" \
+        _gate_status "$tmp" "$n"
+      rc=$?
+      rm -f "$tmp"
+      [ $rc -eq 0 ] || return $rc
+      echo
+      echo "── 9router 侧最近 5 行（asip gate 9r 看全部）──"
+      _gate_router_log 5 0 "$port" ;;
+    9r|9router|peer)
+      case "${1:-}" in
+        -f|follow) follow=1 ;;
+        '') ;;
+        *) n=$1; _gate_num "$n" || return 1
+           [ "${2:-}" = -f ] && follow=1 ;;
+      esac
+      tmp=$(mktemp) || return 1
+      port=""
+      if _gate_slots "$tmp"; then port=$(_gate_port_from_file "$tmp"); fi
+      rm -f "$tmp"
+      _gate_router_log "$n" "$follow" "$port" ;;
+    *) echo "✗ 未知子命令: asip gate $sub" >&2; _gate_usage >&2; return 1 ;;
+  esac
 }
 
 # ── inbox：读 Sister Bus 里各角色报给本项目的消息 ──
@@ -709,6 +915,7 @@ PY
 case "${1:-}" in
   -h|--help|help) _usage ;;
   warp) shift; cmd_warp "$@" ;;
+  gate|slot7|g7) shift; cmd_gate "$@" ;;
   sub) shift; cmd_sub "$@" ;;
   inbox|inb) shift; cmd_inbox "$@" ;;
   # Vercel 中继：子命令全在 python 里（argparse 管，别在 bash 里再抄一份参数表）。

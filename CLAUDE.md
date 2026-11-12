@@ -167,6 +167,25 @@ P2C+预检判据），绝不进 `_repair_slot` 换 WARP 线；若此刻有任何
 promote）；首次上线后下一轮小时刷新会自动落盘 slot-7 配置并拉起进程
 （热重载对不存在进程必然失败 → 回退整组重启，正好把它带起来）。
 
+**日志与命令（`asip gate`）**：证据分散在三处，只看一处会误判 ——
+`daemon.log`（选它 / 报障 / 池内轮换：`第七闸口`、`秒切兜底`、`slot-7`）、
+9router journal（`[ASIP] rotate ... to=slot-7 ... to_url=…:7897` 与
+`[EGRESS] retry ... accounted on …:7897`；**asip 回了 `to=slot-7` 不等于请求真重放**）、
+`/slots`（健康 / 当前池节点 / 常规闸口还剩几个可选）。
+
+| 命令 | 用途 |
+|---|---|
+| `asip gate` / `asip gate st [N]` | 状态快照 + 两侧最近日志（默认 12 行），含近 1h 池内轮换 / 秒切兜底 / 指向池闸次数 |
+| `asip gate log [N]` | 跟随 asip 侧全部池闸日志（默认回看 200 行，Ctrl-C 退出） |
+| `asip gate events [N]` | 只看守护 / 秒切 / 池内轮换事件，滤掉高频 `slot-7 报 429`（实测约 50 行/min） |
+| `asip gate 9r [N]` / `asip gate 9r -f` | 9router 侧切线与重放日志（默认 30 行；`-f` 跟随） |
+
+别名 `asip slot7` / `asip g7`；`ASIP_ROUTER_SERVICE` 可覆盖 9router 单元名（默认
+`9router.service`）。全部只读，端口从 `/slots` 读，脚本不写死站点值。等价手工查法：
+`journalctl -u auto-switch-ip.service --since "30 min ago" | grep -E '第七闸口|秒切兜底|slot-7'`、
+`journalctl -u 9router.service --since "30 min ago" | grep -E 'to=slot-7|7897'`、
+`curl --unix-socket run/rotate.sock -H "X-Asip-Token: $(cat run/api-token)" http://localhost/slots`。
+
 
 - 触发（两类出口级拦截，阈值不同，外加连错门控）：
   - `abuse403` ≥ `warp.block_threshold`（默认 1）—— IP 信誉拦截，出现即说明当前出口已被标记。
