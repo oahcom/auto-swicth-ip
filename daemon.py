@@ -13625,7 +13625,7 @@ def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
     payload = {"ok": True, "switched": False, "reason": reason,
                "switched_at": switched_at, "ms": 0,
                "active_tag": cur_tag, "active_egress": cur_ip,
-               "avoid_port_until": avoid_until}
+               "avoid_port_until": avoid_until, "switch_to_node": None}
     other, ttag, tip = _pick_healthy_slot(
         slot["name"], {cur_tag} if cur_tag else None, avoid_ips)
     if other is not None:
@@ -13634,6 +13634,11 @@ def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
         payload["switch_to_url"] = "http://127.0.0.1:%d" % other["port"]
         payload["switch_to_tag"] = ttag
         payload["switch_to_egress"] = tip
+        if _is_proxy_gate(other):
+            # 常规闸口全不可选 → 重试目标是第七闸口。它没有 WARP 那种
+            # /128 出口地址（switch_to_egress 只能是 None），把池节点身份
+            # 单独给 9router，它才能认出这次换的是池里的哪条出口。
+            payload["switch_to_node"] = ttag
     else:
         payload["switch_to"] = None
         payload["switch_to_url"] = None
@@ -13738,7 +13743,8 @@ def _rotate_proxy_gate_once(slot, reason, request_started_at=None,
                 _PROXY_GATE_LAST_USED["ts"] = t0
         payload = {"ok": True, "switched": False, "reason": reason_out,
                    "switched_at": h.get("switched_at") or 0.0, "ms": 0,
-                   "active_tag": cur_node, "active_egress": None}
+                   "active_tag": cur_node, "active_egress": None,
+                   "switch_to_node": None}
         if other is not None:
             payload["switched"] = True
             payload["switch_to"] = other["name"]
@@ -13752,6 +13758,13 @@ def _rotate_proxy_gate_once(slot, reason, request_started_at=None,
             payload["switch_to_url"] = "http://127.0.0.1:%d" % slot["port"]
             payload["switch_to_tag"] = rotated
             payload["switch_to_egress"] = None
+            # 池节点没有 WARP 那种 /128 出口地址，9router 拿不到
+            # switch_to_egress 就会按「no new egress」拒绝这一发重放
+            # （2026-11-13 实测 30min 内 83 次 refused）。switched_at 给出
+            # 「请求发出后确实换过出口」的时间证据，switch_to_node 给出换到
+            # 哪个池节点；两者只在真换了节点时填，coalesced 不能骗重放。
+            payload["switched_at"] = t0
+            payload["switch_to_node"] = rotated
         else:
             payload["switch_to"] = None
             payload["switch_to_url"] = None

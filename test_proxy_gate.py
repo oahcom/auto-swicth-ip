@@ -234,6 +234,10 @@ def test_rotate_on_gate_rotates_pool_node(isolated, monkeypatch):
     assert out["switch_to"] == "slot-7"
     assert out["switch_to_url"] == "http://127.0.0.1:7897"
     assert out["switch_to_tag"] == "n2"
+    # 给 9router 的「出口已变」证据：池节点没有 /128 地址，靠这两项
+    assert out["switched_at"] > 0
+    assert out["switch_to_node"] == "n2"
+    assert out["switch_to_egress"] is None
     assert isolated.gate["puts"] == ["n2"]       # PUT 打在池闸自己的 selector
     assert isolated.gate["now"] == "n2"
     # 绝不进 WARP 修整链路（那里会 claim WARP 线）
@@ -270,6 +274,9 @@ def test_rotate_on_gate_coalesces_burst(isolated, monkeypatch):
     assert first["reason"] == "ok"
     second = daemon._rotate_slot_once(GATE, "rate429")
     assert second["reason"] == "coalesced"   # 合并窗内只换一次
+    # 没真换节点就不能给「出口已变」的证据，否则 9router 会白打一发
+    assert not second.get("switch_to_node")
+    assert second.get("switch_to_url") is None
     assert isolated.gate["puts"] == ["n2"]
 
 
@@ -284,6 +291,27 @@ def test_rotate_on_gate_all_exhausted_signals_restart(isolated, monkeypatch):
     assert out["reason"] == "no_healthy_slot"
     assert out["restart_required"] is True
     assert daemon._slot_health("slot-7")["status"] == "bad"
+
+
+def test_redirect_payload_exposes_pool_node_for_gate(isolated):
+    """常规闸口全坏时切到第七闸口：回包带池节点身份，9router 才认得切线。"""
+    for s in WARP_SLOTS:
+        daemon._slot_mark(s["name"], "bad")
+    daemon._slot_mark("slot-7", "ok")
+    out = daemon._slot_redirect_payload(
+        WARP_SLOTS[0], "WARP-A", "2606:a::1", "rate429", time.time() - 5)
+    assert out["switch_to"] == "slot-7"
+    assert out["switch_to_url"] == "http://127.0.0.1:7897"
+    assert out["switch_to_node"] == "n1"
+    assert out["switch_to_egress"] is None
+
+
+def test_redirect_payload_warp_slot_has_no_pool_node(isolated):
+    """常规闸口能接时，回包不得冒充池闸切线。"""
+    out = daemon._slot_redirect_payload(
+        WARP_SLOTS[0], "WARP-A", "2606:a::1", "rate429", time.time() - 5)
+    assert out["switch_to"] != "slot-7"
+    assert out["switch_to_node"] is None
 
 
 # ── 4. 池闸不进任何 WARP 线机制 ─────────────────────────────────────────
