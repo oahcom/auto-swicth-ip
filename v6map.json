@@ -1,0 +1,17 @@
+[
+ {
+  "tag": "ddixx-1dd1.dankenet.help:5474-any",
+  "ip": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+  "family": "v6"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:44503-any",
+  "ip": "2602:f988:84:4f7::e6b",
+  "family": "v6"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:64657-any",
+  "ip": null,
+  "family": "none"
+ }
+]

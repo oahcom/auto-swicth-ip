@@ -1,0 +1,293 @@
+{
+  "ok": 90,
+  "fail": 20,
+  "first429_at": 83,
+  "workers": [
+    {
+      "w": 1,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 1,
+      "stop": "quota"
+    },
+    {
+      "w": 16,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 9,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 19,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 11,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 5,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 18,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 4,
+      "stop": "quota"
+    },
+    {
+      "w": 3,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 6,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 7,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 12,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 3,
+      "stop": "quota"
+    },
+    {
+      "w": 0,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 4,
+      "stop": "quota"
+    },
+    {
+      "w": 10,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 17,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 15,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 3,
+      "stop": "quota"
+    },
+    {
+      "w": 2,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 14,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 8,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 13,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    },
+    {
+      "w": 4,
+      "sid": "ses_e303e6b3cffe",
+      "ok": 5,
+      "stop": "quota"
+    }
+  ],
+  "events": [
+    {
+      "w": 1,
+      "ok_at_fail": 1,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.5
+    },
+    {
+      "w": 16,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.7
+    },
+    {
+      "w": 9,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.7
+    },
+    {
+      "w": 19,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.7
+    },
+    {
+      "w": 11,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.7
+    },
+    {
+      "w": 5,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.8
+    },
+    {
+      "w": 18,
+      "ok_at_fail": 4,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.9
+    },
+    {
+      "w": 3,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.9
+    },
+    {
+      "w": 6,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.9
+    },
+    {
+      "w": 7,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.9
+    },
+    {
+      "w": 12,
+      "ok_at_fail": 3,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.9
+    },
+    {
+      "w": 0,
+      "ok_at_fail": 4,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.9
+    },
+    {
+      "w": 10,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44604,
+      "t": 6.9
+    },
+    {
+      "w": 17,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44603,
+      "t": 7.3
+    },
+    {
+      "w": 15,
+      "ok_at_fail": 3,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44603,
+      "t": 7.4
+    },
+    {
+      "w": 2,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44603,
+      "t": 7.4
+    },
+    {
+      "w": 14,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44603,
+      "t": 7.4
+    },
+    {
+      "w": 8,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44603,
+      "t": 7.4
+    },
+    {
+      "w": 13,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44603,
+      "t": 7.4
+    },
+    {
+      "w": 4,
+      "ok_at_fail": 5,
+      "verdict": "quota",
+      "st": 429,
+      "ra": 44602,
+      "t": 8.7
+    }
+  ],
+  "node": "normal.cn.greatgameupload.org:2155-any",
+  "ip": "82.152.160.7",
+  "workers_n": 20,
+  "secs": 240
+}

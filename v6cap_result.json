@@ -1,0 +1,42 @@
+[
+ {
+  "idx": 6,
+  "tag": "ttll20-ooi.dankenet.help:61827-vl",
+  "mode": "multi",
+  "maxn": 200,
+  "ip_start": "2405:84c0:8060:4500::",
+  "family": "v6",
+  "ok": 40,
+  "stop": {
+   "at_shot": 41,
+   "verdict": "quota",
+   "st": 429,
+   "ra": 40369,
+   "distinct_sessions": 41,
+   "trans_retried": 0
+  },
+  "distinct_sessions": 41,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 40363
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 40362
+   }
+  ],
+  "ip_end": "2405:84c0:8060:4500::"
+ },
+ {
+  "idx": 7,
+  "tag": "ttll20-ooi.dankenet.help:26514-vl",
+  "mode": "multi",
+  "maxn": 200,
+  "ip_start": null,
+  "family": "none",
+  "err": "no_ip"
+ }
+]

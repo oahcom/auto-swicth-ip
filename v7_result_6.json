@@ -1,0 +1,33 @@
+[
+ {
+  "idx": 6,
+  "tag": "WARP-CF-G",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 1500,
+  "ip_start": "2a09:bac5:1f04:3046::4cf:e",
+  "family": "v6",
+  "sessions": 15,
+  "ok": 2,
+  "death": [],
+  "dur_sec": 6.8,
+  "per_worker": {
+   "12": 1,
+   "13": 1
+  },
+  "ip_end": "2a09:bac5:1f04:3046::4cf:e",
+  "ip_stable": true,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38605
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38604
+   }
+  ]
+ }
+]

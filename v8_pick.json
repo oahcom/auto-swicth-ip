@@ -1,0 +1,66 @@
+{
+ "warp": [
+  {
+   "tag": "WARP-H2-NRT-1",
+   "ip": "2a09:bac5:4306:dc::16:16f",
+   "family": "v6"
+  },
+  {
+   "tag": "WARP-CF-B",
+   "ip": "2a09:bac5:1f06:28::4:37b",
+   "family": "v6"
+  },
+  {
+   "tag": "WARP-CF-C",
+   "ip": "2a09:bac1:1980:18::4:2fb",
+   "family": "v6"
+  },
+  {
+   "tag": "WARP-H2-NRT-0",
+   "ip": "2a09:bac5:4304:dc::16:182",
+   "family": "v6"
+  },
+  {
+   "tag": "WARP-CF-G",
+   "ip": "2a09:bac5:1f04:3046::4cf:e",
+   "family": "v6"
+  },
+  {
+   "tag": "WARP-CF",
+   "ip": "2a09:bac5:1f07:1232::1d0:d4",
+   "family": "v6"
+  }
+ ],
+ "v4": [
+  {
+   "tag": "cn.bing.com:443~23-any",
+   "ip": "64.120.94.207",
+   "family": "v4"
+  },
+  {
+   "tag": "cn.bing.com:443~22-any",
+   "ip": "64.120.94.205",
+   "family": "v4"
+  },
+  {
+   "tag": "cn.bing.com:443~21-any",
+   "ip": "64.120.94.204",
+   "family": "v4"
+  },
+  {
+   "tag": "cn.bing.com:443~6-any",
+   "ip": "45.207.156.48",
+   "family": "v4"
+  },
+  {
+   "tag": "unamecf3.xn--ghqu5fm27b67w.com:443~5-vl",
+   "ip": "134.195.101.195",
+   "family": "v4"
+  },
+  {
+   "tag": "unamecf3.xn--ghqu5fm27b67w.com:443~6-vl",
+   "ip": "134.195.101.197",
+   "family": "v4"
+  }
+ ]
+}

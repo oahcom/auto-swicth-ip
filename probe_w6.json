@@ -1,0 +1,122 @@
+[
+ {
+  "tag": "WARP-H2-HKG-71",
+  "ip": "2a09:bac5:3987:2e1e::498:6e",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35643,
+  "sid": "ses_e2fcf5c5dffeTzD8etR7ie7KTh",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-H2-HKG-70",
+  "ip": "2a09:bac1:3180::3d0:11",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34826,
+  "sid": "ses_e2fcf5c17ffe0xkRyQs3rKeZ7k",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-H2-HKG-9",
+  "ip": "2a09:bac5:3984:2646::3d0:3f",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35264,
+  "sid": "ses_e2fcf5c17ffegoS8W9wpculB3B",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-H2-NRT-0",
+  "ip": "2a09:bac1:3b60:10::16:17a",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35083,
+  "sid": "ses_e2fcf5b4fffe22MBSykeTBbZhZ",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-H2-NRT-1",
+  "ip": "2a09:bac5:4304:dc::16:19e",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 37041,
+  "sid": "ses_e2fcf5b76ffeWvIVrwf1WIQ52J",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-H2-SIN-65",
+  "ip": "2a09:bac1:6520:8::278:7d",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 37201,
+  "sid": "ses_e2fcf5b55ffe074s6EFh65hEnh",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-CF-C",
+  "ip": "2a09:bac5:1f01:28::4:34f",
+  "family": "v6",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fcf58f7ffecGEGpAmS6tRyoc",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-H2-HKG-69",
+  "ip": "2a09:bac1:4c20::245:63",
+  "family": "v6",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fcf5c1fffepmgkMbn2GBoYXi",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-CF-B",
+  "ip": "2a09:bac5:1f01:3046::4cf:93",
+  "family": "v6",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fcf5b36ffe4acU2lphxFSOin",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-CF",
+  "ip": "2a09:bac5:1f04:3046::4cf:87",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35388,
+  "sid": "ses_e2fcf588fffeN5mWuAtdOkSZlz",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-H2-HKG-10",
+  "ip": null,
+  "family": "v6",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fcf5bf2ffe0ZoUNkxm8q2Gyz",
+  "trans_retried": 0
+ },
+ {
+  "tag": "WARP-CF-G",
+  "ip": null,
+  "family": "v6",
+  "verdict": "trans",
+  "st": null,
+  "ra": null,
+  "sid": "ses_e2fcee0d6ffeyCo2RHMViSe2Vm",
+  "trans_retried": 2
+ }
+]

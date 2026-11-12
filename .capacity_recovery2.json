@@ -1,0 +1,214 @@
+{
+  "rows": [
+    {
+      "t": 6,
+      "round": 1,
+      "tag": "WARP-H2-HKG-10",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:3987:16dc::247:d7",
+      "ip_b": "2a09:bac5:3987:16dc::247:d7",
+      "same": true,
+      "retry_after": 49114
+    },
+    {
+      "t": 13,
+      "round": 1,
+      "tag": "WARP-H2-SJC-108",
+      "verdict": "transport",
+      "ip_a": "",
+      "ip_b": "2a09:bac1:76c0:28::4:376",
+      "same": false,
+      "retry_after": null
+    },
+    {
+      "t": 16,
+      "round": 1,
+      "tag": "WARP-H2-SIN-145",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:55f9:30c8::4dc:4e",
+      "ip_b": "2a09:bac5:55f9:30c8::4dc:4e",
+      "same": true,
+      "retry_after": 50122
+    },
+    {
+      "t": 81,
+      "round": 2,
+      "tag": "WARP-H2-HKG-10",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:3987:16dc::247:d7",
+      "ip_b": "2a09:bac5:3987:16dc::247:d7",
+      "same": true,
+      "retry_after": 49041
+    },
+    {
+      "t": 84,
+      "round": 2,
+      "tag": "WARP-H2-SJC-108",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:6213:3050::4d0:72",
+      "ip_b": "2a09:bac5:6213:3050::4d0:72",
+      "same": false,
+      "retry_after": 49359
+    },
+    {
+      "t": 87,
+      "round": 2,
+      "tag": "WARP-H2-SIN-145",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:55f9:30c8::4dc:4e",
+      "ip_b": "2a09:bac5:55f9:30c8::4dc:4e",
+      "same": true,
+      "retry_after": 50050
+    },
+    {
+      "t": 151,
+      "round": 3,
+      "tag": "WARP-H2-HKG-10",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:3984:16c8::245:e",
+      "ip_b": "2a09:bac5:3984:16c8::245:e",
+      "same": false,
+      "retry_after": 49108
+    },
+    {
+      "t": 154,
+      "round": 3,
+      "tag": "WARP-H2-SJC-108",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:6217:1246::1d2:26",
+      "ip_b": "2a09:bac5:6217:1246::1d2:26",
+      "same": false,
+      "retry_after": 51429
+    },
+    {
+      "t": 157,
+      "round": 3,
+      "tag": "WARP-H2-SIN-145",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:55f9:30c8::4dc:4e",
+      "ip_b": "2a09:bac5:55f9:30c8::4dc:4e",
+      "same": true,
+      "retry_after": 49981
+    },
+    {
+      "t": 228,
+      "round": 4,
+      "tag": "WARP-H2-HKG-10",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:3987:e6::17:342",
+      "ip_b": "2a09:bac5:3987:e6::17:342",
+      "same": false,
+      "retry_after": 50617
+    },
+    {
+      "t": 232,
+      "round": 4,
+      "tag": "WARP-H2-SJC-108",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:6215:1246::1d2:b6",
+      "ip_b": "2a09:bac5:6215:1246::1d2:b6",
+      "same": false,
+      "retry_after": 49672
+    },
+    {
+      "t": 235,
+      "round": 4,
+      "tag": "WARP-H2-SIN-145",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:55f9:30c8::4dc:4e",
+      "ip_b": "2a09:bac5:55f9:30c8::4dc:4e",
+      "same": true,
+      "retry_after": 49902
+    },
+    {
+      "t": 306,
+      "round": 5,
+      "tag": "WARP-H2-HKG-10",
+      "verdict": "transport",
+      "ip_a": "2a09:bac1:31c0::246:f7",
+      "ip_b": "2a09:bac5:3985:16dc::247:71",
+      "same": false,
+      "retry_after": null
+    },
+    {
+      "t": 310,
+      "round": 5,
+      "tag": "WARP-H2-SJC-108",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:6217:1232::1d0:d2",
+      "ip_b": "2a09:bac5:6217:1232::1d0:d2",
+      "same": false,
+      "retry_after": 49396
+    },
+    {
+      "t": 312,
+      "round": 5,
+      "tag": "WARP-H2-SIN-145",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:55f9:30c8::4dc:4e",
+      "ip_b": "2a09:bac5:55f9:30c8::4dc:4e",
+      "same": true,
+      "retry_after": 49825
+    },
+    {
+      "t": 376,
+      "round": 6,
+      "tag": "WARP-H2-HKG-10",
+      "verdict": "quota",
+      "ip_a": "2a09:bac1:31a0::3cf:5d",
+      "ip_b": "2a09:bac1:31a0::3cf:5d",
+      "same": false,
+      "retry_after": 48706
+    },
+    {
+      "t": 380,
+      "round": 6,
+      "tag": "WARP-H2-SJC-108",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:6217:3050::4d0:38",
+      "ip_b": "2a09:bac5:6217:3050::4d0:38",
+      "same": false,
+      "retry_after": 49627
+    },
+    {
+      "t": 385,
+      "round": 6,
+      "tag": "WARP-H2-SIN-145",
+      "verdict": "OK",
+      "ip_a": "2a09:bac5:55fd:25af::3c1:45",
+      "ip_b": "2a09:bac5:55fd:25af::3c1:45",
+      "same": false,
+      "retry_after": null
+    },
+    {
+      "t": 448,
+      "round": 7,
+      "tag": "WARP-H2-HKG-10",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:3984:16c8::245:b5",
+      "ip_b": "2a09:bac5:3984:16c8::245:b5",
+      "same": false,
+      "retry_after": 48810
+    },
+    {
+      "t": 452,
+      "round": 7,
+      "tag": "WARP-H2-SJC-108",
+      "verdict": "quota",
+      "ip_a": "2a09:bac5:6217:3050::4d0:38",
+      "ip_b": "2a09:bac5:6217:3050::4d0:38",
+      "same": false,
+      "retry_after": 49555
+    },
+    {
+      "t": 456,
+      "round": 7,
+      "tag": "WARP-H2-SIN-145",
+      "verdict": "OK",
+      "ip_a": "2a09:bac5:55fd:25af::3c1:45",
+      "ip_b": "2a09:bac5:55fd:25af::3c1:45",
+      "same": false,
+      "retry_after": null
+    }
+  ]
+}

@@ -1,0 +1,242 @@
+[
+ {
+  "tag": "ttll20-ooi.dankenet.help:12815-any",
+  "any": "45.95.212.132",
+  "api6": "2405:84c0:8011:5700::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:11732-any",
+  "any": "152.175.33.8",
+  "api6": "2405:84c0:8011:d000::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:8656-any",
+  "any": null,
+  "api6": null,
+  "fam": "none"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:34765-any",
+  "any": null,
+  "api6": null,
+  "fam": "none"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:25558-any",
+  "any": "152.175.66.19",
+  "api6": "2405:84c0:8001:3200::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:64657-any",
+  "any": "152.175.66.199",
+  "api6": "2405:84c0:8001:bf00::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:35849-any",
+  "any": null,
+  "api6": null,
+  "fam": "none"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:31966-any",
+  "any": null,
+  "api6": null,
+  "fam": "none"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:23886-any",
+  "any": "152.175.66.199",
+  "api6": "2405:84c0:8001:bf00::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:16996-any",
+  "any": "152.175.97.36",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:48483-any",
+  "any": "152.175.97.37",
+  "api6": "2405:84c0:8031:2400::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:26514-vl",
+  "any": "152.175.97.26",
+  "api6": "2405:84c0:8031:1900::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:30207-vl",
+  "any": "152.175.97.20",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:21174-any",
+  "any": "152.175.97.37",
+  "api6": "2405:84c0:8031:2400::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:42839-any",
+  "any": "152.175.97.36",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:29874-any",
+  "any": "152.175.1.161",
+  "api6": "2405:84c0:8040:9e00::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:5561-any",
+  "any": null,
+  "api6": "2405:84c0:8040:9f00::",
+  "fam": "none"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:11957-any",
+  "any": "152.175.1.161",
+  "api6": "2405:84c0:8040:9e00::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:44073-any",
+  "any": "152.175.1.162",
+  "api6": "2405:84c0:8040:9f00::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:42068-any",
+  "any": null,
+  "api6": null,
+  "fam": "none"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:5474-any",
+  "any": "208.75.135.58",
+  "api6": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:63153-any",
+  "any": "107.149.136.229",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:41723-any",
+  "any": "107.149.136.229",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:6650-any",
+  "any": "115.178.34.42",
+  "api6": "2405:84c0:8052:2900::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:3526-any",
+  "any": "115.178.34.42",
+  "api6": "2405:84c0:8052:2900::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:32992-any",
+  "any": "152.175.146.131",
+  "api6": "2405:84c0:8060:7f00::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:61827-vl",
+  "any": "152.175.146.70",
+  "api6": "2405:84c0:8060:4500::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:60130-any",
+  "any": "152.175.146.131",
+  "api6": "2405:84c0:8060:7f00::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:16895-vl",
+  "any": "152.175.146.70",
+  "api6": "2405:84c0:8060:4500::",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:20472-any",
+  "any": "51.241.140.86",
+  "api6": "2a12:bec4:1872:cea::7bb",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:37735-any",
+  "any": "51.241.140.86",
+  "api6": "2a12:bec4:1872:cea::7bb",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:44503-any",
+  "any": "185.58.159.197",
+  "api6": "2602:f988:84:4f7::e6b",
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:51747-any",
+  "any": "185.58.159.197",
+  "api6": "2602:f988:84:4f7::e6b",
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:21094-any",
+  "any": null,
+  "api6": null,
+  "fam": "none"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:63099-any",
+  "any": "157.85.96.177",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:33068-any",
+  "any": "193.25.218.234",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:3824-any",
+  "any": "193.25.218.234",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:53175-vl",
+  "any": "163.223.210.170",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:40302-vl",
+  "any": "154.26.159.62",
+  "api6": null,
+  "fam": "v4"
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:59753-vl",
+  "any": "200.11.121.188",
+  "api6": null,
+  "fam": "v4"
+ }
+]

@@ -1,0 +1,30 @@
+[
+ {
+  "idx": 0,
+  "tag": "WARP-H2-NRT-1",
+  "mode": "single",
+  "conc": 4,
+  "maxtotal": 400,
+  "ip_start": "2a09:bac5:4301:dc::16:19e",
+  "family": "v6",
+  "sessions": 1,
+  "ok": 0,
+  "death": [],
+  "dur_sec": 1.0,
+  "per_worker": {},
+  "ip_end": "2a09:bac5:4301:dc::16:19e",
+  "ip_stable": true,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37701
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37700
+   }
+  ]
+ }
+]

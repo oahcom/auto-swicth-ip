@@ -1,0 +1,45 @@
+[
+ {
+  "idx": 9,
+  "tag": "WARP-H2-SIN-65",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 900,
+  "ip_start": "2a09:bac5:55f8:1d0f::2e5:13",
+  "family": "v6",
+  "sessions": 15,
+  "ok": 15,
+  "death": [],
+  "dur_sec": 7.7,
+  "per_worker": {
+   "5": 2,
+   "7": 1,
+   "1": 1,
+   "13": 1,
+   "2": 1,
+   "3": 1,
+   "6": 1,
+   "8": 1,
+   "4": 1,
+   "9": 1,
+   "14": 1,
+   "11": 1,
+   "12": 1,
+   "0": 1
+  },
+  "ip_end": "2a09:bac5:55f8:1d0f::2e5:13",
+  "ip_stable": true,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 39817
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 39814
+   }
+  ]
+ }
+]

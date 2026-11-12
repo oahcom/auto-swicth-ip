@@ -1,0 +1,45 @@
+{
+  "tag": "WARP-H2-GIG-78",
+  "port": 1258,
+  "rows": [
+    {
+      "t": 2,
+      "verdict": "quota",
+      "status": 429,
+      "retry_after": 49917
+    },
+    {
+      "t": 67,
+      "verdict": "OK",
+      "status": 200,
+      "retry_after": null
+    },
+    {
+      "t": 130,
+      "verdict": "OK",
+      "status": 200,
+      "retry_after": null
+    },
+    {
+      "t": 192,
+      "verdict": "OK",
+      "status": 200,
+      "retry_after": null
+    },
+    {
+      "t": 253,
+      "verdict": "transport",
+      "status": null,
+      "retry_after": "ECONNRESET: The socket connection was closed unexpectedly. For more information,"
+    },
+    {
+      "t": 315,
+      "verdict": "quota",
+      "status": 429,
+      "retry_after": 51259
+    },
+    {
+      "burst_after": 0
+    }
+  ]
+}

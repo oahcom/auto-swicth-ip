@@ -1,0 +1,41 @@
+[
+ {
+  "idx": 54,
+  "tag": "pq.aws53.yydjc.top:443-vl",
+  "mode": "rotate",
+  "conc": 1,
+  "maxtotal": 80,
+  "ip_start": "52.196.41.126",
+  "sessions": 1,
+  "ok": 39,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 74.3,
+  "per_worker": {
+   "0": 39
+  },
+  "ip_end": "52.196.41.126",
+  "segments": [
+   {
+    "ip": "52.196.41.126",
+    "shots": 0
+   },
+   {
+    "ip": "52.196.41.126",
+    "shots": 39
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 34701
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 34700
+   }
+  ]
+ }
+]

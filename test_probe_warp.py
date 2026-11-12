@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""probe_warp 纯单元测试（无网络）：env 块、会话复用/轮换、错误分类。"""
+"""probe_warp 纯单元测试（无网络）：env 块、每日会话集、错误分类。"""
 import json
 import re
 import time
@@ -54,31 +54,27 @@ def test_classify_quota_and_flagged():
     assert probe_warp.classify(500, "boom") == "err"
 
 
-def test_session_is_stable_and_rotates(tmp_path, monkeypatch):
-    monkeypatch.setattr(probe_warp, "SESSION_STATE_FILE", str(tmp_path / "s.json"))
+def test_daily_sessions_fixed_15_and_cross_day_unique():
+    today = probe_warp._daily_sessions("20261112")
+    assert len(today) == 15
+    assert len(set(today)) == 15
+    assert all(re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", s) for s in today)
+    # 同一天重复调用恒定
+    assert probe_warp._daily_sessions("20261112") == today
+    # 跨天必然不重样
+    assert not set(today) & set(probe_warp._daily_sessions("20261113"))
+    # counter 落在 1..15（上游只接受 0..16，>=100 直接 403）
+    counters = sorted(
+        int((~int(s[4:16], 16)) & probe_warp._MASK48) % 4096 for s in today)
+    assert counters == list(range(1, 16))
 
-    first = probe_warp._session_for(1081)
-    assert first == probe_warp._session_for(1081)
-    assert first.startswith("ses_") and len(first) == 4 + 12 + 14
 
-    rotated = probe_warp._session_for(1081, rotate=True)
-    assert rotated != first
-    data = json.loads((tmp_path / "s.json").read_text())
-    assert data["1081"]["session"] == rotated
-    assert data["1081"]["rotations"] == 1
-
-
-def test_session_expires(monkeypatch, tmp_path):
-    state = tmp_path / "s.json"
-    state.write_text(json.dumps({
-        "1081": {"session": "ses_old", "ts": time.time() - probe_warp.SESSION_TTL_SEC - 1,
-                 "rotations": 3},
-    }))
-    monkeypatch.setattr(probe_warp, "SESSION_STATE_FILE", str(state))
-
-    fresh = probe_warp._session_for(1081)
-    assert fresh != "ses_old"
-    assert json.loads(state.read_text())["1081"]["rotations"] == 0
+def test_pick_session_always_from_daily_set():
+    today = set(probe_warp._daily_sessions())
+    picked = {probe_warp._pick_session() for _ in range(200)}
+    assert picked <= today
+    # 200 次抽样覆盖全部 15 个（单个漏掉的概率 15 * (14/15)^200 ≈ 1e-5）
+    assert len(picked) == 15
 
 
 def test_parse_retry_after_header_numeric():

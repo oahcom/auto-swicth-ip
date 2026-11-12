@@ -1,0 +1,146 @@
+[
+ {
+  "idx": 30,
+  "tag": "pq.aws49.yydjc.top:443-vl",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 900,
+  "ip_start": "54.199.78.171",
+  "sessions": 15,
+  "ok": 0,
+  "trans_cnt": 1,
+  "death": [],
+  "dur_sec": 7.4,
+  "per_worker": {},
+  "ip_end": "54.199.78.171",
+  "segments": [
+   {
+    "ip": "54.199.78.171",
+    "shots": 0
+   },
+   {
+    "ip": "54.199.78.171",
+    "shots": 0
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37117
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37114
+   }
+  ]
+ },
+ {
+  "idx": 31,
+  "tag": "pq.aws48.yydjc.top:443-vl",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 900,
+  "ip_start": "18.183.195.87",
+  "sessions": 15,
+  "ok": 0,
+  "trans_cnt": 8,
+  "death": [],
+  "dur_sec": 5.6,
+  "per_worker": {},
+  "ip_end": "18.183.195.87",
+  "segments": [
+   {
+    "ip": "18.183.195.87",
+    "shots": 0
+   },
+   {
+    "ip": "18.183.195.87",
+    "shots": 0
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38347
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38346
+   }
+  ]
+ },
+ {
+  "idx": 32,
+  "tag": "pq.aws65.yydjc.top:443-vl",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 900,
+  "ip_start": "67.159.48.148",
+  "sessions": 15,
+  "ok": 0,
+  "trans_cnt": 1,
+  "death": [],
+  "dur_sec": 6.5,
+  "per_worker": {},
+  "ip_end": null,
+  "segments": [
+   {
+    "ip": "67.159.48.148",
+    "shots": 0
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37006
+   },
+   {
+    "verdict": "trans",
+    "st": null,
+    "ra": null
+   }
+  ]
+ },
+ {
+  "idx": 33,
+  "tag": "cn.bing.com:443~9-any",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 900,
+  "ip_start": "156.224.78.207",
+  "sessions": 15,
+  "ok": 0,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 3.2,
+  "per_worker": {},
+  "ip_end": "156.224.78.207",
+  "segments": [
+   {
+    "ip": "156.224.78.207",
+    "shots": 0
+   },
+   {
+    "ip": "156.224.78.207",
+    "shots": 0
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37678
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37675
+   }
+  ]
+ }
+]

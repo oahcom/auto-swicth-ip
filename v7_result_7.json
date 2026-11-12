@@ -1,0 +1,30 @@
+[
+ {
+  "idx": 7,
+  "tag": "cn.bing.com:443~6-any",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 1500,
+  "ip_start": "45.207.156.48",
+  "family": "v4",
+  "sessions": 15,
+  "ok": 0,
+  "death": [],
+  "dur_sec": 3.4,
+  "per_worker": {},
+  "ip_end": "45.207.156.48",
+  "ip_stable": true,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38838
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38837
+   }
+  ]
+ }
+]

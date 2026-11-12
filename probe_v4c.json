@@ -1,0 +1,332 @@
+[
+ {
+  "tag": "pq.aws52.yydjc.top:443-vl",
+  "ip": "18.181.220.135",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34829,
+  "sid": "ses_e2fd05cbbffeJ9MFuSQWoKGowp",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:32345-any",
+  "ip": "82.152.160.3",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36377,
+  "sid": "ses_e2fd05c50ffeSZsAajjgYOLUon",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:11957-any",
+  "ip": "152.175.1.161",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35714,
+  "sid": "ses_e2fd05c36ffePDJ1OBitcEPAFu",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:60130-any",
+  "ip": "152.175.146.131",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36329,
+  "sid": "ses_e2fd05bcbffeqhnOX5hFijaxFR",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:13493-any",
+  "ip": "82.27.116.33",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35915,
+  "sid": "ses_e2fd05b78ffeiRd3MofaAEhXlS",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:23886-any",
+  "ip": "152.175.66.199",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35258,
+  "sid": "ses_e2fd05b90ffeuUUou0q6Ay7uS6",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:54395-any",
+  "ip": "152.175.33.8",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34974,
+  "sid": "ses_e2fd05b47ffevgw0QOyjUrKPqA",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:42068-any",
+  "ip": "208.75.135.58",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36973,
+  "sid": "ses_e2fd05b16ffe5UmAJQNslP9zsD",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:28065-any",
+  "ip": "141.148.214.234",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd05b38ffewV1VbLVcYyQR5B",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:28513-any",
+  "ip": "104.28.205.194",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd05b8dffewqcdGdORe8lS8J",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:36502-any",
+  "ip": "103.175.99.31",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd05947ffeYiBxZxdcEcdyR4",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:37234-any",
+  "ip": "160.25.74.55",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd05adcffeyiigbxgMIvtV29",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:3526-any",
+  "ip": "115.178.34.42",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd05b8dffe4K8C72vtuqbTqP",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:37735-any",
+  "ip": "51.241.140.86",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd05928ffe4fYEomd75hdfRB",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:42839-any",
+  "ip": "152.175.97.36",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd0598fffeRMEWAHG8pK0vR0",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:40302-vl",
+  "ip": "154.26.159.62",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd059f6ffeNqFLgrz9ayu0XJ",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:25525-any",
+  "ip": "216.234.143.116",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd05883ffe9HEGe04LVbo603",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:44503-any",
+  "ip": "185.58.159.197",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34016,
+  "sid": "ses_e2fd0584bffeh1n2GG0pe7GwIW",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:44324-any",
+  "ip": null,
+  "family": "v4",
+  "verdict": "trans",
+  "st": null,
+  "ra": null,
+  "sid": "ses_e2fd05c2effeqY0ImbBkNiCYxQ",
+  "trans_retried": 2
+ },
+ {
+  "tag": "cn.bing.com:443~21-any",
+  "ip": "64.120.94.204",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd056f4ffeRPsJvLZysjmyCr",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:47221-any",
+  "ip": "102.130.49.158",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd056e2ffexhmmaMgAwDoO7s",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ddixx-1dd1.dankenet.help:41723-any",
+  "ip": "107.149.136.229",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd058b4ffePWwtmPNvwOPzfp",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.aws51.yydjc.top:443-vl",
+  "ip": "43.206.106.186",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34955,
+  "sid": "ses_e2fd0489dffeoacvvcwm3JKfwZ",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:18854-any",
+  "ip": "45.150.240.166",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd04606ffeue8L9tzQyfDXW3",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:25522-any",
+  "ip": "38.45.66.254",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd04477ffeevCUGWMN49UURF",
+  "trans_retried": 0
+ },
+ {
+  "tag": "unamecf3.xn--ghqu5fm27b67w.com:443~7-vl",
+  "ip": "134.195.101.194",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36187,
+  "sid": "ses_e2fd0416effeqVualfWKwR1je0",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.us01.yydjc.top:443-vl",
+  "ip": "207.32.218.89",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34756,
+  "sid": "ses_e2fd030e1ffe8XPIcCumP308FQ",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.us02.yydjc.top:443-vl",
+  "ip": "104.251.122.9",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34019,
+  "sid": "ses_e2fd041e9ffeDHGtlXCU1LQ0iX",
+  "trans_retried": 0
+ },
+ {
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443~9-vl",
+  "ip": "108.181.24.47",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35585,
+  "sid": "ses_e2fd030e4ffeAMEmVoyuRhjO0D",
+  "trans_retried": 0
+ },
+ {
+  "tag": "unamecf.xn--ghqu5fm27b67w.com:443~4-vl",
+  "ip": "103.62.49.178",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35842,
+  "sid": "ses_e2fd0061fffe4yiy3Zwatalqeh",
+  "trans_retried": 0
+ },
+ {
+  "tag": "upoz.cn.greatgameupload.org:45715-any",
+  "ip": "152.175.65.60",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fcfd749ffesx6dbeD07pABcw",
+  "trans_retried": 0
+ },
+ {
+  "tag": "bilibili-image-cdn.juhazf.cn:50011-any",
+  "ip": "192.3.195.11",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fcfd3e3ffeoCeTZdnHj8r2s8",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:59753-vl",
+  "ip": null,
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fcfcc57ffe5LI0JgeevwCEZF",
+  "trans_retried": 1
+ }
+]

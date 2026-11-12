@@ -255,7 +255,7 @@ def test_launch_falls_back_to_v4_without_ipv6_route(tmp_path):
 
 
 def test_deploy_renders_every_member(tmp_path):
-    """部署脚本的成员渲染器必须覆盖 config 里的全部 usque 隧道，含地址族开关。
+    """部署脚本的成员渲染器必须覆盖 config 里的全部 usque 隧道，含承载/地址族开关。
 
     WG 线（kind=wg）与 H2 线（kind=h2）分别由 deploy/wg-lines-install.sh 和
     deploy/render_h2_lines.py 生成单元，members.py 不该替它们注册设备。
@@ -269,7 +269,10 @@ def test_deploy_renders_every_member(tmp_path):
     assert len(rows) == len(members)
     for row, m in zip(rows, members):
         assert row[0] == m["tag"] and int(row[1]) == m["port"] and row[2] == m["service"]
-        assert row[4] == ("-6" if m.get("ipv6") else "-")
+        # 第 5 列是传输参数：transport 显式给了就以它为准（h2 = v4 TCP+TLS
+        # 承载），否则回落到地址族开关。CF 那 9 条 2026-11-12 起全部是 h2，
+        # 但**出口**仍是 v6 —— 传输与出口地址族不是一个维度，别合并断言。
+        assert row[4] == (m.get("transport") or ("-6" if m.get("ipv6") else "-"))
 
 
 def test_start_script_pins_interpreter():

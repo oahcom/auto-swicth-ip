@@ -1,0 +1,11 @@
+[
+ {
+  "idx": 57,
+  "tag": "pq.aws63.yydjc.top:443-vl",
+  "mode": "single",
+  "conc": 8,
+  "maxtotal": 600,
+  "ip_start": null,
+  "err": "no_ip"
+ }
+]

@@ -1,0 +1,31 @@
+{
+ "A": "upoz.cn.greatgameupload.org:36958-any",
+ "spent": 3,
+ "log": [
+  "[1] 坏节点 upoz.cn.greatgameupload.org:36958-any -> 出口 160.248.69.190",
+  "    session S = ses_e3032dd76ffekITRkDB1O9WAXY",
+  "    S 在坏节点上 -> quota  st=429 ra=40471  (消耗 1)",
+  "[2] ttll20-ooi.dankenet.help:4826-any        ip=45.95.212.97     全新session -> OK     ra=None  (消耗 2)",
+  "\n[3] 关键：同一个 session S 在好节点 45.95.212.97 上打 1 发 ...",
+  "    -> OK     st=200 ra=None  (总消耗 3 发)",
+  "\n>>> 坏节点上的 429 不传染 session：同一 session 换到干净 IP 立刻恢复 -> 限流单位是 IP"
+ ],
+ "step1": {
+  "ip": "160.248.69.190",
+  "sid": "ses_e3032dd76ffekITRkDB1O9WAXY",
+  "verdict": "quota",
+  "ra": 40471
+ },
+ "B": {
+  "tag": "ttll20-ooi.dankenet.help:4826-any",
+  "ip": "45.95.212.97",
+  "ctrl_sid": "ses_e3032d607ffeLKqOFzFE3Z0ZA3",
+  "ctrl_verdict": "OK",
+  "same24": false
+ },
+ "step3": {
+  "verdict": "OK",
+  "ra": null
+ },
+ "verdict": "坏节点上的 429 不传染 session：同一 session 换到干净 IP 立刻恢复 -> 限流单位是 IP"
+}

@@ -1,0 +1,11 @@
+[
+  {
+    "family": "ipv4_only",
+    "node": "normal.cn.greatgameupload.org:2155-any",
+    "v4": "82.152.160.7",
+    "v6": null,
+    "ok": 0,
+    "stop": "quota(ra=44439)",
+    "sec": 0.6
+  }
+]

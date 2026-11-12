@@ -1,0 +1,12 @@
+[
+ {
+  "idx": 13,
+  "tag": "normal.cn.greatgameupload.org:35779-any",
+  "mode": "single",
+  "conc": 4,
+  "maxtotal": 600,
+  "ip_start": "152.175.33.133",
+  "family": "v4",
+  "err": "family_mismatch:v4"
+ }
+]

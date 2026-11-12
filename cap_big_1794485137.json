@@ -1,0 +1,487 @@
+{
+  "node": "ddixx-1dd1.dankenet.help:64245-any",
+  "ip": "45.95.212.122",
+  "body": 451357,
+  "rows": [
+    {
+      "i": 1,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 16.9,
+      "err": null
+    },
+    {
+      "i": 2,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 19.6,
+      "err": null
+    },
+    {
+      "i": 3,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 22.6,
+      "err": null
+    },
+    {
+      "i": 4,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 25.8,
+      "err": null
+    },
+    {
+      "i": 5,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 29.5,
+      "err": null
+    },
+    {
+      "i": 6,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 32.6,
+      "err": null
+    },
+    {
+      "i": 7,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 32.9,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 8,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 33.1,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 9,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 33.3,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 10,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 33.5,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 11,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 33.7,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 12,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 34.0,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 13,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 34.2,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 14,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 34.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 15,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 34.6,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 16,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 34.9,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 17,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 35.1,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 18,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 35.3,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 19,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 35.5,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 20,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 35.8,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 21,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 36.0,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 22,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 36.2,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 23,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 36.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 24,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 36.7,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 25,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 36.9,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 26,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 37.1,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 27,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 37.3,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 28,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 37.5,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 29,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 37.8,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 30,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 38.0,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 31,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 38.2,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 32,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 38.5,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 33,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 38.7,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 34,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 38.9,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 35,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 39.2,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 36,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 39.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 37,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 39.6,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 38,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 39.8,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 39,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 40.1,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 40,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 40.3,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 41,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 40.5,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 42,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 40.7,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 43,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 41.0,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 44,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 41.2,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 45,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 41.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 46,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 41.7,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 47,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 41.9,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 48,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 42.1,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 49,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 42.3,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 50,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 42.5,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 51,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 42.8,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 52,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 43.0,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 53,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 43.2,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 54,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 43.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 55,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 43.7,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 56,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 43.9,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 57,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 44.1,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 58,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 44.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 59,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 44.6,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "i": 60,
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "t": 44.8,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    }
+  ]
+}

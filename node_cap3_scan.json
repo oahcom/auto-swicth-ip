@@ -1,0 +1,60 @@
+{
+  "ts": 1794483009.0977836,
+  "body": 3078,
+  "rows": [
+    {
+      "port": 7890,
+      "ip": "207.32.216.109",
+      "verdict": "quota",
+      "status": 429,
+      "sec": 9.2,
+      "retry_after": 46799,
+      "err": null
+    },
+    {
+      "port": 7892,
+      "ip": "?",
+      "verdict": "OK",
+      "status": 200,
+      "sec": 1.7,
+      "retry_after": null,
+      "err": null
+    },
+    {
+      "port": 7893,
+      "ip": "45.207.156.48",
+      "verdict": "OK",
+      "status": 200,
+      "sec": 1.5,
+      "retry_after": null,
+      "err": null
+    },
+    {
+      "port": 7894,
+      "ip": "45.207.156.48",
+      "verdict": "OK",
+      "status": 200,
+      "sec": 1.8,
+      "retry_after": null,
+      "err": null
+    },
+    {
+      "port": 7895,
+      "ip": "45.207.156.48",
+      "verdict": "OK",
+      "status": 200,
+      "sec": 3.0,
+      "retry_after": null,
+      "err": null
+    },
+    {
+      "port": 7896,
+      "ip": "45.207.156.48",
+      "verdict": "OK",
+      "status": 200,
+      "sec": 2.4,
+      "retry_after": null,
+      "err": null
+    }
+  ]
+}

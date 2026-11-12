@@ -264,8 +264,14 @@ def device_holders(unit_dir: str | Path = "/etc/systemd/system") -> dict[str, li
     """
     holders: dict[str, list[str]] = {}
     units = Path(unit_dir)
-    for svc in list(units.glob("usque-warp*.service")) + \
-            list(units.glob("usque-h2-*.service")):
+    # **扫全部单元，而不是只扫 usque-warp*/usque-h2-***。
+    # WHY：判定在跑与否用的是 `systemctl is-active`，不是「文件存在」，
+    # 所以扫全集不会把 disabled 的历史单元算成占用（原顾虑仍在成立）。
+    # 只扫两类会漏掉别的持有者 —— 实测 2026-11-11：`warp-quota-test.service`
+    # 是 active 的，WorkingDirectory 指向 `.warp/usque-h2new2`，却两个 glob
+    # 都不匹配，于是 h2new2 被当成空闲设备分给自动补的 HKG-168，两条线争
+    # 同一个 CF 设备身份（互顶 H2 会话），而日志里只有各自的重连失败。
+    for svc in sorted(units.glob("*.service")):
         try:
             r = subprocess.run(["systemctl", "is-active", svc.name],
                                capture_output=True, text=True, timeout=5)

@@ -1,0 +1,47 @@
+[
+ {
+  "idx": 0,
+  "tag": "ddixx-1dd1.dankenet.help:8656-any",
+  "spent": 0,
+  "ip_start": null,
+  "error": "no_ip"
+ },
+ {
+  "idx": 1,
+  "tag": "ttll20-ooi.dankenet.help:57092-any",
+  "spent": 134,
+  "ip_start": "45.95.212.122",
+  "sid": "ses_e302c7389ffellxXpDyWhvqS5g",
+  "ok_in_session": 132,
+  "stop": "quota",
+  "ra": 42799,
+  "ip_end": "45.95.212.122",
+  "ip_changes": [],
+  "fresh_sessions": [
+   {
+    "verdict": "quota",
+    "ra": 42798
+   }
+  ],
+  "verdict": "IP 级：132 发后换新 session 仍 quota"
+ },
+ {
+  "idx": 2,
+  "tag": "ddixx-1dd1.dankenet.help:54395-any",
+  "spent": 137,
+  "ip_start": "152.175.33.8",
+  "sid": "ses_e302c8478ffeifMigNB5VMIol9",
+  "ok_in_session": 135,
+  "stop": "quota",
+  "ra": 40760,
+  "ip_end": "152.175.33.8",
+  "ip_changes": [],
+  "fresh_sessions": [
+   {
+    "verdict": "quota",
+    "ra": 40759
+   }
+  ],
+  "verdict": "IP 级：135 发后换新 session 仍 quota"
+ }
+]

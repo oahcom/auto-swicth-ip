@@ -1,0 +1,35 @@
+[
+ {
+  "idx": 0,
+  "tag": "ttll20-ooi.dankenet.help:64657-any",
+  "mode": "single",
+  "conc": 4,
+  "maxtotal": 600,
+  "ip_start": "2405:84c0:8001:bf00::",
+  "family": "v6",
+  "sessions": 1,
+  "ok": 44,
+  "death": [],
+  "dur_sec": 22.0,
+  "per_worker": {
+   "0": 11,
+   "1": 11,
+   "2": 11,
+   "3": 11
+  },
+  "ip_end": "2405:84c0:8001:bf00::",
+  "ip_stable": true,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38911
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38910
+   }
+  ]
+ }
+]

@@ -1,0 +1,11 @@
+[
+ {
+  "idx": 21,
+  "tag": "cn.bing.com:443~22-any",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 900,
+  "ip_start": null,
+  "err": "no_ip"
+ }
+]

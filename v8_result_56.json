@@ -1,0 +1,48 @@
+[
+ {
+  "idx": 56,
+  "tag": "cn.bing.com:443~22-any",
+  "mode": "single",
+  "conc": 8,
+  "maxtotal": 600,
+  "ip_start": "64.120.94.205",
+  "sessions": 1,
+  "ok": 108,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 47.8,
+  "per_worker": {
+   "2": 16,
+   "0": 13,
+   "5": 14,
+   "3": 15,
+   "6": 13,
+   "7": 13,
+   "4": 13,
+   "1": 11
+  },
+  "ip_end": "64.120.94.205",
+  "segments": [
+   {
+    "ip": "64.120.94.205",
+    "shots": 15
+   },
+   {
+    "ip": "64.120.94.205",
+    "shots": 93
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 33967
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 33966
+   }
+  ]
+ }
+]

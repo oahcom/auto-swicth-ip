@@ -1,0 +1,31 @@
+[
+ {
+  "idx": 11,
+  "tag": "WARP-H2-HKG-10",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 900,
+  "ip_start": "2a09:bac5:3982:e6::17:356",
+  "family": "v6",
+  "sessions": 15,
+  "ok": 0,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 6.1,
+  "per_worker": {},
+  "ip_end": "2a09:bac5:3982:e6::17:356",
+  "ip_stable": true,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 39125
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 39124
+   }
+  ]
+ }
+]

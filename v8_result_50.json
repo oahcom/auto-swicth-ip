@@ -1,0 +1,41 @@
+[
+ {
+  "idx": 50,
+  "tag": "ttll20-ooi.dankenet.help:25558-any",
+  "mode": "single",
+  "conc": 1,
+  "maxtotal": 500,
+  "ip_start": "2405:84c0:8001:3200::",
+  "sessions": 1,
+  "ok": 110,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 189.6,
+  "per_worker": {
+   "0": 110
+  },
+  "ip_end": "2405:84c0:8001:3200::",
+  "segments": [
+   {
+    "ip": "2405:84c0:8001:3200::",
+    "shots": 0
+   },
+   {
+    "ip": "2405:84c0:8001:3200::",
+    "shots": 110
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 35298
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 35297
+   }
+  ]
+ }
+]

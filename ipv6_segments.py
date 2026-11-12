@@ -32,7 +32,7 @@ OUT = BASE / ".warp" / "ipv6_segments.json"
 TOL = 120
 
 PORTS = {f"WARP-WG-{i}": 1109 + i for i in range(1, 17)}
-PORTS.update({"WARP-CF": 1080, "WARP-CF-B": 1081, "WARP-CF-D": 1083})
+PORTS.update({"WARP-CF4": 1080, "WARP-CF4-B": 1081, "WARP-CF4-C": 1082, "WARP-CF4-D": 1083, "WARP-CF4-E": 1084, "WARP-CF6": 1085, "WARP-CF6-B": 1086, "WARP-CF6-C": 1087, "WARP-CF6-D": 1088})
 
 LINE_COLO = {
     **{f"WARP-WG-{i}": "NRT" for i in (1, 2, 3)},

@@ -1,0 +1,95 @@
+{
+  "ts": 1794483170.3217149,
+  "rows": [
+    {
+      "tag": "hk-aws-122.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "hk-aws-54.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "hk-aws-53.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "hk-aws-111.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "hk-aws-123.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "hk-aws-124.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "hk-aws-244.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.4,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "sg-aws-109.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.3,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "jp-aws-110.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.3,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    },
+    {
+      "tag": "jp-aws-118.acczzz.com:443-any",
+      "ip": "?",
+      "verdict": "trans",
+      "status": null,
+      "ra": null,
+      "sec": 0.3,
+      "err": "ECONNRESET: The socket connection was closed unexpectedly. F"
+    }
+  ]
+}

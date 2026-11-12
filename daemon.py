@@ -3348,11 +3348,17 @@ def _lines_in_use() -> set[str]:
     a = active_warp_tag()
     if a:
         used.add(a)
+    # 第七闸口没有线台账（tag 恒 None），不把它摘出去的话 missing 恒真，
+    # 每次都退化成全槽 HTTP 兜底。
+    gate_name = (_proxy_gate_slot() or {}).get("name")
     with _SLOT_STATE_LOCK:
-        tags = {h["tag"] for h in _SLOT_HEALTH.values() if h.get("tag")}
-        missing = any(not h.get("tag") for h in _SLOT_HEALTH.values())
+        hs = [h for n, h in _SLOT_HEALTH.items() if n != gate_name]
+        tags = {h["tag"] for h in hs if h.get("tag")}
+        missing = any(not h.get("tag") for h in hs)
     if missing:
         for s in consumer_slots():
+            if s["name"] == gate_name:
+                continue
             t, _ip = _slot_current(s)
             if t:
                 used.add(t)
@@ -7811,6 +7817,10 @@ _DORMANT_PROBE_BUDGET_SEC = DEFAULT_MAX_SECONDS
 _DORMANT_PROBE_TIMEOUT_SEC = DEFAULT_MAX_SECONDS + 300
 _DORMANT_PROBE_ATTEMPT_FILE = ".dormant_probe_attempt"
 _DORMANT_PROBE_LOG_FILE = ".dormant_probe.log"
+# 与 dormant_probe.py 里 main() 的 flock 撞车返回值一致。
+# 这不是「体检失败」，是「另一个实例正在跑」，不能计入失败也不能刷屏。
+_DORMANT_PROBE_RC_BUSY = 7
+_DORMANT_PROBE_LOCK_FILE = ".dormant_probe.lock"
 _DORMANT_PROBE_FAIL_STREAK = 0
 
 
@@ -7852,6 +7862,34 @@ def _dormant_state_updated() -> float:
         return 0.0
 
 
+def _dormant_probe_lock_busy() -> bool:
+    """瞬时探测：另一个体检实例是否正在跑。**不等待、不持有、不设窗口**。
+
+    WHY（2026-11-11 22:32 实测）：服务重启时 `KillMode=process` 只杀主进程，
+    上一轮体检子进程残留并持有 flock。新 daemon 每个 tick 都 spawn 一个
+    `dormant_probe.py`，3 秒内 30 次全部 `rc=7` 退出，还被当成连续失败刷了
+    4 条 FAIL 日志（连续 1/10/20/30 次）。flock 本身是对的，错在调度器把
+    「撞锁跳过」记成了「体检失败」，并且明知在跑还不停起子进程。
+
+    这里只做一次 LOCK_EX|LOCK_NB 探测，拿到立刻释放；拿不到就返回 True。
+    调用方下一 tick 会再探 —— 没有任何等待时间，符合「探测不等待」定标。
+    """
+    try:
+        fd = os.open(os.path.join(_PROJECT, _DORMANT_PROBE_LOCK_FILE),
+                     os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return False            # 探不了就当没人在跑，交给脚本自己的锁兜底
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def _maybe_run_dormant_probe() -> None:
     """主循环每 tick 调一次；到点才在后台线程里跑一次体检。
 
@@ -7873,6 +7911,10 @@ def _maybe_run_dormant_probe() -> None:
         return
     # updated=0 有两种含义：状态文件不存在，或本轮只存了进度（未完成）。
     # 两者都必须立刻跑 —— 后者的 pending 断点保证不会重复全量。
+    if _dormant_probe_lock_busy():
+        # 别的实例（服务重启残留 / 运维手动跑）正在体检：不 spawn、不记失败、
+        # 不设任何等待时间，下一 tick 再探。锁释放后立刻就能跑起来。
+        return
     _mark_dormant_probe_attempt()
     _DORMANT_PROBE_RUNNING = True
 
@@ -7903,6 +7945,10 @@ def _maybe_run_dormant_probe() -> None:
                     + f"（完整输出：{_DORMANT_PROBE_LOG_FILE}）")
                 _DORMANT_PROBE_NEXT_TS = time.time() + _DORMANT_PROBE_PERIOD_SEC
                 _DORMANT_PROBE_FAIL_STREAK = 0
+            elif r.returncode == _DORMANT_PROBE_RC_BUSY:
+                # 探锁与子进程拿锁之间有 TOCTOU 窗口，仍可能撞上。
+                # 这是「跳过」不是「失败」：不计连续失败、不刷屏、不等待。
+                _DORMANT_PROBE_NEXT_TS = 0.0
             elif r.returncode == RC_MORE:
                 # 预算用尽、进度已存盘：这不是失败，是分批。立刻续跑剩下的，
                 # 绝不能套失败退避，否则 247 条要拖好几个小时。
@@ -12110,6 +12156,65 @@ def _slot_current(slot):
     return tag, _warp_line_ip(tag)
 
 
+# ── 第七闸口（代理池兜底）──────────────────────────────────────────────
+# 六条常规闸口各自挂一条 WARP 线；第七闸口的「线」是轮换池本身。严格兜底
+# 的两条硬约束：
+#   1. 普通候选阶段绝不参与 —— 它的 warp selector 指向池 selector，
+#      _slot_current 永远返回 (None, None)，常规选槽/补闸/修整循环自然
+#      跳过它；只有 _pick_healthy_slot 的常规候选集为空时才显式考虑它。
+#   2. 9router 的常规端口轮询（ASIP_LOCAL_PROXY_PORT 默认 7890,7892-7896）
+#      不含它的端口，流量只能由 /rotate 回包的 switch_to_url 引过来。
+# 它报 429/403 的含义也与常规闸口不同：是「这个池节点被烧了」，动作是池内
+# 换节点（pick_next_node 同一套判据），绝不换回 WARP 线。
+_PROXY_GATE_LAST_USED = {"ts": 0.0}    # 最近一次被指为重试目标/在役的时刻
+_PROXY_GATE_LAST_ROTATE = {"ts": 0.0}  # 最近一次池内换节点时刻
+
+
+def _is_proxy_gate(slot) -> bool:
+    return bool(slot) and slot.get("kind") == "proxy"
+
+
+def _proxy_gate_slot():
+    for s in consumer_slots():
+        if s.get("kind") == "proxy":
+            return s
+    return None
+
+
+def _pool_selector_name() -> str:
+    return CFG["singbox"]["selector"]
+
+
+def _proxy_gate_current(slot):
+    """第七闸口当前挂的池节点 (tag, None)。进程挂/读不到返回 (None, None)。
+
+    ip 一栏刻意为 None：池节点的出口地址由 node_info 台账按需实测，不像
+    WARP 线那样有线级 ip 缓存可读；调用方拿 tag 已足够记账与展示。
+    """
+    if not _is_proxy_gate(slot):
+        return None, None
+    _, data = slot_singbox_api(slot, "/proxies/" + slot["pool_selector"],
+                                silent=True)
+    tag = (data or {}).get("now")
+    if not tag or tag == "direct":
+        return None, None
+    return tag, None
+
+
+def _proxy_gate_nodes(slot):
+    """第七闸口自己的池 selector：(nodes, current)。查不到返回 ([], None)。
+
+    注意节点名与主进程池 selector 完全同名同序（同一份订阅渲染），所以
+    _DEAD_NODES / _NODE_DELAYS 等池状态对它同样成立。
+    """
+    _, data = slot_singbox_api(slot, "/proxies/" + slot["pool_selector"],
+                                silent=True)
+    if not data:
+        return [], None
+    nodes = [x for x in (data.get("all") or []) if _is_pool_node(x)]
+    return nodes, data.get("now")
+
+
 def _slot_note_switch(slot, old_tag, old_ip, new_tag, new_ip, ts):
     """记一次槽位 selector 的**真实**变更，并维护迟到请求判断所需的台账。
 
@@ -12345,6 +12450,10 @@ def assign_consumer_slots(force=False):
             used.add(tag)
     for s in slots:
         name = s["name"]
+        if _is_proxy_gate(s):
+            # 第七闸口的「线」是池节点，不参与 WARP 线认领；健康与轮换由
+            # _proxy_gate_keeper 维护。
+            continue
         if name == serving:
             continue  # 它的线在服务主出口，别动
         tag, ip = state[name]
@@ -12453,6 +12562,8 @@ def _probe_line_for_slots(tag, ip, fresh=False):
     # 补闸：OK、不在任何闸内、不是主出口 → 塞进一个坏闸
     if verdict == "OK" and holder is None and tag != active_warp_tag():
         for s in consumer_slots():
+            if _is_proxy_gate(s):
+                continue  # 池闸不收 WARP 线：塞了线它就不再是纯池闸
             if s["name"] == serving:
                 continue
             if _slot_health(s["name"])["status"] != "bad":
@@ -12577,12 +12688,18 @@ def _slot_snapshot():
     serving = _slot_serving_name()
     out = []
     for s in consumer_slots():
-        tag, ip = _slot_current(s)
+        if _is_proxy_gate(s):
+            # 池闸的「当前线」是它挂的池节点；9router 侧的 /slots 解析只读
+            # name/port/tag/egress，多出来的 kind 是给人看的。
+            tag, ip = _proxy_gate_current(s)
+        else:
+            tag, ip = _slot_current(s)
         h = _slot_health(s["name"])
         probe = _PROBE_BEFORE_ROTATE.get("%s|%s" % (tag, ip)) if (tag and ip) else None
         out.append({
             "name": s["name"],
             "selector": s["selector"],
+            "kind": s.get("kind") or "warp",
             # 端口是 9router 侧唯一稳定的槽位键：它只知道 127.0.0.1:789N，
             # 不知道 slot-N。/slots 不吐端口的话，客户端只能靠数组下标猜，
             # 而 consumer_slots() 的端口跳过 7891，下标与端口不是同一套编号。
@@ -12762,6 +12879,9 @@ def _slot_pick_key(slot, tag, ip, now, serving):
 # 太慢。这里按 **asip 自己看到的出口地址**（_slot_current，不是调用方报来的
 # 那个）打一个 90 秒短冷却：这段时间不把这个地址再选给任何请求。
 #
+# 例外：transport 既可能是线路真坏，也可能只是大 body 首字节慢（探针随后
+# 实测就是好的）。这类先异步复测再决定，见 _cool_egress_after_recheck。
+#
 # 与 ban_until 的分工：ban_until 是「上游判了这个地址多久配额」，按
 # Retry-After 走（生产 429 兜底 12 小时）；这里只求躲开当前这一波，不写长期
 # 账、不参与隔离判定、不进探针台账。
@@ -12798,6 +12918,71 @@ def _egress_cooling_left(ip, now=None) -> float:
     with _EGRESS_COOLING_LOCK:
         until = _EGRESS_COOLING.get(ip) or 0.0
     return max(0.0, until - t)
+
+# 传输类失败的复测去重表：ip -> 最近一次复测的时刻。
+# 同一出口在复测窗口（_EGRESS_RECHECK_WINDOW_SEC）内只复测一次：并发上报
+# 不会各起一条线程，复测刚判 OK 的那条线也不会被下一发报障立刻再探一遍。
+_EGRESS_RECHECK_WINDOW_SEC = 60.0
+_EGRESS_RECHECK: dict[str, float] = {}
+_EGRESS_RECHECK_LOCK = threading.Lock()
+
+
+def _egress_recheck_run(ip, tag):
+    """对报障出口真打一次探针，只有真不通才冷却。
+
+    WHY 必须复测：固定小 payload 的探针代表不了真实流量（本段注释里那条
+    「3KB 探针判 OK、20KB+ 真实请求失败」）。首字节/响应头超时既可能是
+    线路真坏，也可能只是大 body 慢 —— 旧逻辑一律打 90s 冷却，几条线轮流
+    被冷却后 _pick_healthy_slot 抽干，no_healthy_slot / 503 被放大。
+    这里用生产同一台探测器（probe_warp，同指纹同配额）重测这个出口。
+    """
+    try:
+        probed = _probe_line_before_rotate(tag, ip, fresh=True)
+        verdict = (probed or {}).get("verdict")
+        if verdict == "OK":
+            log("· 出口 %s 报 transport 但复测 OK（%ss），不打冷却"
+                % (ip, (probed or {}).get("sec", "?")))
+            return
+        _mark_egress_cooling(ip)
+        log("· 出口 %s 报 transport 且复测 %s，按原逻辑冷却 %.0fs"
+            % (ip, verdict or "无结论", _egress_cooling_sec()))
+    except Exception as e:
+        # 复测本身炸了不能当成「线路没问题」：维持原逻辑冷却。
+        _mark_egress_cooling(ip)
+        log("✗ 出口 %s 复测异常（%s），按原逻辑冷却" % (ip, e))
+    finally:
+        # 不摘条目：从结论落定起再算一个窗口，窗口内重复报障不再复测。
+        with _EGRESS_RECHECK_LOCK:
+            _EGRESS_RECHECK[ip] = time.time()
+
+
+def _cool_egress_after_recheck(ip, tag):
+    """transport 类失败：先复测再决定冷却，不阻塞 HTTP 线程。
+
+    复测要 4~12s，不能在 _API_LOCK 内同步跑（9router 的 ASIP_TIMEOUT_MS
+    只有 2s）。所以这一步只起线程；复测期间该地址暂不冷却 —— 代价是这几秒
+    内它仍可能被选给别人。
+    """
+    if not ip or _egress_cooling_sec() <= 0:
+        return
+    if not tag:
+        # 读不到是哪条线（_slot_current 没结论）：无从复测，保守冷却。
+        _mark_egress_cooling(ip)
+        return
+    if _egress_cooling_left(ip) > 0:
+        # 已经因复测失败冷却中：结论已定，重复报障不必再探一次。
+        return
+    now = time.time()
+    with _EGRESS_RECHECK_LOCK:
+        for k in [k for k, ts in _EGRESS_RECHECK.items()
+                  if now - ts > _EGRESS_RECHECK_WINDOW_SEC]:
+            _EGRESS_RECHECK.pop(k, None)
+        if ip in _EGRESS_RECHECK:
+            log("· 出口 %s 复测窗口内已探过，重复报障不再起线程" % ip)
+            return
+        _EGRESS_RECHECK[ip] = now
+    threading.Thread(target=_egress_recheck_run, args=(ip, tag),
+                     daemon=True, name="egress-recheck").start()
 
 
 def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
@@ -12847,6 +13032,19 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
             continue
         candidates.append((s, tag, ip))
     if not candidates:
+        # 六个常规闸口一个都选不出来 —— 第七闸口（代理池兜底）是最后的
+        # 选择，且**只在这里**被考虑：上面常规候选存在时它永远不出场。
+        # name 是正在报障的那台闸：报障的若是池闸自己，也别原样把池闸
+        # 递回去（那条路由 _rotate_proxy_gate_once 换完节点再给）。
+        gate = _proxy_gate_slot()
+        if (gate is not None and gate["name"] != name
+                and _slot_health(gate["name"])["status"] == "ok"):
+            gtag, _gip = _proxy_gate_current(gate)
+            if gtag:
+                _PROXY_GATE_LAST_USED["ts"] = t0
+                log("· 秒切兜底：常规闸口全部不可选，第七闸口（代理池）接手"
+                    "（池节点=%s）" % gtag)
+                return gate, gtag, None
         return None, None, None
     # 排序而不是「跳过 serving 后取第一个」：新鲜度第一、延迟第二（见
     # _slot_pick_key）。candidates 本身是轮询顺序，稳定排序下键完全相同的
@@ -12865,6 +13063,51 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
     return chosen
 
 
+def _fast_switch_to_proxy_gate(reason, cur):
+    """主路径秒切的第七闸口分支：主出口 opencode-out 翻到轮换池 proxy。
+
+    与槽位路径的第七闸口同一语义 —— 六个常规闸口（含主出口当前线）全都
+    选不出来才走到这里。区别只是主路径没有独立端口可指，动作发生在主进程
+    自己的 selector 上（opencode-out 的成员里本就有池 selector）。池内
+    节点轮换由主循环既有的池轮换接管：落池后 opencode_out_on_warp() 变
+    False，主动/错误轮换都会启动。
+
+    不查落池冷却（proxy_fallback_cooldown_sec）：那条冷却防的是「落池→
+    回切→又落池」的翻转循环，而这里进来的前提是常规闸口全都选不出来，
+    不落池的唯一替代是 restart_required —— 冷却只会把兜底闸焊死。池还
+    能不能服务由 _proxy_pool_healthy_cached 现场把一道关。
+    """
+    global _proxy_dwell_since, _ACTIVE_WARP_IP, _last_proxy_fallback_ts
+    if not opencode_out_on_warp():
+        # 已经在池上：selector 不必再翻，直接把池身份回给调用方重试。
+        return {"tag": _pool_selector_name(), "egress": None}
+    pool_ok = _proxy_pool_healthy_cached()
+    if pool_ok is not True:
+        log("· 秒切第七闸口：池健康探测未通过（%s），放弃" % pool_ok)
+        return None
+    old_ip = (_warp_line_ip(cur) if cur else None) or _ACTIVE_WARP_IP
+    if not _switch_warp(_pool_selector_name()):
+        log("· 秒切第七闸口：翻 selector 失败")
+        return None
+    landed = time.time()
+    if cur is not None:
+        # 与 _fallback_to_proxy 同一套落地记账：旧线只记「已用」不记脏，
+        # 地址退休表补一笔，迟到的 429 才认得出「这条出口已经不承载流量」。
+        _mark_warp_ip_used(old_ip, landed)
+    _last_proxy_fallback_ts = landed
+    try:
+        _write_json_atomic(_proxy_fallback_path(), {"ts": landed})
+    except Exception as e:
+        log("⚠ 落池时刻落盘失败: %s" % e)
+    _begin_segment(landed)
+    _proxy_dwell_since = landed
+    _ACTIVE_WARP_IP = None
+    _exit_ledger_note(old_ip, None, landed)
+    _MAIN_SLOT_NAME["name"] = None
+    log("⚡ 秒切第七闸口：主出口翻到轮换池（原因=%s）" % reason)
+    return {"tag": _pool_selector_name(), "egress": None}
+
+
 def _fast_switch(reason):
     """把主出口立刻切到一条健康备用线上。只做同步的 selector 翻转 + 记账。
 
@@ -12881,6 +13124,8 @@ def _fast_switch(reason):
     # 只尝试一次公平选出的健康槽。旧实现按数组顺序逐个试，既偏袒 slot-1，
     # 又会在多个 selector PUT 失败时把健康候选挨个烧一遍。
     s, tag, ip = _pick_healthy_slot(None, {cur} if cur else None)
+    if s is not None and _is_proxy_gate(s):
+        return _fast_switch_to_proxy_gate(reason, cur)
     if s is not None and _switch_warp(tag, ip=ip):
         # 与正常换线路径同一套落地记账，缺一条就会让迟到 429 认不出「这条出口
         # 已经被换走」，于是再烧一条备用线。顺序不能变：_switch_warp 内部的
@@ -13342,7 +13587,6 @@ def _note_client_gone(result: dict) -> None:
             f"reason={result.get('reason')} ms={result.get('ms')}"
             f"（换线生效，只是没人收响应）")
 
-
 def _slot_no_usable_gate():
     """「这次确实没有可用闸口」：只在首轮探测收敛后给出重启信号。
 
@@ -13409,6 +13653,120 @@ def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
     return payload
 
 
+def _proxy_gate_rotate_node(slot, cur_node, reason):
+    """第七闸口池内换节点；返回新节点名，失败返回 None。
+
+    与主路径池轮换（_rotate_on_error / _rotate_pool_proactive）同一套判据：
+    旧节点按 429 冷却（不拉黑 —— 429 恰恰说明链路通，判死交给健康检查的
+    60% 保底守卫），新节点用 pick_next_node 的 P2C + 预检。绝不碰 WARP：
+    第七闸口的「换线」只有池内换节点这一种。
+
+    注意 PUT 直接打这台槽位自己的 pool selector：主循环的池轮换只翻主进程
+    的 proxy selector，翻不到这台进程 —— 各自翻各自的，池状态（_DEAD_NODES
+    / 延迟表）两边共用。
+    """
+    name = slot["name"]
+    nodes, _cur = _proxy_gate_nodes(slot)
+    if not nodes:
+        _slot_mark(name, "bad", "unreachable")
+        return None
+    if cur_node and reason not in ("proactive", "dead"):
+        # 报障换节点才冷却旧节点；dead 已在 _DEAD_NODES 里，再冷却无意义。
+        _cool_down_node(cur_node)
+    nxt = pick_next_node(cur_node or "", nodes, set(), count_call=False)
+    if not nxt:
+        _slot_mark(name, "bad", "no_candidate")
+        log("✗ 第七闸口无可换池节点（%s，dead=%d）"
+            % (reason, len(_DEAD_NODES)))
+        return None
+    if nxt != cur_node:
+        r, _ = slot_singbox_api(slot, "/proxies/" + slot["pool_selector"],
+                                method="PUT", body={"name": nxt})
+        if r not in (200, 204):
+            log("✗ 第七闸口切池节点失败 (%s): status=%s" % (nxt, r))
+            return None
+        time.sleep(0.2)
+        _, verify = slot_singbox_api(slot, "/proxies/" + slot["pool_selector"],
+                                     silent=True)
+        if (verify or {}).get("now") != nxt:
+            log("✗ 第七闸口切池节点验证失败: PUT %s 但 now=%s"
+                % (nxt, (verify or {}).get("now")))
+            return None
+        _slot_mark(name, "ok", "OK")
+        update_node_info_async(nxt)
+        log("↻ 第七闸口池内轮换：%s → %s（%s）"
+            % (cur_node or "未知", nxt, reason))
+    _PROXY_GATE_LAST_ROTATE["ts"] = time.time()
+    return nxt
+
+
+def _rotate_proxy_gate_once(slot, reason, request_started_at=None,
+                            egress_ip=None, req_id=None, ban_after=None):
+    """第七闸口的 /rotate：常规闸口恢复了就立刻回去，否则池内换节点。
+
+    严格兜底的另一半语义在这里：即便流量已经在第七闸口上，只要有任何常规
+    闸口健康，重试目标马上指回常规闸口 —— 池闸不占坑。429/403 落在池闸上
+    的含义是「这个池节点也被烧了」，动作是池内换节点（同主路径落池后的
+    错误轮换），不是换 WARP 线。
+
+    ban_after / egress_ip 只对 WARP 地址台账有意义，池节点没有那套账，
+    收下参数但不使用。
+    """
+    t0 = time.time()
+    cfg = _api_cfg()
+    name = slot["name"]
+    with _API_LOCK:
+        _api_stats["calls"] += 1
+        cur_node, _cur_ip = _proxy_gate_current(slot)
+        h = _slot_health(name)
+        last_attempt = float(h.get("last_rotate_ts") or 0.0)
+        # 与常规闸口同一套合并窗：一批并发 429 只换一次池节点。
+        if last_attempt and t0 - last_attempt < cfg.get("coalesce_ms", 800) / 1000.0:
+            _api_stats["coalesced"] += 1
+            reason_out = "coalesced"
+        else:
+            h["last_rotate_ts"] = t0
+            reason_out = "ok"
+        # 重试目标：常规健康闸口优先（恢复即回，不在池闸上多留一秒）。
+        other, ttag, tip = _pick_healthy_slot(
+            name, None, {egress_ip} if egress_ip else None)
+        rotated = None
+        if other is None and reason_out == "ok":
+            # 没有常规闸口可回：在第七闸口自己的池里换节点。
+            rotated = _proxy_gate_rotate_node(slot, cur_node, reason)
+            if rotated:
+                _PROXY_GATE_LAST_USED["ts"] = t0
+        payload = {"ok": True, "switched": False, "reason": reason_out,
+                   "switched_at": h.get("switched_at") or 0.0, "ms": 0,
+                   "active_tag": cur_node, "active_egress": None}
+        if other is not None:
+            payload["switched"] = True
+            payload["switch_to"] = other["name"]
+            payload["switch_to_url"] = "http://127.0.0.1:%d" % other["port"]
+            payload["switch_to_tag"] = ttag
+            payload["switch_to_egress"] = tip
+        elif rotated:
+            # 第七闸口自己就是重试目标：端口不变，节点已换。
+            payload["switched"] = True
+            payload["switch_to"] = name
+            payload["switch_to_url"] = "http://127.0.0.1:%d" % slot["port"]
+            payload["switch_to_tag"] = rotated
+            payload["switch_to_egress"] = None
+        else:
+            payload["switch_to"] = None
+            payload["switch_to_url"] = None
+            if reason_out != "coalesced":
+                # 池也换不出节点：与常规闸口同一收口语义。
+                payload["line_unknown"] = True
+                payload["reason"] = "no_healthy_slot"
+                if _slot_no_usable_gate():
+                    payload["restart_required"] = True
+        log("⇢ %s 报 %s（%s）[req=%s] 池节点=%s，重试改走 %s"
+            % (name, reason, reason_out, req_id or "-", cur_node or "未知",
+               payload.get("switch_to_url") or "无可用闸口"))
+        return payload
+
+
 def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
                       req_id=None, ban_after=None):
     """带防重的槽位 /rotate：迟到请求只重连，不为旧证据烧掉新线。
@@ -13421,6 +13779,10 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
     与主路径不同的只有结果：不等后台修完，直接回一条健康槽的端口让调用方
     立刻重试。
     """
+    if _is_proxy_gate(slot):
+        # 第七闸口不走 WARP 修整链路：报障 = 池内换节点。
+        return _rotate_proxy_gate_once(
+            slot, reason, request_started_at, egress_ip, req_id, ban_after)
     t0 = time.time()
     cfg = _api_cfg()
     name = slot["name"]
@@ -13464,7 +13826,12 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         # _slot_current 读到的 cur_ip —— 调用方传来的 egress_ip 有可能是别的
         # 请求残留的（9router 侧 currentAsipEgress 是进程级全局），拿它冷却
         # 会去惩罚一条无辜的线，而真正该躲的那条继续放行。
-        if cur_ip and reason in ("rate429", "transport", "abuse403"):
+        # 唯一例外是 transport：它同时覆盖「线路真断」和「大 body 首字节慢」，
+        # 后者探针复测就是好的，直接冷却会把六条闸一条条抽干。这类先异步复测
+        # 一次再决定（见 _cool_egress_after_recheck）。
+        if cur_ip and reason == "transport":
+            _cool_egress_after_recheck(cur_ip, cur_tag)
+        elif cur_ip and reason in ("rate429", "abuse403"):
             _mark_egress_cooling(cur_ip, t0)
         if reason not in ("proactive", "transport") and cur_ip:
             _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason,
@@ -13719,8 +14086,11 @@ def _slot_keeper() -> None:
         if not slots:
             return
         serving = _slot_serving_name()
+        # 第七闸口由 _proxy_gate_keeper 维护，这里的补闸/就绪判断只看常规
+        # 闸口：给它 claim WARP 线会把它从池闸变成线闸。
         bad = [s for s in slots
-               if s["name"] != serving
+               if not _is_proxy_gate(s)
+               and s["name"] != serving
                and _slot_health(s["name"])["status"] != "ok"]
         if not bad:
             log("✓ 所有槽位就绪")
@@ -13732,6 +14102,107 @@ def _slot_keeper() -> None:
             _probe_line_for_slots(pick, ip)  # 探测 + 自动补闸/同步
         time.sleep(2)
     log("⚠ 槽位启动未全部就绪，剩余坏闸将由 /rotate 路径继续修复")
+
+
+def _proxy_gate_check_sec() -> float:
+    try:
+        return float(CFG["intervals"].get("proxy_gate_check_sec", 60))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _proxy_gate_serving_window_sec() -> float:
+    """第七闸口「在役」窗口：最近一次被指为重试目标之后多久算还在服务。
+
+    9router 不会告诉 asip 它此刻是否还把流量打在 7897 上，只能按「最近
+    被指过去」推断。窗口内按 proactive_rotate_sec 的节奏换节点保持地址
+    新鲜；窗口外它是待命的兜底闸，不轮换（省节点配额），只维护健康结论。
+    """
+    try:
+        return float(CFG["intervals"].get("proxy_gate_serving_window_sec", 300))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _proxy_gate_maintain(gate) -> None:
+    """第七闸口单轮维护：死节点换掉、在役时按节奏换、健康结论刷新。
+
+    健康结论的口径：进程活着（Clash API 应答）+ 当前节点未被判死 + 池
+    采样健康（_PROXY_HEALTH_CACHE，TTL 120s，与落池判据共用）。None（查
+    不到）不动旧结论 —— 抖动不是坏消息。
+    """
+    if not _warp().get("proxy_fallback_enabled", False):
+        # 运维明确关了落池：池闸同步关掉，不跟健康探测较劲。
+        _slot_mark(gate["name"], "bad", "disabled")
+        return
+    name = gate["name"]
+    nodes, cur = _proxy_gate_nodes(gate)
+    if not nodes:
+        _slot_mark(name, "bad", "unreachable")
+        return
+    now = time.time()
+    cur_dead = bool(cur) and cur in _DEAD_NODES
+    serving = now - _PROXY_GATE_LAST_USED["ts"] < _proxy_gate_serving_window_sec()
+    if not cur or cur == "direct" or cur_dead:
+        _proxy_gate_rotate_node(gate, cur, "dead" if cur_dead else "no_node")
+    elif (serving
+          and now - _PROXY_GATE_LAST_ROTATE["ts"]
+          >= float(CFG["intervals"]["proactive_rotate_sec"])):
+        # 在役时才主动轮换；_pool_should_rotate 的池侧节奏只管主进程，
+        # 池闸自己的节奏在这里。
+        _proxy_gate_rotate_node(gate, cur, "proactive")
+    # 健康结论（rotate 可能已改过状态，重新读）
+    h = _slot_health(name)
+    if h["status"] == "repairing":
+        return
+    nodes, cur = _proxy_gate_nodes(gate)
+    if not nodes:
+        _slot_mark(name, "bad", "unreachable")
+        return
+    if not cur or cur in _DEAD_NODES:
+        _slot_mark(name, "bad", "pool_exhausted")
+        return
+    ok = _proxy_pool_healthy_cached(now)
+    if ok is True:
+        _slot_mark(name, "ok", None)
+    elif ok is False:
+        _slot_mark(name, "bad", "pool_dead")
+
+
+def _proxy_gate_keeper() -> None:
+    """第七闸口的持续维护线程：健康结论 + 池内轮换。
+
+    常规闸口的补闸引擎是「探测 OK 自动塞线」；池闸的对应动作是池内换
+    节点。轮换必须作用在它自己的 pool selector 上 —— 主循环的池轮换只
+    翻主进程的 proxy selector，翻不到这台进程；不在 keeper 里做，就会出
+    现「轮换的是主进程、实际流量在第七闸口」的错位。
+    """
+    gate = None
+    for _ in range(40):
+        time.sleep(2)
+        gate = _proxy_gate_slot()
+        if gate is None:
+            return
+        _, data = slot_singbox_api(gate, "/proxies/" + gate["pool_selector"],
+                                   silent=True)
+        if data:
+            break
+    else:
+        if gate is not None:
+            _slot_mark(gate["name"], "bad", "unreachable")
+            log("⚠ 第七闸口放弃：sing-box 在 80s 内未就绪")
+        return
+    log("⇄ 第七闸口（代理池兜底）开始维护：%s port=%d clash=%d"
+        % (gate["name"], gate["port"], gate["clash_api_port"]))
+    while True:
+        time.sleep(_proxy_gate_check_sec())
+        gate = _proxy_gate_slot()
+        if gate is None:
+            return   # 配置热更后闸被关掉：线程自然退出
+        try:
+            _proxy_gate_maintain(gate)
+        except Exception as e:
+            log("⚠ 第七闸口维护异常: %s" % e)
 
 
 def _start_rotate_server() -> None:
@@ -14226,6 +14697,12 @@ def main():
     if consumer_slots():
         threading.Thread(target=_slot_keeper, daemon=True,
                          name="slot-keeper").start()
+
+    # 第七闸口（代理池兜底）：与常规槽位 keeper 并行的独立维护线程 ——
+    # 常规 keeper 只管 WARP 线，池闸的健康与池内轮换都归它。
+    if _proxy_gate_slot() is not None:
+        threading.Thread(target=_proxy_gate_keeper, daemon=True,
+                         name="proxy-gate-keeper").start()
 
     # 初始化 node_info 表
     init_node_info_db()

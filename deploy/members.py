@@ -43,5 +43,12 @@ if __name__ == "__main__":
             if m.get("kind") in ("wg", "h2"):
                 continue
             n = m["port"] - 1079
+            # 第 5 列是 usque-launch.sh 的传输参数（install.sh 原样写进 ExecStart）：
+            #   h2    → --http2 -s '' -P 443（v4 TCP+TLS，UDP 被 ACL 拦时唯一通路）
+            #   -6    → -6（MASQUE over IPv6 / QUIC）
+            #   -     → 缺省（MASQUE over IPv4 / QUIC）
+            t = m.get("transport")
+            if t is None:
+                t = "-6" if m.get("ipv6") else "-"
             print(m["tag"], m["port"], m["service"],
-                  "usque" if n == 1 else f"usque{n}", "-6" if m.get("ipv6") else "-")
+                  "usque" if n == 1 else f"usque{n}", t)

@@ -76,7 +76,9 @@ def _service_of_tag(tag: str) -> str:
     tag 的命名契约（见 `config.py` 的端口契约）：
       WARP-WG-<N>    → warp-wg-<N>.service
       WARP-H2-<...>  → usque-h2-<N>.service（N 从末尾数字取）
-      WARP-CF-<x>    → usque-warp-<x>.service
+      WARP-CF4[-<x>] → usque-warp[-<x>].service（v4 入口，同上）
+      WARP-CF6[-<x>] → usque-warp[-<x>].service（v6 入口，同上）
+      WARP-CF-<x>    → usque-warp-<x>.service（旧命名，兼容）
     推不出的一律返回空串 —— 查不到单元名就按「无从查起」处理，不猜。
     """
     m = re.fullmatch(r"WARP-WG-(\d+)", tag)
@@ -88,6 +90,13 @@ def _service_of_tag(tag: str) -> str:
     m = re.fullmatch(r"WARP-H2-SCAN-(\d+)", tag)
     if m:
         return f"usque-h2-{m.group(1)}.service"
+    # 2026-11-13 起 CF 线带入口族标记：WARP-CF4/-4-B..（v4 入口）、
+    # WARP-CF6/-6-B..（v6 入口）。后缀为空 = 主单元 usque-warp。
+    m = re.fullmatch(r"WARP-CF[46](?:-([A-Za-z0-9]+))?", tag)
+    if m:
+        suffix = m.group(1)
+        return f"usque-warp-{suffix.lower()}.service" if suffix else "usque-warp.service"
+    # 旧命名（WARP-CF / WARP-CF-B）：台账与历史日志里还在，保留兼容。
     m = re.fullmatch(r"WARP-CF-([A-Za-z0-9]+)", tag)
     if m:
         return f"usque-warp-{m.group(1).lower()}.service"

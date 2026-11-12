@@ -1,0 +1,376 @@
+{
+  "node": "upoz.cn.greatgameupload.org:20470-any",
+  "ip": "82.27.116.31",
+  "conc": 1,
+  "rows": [
+    {
+      "i": 1,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.3,
+      "err": null,
+      "phase": "burst"
+    },
+    {
+      "i": 1,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 2,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.2,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 3,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.8,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 4,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 5,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.7,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 6,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.3,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 7,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.3,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 8,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 9,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.0,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 10,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 0.9,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 11,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 2.5,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 12,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.9,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 13,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.7,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 14,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 2.0,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 15,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.8,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 16,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.5,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 17,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.5,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 18,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 19,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.3,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 20,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.3,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 21,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 0.9,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 22,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 0.9,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 23,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 0.9,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 24,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 25,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.1,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 26,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 0.9,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 27,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 28,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.1,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 29,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 2.1,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 30,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.3,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 31,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 32,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 33,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.7,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 34,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.3,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 35,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 2.1,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 36,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.3,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 37,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.1,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 38,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.9,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 39,
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "sec": 1.4,
+      "err": null,
+      "phase": "seq"
+    },
+    {
+      "i": 40,
+      "verdict": "quota",
+      "status": 429,
+      "ra": 46042,
+      "sec": 0.6,
+      "err": null,
+      "phase": "seq"
+    }
+  ]
+}

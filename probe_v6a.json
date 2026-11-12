@@ -1,0 +1,102 @@
+[
+ {
+  "tag": "ttll20-ooi.dankenet.help:25558-any",
+  "ip": "2405:84c0:8001:3200::",
+  "family": "v6",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd8ff48ffegOFyc22uVVD5O2",
+  "trans_retried": 0
+ },
+ {
+  "tag": "normal.cn.greatgameupload.org:25526-any",
+  "ip": "167.253.97.77",
+  "family": "v6",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd8fe9fffeelnIocfjlFS2Zx",
+  "trans_retried": 0
+ },
+ {
+  "tag": "normal.cn.greatgameupload.org:35779-any",
+  "ip": "152.175.33.133",
+  "family": "v6",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd90027ffeuThjjms1ZkM0O7",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:11732-any",
+  "ip": null,
+  "family": "v6",
+  "verdict": "trans",
+  "st": null,
+  "ra": null,
+  "sid": "ses_e2fd90074ffey2mTYXao7gzybY",
+  "trans_retried": 2
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:32236-any",
+  "ip": null,
+  "family": "v6",
+  "verdict": "trans",
+  "st": null,
+  "ra": null,
+  "sid": "ses_e2fd8ffe0ffekhrf1p5ZQY0gOl",
+  "trans_retried": 2
+ },
+ {
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443~4-vl",
+  "ip": "67.159.48.149",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34861,
+  "sid": "ses_e2fd8f8f1ffeAEoOASMOV0lpjs",
+  "trans_retried": 0
+ },
+ {
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443~2-vl",
+  "ip": "67.159.48.147",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35133,
+  "sid": "ses_e2fd8f8d6ffeqyEDwbDV1V53Wq",
+  "trans_retried": 0
+ },
+ {
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443-vl",
+  "ip": "67.159.48.146",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34736,
+  "sid": "ses_e2fd8f877ffeyFTzseEu5caLgY",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.aws63.yydjc.top:443-vl",
+  "ip": "2001:49f0:d0db:2a::2",
+  "family": "v6",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd8ebfdffe7ZTeIsjR2Ly4oe",
+  "trans_retried": 0
+ },
+ {
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443~3-vl",
+  "ip": "67.159.48.148",
+  "family": "v6",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35792,
+  "sid": "ses_e2fd8ec92ffeKRHVyxArDk1gUW",
+  "trans_retried": 0
+ }
+]

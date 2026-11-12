@@ -3444,7 +3444,9 @@ def test_proactive_rotate_keeps_fail_cooldown(monkeypatch):
     monkeypatch.setattr(daemon, "_last_warp_reconnect_ts", 1030.0)  # 之后失败
     # 本用例测的是冷却，不是配额：桩掉计数，免得真查生产库、也免得配额不足
     # 时压根走不到换线分支。
-    monkeypatch.setattr(daemon, "count_dsv4_ok_since", lambda ts: 150)
+    # 阈值不写死：2026-11-13 起是 300，写死 150 会让本用例永远到不了换线分支。
+    monkeypatch.setattr(daemon, "count_dsv4_ok_since",
+                        lambda ts: daemon._warp()["proactive_after_dsv4_ok"])
     seen = []
     monkeypatch.setattr(daemon, "_reconnect_warp_now",
                         lambda reason, now, ignore_cooldown=False, interrupt=True, respect_evidence=True:
@@ -4043,15 +4045,17 @@ def test_publish_clash_snapshot_keeps_selectors_apart(monkeypatch):
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "selector": "opencode-out"})
 
     daemon._publish_clash_snapshot("proxy", {"all": ["n1", "n2"], "now": "n1"})
-    daemon._publish_clash_snapshot("opencode-out", {"all": ["WARP-CF", "proxy"], "now": "WARP-CF"})
+    # tag 必须是 config.py 里真实存在的成员：2026-11-13 起 CF 线带入口族标记
+    # （WARP-CF4-* / WARP-CF6-*），active_warp_tag() 会回查 members，写旧名会返回 None。
+    daemon._publish_clash_snapshot("opencode-out", {"all": ["WARP-CF4", "proxy"], "now": "WARP-CF4"})
 
     assert daemon._pool_snapshot() == (["n1", "n2"], "n1")
     # 换线只写 now 时不得把 all 清空（刷新线程和换线线程谁先到都可能）
-    daemon._publish_clash_snapshot("opencode-out", {"now": "WARP-CF-B"})
+    daemon._publish_clash_snapshot("opencode-out", {"now": "WARP-CF4-B"})
     snap = daemon._clash_snapshot("opencode-out")
-    assert snap["now"] == "WARP-CF-B"
-    assert snap["all"] == ["WARP-CF", "proxy"], "只写 now 不应清掉 all"
-    assert daemon.active_warp_tag() == "WARP-CF-B"
+    assert snap["now"] == "WARP-CF4-B"
+    assert snap["all"] == ["WARP-CF4", "proxy"], "只写 now 不应清掉 all"
+    assert daemon.active_warp_tag() == "WARP-CF4-B"
 
 
 # ============= 24. 出口 IP 历史池（只追加、永不清理） =============

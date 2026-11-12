@@ -1,0 +1,39 @@
+[
+ {
+  "idx": 20,
+  "tag": "cn.bing.com:443~7-any",
+  "mode": "fixedN",
+  "conc": 15,
+  "maxtotal": 900,
+  "ip_start": "154.83.84.34",
+  "sessions": 15,
+  "ok": 0,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 2.3,
+  "per_worker": {},
+  "ip_end": "154.83.84.34",
+  "segments": [
+   {
+    "ip": "154.83.84.34",
+    "shots": 0
+   },
+   {
+    "ip": "154.83.84.34",
+    "shots": 0
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 36050
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 36049
+   }
+  ]
+ }
+]

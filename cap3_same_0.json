@@ -1,0 +1,31 @@
+{
+  "mode": "same",
+  "port": 0,
+  "ip": "52.69.72.232",
+  "body": 3070,
+  "ok": 0,
+  "sessions": 1,
+  "stop": "egress_blocked",
+  "sec": 1.4,
+  "rows": [
+    {
+      "i": 1,
+      "sid": "ses_e3078fef4f",
+      "verdict": "quota",
+      "status": 429,
+      "ra": 48504,
+      "t": 0.5,
+      "err": null
+    },
+    {
+      "i": 1,
+      "corroborate": true,
+      "verdict": "quota",
+      "status": 429,
+      "ra": 48503,
+      "sid": "ses_e3078fcf5f",
+      "ip_before": "52.69.72.232",
+      "ip_after": "52.69.72.232"
+    }
+  ]
+}

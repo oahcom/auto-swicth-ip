@@ -1,0 +1,41 @@
+[
+ {
+  "idx": 64,
+  "tag": "upoz.cn.greatgameupload.org:36502-any",
+  "mode": "rotate",
+  "conc": 1,
+  "maxtotal": 80,
+  "ip_start": "103.175.99.31",
+  "sessions": 1,
+  "ok": 39,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 78.7,
+  "per_worker": {
+   "0": 39
+  },
+  "ip_end": "103.175.99.31",
+  "segments": [
+   {
+    "ip": "103.175.99.31",
+    "shots": 0
+   },
+   {
+    "ip": "103.175.99.31",
+    "shots": 39
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 35366
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 35365
+   }
+  ]
+ }
+]

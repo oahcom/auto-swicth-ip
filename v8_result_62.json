@@ -1,0 +1,39 @@
+[
+ {
+  "idx": 62,
+  "tag": "WARP-CF-C",
+  "mode": "single",
+  "conc": 16,
+  "maxtotal": 600,
+  "ip_start": "2a09:bac1:19e0:18::4:329",
+  "sessions": 1,
+  "ok": 0,
+  "trans_cnt": 1,
+  "death": [],
+  "dur_sec": 16.0,
+  "per_worker": {},
+  "ip_end": "2a09:bac1:19e0:18::4:329",
+  "segments": [
+   {
+    "ip": "2a09:bac1:19e0:18::4:329",
+    "shots": 0
+   },
+   {
+    "ip": "2a09:bac1:19e0:18::4:329",
+    "shots": 0
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 33900
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 33893
+   }
+  ]
+ }
+]

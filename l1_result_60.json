@@ -1,0 +1,39 @@
+{
+ "tag": "pq.aws55.yydjc.top:443-vl",
+ "family": "v4",
+ "steps": [
+  {
+   "label": "step1: 老session A 首打",
+   "sid": "ses_e2fd320c7ffecXTCmzKZgalRru",
+   "verdict": "OK",
+   "st": 200,
+   "ra": null
+  },
+  {
+   "label": "step3: 老session A 复打",
+   "sid": "ses_e2fd320c7ffecXTCmzKZgalRru",
+   "verdict": "quota",
+   "st": 429,
+   "ra": 37343
+  },
+  {
+   "label": "step4: 全新 session 复打",
+   "sid": "ses_e2fd1f7b8ffehvp5iAJ35yLYop",
+   "verdict": "quota",
+   "st": 429,
+   "ra": 37342
+  }
+ ],
+ "ip": "13.158.42.154",
+ "session_A": "ses_e2fd320c7ffecXTCmzKZgalRru",
+ "killed_at": {
+  "n": 39,
+  "verdict": "quota",
+  "st": 429,
+  "ra": 37344,
+  "sid": "ses_e2fd1fcb4ffe4cMIsWH6V54tjA"
+ },
+ "new_sessions_used": 39,
+ "ip_end": "13.158.42.154",
+ "ip_stable": true
+}

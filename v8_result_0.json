@@ -1,0 +1,39 @@
+[
+ {
+  "idx": 0,
+  "tag": "WARP-H2-HKG-71",
+  "mode": "single",
+  "conc": 4,
+  "maxtotal": 700,
+  "ip_start": "2a09:bac5:3982:16d2::246:f9",
+  "sessions": 1,
+  "ok": 0,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 0.9,
+  "per_worker": {},
+  "ip_end": "2a09:bac5:3982:16d2::246:f9",
+  "segments": [
+   {
+    "ip": "2a09:bac5:3982:16d2::246:f9",
+    "shots": 0
+   },
+   {
+    "ip": "2a09:bac5:3982:16d2::246:f9",
+    "shots": 0
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 36311
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 36310
+   }
+  ]
+ }
+]

@@ -119,9 +119,6 @@ def env_marker(now: float | None = None) -> str:
 ENV_WORKING_DIR = env_workdir()
 ENV_MARKER = env_marker()
 BUN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_fetch.mjs")
-SESSION_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  ".probe_sessions.json")
-SESSION_TTL_SEC = 2 * 60 * 60
 ROTATE_DELAY_SEC = 1.5
 # 429 封禁时长：头优先于体，对齐 9router parseRetryAfterMs 的取数顺序。
 RETRY_HEADERS = ("retry-after", "x-ratelimit-reset-after", "reset-after",
@@ -195,54 +192,36 @@ FINGERPRINT_TOOLS = [
 ]
 
 
-def _session_id() -> str:
-    """上游解码前 12 位 hex 并拒绝过大的 counter（实测 0..16 通过，>=100 拒），必须是 1。"""
-    prefix = ~(int(time.time() * 1000) * 0x1000 + 1) & _MASK48
-    return "ses_" + format(prefix, "012x") + "".join(secrets.choice(_B62) for _ in range(14))
+SESSION_DAILY_COUNT = 15
+# 前缀 12 hex 里编码的时钟锚点（当天几点）。上游会把前缀解码成时间戳并与请求时钟比对，
+# 偏差过大直接 429；锚在当天 00:00 时，全天偏差落在 0~24h。
+SESSION_DAY_ANCHOR_HOUR = 0
 
 
-_SESS_LOCK = threading.Lock()
+def _daily_sessions(day: str | None = None) -> list[str]:
+    """当天固定的 15 个会话 id —— 确定性派生，不落盘、不轮换、不看过期。
 
-
-def _load_sessions() -> dict:
-    try:
-        with open(SESSION_STATE_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_sessions(data: dict) -> None:
-    try:
-        write_json(SESSION_STATE_FILE, data)
-    except OSError as e:
-        print(f"⚠ 会话表写入失败: {e}", file=sys.stderr)
-
-
-def _session_for(port: int, rotate: bool = False) -> str:
-    """一条隧道一个稳定会话，TTL 2h（对齐 9router stableSessionId）。
-
-    新会话只在首次、过期或 quota 轮换时生成。每请求换会话会白烧配额，
-    且上游会按会话前缀的时钟拒收旧 id —— 所以不能长期复用，必须带 TTL。
+    - 前 12 hex = ~(当天锚点毫秒 * 0x1000 + 序号) 的低 48 位，counter 取 1..15
+      （上游实测 counter 0..16 通过、>=100 直接 403 FreeTierError）。
+    - 后 14 位 = sha256("opencode-daily-session|YYYYMMDD|序号") 映射到 base62，
+      因此同一天恒定、跨天必然不重样。
     """
-    now = time.time()
-    key = str(port)
-    with _SESS_LOCK:
-        data = _load_sessions()
-        entry = data.get(key)
-        if not isinstance(entry, dict):
-            entry = None
-        expired = entry is None or now - float(entry.get("ts") or 0) > SESSION_TTL_SEC
-        if rotate or expired:
-            if rotate and entry is not None and not expired:
-                rotations = int(entry.get("rotations") or 0) + 1
-            else:
-                rotations = 0
-            entry = {"session": _session_id(), "ts": now, "rotations": rotations}
-            data[key] = entry
-            _save_sessions(data)
-        return entry["session"]
+    if day is None:
+        day = time.strftime("%Y%m%d")
+    anchor = time.mktime(time.strptime(day, "%Y%m%d")) + SESSION_DAY_ANCHOR_HOUR * 3600
+    day_ms = int(anchor * 1000)
+    out = []
+    for i in range(SESSION_DAILY_COUNT):
+        prefix = ~(day_ms * 0x1000 + (i + 1)) & _MASK48
+        digest = hashlib.sha256(f"opencode-daily-session|{day}|{i}".encode()).digest()
+        suffix = "".join(_B62[b % 62] for b in digest[:14])
+        out.append("ses_" + format(prefix, "012x") + suffix)
+    return out
+
+
+def _pick_session() -> str:
+    """从当天 15 个里等概率随机取一个。"""
+    return secrets.choice(_daily_sessions())
 
 
 def _apply_env_marker(body: dict) -> dict:
@@ -611,7 +590,7 @@ def probe(port: int, timeout: float) -> tuple[str, float, str, int | None]:
         return "noprobe", 0.0, "bun not found (set PROBE_BUN_BIN)", None
     try:
         with _LocalBridge(port) as proxy_url:
-            session = _session_for(port)
+            session = _pick_session()
             status, head, retry, err = _bun_probe(bun, proxy_url, session, timeout)
             if err is not None:
                 return "unreachable", round(time.time() - t0, 1), f"bun: {err}"[:100], None
@@ -621,7 +600,7 @@ def probe(port: int, timeout: float) -> tuple[str, float, str, int | None]:
                         parse_retry_after(retry, head))
             # quota 一律按出口判定；换一代会话只为排除上游对单次请求的门控，
             # 重试仍 quota 即确认该出口不可用。对齐 opencode.js 的一次重试。
-            session = _session_for(port, rotate=True)
+            session = _pick_session()
             time.sleep(ROTATE_DELAY_SEC)
             status, head, retry, err = _bun_probe(bun, proxy_url, session, timeout)
             if err is not None:

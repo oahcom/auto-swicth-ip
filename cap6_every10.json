@@ -1,0 +1,372 @@
+{
+  "mode": "every10",
+  "node": "cn.bing.com:443~6-any",
+  "ip": "45.207.156.48",
+  "body": 3080,
+  "ok": 40,
+  "sessions": 4,
+  "stop": "max",
+  "sec": 65.9,
+  "rows": [
+    {
+      "i": 1,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 1.2,
+      "err": null
+    },
+    {
+      "i": 2,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 2.6,
+      "err": null
+    },
+    {
+      "i": 3,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 4.1,
+      "err": null
+    },
+    {
+      "i": 4,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 5.8,
+      "err": null
+    },
+    {
+      "i": 5,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 7.2,
+      "err": null
+    },
+    {
+      "i": 6,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 9.0,
+      "err": null
+    },
+    {
+      "i": 7,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 10.5,
+      "err": null
+    },
+    {
+      "i": 8,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 11.8,
+      "err": null
+    },
+    {
+      "i": 9,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 13.6,
+      "err": null
+    },
+    {
+      "i": 10,
+      "sid": "ses_e307669caf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 15.2,
+      "err": null
+    },
+    {
+      "i": 11,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 17.3,
+      "err": null
+    },
+    {
+      "i": 12,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 18.7,
+      "err": null
+    },
+    {
+      "i": 13,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 21.2,
+      "err": null
+    },
+    {
+      "i": 14,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 24.0,
+      "err": null
+    },
+    {
+      "i": 15,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 25.6,
+      "err": null
+    },
+    {
+      "i": 16,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 27.1,
+      "err": null
+    },
+    {
+      "i": 17,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 28.6,
+      "err": null
+    },
+    {
+      "i": 18,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 30.1,
+      "err": null
+    },
+    {
+      "i": 19,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 31.3,
+      "err": null
+    },
+    {
+      "i": 20,
+      "sid": "ses_e30762e60f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 32.6,
+      "err": null
+    },
+    {
+      "i": 21,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 34.4,
+      "err": null
+    },
+    {
+      "i": 22,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 36.7,
+      "err": null
+    },
+    {
+      "i": 23,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 38.7,
+      "err": null
+    },
+    {
+      "i": 24,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 40.7,
+      "err": null
+    },
+    {
+      "i": 25,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 42.5,
+      "err": null
+    },
+    {
+      "i": 26,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 44.4,
+      "err": null
+    },
+    {
+      "i": 27,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 46.2,
+      "err": null
+    },
+    {
+      "i": 28,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 48.1,
+      "err": null
+    },
+    {
+      "i": 29,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 49.7,
+      "err": null
+    },
+    {
+      "i": 30,
+      "sid": "ses_e3075ea6bf",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 51.8,
+      "err": null
+    },
+    {
+      "i": 31,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 53.5,
+      "err": null
+    },
+    {
+      "i": 32,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 55.0,
+      "err": null
+    },
+    {
+      "i": 33,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 56.0,
+      "err": null
+    },
+    {
+      "i": 34,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 57.3,
+      "err": null
+    },
+    {
+      "i": 35,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 58.5,
+      "err": null
+    },
+    {
+      "i": 36,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 60.1,
+      "err": null
+    },
+    {
+      "i": 37,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 61.2,
+      "err": null
+    },
+    {
+      "i": 38,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 62.6,
+      "err": null
+    },
+    {
+      "i": 39,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 64.3,
+      "err": null
+    },
+    {
+      "i": 40,
+      "sid": "ses_e30759f98f",
+      "verdict": "OK",
+      "status": 200,
+      "ra": null,
+      "t": 65.9,
+      "err": null
+    }
+  ]
+}

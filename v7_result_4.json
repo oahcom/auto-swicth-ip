@@ -1,0 +1,35 @@
+[
+ {
+  "idx": 4,
+  "tag": "cn.bing.com:443~23-any",
+  "mode": "single",
+  "conc": 4,
+  "maxtotal": 400,
+  "ip_start": "64.120.94.207",
+  "family": "v4",
+  "sessions": 1,
+  "ok": 215,
+  "death": [],
+  "dur_sec": 152.7,
+  "per_worker": {
+   "0": 56,
+   "3": 51,
+   "2": 53,
+   "1": 55
+  },
+  "ip_end": "64.120.94.207",
+  "ip_stable": true,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37870
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37870
+   }
+  ]
+ }
+]

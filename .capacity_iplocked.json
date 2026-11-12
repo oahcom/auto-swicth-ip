@@ -1,0 +1,21 @@
+{
+  "tag": "WARP-H2-GIG-78",
+  "port": 1258,
+  "ip0": "2a09:bac5:5ad:878::d8:167",
+  "rows": [
+    {
+      "i": 1,
+      "t": 4.6,
+      "verdict": "transport",
+      "ip_a": "",
+      "ip_b": "",
+      "same_ip": false,
+      "retry_after": null
+    },
+    {
+      "after": "err",
+      "ip": "",
+      "same_as_wall": true
+    }
+  ]
+}

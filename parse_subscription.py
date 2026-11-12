@@ -976,10 +976,14 @@ def _build_lan_guard(inbounds: list[dict]) -> list[dict]:
 def make_config(nodes: list[dict], listen_port: int = 0,
                 clash_port: int = 0, clash_secret: str = "",
                 include_h2: bool = False, stats_out=None,
-                slot_index: int = 0, include_lan: bool = True) -> dict:
+                slot_index: int = 0, include_lan: bool = True,
+                default_to_pool: bool = False) -> dict:
     """生成 sing-box 配置：mixed port + selector + clash API
 
     include_h2: 是否包含 hysteria2 节点（WSL2 下 utls 不兼容，默认排除）
+    default_to_pool: 第七闸口（代理池兜底闸）用 —— warp selector 的
+      default 指到池 selector 而不是某条 WARP 线。重启后 selector 复位到
+      default，正好复位回「池闸」而不是某条线，这是兜底闸自愈的关键。
     """
     if not listen_port:
         listen_port = CFG["singbox"]["mixed_port"]
@@ -1067,11 +1071,15 @@ def make_config(nodes: list[dict], listen_port: int = 0,
             },
             # opencode 流量固定走 WARP：403 实为 IP 信誉拦截，轮换池全在脏 IP 上。
             # 多个 WARP 出口时是主备 selector：daemon 切到备线即可让主隧道重连换 IP。
+            # 第七闸口（default_to_pool）：default 指到池 selector —— 这台进程
+            # 的 opencode 流量天然走池，daemon 也永远不往里 PUT WARP 线。
             *([{
                 "type": "selector",
                 "tag": warp_selector,
                 "outbounds": [w["tag"] for w in warps] + [pool_selector],
-                "default": warps[slot_index % len(warps)]["tag"] if warps else "",
+                "default": (pool_selector if default_to_pool
+                            else (warps[slot_index % len(warps)]["tag"]
+                                  if warps else "")),
                 "interrupt_exist_connections": False,
             }] if warps else []),
 
@@ -1291,7 +1299,9 @@ if __name__ == "__main__":
                               args.secret or get_singbox_secret(),
                               include_h2=args.include_h2,
                               stats_out=(args.out if i == 0 else None),
-                              slot_index=i, include_lan=(i == 0))
+                              slot_index=i, include_lan=(i == 0),
+                              default_to_pool=bool(slot.get("kind")
+                                                   == "proxy"))
             write_json(out_path, cfg, mode=0o600, indent=2)
     else:
         out_path = args.out + ".tmp" if drafting else args.out

@@ -158,6 +158,16 @@ CFG = {
         # 相当于把「一个消费者」变成 N 个，9router 在端口之间轮询。
         # 端口从 7892 起，避开 mixed-in(7890) 与 LAN 口(7891)。
         "consumer_slots": 6,
+        # 第七闸口：代理池兜底闸（slot-7）。它不是第 7 条 WARP 线，而是把
+        # 池 selector 当自己的「线」—— opencode 流量落到它上面 = 走轮换池。
+        # 严格兜底的两条硬保证：
+        #   1. asip 侧：_pick_healthy_slot 只有在六个常规闸口全都选不出来
+        #      时才会把它当重试目标（常规候选阶段它根本不进场）；
+        #   2. 9router 侧：常规轮询端口 ASIP_LOCAL_PROXY_PORT 默认
+        #      7890,7892-7896，不含它的端口 —— 流量只能由 /rotate 回包的
+        #      switch_to_url 引到它上面。
+        # 9router 侧无需任何改动；asip 关掉它也只要设 False。
+        "proxy_gate": True,
         # 局域网入站：0 = 不生成（默认关闭）。开启后另起一个 mixed 入站监听
         # 0.0.0.0，与环回口互不影响 —— 环回口给 9router/daemon，局域网口给
         # 手机/其他机器，前者永远不需要认证，后者必须有。
@@ -211,6 +221,15 @@ CFG = {
         # 池真的持续在拦（约 150 条请求量级），而不是正常的 429 抖动。
         "proxy_blocked_threshold": 50,
         "proxy_dead_ratio": 0.5,       # 池黑名单节点占比 ≥N
+        # 第七闸口（代理池兜底）的维护节奏：_proxy_gate_keeper 每隔这么
+        # 多秒检查一次池闸 —— 刷新健康结论、把死节点换掉、在役时按
+        # proactive_rotate_sec 的节奏换节点。主循环的池轮换只翻主进程的
+        # proxy selector，翻不到第七闸口自己的进程，轮换必须由 keeper 做。
+        "proxy_gate_check_sec": 60,
+        # 第七闸口「在役」判定窗口：最近一次被指为重试目标之后这么久
+        # 之内，认为 7897 上还有真实流量，需要按节奏换节点保持地址新鲜；
+        # 窗口外它是待命兜底闸，不轮换（省节点配额），只维护健康结论。
+        "proxy_gate_serving_window_sec": 300,
     },
     "thresholds": {
         "recent_window": 5,    # 策略/错误判据的滑动窗口条数（太小会被单条噪声带偏）
@@ -296,33 +315,57 @@ CFG = {
         # 容量不再需要靠 usque 数量堆，多留的 17 条只是多 17 份注册身份和
         # 17 个待探测端口（2026-10-28 已全部 stop + disable，单元文件留着好回滚）。
         "members": [
-            {"tag": "WARP-CF", "port": 1080, "service": "usque-warp.service", "ipv6": True},
-            {"tag": "WARP-CF-B", "port": 1081, "service": "usque-warp-b.service", "ipv6": True},
-            {"tag": "WARP-CF-D", "port": 1083, "service": "usque-warp-d.service"},
-            # 2026-10-30 扩容（主人定）：CF-D 同配置 ×2，v4 传输 → LAX 落地，
-            # 各自独立注册（.warp/usque5 / usque6），不是复制同一份私钥。
-            {"tag": "WARP-CF-E", "port": 1084, "service": "usque-warp-e.service"},
-            {"tag": "WARP-CF-F", "port": 1085, "service": "usque-warp-f.service"},
-            # 2026-11-01 22:20 扩容（第二路径）：WARP 出口不必借机场的 UDP——
-            # usque 走 MASQUE（QUIC 443）本机直连 CF，机场封不封 WARP 网段无关。
-            # 实测 4 条闲置设备拉起即各自拿到独立 v6 出口（1f01/1f06/19c0 段），
-            # 出口池 = 设备数，注册的 20 台全在。WG 线给地点多样性，usque 线给量。
-            {"tag": "WARP-CF-C", "port": 1082, "service": "usque-warp-c.service", "ipv6": True},
-            {"tag": "WARP-CF-G", "port": 1086, "service": "usque-warp-g.service", "ipv6": True},
-            {"tag": "WARP-CF-H", "port": 1087, "service": "usque-warp-h.service", "ipv6": True},
-            {"tag": "WARP-CF-I", "port": 1088, "service": "usque-warp-i.service", "ipv6": True},
+            # 2026-11-13 00:10（主人定）：9 条 CF 线**全部走 h2**，其中 5 条入口 v4、
+            # 4 条入口 v6。理由链：
+            #   1. 本机到 CF 的 UDP 443 被运营商 ACL 拦（ICMP type 3 code 13），
+            #      QUIC 版 v4 端点根本起不来 → 必须走 TCP+TLS 的 --http2。
+            #   2. `--http2` 与 `-6` 可以叠加，v6 侧同样能走 TCP 443（实测
+            #      2606:4700:103::2 Connected 成功）。所以 h2 不等于只能用 v4。
+            #   3. v4/v6 两条 TCP 通路互为备份：一条被封时另一条还能出。
+            # 三个字段别混：
+            #   transport = 本地到 CF 的承载（h2 = v4 TCP+TLS / h2v6 = v6 TCP+TLS /
+            #               quic6 / quic4），deploy/members.py 原样渲染成单元末参。
+            #   entry     = **入口**地址族，也就是 tag 里 4/6 的含义。
+            #   family    = **出口**地址族。两种 h2 的出口都是 WARP 分配的
+            #               2a09:bac* v6，所以这里恒为 v6 —— 别拿它当 entry 用。
+            # h2_endpoint 是这条线 config.json 里实测可用的端点，daemon 不读，
+            # 留着是为了换端点时不必逐个翻 .warp/usqueN/config.json。
+            {"tag": "WARP-CF4", "port": 1080, "service": "usque-warp.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.3"},
+            {"tag": "WARP-CF4-B", "port": 1081, "service": "usque-warp-b.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.4"},
+            {"tag": "WARP-CF4-C", "port": 1082, "service": "usque-warp-c.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.5"},
+            {"tag": "WARP-CF4-D", "port": 1083, "service": "usque-warp-d.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.6"},
+            {"tag": "WARP-CF4-E", "port": 1084, "service": "usque-warp-e.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.7"},
+            {"tag": "WARP-CF6", "port": 1085, "service": "usque-warp-f.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-B", "port": 1086, "service": "usque-warp-g.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-C", "port": 1087, "service": "usque-warp-h.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-D", "port": 1088, "service": "usque-warp-i.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
             # WARP-WG-13 不再写死在这里：块模型把渠道数从 12 扩到 20 之后，
             # 第 13 条就是生成成员里的普通一条，写死会得到两个同 tag 成员
             # （同一端口、同一单元、同一份设备），selector 里重复项直接报错。
             # 线路数不足 13 的部署仍需要它，见 `_append_wg_members` 末尾。
             #
-            # 2026-11-02：H2 线路并入。与 usque/WG 的区别是**承载层**——
-            # 本地 usque 走 `--http2 -s ''` 连 `127.0.0.1:2270N`，由 sing-box
-            # 的 direct 入站经机场节点转发到 CF MASQUE 端点。对 daemon 而言
-            # 它就是一条普通 socks 出口，探测/换线/预热路径无需分叉。
-            # 端口落在 1180 段（避开 usque 的 1080-1089 与 WG 的 1110-1138）。
-            # 单元由 deploy/render_h2_lines.py 渲染，tag 里的 colo 是**实测**
-            # 落点，不是预期值（见 docs/warp-channel-allocation.md）。
+            # 2026-11-02：H2 线路并入。与上面 9 条的区别是**落地路径**——
+            # 那 114 条 H2 线由本机 usque 连 `127.0.0.1:2270N`，再经 sing-box
+            # 的 direct 入站借机场节点转发到 CF；本文件的 9 条是**直连** CF 端点。
+            # 对 daemon 而言两者都是普通 socks 出口，探测/换线路径无需分叉。
         ],
         # 换线触发阈值（两类都按出口 IP 判定，换出口即拿到新配额/新信誉）：
         # 两者都是 1：任何一条出口级拦截出现即换，不再等累计。
@@ -381,7 +424,11 @@ CFG = {
         # 效果是把健康段拉到约 2 分钟，快限流的段仍由 429 兜底接管。
         # 若观察到 429 占比上升，把本值调小（每段随之变短）；调大更省地址，
         # 但更多段会在半途吃 429。
-        "proactive_after_dsv4_ok": 150,
+        # 2026-11-13 00:27 主人要求：阈值 150 → 300（每条线把一个出口用到 300 格
+        # 再主动换，减少换线次数/地址消耗）。注意这是「成功的 dsv4 调用数」，
+        # 不是 HTTP 请求条数；单 IP 实测容量 150+ 是**判活前的上限估计**，
+        # 真按 300 走会有一部分段在半途吃 429，由错误换线兜底。
+        "proactive_after_dsv4_ok": 300,
         # 备线「可服务性」探针：暂未实现。曾尝试经目标隧道的 SOCKS 直接向
         # opencode 发最小请求，但免费层的客户端指纹校验无法通过 —— 试过
         # /zen/v1 与 /inference/v1 两个端点、v1/v2 两种 UA、cli/desktop 两种
@@ -1167,6 +1214,33 @@ def consumer_slots() -> list[dict]:
             # 任一处改名就会静默拉起旧配置。
             "config_file": consumer_slot_config_path(str(sb.get("config_file")
                                                        or ""), i),
+        })
+    if n and sb.get("proxy_gate", True):
+        # 第七闸口（代理池兜底）：端口/Clash 端口沿用同一套避让规则继续
+        # 编号（6 槽时是 7897 / 9097，均未被占用）。kind=proxy 是它和常规
+        # 闸口的分界：daemon 所有 WARP 线逻辑（claim/put/repair/补闸）都
+        # 跳过它，池内轮换只碰它的 pool_selector。
+        # 它的 config_file 仍由同一命名规则产出（<base>-slot7.json），
+        # 解析器随订阅刷新一起渲染它，promote 成组校验也自动覆盖。
+        clash_p = base_clash + n
+        if clash_p >= 9091:
+            clash_p += 1
+        port_p = base_port + n
+        if port_p >= 7891:
+            port_p += 1
+        out.append({
+            "name": "slot-%d" % (n + 1),
+            "kind": "proxy",
+            # selector 与常规闸口同名（opencode-out），但它的 default 在
+            # 配置渲染时指到池 selector（parse_subscription 的
+            # default_to_pool），且 daemon 永远不会往里 PUT WARP 线。
+            "selector": sel,
+            # 它的「线」是池节点：轮换/读当前节点都作用在这个 selector 上。
+            "pool_selector": sb.get("selector") or "proxy",
+            "port": port_p,
+            "clash_api_port": clash_p,
+            "config_file": consumer_slot_config_path(str(sb.get("config_file")
+                                                       or ""), n),
         })
     return out
 

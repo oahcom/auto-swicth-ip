@@ -1,0 +1,68 @@
+{
+  "ts": 1794478965.455413,
+  "results": [
+    {
+      "tag": "WARP-H2-HKG-10",
+      "port": 1190,
+      "ok": 0,
+      "sec": 6.0,
+      "stop": "quota(status=429)",
+      "retry_after": 51575,
+      "head": null
+    },
+    {
+      "tag": "WARP-H2-FRA-76",
+      "port": 1256,
+      "ok": 10,
+      "sec": 32.6,
+      "stop": "quota(status=429)",
+      "retry_after": 51660,
+      "head": "data: {\"id\":\"chatcmpl-RR3ex9evkxtob4PB790aaxk2\",\"object\":\"chat.completion.chunk\""
+    },
+    {
+      "tag": "WARP-H2-GIG-78",
+      "port": 1258,
+      "ok": 10,
+      "sec": 31.3,
+      "stop": "quota(status=429)",
+      "retry_after": 50703,
+      "head": "data: {\"id\":\"chatcmpl-b355885eafa167f1\",\"object\":\"chat.completion.chunk\",\"create"
+    },
+    {
+      "tag": "WARP-H2-LHR-83",
+      "port": 1263,
+      "ok": 0,
+      "sec": 1.5,
+      "stop": "quota(status=429)",
+      "retry_after": 50612,
+      "head": null
+    },
+    {
+      "tag": "WARP-H2-BOM-88",
+      "port": 1268,
+      "ok": 10,
+      "sec": 25.3,
+      "stop": "quota(status=429)",
+      "retry_after": 49975,
+      "head": "data: {\"id\":\"chatcmpl-b176392530a5b570\",\"object\":\"chat.completion.chunk\",\"create"
+    },
+    {
+      "tag": "WARP-H2-SJC-108",
+      "port": 1288,
+      "ok": 0,
+      "sec": 6.0,
+      "stop": "quota(status=429)",
+      "retry_after": 51008,
+      "head": null
+    },
+    {
+      "tag": "WARP-H2-SIN-145",
+      "port": 1325,
+      "ok": 0,
+      "sec": 6.0,
+      "stop": "quota(status=429)",
+      "retry_after": 51716,
+      "head": null
+    }
+  ]
+}

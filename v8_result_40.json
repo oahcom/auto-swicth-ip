@@ -1,0 +1,41 @@
+[
+ {
+  "idx": 40,
+  "tag": "ddixx-1dd1.dankenet.help:5474-any",
+  "mode": "single",
+  "conc": 1,
+  "maxtotal": 400,
+  "ip_start": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+  "sessions": 1,
+  "ok": 57,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 79.3,
+  "per_worker": {
+   "0": 57
+  },
+  "ip_end": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+  "segments": [
+   {
+    "ip": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+    "shots": 0
+   },
+   {
+    "ip": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+    "shots": 57
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38066
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 38066
+   }
+  ]
+ }
+]

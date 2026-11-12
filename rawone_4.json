@@ -1,0 +1,17 @@
+{
+ "status": 429,
+ "headers": {
+  "cf-placement": "remote-IAD",
+  "cf-ray": "a59641b45d281181-HKG",
+  "connection": "keep-alive",
+  "content-length": "208",
+  "content-type": "application/json",
+  "date": "Thu, 12 Nov 2026 14:34:17 GMT",
+  "retry-after": "36011",
+  "server": "cloudflare",
+  "server-timing": "gateway;dur=15, total;dur=15",
+  "x-opencode-log-id": "01a1d02e-4d30-7e79-861c-ab1450508134"
+ },
+ "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go\"}}",
+ "bodyLen": 208
+}

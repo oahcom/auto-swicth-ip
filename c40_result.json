@@ -1,0 +1,47 @@
+{
+ "spent": 118,
+ "log": [
+  "[探测] ttll20-ooi.dankenet.help:4826-any        ip=45.95.212.97     -> OK      (消耗 1)",
+  "\n[1] 在 45.95.212.97 上用 session S=ses_e302f2f3fffeoi7YFRE1YFxS4b 连打 ...",
+  "    已 10 发 ...",
+  "    已 20 发 ...",
+  "    已 30 发 ...",
+  "    已 40 发 ...",
+  "    已 50 发 ...",
+  "    已 60 发 ...",
+  "    已 70 发 ...",
+  "    已 80 发 ...",
+  "    已 90 发 ...",
+  "    已 100 发 ...",
+  "    已 110 发 ...",
+  "    打出 114 发后 quota ra=40957；出口 2405:84c0:8011:3800:: (未变=False)",
+  "\n[2] 同一 IP 上换全新 session ...",
+  "    全新 session #1 -> OK     ra=None",
+  "    全新 session #2 -> OK     ra=None",
+  "\n>>> 额度按 (session,IP) 记：同一 IP 上换新 session 立刻能用 -> 114 发是单个 session 的上限"
+ ],
+ "node": {
+  "tag": "ttll20-ooi.dankenet.help:4826-any",
+  "ip": "45.95.212.97"
+ },
+ "step1": {
+  "sid": "ses_e302f2f3fffeoi7YFRE1YFxS4b",
+  "ok": 114,
+  "stop": "quota",
+  "ra": 40957,
+  "ip": "2405:84c0:8011:3800::"
+ },
+ "step2": [
+  {
+   "sid": "ses_e302d60c0ffeLIAA",
+   "verdict": "OK",
+   "ra": null
+  },
+  {
+   "sid": "ses_e302d4673ffeBzNQ",
+   "verdict": "OK",
+   "ra": null
+  }
+ ],
+ "verdict": "额度按 (session,IP) 记：同一 IP 上换新 session 立刻能用 -> 114 发是单个 session 的上限"
+}

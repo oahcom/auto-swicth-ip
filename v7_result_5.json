@@ -1,0 +1,30 @@
+[
+ {
+  "idx": 5,
+  "tag": "unamecf3.xn--ghqu5fm27b67w.com:443~5-vl",
+  "mode": "single",
+  "conc": 4,
+  "maxtotal": 400,
+  "ip_start": "134.195.101.195",
+  "family": "v4",
+  "sessions": 1,
+  "ok": 0,
+  "death": [],
+  "dur_sec": 1.9,
+  "per_worker": {},
+  "ip_end": "134.195.101.195",
+  "ip_stable": true,
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 40073
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 40061
+   }
+  ]
+ }
+]

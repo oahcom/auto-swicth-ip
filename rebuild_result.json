@@ -1,0 +1,831 @@
+{
+ "52.69.72.232": {
+  "ip": "52.69.72.232",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "cap3_same_0.json",
+    "ts": 1794483095.1316333,
+    "node": null,
+    "ip": "52.69.72.232",
+    "ok": 0,
+    "stop": "egress_blocked",
+    "ra": null,
+    "mode": "single",
+    "conc": null,
+    "sessions": 1,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "154.83.87.187": {
+  "ip": "154.83.87.187",
+  "family": "v4",
+  "prod": 3,
+  "drift": false,
+  "total_ok": 6,
+  "runs": [
+   {
+    "file": "cap6_each.json",
+    "ts": 1794484322.445758,
+    "node": "cn.bing.com:443~8-any",
+    "ip": "154.83.87.187",
+    "ok": 6,
+    "stop": "egress_blocked",
+    "ra": null,
+    "mode": "rotate",
+    "conc": null,
+    "sessions": 7,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "45.207.156.48": {
+  "ip": "45.207.156.48",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 40,
+  "runs": [
+   {
+    "file": "cap6_every10.json",
+    "ts": 1794483328.9047053,
+    "node": "cn.bing.com:443~6-any",
+    "ip": "45.207.156.48",
+    "ok": 40,
+    "stop": "max",
+    "ra": null,
+    "mode": "single",
+    "conc": null,
+    "sessions": 4,
+    "ip_end": null,
+    "drift": false
+   },
+   {
+    "file": "v7_result_7.json",
+    "ts": 1794490994.6522293,
+    "node": "cn.bing.com:443~6-any",
+    "ip": "45.207.156.48",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 38838,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "45.207.156.48",
+    "drift": false
+   }
+  ]
+ },
+ "156.224.78.207": {
+  "ip": "156.224.78.207",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 97,
+  "runs": [
+   {
+    "file": "cap6_same.json",
+    "ts": 1794484231.923264,
+    "node": "cn.bing.com:443~9-any",
+    "ip": "156.224.78.207",
+    "ok": 97,
+    "stop": "egress_blocked",
+    "ra": null,
+    "mode": "single",
+    "conc": null,
+    "sessions": 2,
+    "ip_end": null,
+    "drift": false
+   },
+   {
+    "file": "v8_result_30.json",
+    "ts": 1794492393.6510952,
+    "node": "cn.bing.com:443~9-any",
+    "ip": "156.224.78.207",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 37678,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "156.224.78.207",
+    "drift": false
+   }
+  ]
+ },
+ "45.95.212.122": {
+  "ip": "45.95.212.122",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 12,
+  "runs": [
+   {
+    "file": "cap_big_1794485081.json",
+    "ts": 1794485081.1866834,
+    "node": "ddixx-1dd1.dankenet.help:64245-any",
+    "ip": "45.95.212.122",
+    "ok": 6,
+    "stop": null,
+    "ra": null,
+    "mode": "?",
+    "conc": null,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   },
+   {
+    "file": "cap_big_1794485137.json",
+    "ts": 1794485137.9269886,
+    "node": "ddixx-1dd1.dankenet.help:64245-any",
+    "ip": "45.95.212.122",
+    "ok": 6,
+    "stop": null,
+    "ra": null,
+    "mode": "?",
+    "conc": null,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "160.248.69.190": {
+  "ip": "160.248.69.190",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 72,
+  "runs": [
+   {
+    "file": "cap_big_1794485178.json",
+    "ts": 1794485178.6664655,
+    "node": "upoz.cn.greatgameupload.org:36958-any",
+    "ip": "160.248.69.190",
+    "ok": 12,
+    "stop": null,
+    "ra": null,
+    "mode": "?",
+    "conc": null,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   },
+   {
+    "file": "cap_big_1794485411.json",
+    "ts": 1794485411.1119635,
+    "node": "upoz.cn.greatgameupload.org:36958-any",
+    "ip": "160.248.69.190",
+    "ok": 60,
+    "stop": null,
+    "ra": null,
+    "mode": "?",
+    "conc": null,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "45.95.212.167": {
+  "ip": "45.95.212.167",
+  "family": "v4",
+  "prod": 3,
+  "drift": false,
+  "total_ok": 40,
+  "runs": [
+   {
+    "file": "cap_conc_1794484452.json",
+    "ts": 1794484452.2257614,
+    "node": "ttll20-ooi.dankenet.help:32236-any",
+    "ip": "45.95.212.167",
+    "ok": 40,
+    "stop": null,
+    "ra": null,
+    "mode": "conc",
+    "conc": 20,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "2405:84c0:8011:a100::": {
+  "ip": "2405:84c0:8011:a100::",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 34,
+  "runs": [
+   {
+    "file": "cap_conc_1794484523.json",
+    "ts": 1794484523.5177917,
+    "node": "ttll20-ooi.dankenet.help:17121-any",
+    "ip": "2405:84c0:8011:a100::",
+    "ok": 34,
+    "stop": null,
+    "ra": null,
+    "mode": "conc",
+    "conc": 1,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "82.27.116.31": {
+  "ip": "82.27.116.31",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 40,
+  "runs": [
+   {
+    "file": "cap_conc_1794484650.json",
+    "ts": 1794484650.699854,
+    "node": "upoz.cn.greatgameupload.org:20470-any",
+    "ip": "82.27.116.31",
+    "ok": 40,
+    "stop": null,
+    "ra": null,
+    "mode": "conc",
+    "conc": 1,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "82.152.160.7": {
+  "ip": "82.152.160.7",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "cap_v6_result.json",
+    "ts": 1794487103.7433307,
+    "node": "normal.cn.greatgameupload.org:2155-any",
+    "ip": "82.152.160.7",
+    "ok": 0,
+    "stop": "quota(ra=44439)",
+    "ra": null,
+    "mode": "?",
+    "conc": null,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "2405:84c0:8060:4500::": {
+  "ip": "2405:84c0:8060:4500::",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 40,
+  "runs": [
+   {
+    "file": "v6cap_result.json",
+    "ts": 1794489712.2347589,
+    "node": "ttll20-ooi.dankenet.help:61827-vl",
+    "ip": "2405:84c0:8060:4500::",
+    "ok": 40,
+    "stop": "quota",
+    "ra": 40363,
+    "mode": "rotate",
+    "conc": null,
+    "sessions": 41,
+    "ip_end": "2405:84c0:8060:4500::",
+    "drift": false
+   }
+  ]
+ },
+ "2405:84c0:8001:bf00::": {
+  "ip": "2405:84c0:8001:bf00::",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 44,
+  "runs": [
+   {
+    "file": "v7_result.json",
+    "ts": 1794490494.0186977,
+    "node": "ttll20-ooi.dankenet.help:64657-any",
+    "ip": "2405:84c0:8001:bf00::",
+    "ok": 44,
+    "stop": "quota",
+    "ra": 38911,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "2405:84c0:8001:bf00::",
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac5:4301:dc::16:19e": {
+  "ip": "2a09:bac5:4301:dc::16:19e",
+  "family": "v6",
+  "prod": 7,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v7_result_0.json",
+    "ts": 1794490780.9495523,
+    "node": "WARP-H2-NRT-1",
+    "ip": "2a09:bac5:4301:dc::16:19e",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 37701,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "2a09:bac5:4301:dc::16:19e",
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac5:1f07:28::4:362": {
+  "ip": "2a09:bac5:1f07:28::4:362",
+  "family": "v6",
+  "prod": 0,
+  "drift": true,
+  "total_ok": 403,
+  "runs": [
+   {
+    "file": "v7_result_1.json",
+    "ts": 1794491236.2712615,
+    "node": "WARP-CF-B",
+    "ip": "2a09:bac5:1f07:28::4:362",
+    "ok": 403,
+    "stop": "OK",
+    "ra": null,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "2a09:bac5:1f02:1246::1d2:ca",
+    "drift": true
+   }
+  ]
+ },
+ "2a09:bac5:1f07:1232::1d0:d4": {
+  "ip": "2a09:bac5:1f07:1232::1d0:d4",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 85,
+  "runs": [
+   {
+    "file": "v7_result_8.json",
+    "ts": 1794491324.7288644,
+    "node": "WARP-CF",
+    "ip": "2a09:bac5:1f07:1232::1d0:d4",
+    "ok": 72,
+    "stop": "OK",
+    "ra": null,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "2a09:bac5:1f07:1232::1d0:d4",
+    "drift": false
+   },
+   {
+    "file": "v7_result_10.json",
+    "ts": 1794491478.093459,
+    "node": "WARP-CF",
+    "ip": "2a09:bac5:1f07:1232::1d0:d4",
+    "ok": 13,
+    "stop": "quota",
+    "ra": 39519,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "2a09:bac5:1f07:1232::1d0:d4",
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac5:3982:e6::17:356": {
+  "ip": "2a09:bac5:3982:e6::17:356",
+  "family": "v6",
+  "prod": 2,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v7_result_11.json",
+    "ts": 1794491429.1472292,
+    "node": "WARP-H2-HKG-10",
+    "ip": "2a09:bac5:3982:e6::17:356",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 39125,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "2a09:bac5:3982:e6::17:356",
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac5:1f05:1246::1d2:85": {
+  "ip": "2a09:bac5:1f05:1246::1d2:85",
+  "family": "v6",
+  "prod": 0,
+  "drift": true,
+  "total_ok": 56,
+  "runs": [
+   {
+    "file": "v7_result_12.json",
+    "ts": 1794491649.0542061,
+    "node": "WARP-CF-B",
+    "ip": "2a09:bac5:1f05:1246::1d2:85",
+    "ok": 56,
+    "stop": "quota",
+    "ra": 36449,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "2a09:bac1:19c0:18::1d2:4f",
+    "drift": true
+   }
+  ]
+ },
+ "152.175.33.133": {
+  "ip": "152.175.33.133",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v7_result_13.json",
+    "ts": 1794491577.5020828,
+    "node": "normal.cn.greatgameupload.org:35779-any",
+    "ip": "152.175.33.133",
+    "ok": 0,
+    "stop": "family_mismatch:v4",
+    "ra": null,
+    "mode": "single",
+    "conc": 4,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "67.159.48.146": {
+  "ip": "67.159.48.146",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v7_result_15.json",
+    "ts": 1794491605.955687,
+    "node": "downloadcfpro.xn--ghq880n3na965a.com:443-vl",
+    "ip": "67.159.48.146",
+    "ok": 0,
+    "stop": "family_mismatch:v4",
+    "ra": null,
+    "mode": "single",
+    "conc": 4,
+    "sessions": null,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac5:1f02:3050::4d0:f": {
+  "ip": "2a09:bac5:1f02:3050::4d0:f",
+  "family": "v6",
+  "prod": 0,
+  "drift": true,
+  "total_ok": 210,
+  "runs": [
+   {
+    "file": "v7_result_2.json",
+    "ts": 1794491054.5097036,
+    "node": "WARP-CF-C",
+    "ip": "2a09:bac5:1f02:3050::4d0:f",
+    "ok": 210,
+    "stop": "OK",
+    "ra": null,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "2a09:bac5:1f03:3046::4cf:40",
+    "drift": true
+   }
+  ]
+ },
+ "2a09:bac1:3b20:10::16:188": {
+  "ip": "2a09:bac1:3b20:10::16:188",
+  "family": "v6",
+  "prod": 18,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v7_result_3.json",
+    "ts": 1794490778.877924,
+    "node": "WARP-H2-NRT-0",
+    "ip": "2a09:bac1:3b20:10::16:188",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 40720,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "2a09:bac1:3b20:10::16:188",
+    "drift": false
+   }
+  ]
+ },
+ "64.120.94.207": {
+  "ip": "64.120.94.207",
+  "family": "v4",
+  "prod": 3,
+  "drift": false,
+  "total_ok": 215,
+  "runs": [
+   {
+    "file": "v7_result_4.json",
+    "ts": 1794490941.7558656,
+    "node": "cn.bing.com:443~23-any",
+    "ip": "64.120.94.207",
+    "ok": 215,
+    "stop": "quota",
+    "ra": 37870,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "64.120.94.207",
+    "drift": false
+   }
+  ]
+ },
+ "134.195.101.195": {
+  "ip": "134.195.101.195",
+  "family": "v4",
+  "prod": 3,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v7_result_5.json",
+    "ts": 1794490797.796095,
+    "node": "unamecf3.xn--ghqu5fm27b67w.com:443~5-vl",
+    "ip": "134.195.101.195",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 40073,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "134.195.101.195",
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac5:1f04:3046::4cf:e": {
+  "ip": "2a09:bac5:1f04:3046::4cf:e",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 2,
+  "runs": [
+   {
+    "file": "v7_result_6.json",
+    "ts": 1794490998.0037274,
+    "node": "WARP-CF-G",
+    "ip": "2a09:bac5:1f04:3046::4cf:e",
+    "ok": 2,
+    "stop": "quota",
+    "ra": 38605,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "2a09:bac5:1f04:3046::4cf:e",
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac5:55f8:1d0f::2e5:13": {
+  "ip": "2a09:bac5:55f8:1d0f::2e5:13",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 15,
+  "runs": [
+   {
+    "file": "v7_result_9.json",
+    "ts": 1794491151.317042,
+    "node": "WARP-H2-SIN-65",
+    "ip": "2a09:bac5:55f8:1d0f::2e5:13",
+    "ok": 15,
+    "stop": "quota",
+    "ra": 39817,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "2a09:bac5:55f8:1d0f::2e5:13",
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac5:3982:16d2::246:f9": {
+  "ip": "2a09:bac5:3982:16d2::246:f9",
+  "family": "v6",
+  "prod": 2,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v8_result_0.json",
+    "ts": 1794491759.9396236,
+    "node": "WARP-H2-HKG-71",
+    "ip": "2a09:bac5:3982:16d2::246:f9",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 36311,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "2a09:bac5:3982:16d2::246:f9",
+    "drift": false
+   }
+  ]
+ },
+ "2a09:bac1:31c0::247:aa": {
+  "ip": "2a09:bac1:31c0::247:aa",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v8_result_1.json",
+    "ts": 1794491760.3319783,
+    "node": "WARP-H2-HKG-9",
+    "ip": "2a09:bac1:31c0::247:aa",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 37019,
+    "mode": "single",
+    "conc": 4,
+    "sessions": 1,
+    "ip_end": "2a09:bac1:31c0::247:aa",
+    "drift": false
+   }
+  ]
+ },
+ "154.83.84.34": {
+  "ip": "154.83.84.34",
+  "family": "v4",
+  "prod": 7,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v8_result_20.json",
+    "ts": 1794492189.3871994,
+    "node": "cn.bing.com:443~7-any",
+    "ip": "154.83.84.34",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 36050,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "154.83.84.34",
+    "drift": false
+   }
+  ]
+ },
+ "54.199.78.171": {
+  "ip": "54.199.78.171",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v8_result_30.json",
+    "ts": 1794492393.6510952,
+    "node": "pq.aws49.yydjc.top:443-vl",
+    "ip": "54.199.78.171",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 37117,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "54.199.78.171",
+    "drift": false
+   }
+  ]
+ },
+ "18.183.195.87": {
+  "ip": "18.183.195.87",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v8_result_30.json",
+    "ts": 1794492393.6510952,
+    "node": "pq.aws48.yydjc.top:443-vl",
+    "ip": "18.183.195.87",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 38347,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": "18.183.195.87",
+    "drift": false
+   }
+  ]
+ },
+ "67.159.48.148": {
+  "ip": "67.159.48.148",
+  "family": "v4",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 0,
+  "runs": [
+   {
+    "file": "v8_result_30.json",
+    "ts": 1794492393.6510952,
+    "node": "pq.aws65.yydjc.top:443-vl",
+    "ip": "67.159.48.148",
+    "ok": 0,
+    "stop": "quota",
+    "ra": 37006,
+    "mode": "fixedN",
+    "conc": 15,
+    "sessions": 15,
+    "ip_end": null,
+    "drift": false
+   }
+  ]
+ },
+ "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81": {
+  "ip": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 57,
+  "runs": [
+   {
+    "file": "v8_result_40.json",
+    "ts": 1794493053.556721,
+    "node": "ddixx-1dd1.dankenet.help:5474-any",
+    "ip": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+    "ok": 57,
+    "stop": "quota",
+    "ra": 38066,
+    "mode": "single",
+    "conc": 1,
+    "sessions": 1,
+    "ip_end": "2a0c:9a40:9205:1:be24:11ff:fe8f:aa81",
+    "drift": false
+   }
+  ]
+ },
+ "2602:f988:84:4f7::e6b": {
+  "ip": "2602:f988:84:4f7::e6b",
+  "family": "v6",
+  "prod": 0,
+  "drift": false,
+  "total_ok": 158,
+  "runs": [
+   {
+    "file": "v8_result_41.json",
+    "ts": 1794493280.8953106,
+    "node": "ttll20-ooi.dankenet.help:44503-any",
+    "ip": "2602:f988:84:4f7::e6b",
+    "ok": 158,
+    "stop": "quota",
+    "ra": 34884,
+    "mode": "single",
+    "conc": 1,
+    "sessions": 1,
+    "ip_end": "2602:f988:84:4f7::e6b",
+    "drift": false
+   }
+  ]
+ }
+}

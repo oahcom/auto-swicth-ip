@@ -1,0 +1,42 @@
+[
+ {
+  "tag": "WARP-CF",
+  "ip": "2a09:bac5:1f07:1232::1d0:d4",
+  "family": "v6"
+ },
+ {
+  "tag": "WARP-H2-NRT-63",
+  "ip": "2a09:bac5:4304:dc::16:224",
+  "family": "v6"
+ },
+ {
+  "tag": "WARP-H2-SIN-65",
+  "ip": "2a09:bac1:6520:8::2e5:2c",
+  "family": "v6"
+ },
+ {
+  "tag": "WARP-H2-HKG-10",
+  "ip": "2a09:bac5:3983:2646::3d0:2b",
+  "family": "v6"
+ },
+ {
+  "tag": "WARP-H2-HKG-71",
+  "ip": "2a09:bac1:31a0::3cf:28",
+  "family": "v6"
+ },
+ {
+  "tag": "WARP-H2-HKG-9",
+  "ip": "2a09:bac5:3983:e6::17:362",
+  "family": "v6"
+ },
+ {
+  "tag": "WARP-H2-HKG-70",
+  "ip": "2a09:bac1:3180::17:2f5",
+  "family": "v6"
+ },
+ {
+  "tag": "WARP-H2-HKG-69",
+  "ip": "2a09:bac1:4c40::17:341",
+  "family": "v6"
+ }
+]

@@ -129,7 +129,44 @@ http_proxy=http://lan:<password>@<主机IP>:7891 curl https://api.github.com/zen
 ①建 systemd 单元并起进程；②`.warp/warp-outbound.json` 加条目（`make_config` 据此并入
 sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 进程**（改文件不重载无效）。
 
-### 主备换线（daemon 自动）
+### 第七闸口（代理池兜底，slot-7）
+
+六条常规闸口之外的第 7 台独立 sing-box 进程（端口 7897 / Clash 9097，配置
+`singbox-config.json-slot7.json`）。它的「线」不是 WARP，而是**轮换池**：配置
+渲染时 `opencode-out` 的 default 指到池 selector `proxy`（`parse_subscription
+make_config(default_to_pool=True)`），且 daemon 永远不往它的 selector 里 PUT
+WARP 线。**严格兜底**的两条硬保证：
+
+1. **asip 侧**：`_pick_healthy_slot` 的常规候选循环天然跳过它（它的 warp
+   selector 指向池，`_slot_current` 返回 `(None, None)`）；只有六个常规闸口
+   全都选不出来时，才在候选集为空的分支里显式考虑它（`_proxy_gate_slot`，
+   还要求 keeper 标的健康状态为 ok）。槽位路径上它出现在 `/rotate` 回包的
+   `switch_to_url=http://127.0.0.1:7897`；主路径（无 egress_proxy_url）上
+   等价动作是 `_fast_switch_to_proxy_gate`：主出口 `opencode-out` 翻到
+   `proxy`（同一套落池记账，`_proxy_dwell_since` 起表，回切判据照常工作）。
+2. **9router 侧**：常规轮询端口来自 `ASIP_LOCAL_PROXY_PORT`（默认
+   `7890,7892-7896`，**不含 7897**）—— 正常流量永远轮不到它，只有 asip
+   主动把流量指过去。9router 无需任何改动。
+
+它报 429/403 的语义与常规闸口不同：「这个池节点被烧了」→ `_rotate_proxy_
+gate_once` 在**它自己的 pool selector** 上换节点（`pick_next_node` 同一套
+P2C+预检判据），绝不进 `_repair_slot` 换 WARP 线；若此刻有任何常规闸口恢复
+健康，重试目标立刻指回常规闸口（池闸不占坑）。
+
+**池内轮换的归属**：主循环的池轮换（`_rotate_pool_proactive` /
+`_rotate_on_error_bg`）只翻**主进程**的 `proxy` selector，翻不到这台进程。
+池闸自己的轮换由 `_proxy_gate_keeper`（`proxy-gate-keeper` 线程）负责：
+每 `proxy_gate_check_sec`(60s) 刷健康结论（进程活着 + 当前节点未判死 +
+`_proxy_pool_healthy_cached` 池采样）、死节点立刻换、在役（最近
+`proxy_gate_serving_window_sec`(300s) 内被指为重试目标）时按
+`proactive_rotate_sec` 节奏换，待命时不轮换（省节点配额）。开关
+`singbox.proxy_gate`（默认开）与 `warp.proxy_fallback_enabled`（关则池闸
+同步关闭）。
+
+配置渲染随订阅刷新成组进行（`_config_set_pairs` 覆盖 slot-7 草稿与
+promote）；首次上线后下一轮小时刷新会自动落盘 slot-7 配置并拉起进程
+（热重载对不存在进程必然失败 → 回退整组重启，正好把它带起来）。
+
 
 - 触发（两类出口级拦截，阈值不同，外加连错门控）：
   - `abuse403` ≥ `warp.block_threshold`（默认 1）—— IP 信誉拦截，出现即说明当前出口已被标记。
@@ -189,7 +226,7 @@ sing-box）；③重新生成/补齐 `singbox-config.json` 并**重启 sing-box 
   池内 anytls 节点全部 connection reset，落池等于断流（02:57 实测落池后 egress_log
   停在 `pq.aws67.yydjc.top:443-vl`）。新换线路径根本不会走到落池；旧路径保留仅作回滚。
 - **主动轮换两种判据，`proactive_mode` 二选一（互斥，只有一个生效）**：`requests`（**当前生效**，
-  当前出口上**成功的 dsv4 调用**累计满 `proactive_after_dsv4_ok`=150 格）与 `fixed`
+  当前出口上**成功的 dsv4 调用**累计满 `proactive_after_dsv4_ok`=300 格）与 `fixed`
   （每 `proactive_fixed_sec`=60s）。配置只能是 `fixed`/`requests`；导入时会校验，
   其他值（含遗留的 `lifetime`）直接 `SystemExit` 退出，不再静默回退。
   互斥由分支末的 `return` 保证：两个判据叠加时，fixed 到点那次换线会把 requests 的配额
@@ -678,6 +715,9 @@ singbox.max_restart_attempts: 3                # 最大重启次数
 singbox.mixed_port: 7890                       # 环回 mixed 入站（无认证）
 singbox.lan_port: 7891                         # 局域网 mixed 入站（0=关闭，需认证文件）
 singbox.lan_cidrs: [192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12]  # 局域网入站允许来源
+singbox.proxy_gate: True                       # 第七闸口（代理池兜底 slot-7，见上节）
+intervals.proxy_gate_check_sec: 60             # 池闸维护节奏（健康结论/死节点/在役轮换）
+intervals.proxy_gate_serving_window_sec: 300   # 池闸「最近被指为重试目标」算在役的窗口
 bad_nodes.ttl_sec: 300                         # bad node TTL (5min)
 
 # warp（换线核心）—— **完整配置说明见 docs/reference/config.md**
@@ -789,6 +829,7 @@ _POOL_MIN_RATIO = 0.3                          # 允许 70% 节点被拉黑（da
 | `deploy/asip-cli.sh` | — | asip 运维 CLI 源文件（本项目为唯一副本，`~/.local/bin/asip` 是指向它的软链）；自身不含任何站点设置 |
 | `test_portability.py` | — | 可移植性回归（20 例）：路径不越出仓库、运行期文件无硬编码家目录、成员可部署、单元渲染全覆盖、CLI 设置随 config 变化 |
 | `test_asip_tools.py` | 73 | asip 工具单测（5 例）：Clash 选择码/密钥轮换、脱敏、原子写权限 |
+| `test_proxy_gate.py` | — | 第七闸口（代理池兜底 slot-7）单测（19 例）：严格兜底选槽、主路径落池秒切、池内换节点/合并/收口、恢复即回常规闸口、不进 WARP 线机制、keeper 健康与轮换节奏、配置层端口/默认值 |
 | `asip/` | — | 可复用无副作用工具：`atomic_io`（唯一临时名 + fsync 原子写、`append_line`、`update_json`）、`redact`、`clash_client`（`request_json`/`selector_state`/`delay`/`delays`/`connections`）、`egress`（`probe_egress` 保留失败原因）、`proc`（强制超时、无 shell）、`http`（`status=None` 区分传输失败）；daemon 同名门面委托 |
 | `test_asip_*.py` | — | 共享层离线单测：`test_asip_{proc,http,egress,atomic,clash}.py` + `test_asip_integration.py`（daemon 边界）；无 `test_asip_unit.py` 文件 |
 | `warp_line_worker.py` | — | 每条 WARP 隧道常驻 worker：`_plan` 决策与执行分离，`dry_run` 只读；由 `warp.line_worker` 开关接管三个旧守护 |

@@ -71,3 +71,5 @@ backups/
 
 # 线上快照备份：体积大且含凭据，不进仓库
 deploy/daemon.py.*
+
+.dormant_probe_attempt

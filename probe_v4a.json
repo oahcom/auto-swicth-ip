@@ -1,0 +1,202 @@
+[
+ {
+  "tag": "pq.aws51.yydjc.top:443-vl",
+  "ip": "43.206.106.186",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35343,
+  "sid": "ses_e2fd63382ffeGxA0LV5oej7kIK",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.aws56.yydjc.top:443-vl",
+  "ip": "18.183.53.89",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35145,
+  "sid": "ses_e2fd6334cffercZFTKFHlVtYIc",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.aws50.yydjc.top:443-vl",
+  "ip": "13.231.57.92",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36057,
+  "sid": "ses_e2fd6330effelJQCGMadlJfSmB",
+  "trans_retried": 0
+ },
+ {
+  "tag": "203.10.96.138:443-vl",
+  "ip": "203.10.96.139",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34594,
+  "sid": "ses_e2fd632dcffei9yAVzmdV7NZcf",
+  "trans_retried": 0
+ },
+ {
+  "tag": "unamecf3.xn--ghqu5fm27b67w.com:443~3-vl",
+  "ip": "104.251.122.87",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36030,
+  "sid": "ses_e2fd6302bffecoqnp5QxlaUHPJ",
+  "trans_retried": 0
+ },
+ {
+  "tag": "unamecf3.xn--ghqu5fm27b67w.com:443-vl",
+  "ip": "207.32.216.109",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 37273,
+  "sid": "ses_e2fd62ea0ffeeOwHd24T9g8Dnn",
+  "trans_retried": 0
+ },
+ {
+  "tag": "unamecf3.xn--ghqu5fm27b67w.com:443~4-vl",
+  "ip": "162.251.162.201",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36608,
+  "sid": "ses_e2fd62e60ffeiLhYplT7aaPL1U",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.aws55.yydjc.top:443-vl",
+  "ip": "13.158.42.154",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd633e5ffe3Tk7OYVOuEB4jo",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.us04.yydjc.top:443-vl",
+  "ip": "104.251.123.25",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34652,
+  "sid": "ses_e2fd630d3ffeXPBaNmYOoGZNhj",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.aws53.yydjc.top:443-vl",
+  "ip": "52.196.41.126",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd633bbffejhyTkK4vrh65Ci",
+  "trans_retried": 0
+ },
+ {
+  "tag": "cn.bing.com:443~22-any",
+  "ip": "64.120.94.205",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd62d93ffeAVhsKLq1CGyrLb",
+  "trans_retried": 0
+ },
+ {
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443~7-vl",
+  "ip": "108.181.23.235",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 37017,
+  "sid": "ses_e2fd62b71ffeNXPE23FrD4KJrZ",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.aws52.yydjc.top:443-vl",
+  "ip": "35.72.35.120",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 34497,
+  "sid": "ses_e2fd61f21ffe4D2utVJr0776xh",
+  "trans_retried": 0
+ },
+ {
+  "tag": "ttll20-ooi.dankenet.help:44324-any",
+  "ip": null,
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd63349ffergBLVnbZJjv2La",
+  "trans_retried": 1
+ },
+ {
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443~6-vl",
+  "ip": "108.181.24.43",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36768,
+  "sid": "ses_e2fd627f0ffeW5LPRx6onamaOp",
+  "trans_retried": 0
+ },
+ {
+  "tag": "unamecf3.xn--ghqu5fm27b67w.com:443~2-vl",
+  "ip": "207.32.218.91",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35379,
+  "sid": "ses_e2fd61b2dffeIhf24X8R0eu5hc",
+  "trans_retried": 0
+ },
+ {
+  "tag": "unamecf3.xn--ghqu5fm27b67w.com:443~6-vl",
+  "ip": "134.195.101.197",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36247,
+  "sid": "ses_e2fd62fd3ffev0xtKQ8RnVVrPJ",
+  "trans_retried": 0
+ },
+ {
+  "tag": "pq.aws54.yydjc.top:443-vl",
+  "ip": "13.158.19.250",
+  "family": "v4",
+  "verdict": "OK",
+  "st": 200,
+  "ra": null,
+  "sid": "ses_e2fd60cb5ffeDunBfDrNFkIrrM",
+  "trans_retried": 0
+ },
+ {
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443~8-vl",
+  "ip": "208.87.242.97",
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 35348,
+  "sid": "ses_e2fd60a52ffe0Xzbs7r9DgGJSb",
+  "trans_retried": 0
+ },
+ {
+  "tag": "unamecf.xn--ghqu5fm27b67w.com:443~4-vl",
+  "ip": null,
+  "family": "v4",
+  "verdict": "quota",
+  "st": 429,
+  "ra": 36216,
+  "sid": "ses_e2fd5b8a5ffeOk9UP1Qtcvypnr",
+  "trans_retried": 0
+ }
+]

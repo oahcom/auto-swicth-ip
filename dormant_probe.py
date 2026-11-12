@@ -55,6 +55,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 LIVE = ROOT / "singbox-config.json"
 STATE = ROOT / ".dormant_state.json"
+# 临时 sing-box 实例异常退出时留档（旧版无条件删，死因查不到）
+INSTANCE_LOG = ".dormant_probe_instance.log"
 TEST_URL = "https://www.gstatic.com/generate_204"
 NODE_TYPES = {"vless", "vmess", "trojan", "anytls", "shadowsocks", "hysteria2"}
 
@@ -212,22 +214,67 @@ def free_port(exclude=None) -> int:
     raise RuntimeError("找不到空闲端口（保留段与内核临时段都被占满）")
 
 
-def kill_orphans() -> int:
-    """清掉上次异常退出留下的探测进程（只认自己的临时配置路径）。
+def _proc_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
 
-    注意：服务态下 `PrivateTmp=yes`，每次启动都是全新的私有 /tmp，所以下面扫
-    /tmp 文件那半句在服务态是空转（手动跑才有意义）；进程那半句靠的是共享的
-    /proc，始终有效。
+
+def _proc_ppid(pid: int) -> int:
+    """/proc/<pid>/stat: pid (comm) state ppid ... —— comm 可能含空格/括号。"""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            return int(f.read().split(") ", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return -1
+
+
+def _active_probe_pids() -> set[int]:
+    """当前活着的 dormant_probe.py 进程（排除自己）。"""
+    me = os.getpid()
+    out: set[int] = set()
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for n in names:
+        if n.isdigit() and int(n) != me and "dormant_probe.py" in _proc_cmdline(int(n)):
+            out.add(int(n))
+    return out
+
+
+def kill_orphans() -> int:
+    """只清**没有活跃主人**的临时 sing-box，绝不碰仍在服务的实例。
+
+    WHY（2026-11-11 实测事故）：旧版无差别 `pgrep -af` + SIGTERM 杀掉所有
+    `sing-box run -c /tmp/dormant-probe-*` 进程。`PrivateTmp` 只隔离 /tmp
+    **文件**，不隔离 /proc：服务态与手动跑的实例互相看得见。服务重启时
+    `KillMode=process` 只杀主进程，上一轮体检子进程连同它的临时 sing-box
+    会残留；新实例一旦启动就把它杀掉 → 前一个剩下的节点全部 curl 失败，
+    被记成 error。实例早期被杀就是 225/247 全 error、整轮作废，状态永远
+    写不出来；跑到后段被杀就是中途 `port-closed` 后 19 条 error。
+
+    判据：`start_new_session=True` 启的 sing-box，其 PPID 就是 spawn 它的
+    dormant_probe.py。PPID 在活跃集合里 → 有主，跳过；PPID=1（父进程被
+    KillMode=process 干掉）或已消失 → 才是真孤儿，可以清。
     """
     r = subprocess.run(["pgrep", "-af", r"sing-box run -c /tmp/dormant-probe-"],
                        capture_output=True, text=True)
+    active = _active_probe_pids()
     killed = 0
     for line in r.stdout.splitlines():
-        pid = line.split()[0]
         try:
-            os.kill(int(pid), 15)
+            pid = int(line.split()[0])
+        except (ValueError, IndexError):
+            continue
+        if _proc_ppid(pid) in active:
+            continue                      # 有主：另一个实例正在用它
+        try:
+            os.kill(pid, 15)
             killed += 1
-        except (OSError, ValueError):
+        except OSError:
             pass
     for d in {Path(tempfile.gettempdir()), ROOT}:
         # .log 也要清：Popen 抛异常或启动期被 SIGTERM 时，那份 0600 的 sing-box
@@ -560,6 +607,34 @@ def main() -> int:
                 # 完全没历史的节点，单次 7s 超时就判死太狠（它可能只是慢）：
                 # 加长超时再试一次，还不行才记死。有历史的节点走 strikes。
                 res = probe_one(tag, secret, clash, mixed, min(args.timeout * 2, 20))
+            instance_dead = (proc is not None and proc.poll() is not None)
+            if res == ERROR and (instance_dead
+                                 or _LAST_HTTP.get(tag) == "port-closed"):
+                # 临时实例已经退出：后面每一条都只会是 error（clash API 连不上、
+                # curl 也走不通），继续跑只是把整轮污染成「探测链路坏」，
+                # 于是 errors > 阈值 → 整轮作废、状态永远写不出来。
+                # 正确做法：保住已测完的部分，把没测的留给下一轮立即续跑。
+                try:
+                    errf.flush()
+                    errf.seek(0)
+                    tail = (errf.read() or "").strip()[-600:]
+                except Exception:
+                    tail = ""
+                print(f"✗ 临时实例在第 {i}/{len(tags)} 条时退出"
+                      f"（rc={getattr(proc, 'returncode', None)}）；本轮到此为止",
+                      flush=True)
+                if tail:
+                    print("  实例日志尾部：\n" + tail, flush=True)
+                if i <= 1:
+                    # 一条都没测成就崩：没有可保留的进度，如实报故障，
+                    # 别用 RC_MORE 制造「立即续跑但每轮都原地崩」的空转。
+                    return 3
+                if not args.dry_run:
+                    # 本条没测完，不能 _mark_done；pending 里自然还留着它和后面所有条。
+                    save_state(st, final=False)
+                    print(f"  已存进度，剩 {len(st.get('pending') or [])} 条立即续跑",
+                          flush=True)
+                return RC_MORE
             if res == OK:
                 alive.append(tag)
             elif res == ERROR:
@@ -615,6 +690,9 @@ def main() -> int:
                       flush=True)
                 return RC_MORE
     finally:
+        # 必须在 terminate() 之前取：之后 poll() 恒非 None，就分不清
+        # 「实例自己崩了」和「本轮正常收尾」了。
+        crashed_before_cleanup = bool(proc is not None and proc.poll() is not None)
         if proc is not None:
             proc.terminate()
             try:
@@ -626,8 +704,26 @@ def main() -> int:
         except OSError:
             pass
         if errf is not None:
-            # 这份临时日志里是 sing-box 的完整输出（含节点参数与临时配置路径）。
-            # 尾部已经打进 journal，文件不必留 —— 留着会一次次堆在 /tmp。
+            # 旧版无条件 unlink，只在「启动失败」时把尾部打进 stdout；
+            # 实例**跑到一半崩了**时 sing-box 自己说的话全被删光，
+            # 225/247 全 error 查了三轮都拿不到死因。异常轮必须留档。
+            abnormal = crashed_before_cleanup or errors > 0
+            try:
+                errf.flush()
+                errf.seek(0)
+                content = errf.read()
+            except Exception:
+                content = ""
+            if abnormal and content.strip():
+                try:
+                    with open(os.path.join(str(ROOT), INSTANCE_LOG),
+                              "w", encoding="utf-8") as f:
+                        f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                                f"rc={getattr(proc, 'returncode', None)} "
+                                f"errors={errors}\n")
+                        f.write(content[-20000:])
+                except OSError:
+                    pass
             try:
                 errf.close()
             except Exception:

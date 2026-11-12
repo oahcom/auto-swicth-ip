@@ -1,0 +1,12 @@
+[
+ {
+  "idx": 15,
+  "tag": "downloadcfpro.xn--ghq880n3na965a.com:443-vl",
+  "mode": "single",
+  "conc": 4,
+  "maxtotal": 600,
+  "ip_start": "67.159.48.146",
+  "family": "v4",
+  "err": "family_mismatch:v4"
+ }
+]

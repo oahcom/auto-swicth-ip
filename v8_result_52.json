@@ -1,0 +1,41 @@
+[
+ {
+  "idx": 52,
+  "tag": "normal.cn.greatgameupload.org:35779-any",
+  "mode": "single",
+  "conc": 1,
+  "maxtotal": 600,
+  "ip_start": "152.175.33.133",
+  "sessions": 1,
+  "ok": 261,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 423.6,
+  "per_worker": {
+   "0": 261
+  },
+  "ip_end": "152.175.33.133",
+  "segments": [
+   {
+    "ip": "152.175.33.133",
+    "shots": 0
+   },
+   {
+    "ip": "152.175.33.133",
+    "shots": 261
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 36876
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 36876
+   }
+  ]
+ }
+]

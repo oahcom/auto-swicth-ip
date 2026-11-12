@@ -172,7 +172,7 @@ sudo systemctl restart 9router
 - 403（abusive traffic）/429（Rate limit exceeded）各达阈值 1，且窗口内连错 ≥3 条
   → `PUT /proxies/opencode-out` 切到另一条 WARP 隧道（在途请求不断）
 - 主动轮换不等出错就换，两种判据二选一（`proactive_mode`，互斥）：`requests`（当前生效）
-  按当前出口已用的 dsv4 配额格数（`proactive_after_dsv4_ok`=150）；`fixed` 每 60s
+  按当前出口已用的 dsv4 配额格数（`proactive_after_dsv4_ok`=300）；`fixed` 每 60s
 
 **轮换池（非 opencode 流量）**：
 - daemon 每 60s 调 Clash API `PUT /proxies/proxy` 切换池节点

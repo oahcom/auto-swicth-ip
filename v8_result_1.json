@@ -1,0 +1,39 @@
+[
+ {
+  "idx": 1,
+  "tag": "WARP-H2-HKG-9",
+  "mode": "single",
+  "conc": 4,
+  "maxtotal": 700,
+  "ip_start": "2a09:bac1:31c0::247:aa",
+  "sessions": 1,
+  "ok": 0,
+  "trans_cnt": 0,
+  "death": [],
+  "dur_sec": 0.9,
+  "per_worker": {},
+  "ip_end": "2a09:bac1:31c0::247:aa",
+  "segments": [
+   {
+    "ip": "2a09:bac1:31c0::247:aa",
+    "shots": 0
+   },
+   {
+    "ip": "2a09:bac1:31c0::247:aa",
+    "shots": 0
+   }
+  ],
+  "confirm": [
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37019
+   },
+   {
+    "verdict": "quota",
+    "st": 429,
+    "ra": 37018
+   }
+  ]
+ }
+]
