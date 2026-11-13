@@ -478,6 +478,13 @@ CFG = {
         # 换线对 403 与 429 都有效，两者都是出口 IP 级拦截。
         "blocked_guard_sec": 21600,   # 6h：403 恢复期
         "rate429_guard_sec": 60,      # 429 默认冷却（精确值经 ban_until 覆盖）
+        # 台账生命周期（docs/design-20261113-ledger-lifecycle.md）：
+        # expires_at 的保留窗口，条目到期后才允许清理。默认与
+        # ip_reuse_guard_sec 同值，独立配置便于灰度期单独调。
+        "ledger_retention_sec": 86400,
+        # 清理判据模式："legacy" 走旧规则（ts cutoff + ban_until 豁免），
+        # "expires_at" 只看 expires_at < now（INV-4）。P2 切换，回滚只需改配置。
+        "ledger_cleanup_mode": "legacy",
         # 生产侧 429 的**定性方式**：单发 429 就判死这条线，还是先复测再判死。
         #   off      —— 不复测，直接冷却 + 24h 标脏（P0-1 之前的旧行为，仅作回退）
         #   borrowed —— 只有借道来的 429 复测（当前生产行为，默认）

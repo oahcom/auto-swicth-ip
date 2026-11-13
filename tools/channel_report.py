@@ -47,6 +47,7 @@ if _env.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 import ipv6_segments  # noqa: E402
+from asip import ledger_policy  # noqa: E402
 from asip.redact import redact_secrets  # noqa: E402
 from config import CFG, extra_subscription_urls, subscription_urls  # noqa: E402
 from parse_subscription import source_label  # noqa: E402
@@ -1200,18 +1201,11 @@ def blocked_ip_summary(now: float | None = None,
     次级优质复用的地址也算成被封 —— 实测 4.2 万条标记里约 1.6 万条是这种
     残留，按它判断「池子还有多少能用的 IP」会严重偏保守。
 
-    这里不 import daemon（它有 import 期副作用），按同一套规则本地重算：
-      TTL  = abuse403: blocked_guard_sec / rate429: rate429_guard_sec /
-             legacy(kind 缺失): blocked_ttl_sec
-      ban_until 只在 ban_kind=="rate429" 且晚于该类起点时覆盖默认窗口
-      多类标记各算各的，解除时间取最晚
-    daemon 的判定规则若改动，本函数必须同步，否则报表又会和选线口径分家。
+    释放时刻计算委托 `asip.ledger_policy`（D-1 单一事实源），不再本地重算。
     """
     now = time.time() if now is None else float(now)
     w = CFG["warp"]
-    ttl = {"abuse403": float(w.get("blocked_guard_sec", 21600)),
-           "rate429": float(w.get("rate429_guard_sec", 60)),
-           "legacy": float(w.get("blocked_ttl_sec", 86400))}
+    ttl = ledger_policy.make_ttl(w)
     raw = _read_json(path or PROJECT / ".warp_ip_used.json") or {}
     used = raw.get("used") if isinstance(raw, dict) and isinstance(
         raw.get("used"), dict) else raw
@@ -1226,31 +1220,14 @@ def blocked_ip_summary(now: float | None = None,
         if not isinstance(entry, dict) or not entry.get("blocked"):
             continue
         out["marked"] += 1
-        stamps = entry.get("blocked_ts_by_kind")
-        if not isinstance(stamps, dict) or not stamps:
-            # 旧格式回退链，与 _warp_block_stamps 一致。
-            t = (entry.get("blocked_ts") or entry.get("last_ok_ts")
-                 or entry.get("ts") or 0)
-            k = entry.get("blocked_kind")
-            stamps = {(k if k in ("abuse403", "rate429") else "legacy"): float(t)}
-        ban_until = entry.get("ban_until")
-        ban_kind = entry.get("ban_kind")
-        ban_until = (float(ban_until)
-                     if isinstance(ban_until, (int, float)) and ban_kind == "rate429"
-                     else None)
-        release = now
-        for kind, start in stamps.items():
-            kind = kind if kind in ttl else "legacy"
-            start = float(start)
-            end = (ban_until if (ban_until and kind == ban_kind
-                                 and ban_until > start)
-                   else start + ttl[kind])
-            release = max(release, end)
+        stamps = ledger_policy.block_stamps(entry)
+        release = ledger_policy.block_release_ts(entry, ttl)
         out["by_kind"]["+".join(sorted(stamps))] += 1
         if release > now:
             out["active"] += 1
             releases.append(release)
-            if ban_until and ban_until > now and release == ban_until:
+            bu, _bk = ledger_policy.parse_ban_until(entry)
+            if bu and bu > now and release == bu:
                 out["ban_until_active"] += 1
         else:
             out["expired"] += 1
