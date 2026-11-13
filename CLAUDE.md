@@ -167,6 +167,17 @@ P2C+预检判据），绝不进 `_repair_slot` 换 WARP 线；若此刻有任何
 promote）；首次上线后下一轮小时刷新会自动落盘 slot-7 配置并拉起进程
 （热重载对不存在进程必然失败 → 回退整组重启，正好把它带起来）。
 
+**配置漂移自愈（`slot_drift_heal`，默认开）**：sing-box 的
+`PUT /configs?force=true` 热重载**不会重建 outbound**——磁盘配置更新后
+进程里的 selector 成员仍是旧的，新线 PUT 只拿 400 not found（2026-11-13
+实测：磁盘 147 / 运行时 108，10 条新鲜 OK 线塞不进）。**成员变更必须整
+进程重启**。自愈两层：方一 `_reload_config_set` 热载后逐槽校验
+`_slot_members_drift`（只认台账里的真实 WARP 线，休眠 tag 不算），漂移槽
+滚动 `_restart_slot_process`（serving/repairing 只告警不重启）；方二
+`_slot_drift_maybe_heal` 挂在补闸 keeper——补闸连续被挡 ≥3min 且台账有
+OK 候选才触发，冷却 15min、失败退避 15→30→60min。判据读不到 API 时返回
+None（无法判定），绝不误重启；统计在 `/debug/state` 的 `config_drift`。
+
 **日志与命令（`asip gate`）**：池闸日志有**独立账本 `gate.log`**（项目根目录，
 5MB×5 轮转、0600），由 `daemon.py` 的 `_GateLineFilter` 按 `_GATE_LOG_RE`
 从 `log()` 分流；`daemon.log` 默认**不再收池闸行**（`slot-7 报 429` 实测约
