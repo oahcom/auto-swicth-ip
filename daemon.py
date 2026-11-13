@@ -12634,7 +12634,32 @@ def _channel_verdict_snapshot(tag: str, ip: str | None) -> dict:
 # 唤醒常驻 keeper，keeper 读 _warp_line_fresh_candidates 把游离 OK 线回填。
 _SLOT_REFILL_EVENT = threading.Event()
 _SLOT_REFILL_LOCK = threading.Lock()
-_SLOT_REFILL_STATS = {"rounds": 0, "filled": 0, "last_ts": 0.0}
+_SLOT_REFILL_STATS = {"rounds": 0, "filled": 0, "last_ts": 0.0,
+                      "skipped_not_member": 0}
+_SLOT_REFILL_LAST_WARN = {"ts": 0.0}
+
+
+def _slot_selector_members(slot):
+    """运行时 selector 的实际成员；读不到返回 None（不过滤，退回原行为）。
+
+    磁盘配置更新后进程没重载时，配置里新加的线并不在 Clash API 的 `all`
+    里，PUT 过去只会拿到 400 `Selector update error: not found`。2026-11-13
+    六个槽连报 no_candidate 就是这个：候选有 10 条新鲜 OK，却一条也塞不进。
+    """
+    _r, data = slot_singbox_api(
+        slot, "/proxies/" + slot["selector"], silent=True)
+    all_ = (data or {}).get("all")
+    return set(all_) if isinstance(all_, list) and all_ else None
+
+
+def _refill_warn_config_drift(skipped: int) -> None:
+    now = time.time()
+    if now - _SLOT_REFILL_LAST_WARN["ts"] < 300:
+        return
+    _SLOT_REFILL_LAST_WARN["ts"] = now
+    log("⚠ 探测补闸跳过 %d 次：新鲜 OK 线不在槽位 selector 成员里"
+        "（配置文件已更新但 sing-box 进程仍是旧配置）—— 需重启槽位 sing-box "
+        "或让订阅刷新重载配置" % skipped)
 
 
 def _note_probe_ok_for_refill() -> None:
@@ -12717,6 +12742,7 @@ def _refill_slots_from_probe(preferred=None, probed=None, reason="probe",
         if not need:
             return []
         filled = []
+        skipped = 0
         with _SLOT_PICK_LOCK:
             # 同一临界区内读一次占用表即可：其它 claim/put 共用这把锁，
             # 期间不会有第三方改 selector；自己 PUT 进去的 tag 随手补进集合。
@@ -12725,8 +12751,12 @@ def _refill_slots_from_probe(preferred=None, probed=None, reason="probe",
                 name = s["name"]
                 if _slot_health(name)["status"] not in ("bad", "unknown"):
                     continue
+                members = _slot_selector_members(s)
                 for tag, ip in cands:
                     if tag == active or tag in occupied:
+                        continue
+                    if members is not None and tag not in members:
+                        skipped += 1
                         continue
                     if ip and _warp_ip_is_blocked(ip, now):
                         continue
@@ -12743,6 +12773,9 @@ def _refill_slots_from_probe(preferred=None, probed=None, reason="probe",
                     log("＋ 探测补闸：%s → %s（出口=%s，%s）"
                         % (tag, name, ip or "未知", reason))
                     break
+        if skipped:
+            _SLOT_REFILL_STATS["skipped_not_member"] += skipped
+            _refill_warn_config_drift(skipped)
         return filled
     finally:
         _SLOT_REFILL_LOCK.release()

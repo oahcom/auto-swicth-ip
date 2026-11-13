@@ -83,16 +83,29 @@ def sandbox(monkeypatch):
         monkeypatch.setattr(daemon, n, lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_warp_member", lambda t: bool(t))
 
+    # 运行时 selector 成员快照：默认六条候选线都在，个别用例会把它缩小，
+    # 模拟「磁盘配置更新了但 sing-box 进程没重载」的配置漂移。
+    members = {"WARP-OK-%d" % i for i in range(1, 7)}
+    members.update("WARP-OLD-%d" % i for i in range(1, 7))
+
+    def fake_selector(slot, path, method="GET", body=None, timeout=3,
+                      silent=False):
+        return 200, {"all": sorted(members)}
+    monkeypatch.setattr(daemon, "slot_singbox_api", fake_selector)
+
     daemon._SLOT_HEALTH.clear()
     daemon._MAIN_SLOT_NAME["name"] = "slot-1"
     daemon._SLOT_REFILL_EVENT.clear()
     daemon._SLOT_REFILL_STATS.update({"rounds": 0, "filled": 0,
-                                      "last_ts": 0.0})
+                                      "last_ts": 0.0,
+                                      "skipped_not_member": 0})
+    daemon._SLOT_REFILL_LAST_WARN["ts"] = 0.0
     for s in ALL_SLOTS:
         daemon._slot_mark(s["name"], "bad")
 
     return types.SimpleNamespace(current=current, puts=puts, main=main,
-                                 fresh=fresh, verdicts=verdicts)
+                                 fresh=fresh, verdicts=verdicts,
+                                 members=members)
 
 
 # ── 1. 探测器出的 OK 游离线要真的进槽 ──────────────────────────────────
@@ -186,10 +199,33 @@ def test_refill_no_bad_slots_returns_empty(sandbox):
 def test_probe_line_free_tag_refills_immediately(sandbox):
     """兼容既有契约：游离线判 OK 时优先塞进坏闸，且池闸不被塞。"""
     sandbox.fresh.clear()
+    sandbox.members.add("WARP-FREE")
     daemon._probe_line_for_slots("WARP-FREE", "2606:free::1")
     assert ("slot-2", "WARP-FREE") in sandbox.puts
     assert all(name != "slot-7" for name, _tag in sandbox.puts)
     assert daemon._slot_health("slot-2")["status"] == "ok"
+
+
+# ── 5. 配置漂移：磁盘有新线、运行时 selector 没有 ──────────────────────
+
+def test_refill_skips_lines_missing_from_runtime_selector(sandbox):
+    """配置已更新但进程未重载时，PUT 这些线只会拿 400；必须跳过而不是空转。"""
+    sandbox.members.intersection_update({"WARP-OK-1", "WARP-OK-2",
+                                         "WARP-OK-3"})
+    filled = daemon._refill_slots_from_probe(reason="probe")
+    tags = [tag for tag, _name in filled]
+    assert tags == ["WARP-OK-1", "WARP-OK-2", "WARP-OK-3"]
+    assert daemon._SLOT_REFILL_STATS["skipped_not_member"] > 0
+    assert all(tag in sandbox.members for _name, tag in sandbox.puts)
+
+
+def test_refill_unreadable_selector_snapshot_falls_back(sandbox, monkeypatch):
+    """Clash API 读不到成员时不过滤，退回原行为（宁可多试一次）。"""
+    monkeypatch.setattr(daemon, "slot_singbox_api",
+                        lambda slot, path, **kw: (0, None))
+    filled = daemon._refill_slots_from_probe(reason="probe")
+    assert len(filled) == 5
+    assert daemon._SLOT_REFILL_STATS["skipped_not_member"] == 0
 
 
 # ── 4. 探测写出 OK 结论必须唤醒补闸 ────────────────────────────────────

@@ -67,6 +67,10 @@ REQ_RETRY = re.compile(
 # [EGRESS] asip rotated egress (ok) -> retry 1/2 on fresh connection (req=x)
 REQ_ROTATED = re.compile(
     r"\[EGRESS\]\s*asip rotated egress\s*\((\w+)\)\s*->\s*retry\s+(\d+)/(\d+)")
+# [EGRESS] 429 re-session replay -> 200 (false positive); skip accounting (req=x)
+# P0-3 原目标：同出口换 session 复测的结论。只进事件序列，不参与 hop/归因链 ——
+# 它既不是一次换线，也不是一次报障记账。
+REQ_RESESSION = re.compile(r"\[EGRESS\]\s*429 re-session replay(.*)$")
 
 
 def read_lines(args):
@@ -194,6 +198,8 @@ class ReqTrace:
                                  % (ts, short_port(ev.get("port")), egress_id(ev) or "-"))
                 elif k == "rotated":
                     lines.append("  %s  rotated   (%s)" % (ts, ev.get("status")))
+                elif k == "resession":
+                    lines.append("  %s  resession %s" % (ts, ev.get("detail", "")))
                 elif k == "retry":
                     lines.append("  %s  retry %s/%s %s  记在 :%s (%s)"
                                  % (ts, ev.get("n"), ev.get("m"), ev.get("code"),
@@ -251,6 +257,13 @@ def build(traces, line, state):
         h["_kind"] = "rotate"
         tr.hops.append(h)
         tr.events.append(h)
+        return
+    mres = REQ_RESESSION.search(t)
+    if mres:
+        # 行尾的 (req=xxx) 只是关联键，别混进结论文本。
+        detail = re.sub(r"\s*\(req=[A-Za-z0-9_-]+\)\s*$", "",
+                        mres.group(1)).strip()
+        tr.events.append({"_kind": "resession", "_ts": ts, "detail": detail})
         return
     mretry = REQ_RETRY.search(t)
     if mretry:

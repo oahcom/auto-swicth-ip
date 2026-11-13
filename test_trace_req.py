@@ -230,3 +230,20 @@ def test_end_to_end_from_file(mod, tmp_path, monkeypatch, capsys):
     assert "换线 1 次" in out
     assert "pq.us07.yydjc.top:443-vl" in out
     assert "成功" in out
+
+
+# ── ⑦ P0-3：429 同出口换 session 复测事件 ──────────────────────────────────
+SAMPLE_RESESSION = (
+    "[03:45:00] ⚠️  [EGRESS] 429 re-session replay -> 200 "
+    "(false positive); skip accounting (req=zz1)"
+)
+
+
+def test_resession_event_is_captured_without_req_suffix(mod):
+    """复测结论要能被按 req 重建，行尾 (req=) 不能混进结论文本。"""
+    tr = _feed(mod, [SAMPLE_RESESSION])["zz1"]
+    kinds = [e["_kind"] for e in tr.events]
+    assert kinds == ["resession"], kinds
+    detail = tr.events[0]["detail"]
+    assert "200" in detail and "false positive" in detail, detail
+    assert "req=" not in detail, "关联键不该出现在结论里：%s" % detail
