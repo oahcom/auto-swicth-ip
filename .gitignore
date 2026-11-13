@@ -73,3 +73,4 @@ backups/
 deploy/daemon.py.*
 
 .dormant_probe_attempt
+.api_stats.json

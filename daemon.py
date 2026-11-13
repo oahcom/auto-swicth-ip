@@ -380,6 +380,8 @@ _WARP_IP_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".
 _LEDGER_SHADOW = {"checked": 0, "violations": 0, "exact_match": 0,
                   "deviation_sum": 0.0, "deviation_max": 0.0,
                   "deviation_min": 0.0}
+# 清理到空表时显式放行一次写空（R-6/D-3），_save_warp_ip_used 读后复位。
+_LEDGER_ALLOW_EMPTY_WRITE = False
 # 出口 IP 历史日志：只追加、永不清理、启动不加载。与热表分开是因为热表每次
 # 写入都要全量重写且只保留窗口内条目；历史放在里面会让每次换线重写整年数据。
 _WARP_IP_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -437,21 +439,57 @@ def _warp_ip_used_path() -> str:
 
 
 def _load_warp_ip_used() -> None:
-    """启动时加载落盘的 IP 使用记录（旧版文件里的 `seen` 键直接忽略）。"""
+    """启动时加载落盘的 IP 使用记录（旧版文件里的 `seen` 键直接忽略）。
+
+    载入时归一化（§3.6）：老条目缺 expires_at → 保守补齐
+    `expires_at = max(ts, 该轮最晚解禁时刻) + ledger_retention_sec`；
+    ban_until 类型非 rate429 或数值非法 → 置空并按默认窗口重算。
+    归一化条数记入启动日志。
+    """
     try:
         with open(_warp_ip_used_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
         # 兼容两种格式：{ip: {...}} 或 {"used": {...}}
         used = data.get("used", data) if isinstance(data, dict) else {}
+        w = _warp()
+        retention = float(w.get("ledger_retention_sec", 86400))
+        ttl = ledger_policy.make_ttl(w)
+        normalized = 0
         for ip, v in used.items():
             if isinstance(v, dict) and "ts" in v:
+                changed = _normalize_ledger_entry(v, retention, ttl)
+                if changed:
+                    normalized += 1
                 _WARP_IP_USED[ip] = v
             elif isinstance(v, (int, float)):
                 _WARP_IP_USED[ip] = {"ts": float(v), "blocked": False}
+                normalized += 1
+        if normalized:
+            log(f"  · 台账载入归一化 {normalized} 条（补 expires_at / 作废坏 ban_until）")
     except FileNotFoundError:
         pass
     except Exception as e:
         log(f"✗ 加载 .warp_ip_used.json 失败: {e}")
+
+
+def _normalize_ledger_entry(entry: dict, retention: float, ttl: dict) -> bool:
+    """载入时归一化单条台账（§3.6）。返回是否有改动。"""
+    changed = False
+    # ban_until 类型非 rate429 或数值非法 → 置空
+    bu_raw = entry.get("ban_until")
+    if bu_raw is not None:
+        bu = _as_ts(bu_raw)
+        if bu is None or bu <= 0 or entry.get("ban_kind") != "rate429":
+            entry["ban_until"] = None
+            entry["ban_kind"] = None
+            changed = True
+    # 缺 expires_at → 保守补齐
+    if _as_ts(entry.get("expires_at")) is None:
+        ts = _as_ts(entry.get("ts")) or 0.0
+        release = ledger_policy.block_release_ts(entry, ttl)
+        entry["expires_at"] = max(ts, release) + retention
+        changed = True
+    return changed
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -490,15 +528,24 @@ def _save_warp_ip_used() -> None:
 
     进程内为空但盘上已有台账时拒绝写入：并发跑的测试进程/误启动的实例
     用空内存覆盖会把 16h 的 ban_until 全抹掉（已实际发生过）。
+    `_LEDGER_ALLOW_EMPTY_WRITE` 供清理逻辑显式放行一次写空（R-6/D-3）。
     """
+    global _LEDGER_ALLOW_EMPTY_WRITE
     path = _warp_ip_used_path()
-    if not _WARP_IP_USED:
+    if not _WARP_IP_USED and not _LEDGER_ALLOW_EMPTY_WRITE:
         try:
             if os.path.getsize(path) > 2:
                 log(f"  · 跳过空台账覆盖 {path}（盘上已有记录）")
                 return
         except OSError:
             pass
+    if not _WARP_IP_USED and _LEDGER_ALLOW_EMPTY_WRITE:
+        try:
+            if os.path.getsize(path) > 2:
+                log(f"  · 清理到空表，显式放行写空 {path}")
+        except OSError:
+            pass
+    _LEDGER_ALLOW_EMPTY_WRITE = False
     _write_json_atomic(path, {"used": _WARP_IP_USED})
 
 
@@ -7388,6 +7435,14 @@ def _record_active_ip_success(total: int, errors: int) -> None:
         if not first or float(first) < float(entry.get("ts") or 0):
             entry["first_ok_ts"] = min(fresh)
         entry["last_ok_ts"] = max(float(entry.get("last_ok_ts") or 0), max(fresh))
+        # P1 双写：真实成功流量打点续命（§3.3 EVENT_SUCCESS）
+        # 锚点 = 最近一次成功时刻（last_ok_ts），不是 time.time()
+        _w = _warp()
+        entry["expires_at"] = ledger_policy.compute_expires_at(
+            entry, ledger_policy.EVENT_SUCCESS,
+            float(entry["last_ok_ts"]),
+            float(_w.get("ledger_retention_sec", 86400)),
+            ledger_policy.make_ttl(_w))
         _save_warp_ip_used()
     tag = active_warp_tag()
     if tag:
@@ -7559,7 +7614,8 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
              "blocked_kind": kind if blocked else None, "first_seen": now,
              "blocked_ts": now if blocked else None,
              "blocked_ts_by_kind": {}, "served_sec": None, "last_ok_ts": None,
-             "probe_ok_ts": None, "ban_until": None, "ban_kind": None}
+             "probe_ok_ts": None, "ban_until": None, "ban_kind": None,
+             "expires_at": None}
     entry = _WARP_IP_USED.setdefault(ip, fresh)
     if not isinstance(entry, dict):
         # 兼容旧格式（float）
@@ -7612,24 +7668,64 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
                 entry["ban_until"] = new_until
                 entry["ban_kind"] = "rate429"
     entry["blocked"] = entry.get("blocked", False) or blocked
+    # ---- P1 双写 expires_at + P0 影子统计（§3.3 事件契约） ----
     w = _warp()
-    cutoff = now - w["ip_reuse_guard_sec"]
-    # 被标记过的 IP 保留到惩罚期结束：取两档恢复期（403 6h）与 blocked_ttl_sec
-    # 的最大值兜底；解析到精确封禁的条目由下方 ban_until > now 单独保护，
-    # 不会因默认窗口缩短（429 现在 60s）被提前清掉放回候选池。
-    blocked_cutoff = now - max(w.get("blocked_guard_sec", 86400),
-                               w.get("rate429_guard_sec", 86400),
-                               w.get("blocked_ttl_sec", 86400))
-    for k in list(_WARP_IP_USED):
-        v = _WARP_IP_USED[k]
-        # 上游给出长于默认窗口的确切封禁时，条目必须留到 ban_until。
-        ban_until = _as_ts(v.get("ban_until")) if isinstance(v, dict) else None
-        if ban_until is not None and ban_until > now:
-            continue
-        ts = v.get("ts") if isinstance(v, dict) else v
-        keep = blocked_cutoff if (isinstance(v, dict) and v.get("blocked")) else cutoff
-        if ts < keep:
+    retention = float(w.get("ledger_retention_sec", 86400))
+    ttl = ledger_policy.make_ttl(w)
+    if not blocked:
+        event = ledger_policy.EVENT_TOUCH
+    elif new_round:
+        event = ledger_policy.EVENT_NEW_ROUND
+    elif ban_extended:
+        event = ledger_policy.EVENT_BAN_EXTEND
+    else:
+        event = ledger_policy.EVENT_SAME_ROUND
+    old_expires = _as_ts(entry.get("expires_at"))
+    if old_expires is None or ledger_policy.is_extending(event):
+        entry["expires_at"] = ledger_policy.compute_expires_at(
+            entry, event, now, retention, ttl)
+    # P0 影子偏差监控（INV-1）：expires_at 锚点 ≥ 判定侧释放时刻
+    dev = ledger_policy.shadow_deviation(entry, retention, ttl)
+    if dev is not None:
+        s = _LEDGER_SHADOW
+        s["checked"] += 1
+        s["deviation_sum"] += dev
+        if dev < 0:
+            s["violations"] += 1
+        if dev == 0:
+            s["exact_match"] += 1
+        s["deviation_max"] = max(s["deviation_max"], dev)
+        s["deviation_min"] = min(s["deviation_min"], dev)
+    # ---- 清理（P2 起由 ledger_cleanup_mode 控制判据） ----
+    cleanup_mode = w.get("ledger_cleanup_mode", "legacy")
+    if cleanup_mode == "expires_at":
+        for k in list(_WARP_IP_USED):
+            v = _WARP_IP_USED[k]
+            exp = _as_ts(v.get("expires_at")) if isinstance(v, dict) else None
+            if exp is not None and exp >= now:
+                continue
             del _WARP_IP_USED[k]
+    else:
+        cutoff = now - w["ip_reuse_guard_sec"]
+        # 被标记过的 IP 保留到惩罚期结束：取两档恢复期（403 6h）与 blocked_ttl_sec
+        # 的最大值兜底；解析到精确封禁的条目由下方 ban_until > now 单独保护，
+        # 不会因默认窗口缩短（429 现在 60s）被提前清掉放回候选池。
+        blocked_cutoff = now - max(w.get("blocked_guard_sec", 86400),
+                                   w.get("rate429_guard_sec", 86400),
+                                   w.get("blocked_ttl_sec", 86400))
+        for k in list(_WARP_IP_USED):
+            v = _WARP_IP_USED[k]
+            # 上游给出长于默认窗口的确切封禁时，条目必须留到 ban_until。
+            ban_until = _as_ts(v.get("ban_until")) if isinstance(v, dict) else None
+            if ban_until is not None and ban_until > now:
+                continue
+            ts = v.get("ts") if isinstance(v, dict) else v
+            keep = blocked_cutoff if (isinstance(v, dict) and v.get("blocked")) else cutoff
+            if ts < keep:
+                del _WARP_IP_USED[k]
+    global _LEDGER_ALLOW_EMPTY_WRITE
+    if not _WARP_IP_USED:
+        _LEDGER_ALLOW_EMPTY_WRITE = True
     _save_warp_ip_used()
 
 def _warp_model_usable(member: dict, ip: str) -> bool:
@@ -12200,6 +12296,20 @@ _api_stats = {"calls": 0, "switched": 0, "coalesced": 0, "retired": 0,
 # 快照 + 退出时补写，启动时合并回来。
 _API_STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                ".api_stats.json")
+# pytest 泄漏防护：pytest 进程 import 本模块同样会注册 atexit/周期钩子，
+# 不加拦的话测试计数会写进仓库根真实文件，下次生产启动再被合并回去
+# （实测发生过：15:34 全量 pytest 落了一封 calls:1/borrowed:5 的假账）。
+# 只拦「跑在 pytest 里且路径仍是默认真实路径」——用例 monkeypatch 成
+# tmp 路径后不受影响，生产行为不变。
+_API_STATS_FILE_DEFAULT = _API_STATS_FILE
+
+
+_IN_PYTEST = "pytest" in sys.modules  # import 时判定：atexit 阶段 PYTEST_CURRENT_TEST 已被清除
+
+
+def _api_stats_io_blocked() -> bool:
+    return _IN_PYTEST and _API_STATS_FILE == _API_STATS_FILE_DEFAULT
+
 # stats_boot 的口径基线：启动合并完成后快照的「持久化累计值」。payload 里
 # stats 保持跨重启累计语义，stats_boot = stats - 基线 = 本次运行新增。
 _API_STATS_BASELINE: dict = {}
@@ -12228,6 +12338,8 @@ def _load_api_stats_boot() -> None:
 
     文件不存在 / 损坏 / JSON 非 dict → 静默从零（统计丢得起，启动不能停）。
     """
+    if _api_stats_io_blocked():
+        return
     try:
         with open(_API_STATS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -12252,6 +12364,8 @@ def _persist_api_stats() -> None:
     周期快照与退出钩子共用。失败只 log 不 raise —— 统计落盘不值得掀翻
     任何一条调用链。
     """
+    if _api_stats_io_blocked():
+        return
     try:
         snap = dict(_api_stats)
         snap["persisted_at"] = time.time()
@@ -14085,6 +14199,26 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                     log(f"✗ 后台修整启动失败: {e}")
 
 
+def _ledger_rank_dist() -> dict:
+    """台账条目的档位分布（Q2/R-1 观察指标）。
+
+    档 0 从未出现（不在台账）、1 探针 OK、2 撑过生产、3 出现过无成功。
+    档 0 占比异常上升 → 档位回落风险（R-1）显现，需关注 403/429 命中率。
+    """
+    dist = {"rank1_probe_ok": 0, "rank2_prod_ok": 0, "rank3_no_success": 0}
+    with _WARP_IP_LOCK:
+        for entry in _WARP_IP_USED.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("probe_ok_ts"):
+                dist["rank1_probe_ok"] += 1
+            elif entry.get("last_ok_ts"):
+                dist["rank2_prod_ok"] += 1
+            else:
+                dist["rank3_no_success"] += 1
+    return dist
+
+
 def _api_debug_state() -> dict:
     """测试与排障用的状态快照。
 
@@ -14116,6 +14250,8 @@ def _api_debug_state() -> dict:
         "slot_refill": dict(_SLOT_REFILL_STATS),
         "config_drift": {k: (dict(v) if isinstance(v, dict) else v)
                          for k, v in _SLOT_DRIFT.items()},
+        "ledger_shadow": dict(_LEDGER_SHADOW),
+        "ledger_rank_dist": _ledger_rank_dist(),
         "active_ip": _ACTIVE_WARP_IP,
         "line_ip": {m["tag"]: _warp_line_ip(m["tag"])
                     for m in _warp()["members"]},
