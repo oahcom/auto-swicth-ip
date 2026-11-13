@@ -56,6 +56,7 @@ from asip.atomic_io import update_json as _atomic_update_json
 from asip.atomic_io import write_text as _atomic_write_text
 from asip.clash_client import ClashClient
 from asip.egress import TRACE_URL, probe_egress
+from asip import ledger_policy
 from asip.redact import redact_secrets as _redact_secrets
 
 # WARP 渠道模型（块 = colo）与夜间锁策略。两者都是纯函数模块，import 它们不会
@@ -372,6 +373,13 @@ _warp_cooldown_until: float = 0     # 冷却截止，防重连风暴
 _WARP_IP_USED: dict[str, dict] = {}
 _WARP_IP_LOCK = threading.Lock()   # _WARP_IP_USED 跨线程读写（换线线程 + 主循环）
 _WARP_IP_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".warp_ip_used.json")
+# P0 影子统计（docs/design-20261113-ledger-lifecycle.md §3.8/§6.3）：
+# 每次写入时计算影子 expires_at 锚点与判定侧释放时刻的偏差，INV-1 监控。
+# 偏差恒 ≥0 说明「删除判据不会提前放回封禁中的地址」；负值即违例。
+# 暴露到 /debug/state 的 "ledger_shadow" 键。
+_LEDGER_SHADOW = {"checked": 0, "violations": 0, "exact_match": 0,
+                  "deviation_sum": 0.0, "deviation_max": 0.0,
+                  "deviation_min": 0.0}
 # 出口 IP 历史日志：只追加、永不清理、启动不加载。与热表分开是因为热表每次
 # 写入都要全量重写且只保留窗口内条目；历史放在里面会让每次换线重写整年数据。
 _WARP_IP_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -7012,20 +7020,14 @@ def _warp_block_remaining(entry: dict, now: float) -> float:
     上游 429 带 `Retry-After` 时，探针把确切恢复时刻写进 `ban_until`；它替换
     同类型的默认惩罚期（rate429 的默认 60s），不是与之取最大值 —— 默认值只是
     没有观测时的兜底回池节奏。403 等其它类型仍按各自窗口并行，仍遵守「按多的来」。
+    释放时刻计算委托 ledger_policy.block_release_ts（D-1 单一事实源）。
     """
     stamps = _warp_block_stamps(entry)
     if not stamps:
         return _warp_block_ttl(None)
-    ban_until, ban_kind = _warp_ban_until(entry)
-    remain = 0.0
-    for k, t in stamps.items():
-        # 同 `_warp_block_window`：ban_until 必须晚于该类型起点，否则是旧版
-        # 台账留下的不一致组合，按默认窗口保守处理。
-        if ban_until is not None and k == ban_kind and ban_until > t:
-            remain = max(remain, ban_until - now)
-        else:
-            remain = max(remain, t + _warp_block_ttl(k) - now)
-    return remain
+    release = ledger_policy.block_release_ts(
+        entry, ledger_policy.make_ttl(_warp()))
+    return release - now
 
 
 def _warp_ip_recently_used(ip: str | None, now: float,
@@ -7085,7 +7087,8 @@ def _warp_ip_is_blocked(ip: str | None, now: float | None = None) -> bool:
         return False
     if now is None:
         now = time.time()
-    return _warp_block_remaining(entry, now) > 0
+    return ledger_policy.is_effectively_blocked(
+        entry, now, ledger_policy.make_ttl(_warp()))
 
 
 def _ip_history_is_truth() -> bool:
@@ -7555,6 +7558,8 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
         # 兼容旧格式（float）
         _WARP_IP_USED[ip] = entry = fresh
     entry["ts"] = now
+    ban_extended = False
+    new_round = False
     if blocked:
         # 已满期的类型先剔除：它属于上一轮，重新标记要开新一轮。
         # 只在已标记时读旧起点 —— 干净地址没有惩罚起点，回退链会把 last_ok_ts
@@ -7593,7 +7598,11 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
                 secs = min(max(secs, 1.0), 86400.0)
                 until = now + secs
                 prev_until = _as_ts(entry.get("ban_until"))
-                entry["ban_until"] = max(until, prev_until) if prev_until and prev_until > now else until
+                new_until = (max(until, prev_until)
+                             if prev_until and prev_until > now else until)
+                if new_until != prev_until:
+                    ban_extended = True
+                entry["ban_until"] = new_until
                 entry["ban_kind"] = "rate429"
     entry["blocked"] = entry.get("blocked", False) or blocked
     w = _warp()
@@ -10671,6 +10680,8 @@ def _reload_config_set(changed: list[tuple[str, str]]) -> bool:
                 CFG["singbox"]["config_file"], i)
             if final not in changed_finals:
                 continue
+            if _is_proxy_gate(slot):
+                continue  # 池闸与方二同口径：成员归池管线管，不在此重启
             drift = _slot_drift_after_reload(slot)
             _SLOT_DRIFT["checked"] += 1
             if not drift:
@@ -12700,6 +12711,7 @@ _SLOT_DRIFT = {
     "checked": 0, "healed": 0, "warn_only": 0, "fail": 0,
     "last_heal_ts": 0.0,
     "skip_since": 0.0,        # skipped_not_member 首次连续出现的时刻
+    "last_filled": 0,         # 上次观察到的累计回填数（用于重新计时）
     "slot_last_restart": {},  # name -> ts，每槽 10min 限速
 }
 _SLOT_DRIFT_MIN_GAP = 180.0    # 补闸连续被挡多久才值得动进程（3min）
@@ -12814,6 +12826,12 @@ def _slot_drift_maybe_heal(reason="keeper") -> None:
     if not CFG["singbox"].get("slot_drift_heal", True):
         return
     now = time.time()
+    stats = _SLOT_REFILL_STATS
+    if stats.get("filled", 0) > _SLOT_DRIFT.get("last_filled", 0):
+        # 补闸刚成功回填过 = 挡路不是持续性的：重新计时，别把历史的
+        # skipped 计数（累计口径，从不清零）当成现在还被挡着。
+        _SLOT_DRIFT["last_filled"] = stats["filled"]
+        _SLOT_DRIFT["skip_since"] = 0.0
     if _SLOT_REFILL_STATS.get("skipped_not_member"):
         if not _SLOT_DRIFT["skip_since"]:
             _SLOT_DRIFT["skip_since"] = now

@@ -85,7 +85,7 @@ def drift_sandbox(monkeypatch, tmp_path):
     daemon._MAIN_SLOT_NAME["name"] = "slot-1"
     daemon._SLOT_DRIFT.update({"checked": 0, "healed": 0, "warn_only": 0,
                                "fail": 0, "last_heal_ts": 0.0,
-                               "skip_since": 0.0,
+                               "skip_since": 0.0, "last_filled": 0,
                                "slot_last_restart": {}})
     daemon._SLOT_REFILL_STATS.update({"rounds": 0, "filled": 0,
                                       "last_ts": 0.0,
@@ -213,6 +213,30 @@ def test_drift_heal_needs_sustained_skip(drift_sandbox):
     daemon._SLOT_DRIFT["skip_since"] = daemon.time.time() - 30
     daemon._slot_drift_maybe_heal(reason="keeper")
     assert drift_sandbox.state["popen"] == []
+
+
+def test_drift_heal_resets_timer_after_successful_refill(drift_sandbox):
+    """skipped 是累计口径：补闸刚成功回填过 = 挡路不持续，重新计时。"""
+    _arm_heal(drift_sandbox)
+    daemon._SLOT_DRIFT["skip_since"] = daemon.time.time() - 200
+    daemon._SLOT_REFILL_STATS["filled"] = 3   # 回填刚成功过
+    daemon._slot_drift_maybe_heal(reason="keeper")
+    assert drift_sandbox.state["popen"] == []
+    # skip_since 被重置后因 skipped 仍 >0 重新起算（当前时刻），3min 内不会触发
+    assert daemon._SLOT_DRIFT["last_filled"] == 3
+    assert daemon._SLOT_DRIFT["skip_since"] > 0
+
+
+def test_reload_config_set_skips_proxy_gate(drift_sandbox, monkeypatch):
+    """池闸与方二同口径：成员归池管线管，方一不重启它。"""
+    monkeypatch.setattr(daemon, "reload_singbox_config",
+                        lambda path=None, slot=None: True)
+    drift_sandbox.disk["slot-7"] = set(REAL_LINES) | {"proxy"}
+    drift_sandbox.rt["slot-7"] = {"proxy"}
+    daemon._reload_config_set([(GATE["config_file"], "x")])
+    assert drift_sandbox.state["popen"] == []
+    assert daemon._SLOT_DRIFT["healed"] == 0
+    assert daemon._SLOT_DRIFT["warn_only"] == 0
 
 
 # ── 4. helper：互斥与限速 ────────────────────────────────────────────────
