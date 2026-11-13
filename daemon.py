@@ -1438,6 +1438,13 @@ def _submit_once(key: str, fn, *args) -> bool:
     threading.Thread(target=_run, daemon=True, name=f"bg-{key}").start()
     return True
 def _cleanup_atexit():
+    # M10：退出前补一次统计落盘。try 兜两层：① 本函数在模块加载早期就注册，
+    # 若 import 在 12285 行之后才失败，_persist_api_stats 尚未定义（NameError）；
+    # ② 落盘自身失败不该挡住连接池的收尾。
+    try:
+        _persist_api_stats()
+    except Exception:
+        pass
     _health_pool.shutdown(wait=True)
     _io_pool.shutdown(wait=True)
     with _db_lock:
@@ -12185,7 +12192,76 @@ _last_rotate_ts: float = 0.0
 _api_stats = {"calls": 0, "switched": 0, "coalesced": 0, "retired": 0,
               "too_frequent": 0, "no_standby": 0, "failed": 0, "line_ok": 0,
               "divergence": 0, "borrowed": 0, "stale_ok_pick": 0,
-              "deferred_429": 0, "recheck_ok": 0, "recheck_bad": 0}
+              "deferred_429": 0, "recheck_err": 0, "recheck_ok": 0, "recheck_bad": 0}
+
+# ── M10: _api_stats 落盘（遗留修复 R2）─────────────────────────────────
+# _api_stats 此前纯内存，daemon 重启清零，只能靠「重启前的最后一条日志」
+# 反推历史。与 .warp_ip_used.json 同款口径：仓库根下一个隐藏 JSON，周期
+# 快照 + 退出时补写，启动时合并回来。
+_API_STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ".api_stats.json")
+# stats_boot 的口径基线：启动合并完成后快照的「持久化累计值」。payload 里
+# stats 保持跨重启累计语义，stats_boot = stats - 基线 = 本次运行新增。
+_API_STATS_BASELINE: dict = {}
+
+
+def _merge_api_stats(persisted: dict) -> dict:
+    """把盘上的累计值并进 _api_stats（仅数值键），返回合并后的 dict。
+
+    规则：_api_stats[k] = persisted[k] + _api_stats.get(k, 0)。
+    - persisted_at 是落盘时间戳，不是计数器，跳过；
+    - client_gone 是「本次运行绝对值」（_note_client_gone 直接赋值覆盖而非
+      累加），并进来只会让 stats_boot 在首个事件前残留上一个进程的值、事件
+      后变负数，所以同样跳过。
+    """
+    for k, v in persisted.items():
+        if k in ("persisted_at", "client_gone"):
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        _api_stats[k] = v + _api_stats.get(k, 0)
+    return _api_stats
+
+
+def _load_api_stats_boot() -> None:
+    """启动合并：读 .api_stats.json 并入 _api_stats，建立 stats_boot 基线。
+
+    文件不存在 / 损坏 / JSON 非 dict → 静默从零（统计丢得起，启动不能停）。
+    """
+    try:
+        with open(_API_STATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log(f"· .api_stats.json 损坏，统计从零开始: {e}")
+        return
+    if not isinstance(data, dict):
+        log("· .api_stats.json 内容非 dict，统计从零开始")
+        return
+    _merge_api_stats(data)
+    _API_STATS_BASELINE.clear()
+    _API_STATS_BASELINE.update(
+        {k: v for k, v in _api_stats.items()
+         if isinstance(v, (int, float)) and not isinstance(v, bool)})
+
+
+def _persist_api_stats() -> None:
+    """原子落盘 _api_stats：写 .api_stats.json.tmp 后 os.replace。
+
+    周期快照与退出钩子共用。失败只 log 不 raise —— 统计落盘不值得掀翻
+    任何一条调用链。
+    """
+    try:
+        snap = dict(_api_stats)
+        snap["persisted_at"] = time.time()
+        tmp = _API_STATS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+        os.replace(tmp, _API_STATS_FILE)
+    except Exception as e:
+        log(f"· _api_stats 落盘失败（忽略）: {e}")
+
 
 # 换线前实测台账：tag|ip -> 结论。9router 一次 429 风暴会连着打几十个 /rotate，
 # 每个都实测会把换线拖到几分钟，而同一地址同一时刻的结论不会变。
@@ -14045,6 +14121,13 @@ def _api_debug_state() -> dict:
                     for m in _warp()["members"]},
         "last_rotate_ts": _last_rotate_ts,
         "stats": dict(_api_stats),
+        # M10：stats 是跨重启累计口径；stats_boot = stats - 启动合并时的基线
+        # （_API_STATS_BASELINE，见 _load_api_stats_boot）= 本次运行新增。
+        # 只取数值键；persisted_at / client_gone 这类非累计键不在基线里，
+        # client_gone 本身就是本次运行的绝对值，原样带出即可。
+        "stats_boot": {k: v - _API_STATS_BASELINE.get(k, 0)
+                       for k, v in _api_stats.items()
+                       if isinstance(v, (int, float)) and not isinstance(v, bool)},
         "slots": _slot_snapshot(),
         "probe_divergence": list(_PROBE_DIVERGENCE[-10:]),
         # 换线表是判断 already_retired 的唯一依据，而它只在进程内存里 ——
@@ -15226,6 +15309,10 @@ def _config_consistency_check_impl(now: float | None = None) -> dict:
 
 def main():
     _acquire_single_instance_lock()
+    # M10：启动合并上一次进程的 _api_stats 累计值。必须排在 _start_rotate_server
+    # 之前 —— 9router 的 /rotate 一进来就会写统计，晚了基线会把最早一批事件
+    # 误算成「历史值」，stats_boot 就少计了。
+    _load_api_stats_boot()
     # Log first, then fetch (avoid hanging before any output)
     log("=" * 50)
     log("auto-switch-ip daemon v2 启动 (加固版)")
@@ -15334,6 +15421,8 @@ def main():
     last_summary_ts = 0
     last_proactive_rotate = 0
     last_config_check = 0.0
+    # M10：_api_stats 周期落盘节拍（60s，见主循环 3b3）
+    last_api_stats_persist = 0.0
 
     global _RESTART_COUNT, _NODE_CALL_RESET_TS, _last_wal_checkpoint, _strategy_mode
     global _pool_delay_last
@@ -15570,6 +15659,13 @@ def main():
                 last_config_check = now
                 _submit_once("config-consistency-check", _config_consistency_check)
 
+            # ---- 3b3. _api_stats 周期落盘 (每 60s) ----
+            # M10：统计只在内存里，重启即清零；60s 快照一次，崩溃最多丢 60s。
+            # 写盘是一次几 KB 的原子 replace，但主循环纪律是不阻塞 —— 丢后台。
+            if now - last_api_stats_persist > 60:
+                last_api_stats_persist = now
+                _submit_once("api-stats-persist", _persist_api_stats)
+
             # ---- 3c0. 双向兜底的反向：停在 proxy 上时池挂了才切回 ----
             # 内部要探测整池健康（最慢 15s），丢后台。
             _maybe_failback_to_warp_bg(now)
@@ -15742,6 +15838,12 @@ if __name__ == "__main__":
 
     def _sigterm_handler(signum, frame):
         log("收到 SIGTERM，优雅关闭中...")
+        # M10：systemd stop / kill 走这里，先补一次统计落盘再退出。
+        # atexit（_cleanup_atexit）随后还会写一次 —— 同一份快照覆盖写，无害。
+        try:
+            _persist_api_stats()
+        except Exception:
+            pass
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
