@@ -14345,11 +14345,11 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         # 必须复测），不受这个开关影响。
         _mode429 = _rate429_recheck_mode()
         if _mode429 == "all":
-            # 只延后 rate429 的定性（F3）。abuse403 不延后：它是出口 IP 的
-            # 指纹/信誉级惩罚（blocked_guard_sec=21600 的 6h 恢复期），复测
-            # 探针一发 OK 覆盖不了这个口径 —— 若延后，CF flagged IP 在 all
-            # 档下只吃 90s 短冷却就回池，等于绕过 6h 信誉惩罚。
-            defer_verdict = reason == "rate429"
+            # 借道证据不足（这一发不是本槽发起的），一切 reason（含 abuse403）
+            # 都先复测再定性 —— 复测仍坏才进入定性流程。原地 403 立即标脏
+            # （F3 原意保留：6h 信誉惩罚不被复测覆盖）；原地 429 延后（all 档
+            # 实验目的保留：实测「原地 429 里有多少是假 429」）。
+            defer_verdict = borrowed or reason == "rate429"
         elif _mode429 == "off":
             defer_verdict = False
         else:
@@ -14357,8 +14357,9 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         if defer_verdict and not borrowed and reason == "rate429":
             # all 模式下被延后定性的原地 429：只计数，不影响下面的换线决策 ——
             # 请求已经 429 了必须换，延后的只是「判死」这一步。
-            # F3 之后 defer_verdict 只可能因 rate429 为真（abuse403 不延后），
-            # 403 不会混入这个计数。
+            # F3 之后原地 defer_verdict 只可能因 rate429 为真；借道（borrowed）
+            # 虽也延后定性，但被 not borrowed 排除在外 —— 403 与借道失败都
+            # 不会混入这个计数。
             _api_stats["deferred_429"] += 1
 
         if cur_ip and reason == "transport":

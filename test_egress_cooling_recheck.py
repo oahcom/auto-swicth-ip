@@ -152,6 +152,37 @@ def test_recheck_without_line_conclusion_cools_conservatively(env, monkeypatch):
     assert daemon._egress_cooling_left("2606:a::1") > 80
 
 
+def test_recheck_verdict_counters(env, monkeypatch):
+    """D2：复测三种结论（OK/quota/异常）都必须进 _api_stats 计数，
+    否则 /debug/state 上只能翻日志猜「复测 OK : 复测 quota」的比例。"""
+    monkeypatch.setattr(daemon.threading, "Thread", _InlineThread)
+
+    monkeypatch.setattr(daemon, "_probe_line_before_rotate", _probe_stub("OK"))
+    ok0 = daemon._api_stats.get("recheck_ok", 0)
+    daemon._cool_egress_after_recheck("2606:a::1", "WARP-A")
+    assert daemon._api_stats.get("recheck_ok", 0) == ok0 + 1
+
+    daemon._EGRESS_RECHECK.clear()
+    monkeypatch.setattr(daemon, "_probe_line_before_rotate", _probe_stub("quota"))
+    bad0 = daemon._api_stats.get("recheck_bad", 0)
+    daemon._cool_egress_after_recheck("2606:a::1", "WARP-A")
+    assert daemon._api_stats.get("recheck_bad", 0) == bad0 + 1
+
+    # 清两处状态：_EGRESS_RECHECK 是复测窗口，_EGRESS_COOLING 是上一段
+    # 复测失败留下的冷却 —— 不清的话 _cool_egress_after_recheck 开头
+    # 「已在冷却中」直接 return，boom 根本轮不到执行。
+    daemon._EGRESS_RECHECK.clear()
+    daemon._EGRESS_COOLING.clear()
+
+    def boom(tag, ip, fresh=False):
+        raise RuntimeError("probe crashed")
+    monkeypatch.setattr(daemon, "_probe_line_before_rotate", boom)
+    err0 = daemon._api_stats.get("recheck_err", 0)
+    daemon._cool_egress_after_recheck("2606:a::1", "WARP-A")
+    assert daemon._api_stats.get("recheck_err", 0) == err0 + 1, \
+        "复测异常必须计入 recheck_err（D2）"
+
+
 def test_recheck_exception_falls_back_to_cooling(env, monkeypatch):
     """复测本身抛异常（探针缺失等）也必须冷却，不能把未知当干净。"""
     monkeypatch.setattr(daemon.threading, "Thread", _InlineThread)

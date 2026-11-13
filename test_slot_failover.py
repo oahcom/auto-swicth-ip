@@ -684,10 +684,13 @@ def test_pick_same_key_still_rotates(isolated, monkeypatch):
 def test_borrowed_429_does_not_dirty_lended_line(isolated, monkeypatch):
     """借道重试的 429：不标脏、不冷却被借线、不换它的线，但仍给出下一个备槽。"""
     touched = []
+    rechecked = []
     monkeypatch.setattr(daemon, "_mark_warp_ip_used",
                         lambda ip, now, **kw: touched.append(("dirty", ip, kw)))
     monkeypatch.setattr(daemon, "_mark_egress_cooling",
                         lambda ip, ts=None: touched.append(("cool", ip, ts)))
+    monkeypatch.setattr(daemon, "_cool_egress_after_recheck",
+                        lambda *a, **k: rechecked.append(a))
 
     r = daemon._rotate_slot_once(
         {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
@@ -695,6 +698,8 @@ def test_borrowed_429_does_not_dirty_lended_line(isolated, monkeypatch):
 
     assert r["reason"] == "borrowed_skip", r
     assert touched == [], "借道失败不得给被借线标脏/冷却：%s" % (touched,)
+    assert rechecked == [("2606:b::2", "WARP-B", "rate429")], \
+        "借道 429 转复测时 reason 必须原样透传，日志才分得清样本：%s" % (rechecked,)
     assert not any(name == "slot-2" for name, _ in isolated.puts), \
         "不得换掉被借线的线（它没坏）：%s" % (isolated.puts,)
     assert daemon._slot_health("slot-2")["status"] == "ok", \
@@ -718,7 +723,7 @@ def test_direct_429_still_dirties_own_line(isolated, monkeypatch):
 
 # ===== rate429 定性开关（config.rate429_recheck_mode）=====
 #
-# 三档语义，下面四条用例分别锁住：
+# 三档语义，下面几条用例分别锁住：
 #   borrowed —— 只借道复测（默认，当前生产）
 #   all      —— 所有 429 都先复测再判死（用来实测「原地 429 有多少是假 429」）
 #   off      —— 全关，回到 P0-1 之前（kill switch）
@@ -790,6 +795,108 @@ def test_off_mode_is_a_full_rollback(isolated, monkeypatch):
 
     assert touched == ["2606:b::2"], \
         "off 模式下借道也必须标脏 —— 否则这个开关回退不掉 P0-1"
+
+
+def test_all_mode_does_not_defer_abuse403(isolated, monkeypatch):
+    """F3 回归锁：all 档下 abuse403 必须立即定性标脏，不得延后复测。
+
+    abuse403 是指纹/信誉级惩罚（blocked_guard_sec=21600 的 6h 恢复期），
+    延后定性 = CF flagged IP 只吃 90s 短冷却就回池，绕过 6h 惩罚。
+    """
+    touched = []
+    cooled = []
+    rechecked = []
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "all")
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, **kw: touched.append(ip))
+    monkeypatch.setattr(daemon, "_mark_egress_cooling",
+                        lambda ip, ts=None: cooled.append(ip))
+    monkeypatch.setattr(daemon, "_cool_egress_after_recheck",
+                        lambda *a, **k: rechecked.append(a))
+    monkeypatch.setattr(daemon, "_probe_verdict_for_ip", lambda *a, **k: None)
+    deferred0 = daemon._api_stats.get("deferred_429", 0)
+
+    r = daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "abuse403", egress_ip="2606:b::2")
+
+    assert touched == ["2606:b::2"], \
+        "all 档下 abuse403 必须立即标脏本线（不延后定性）：%s" % (touched,)
+    assert cooled == ["2606:b::2"], \
+        "abuse403 走原逻辑短冷却 + 6h 信誉惩罚，不走复测：%s" % (cooled,)
+    assert rechecked == [], "abuse403 不得转异步复测：%s" % (rechecked,)
+    assert daemon._api_stats.get("deferred_429", 0) == deferred0, \
+        "403 不得混入 deferred_429 计数"
+    assert r["reason"] in ("ok", "coalesced", "too_frequent"), r
+
+
+def test_borrowed_abuse403_still_defers_verdict(isolated, monkeypatch):
+    """借道场景 borrowed 档覆盖所有 reason：abuse403 也先复测再定性，
+    且不标脏被借线 —— 借道那一发不是本槽发起的，证据不足对 403 同样成立。"""
+    touched = []
+    rechecked = []
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, **kw: touched.append(ip))
+    monkeypatch.setattr(daemon, "_mark_egress_cooling",
+                        lambda ip, ts=None: touched.append(("cool", ip)))
+    monkeypatch.setattr(daemon, "_cool_egress_after_recheck",
+                        lambda *a, **k: rechecked.append(a))
+
+    r = daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "abuse403", egress_ip="2606:b::2", borrowed=True)
+
+    assert rechecked == [("2606:b::2", "WARP-B", "abuse403")], \
+        "borrowed 档借道 403 仍要延后定性（转复测）且透传 reason：%s" % (rechecked,)
+    assert touched == [], "借道 403 也不得标脏/冷却被借线：%s" % (touched,)
+    assert r["reason"] == "borrowed_skip", r
+
+
+def test_all_mode_borrowed_abuse403_defers_recheck(isolated, monkeypatch):
+    """all 档 + 借道：借道那一发不是本槽发起的，证据不足对一切 reason 成立 ——
+    abuse403 也先复测再定性，不立即短冷却，不写 6h 台账。"""
+    touched = []
+    cooled = []
+    rechecked = []
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "all")
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, **kw: touched.append((ip, kw.get("kind"))))
+    monkeypatch.setattr(daemon, "_mark_egress_cooling",
+                        lambda ip, ts=None: cooled.append(ip))
+    monkeypatch.setattr(daemon, "_cool_egress_after_recheck",
+                        lambda *a, **k: rechecked.append(a))
+
+    r = daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "abuse403", egress_ip="2606:b::2", borrowed=True)
+
+    assert rechecked == [("2606:b::2", "WARP-B", "abuse403")], \
+        "all 档借道 403 证据不足，必须走 _cool_egress_after_recheck 复测路径 "\
+        "且透传 reason：%s" % (rechecked,)
+    assert cooled == [], "借道 403 不得立即 _mark_egress_cooling 被借线：%s" % (cooled,)
+    assert touched == [], \
+        "借道 403 不得写 6h 台账（_mark_warp_ip_used 不被调用）：%s" % (touched,)
+    assert r["reason"] == "borrowed_skip", r
+
+
+def test_all_mode_borrowed_429_not_counted_as_deferred(isolated, monkeypatch):
+    """all 档 + 借道 429：延后定性的是 borrowed 语义，不算 all 档实验样本 ——
+    deferred_429 只统计原地 429，借道失败不得混入。"""
+    rechecked = []
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "all")
+    monkeypatch.setattr(daemon, "_cool_egress_after_recheck",
+                        lambda *a, **k: rechecked.append(a))
+    deferred0 = daemon._api_stats.get("deferred_429", 0)
+
+    r = daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "rate429", egress_ip="2606:b::2", borrowed=True)
+
+    assert rechecked == [("2606:b::2", "WARP-B", "rate429")], \
+        "借道 429 在 all 档同样先复测再定性：%s" % (rechecked,)
+    assert daemon._api_stats.get("deferred_429", 0) == deferred0, \
+        "borrowed 走 else 分支语义，不得计入 deferred_429"
+    assert r["reason"] == "borrowed_skip", r
 
 
 def test_api_stats_has_observation_keys():
