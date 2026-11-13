@@ -307,6 +307,19 @@ CFG = {
         "min_gap_unverified_sec": 1.0,
     },
 
+    # ===== opencode 专属闸口（kind="opencode"，业务逻辑在 asip/opencode_gate.py）=====
+    # 槽位产出委托 opencode_gate.make_slot；rotate 走 /rotate-opencode-gate
+    # 委托 opencode_gate.handle_rotate。端口基准不在这里另设：
+    # 沿用 singbox.mixed_port / clash_api 的既有避让规则继续编号
+    # （consumer_slots() 把 base_port/base_clash 传给 make_slot）。
+    "opencode_gate": {
+        "slots": 1,            # 槽位数；0 = 不产出该闸口
+        "coalesce_ms": 800,    # 合并窗：一批并发报障只换一次（与 api.coalesce_ms 同值）
+        "cooldown_sec": 300,   # 报障节点的独立冷却（不写公共冷却表）
+        # 专属账本（JSONL）。只记本闸口自己的轮换归因，绝不写公共 node_info。
+        "ledger_path": os.path.join(PROJECT_DIR, ".opencode_gate_ledger.jsonl"),
+    },
+
     "warp": {
         "selector": "opencode-out",
         "socks_host": "127.0.0.1",
@@ -1279,6 +1292,19 @@ def consumer_slots() -> list[dict]:
             "config_file": consumer_slot_config_path(str(sb.get("config_file")
                                                        or ""), n),
         })
+    # opencode 专属闸口（kind="opencode"）：槽位产出委托
+    # asip/opencode_gate.make_slot —— 模块边界红线，这里只接线不写业务逻辑。
+    # 端口/Clash 端口沿用上面同一套避让规则继续编号（slot_index 接着排），
+    # config_file 仍走 consumer_slot_config_path 命名，不自己编号。
+    # 函数内 import：config 是被 opencode_gate 延迟引用的底座，顶层互引会造环。
+    from asip import opencode_gate
+    _og = CFG.get("opencode_gate") or {}
+    try:
+        _og_n = int(_og.get("slots", 0) or 0)
+    except (TypeError, ValueError):
+        _og_n = 0
+    for _j in range(max(0, _og_n)):
+        out.append(opencode_gate.make_slot(base_port, base_clash, n + 1 + _j))
     return out
 
 

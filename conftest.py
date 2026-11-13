@@ -68,6 +68,22 @@ def _disable_warp_blocks(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _disable_opencode_gate(monkeypatch):
+    """opencode 专属闸口测试默认关：既有用例的槽位数/布局断言基线不变。
+
+    生产 config.py 里 `opencode_gate.slots = 1`（consumer_slots() 会多产出
+    一个 kind="opencode" 槽位）。既有用例（test_proxy_gate 的
+    len(slots)==7、test_slot_* 的槽位布局）按 6 WARP + 1 池闸的基线写死，
+    闸口默认开会把它们全部带偏 —— 与夜间锁/块模型同一个「生产默认开、
+    测试默认关，需要的用例自己打开」处理。需要它的用例
+    （test_opencode_gate.py）在自己的 fixture 里把 slots 设回 1。
+    """
+    og = dict(daemon.CFG.get("opencode_gate") or {})
+    og["slots"] = 0
+    monkeypatch.setitem(daemon.CFG, "opencode_gate", og)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_extra_subscriptions(tmp_path, monkeypatch):
     """追加订阅台账指向 tmp：否则 pytest 会读到生产的 `.extra_subscriptions`，
     于是「daemon 读到了哪些源」「试跑插一个源」全被真实台账污染 —— 更糟的是

@@ -981,7 +981,8 @@ def make_config(nodes: list[dict], listen_port: int = 0,
     """生成 sing-box 配置：mixed port + selector + clash API
 
     include_h2: 是否包含 hysteria2 节点（WSL2 下 utls 不兼容，默认排除）
-    default_to_pool: 第七闸口（代理池兜底闸）用 —— warp selector 的
+    default_to_pool: 池型闸口（第七闸口 kind=proxy / opencode 闸口
+      kind=opencode）用 —— warp selector 的
       default 指到池 selector 而不是某条 WARP 线。重启后 selector 复位到
       default，正好复位回「池闸」而不是某条线，这是兜底闸自愈的关键。
     """
@@ -1301,7 +1302,7 @@ if __name__ == "__main__":
                               stats_out=(args.out if i == 0 else None),
                               slot_index=i, include_lan=(i == 0),
                               default_to_pool=bool(slot.get("kind")
-                                                   == "proxy"))
+                                                   in ("proxy", "opencode")))
             write_json(out_path, cfg, mode=0o600, indent=2)
     else:
         out_path = args.out + ".tmp" if drafting else args.out

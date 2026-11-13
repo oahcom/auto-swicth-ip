@@ -58,6 +58,9 @@ from asip.clash_client import ClashClient
 from asip.egress import TRACE_URL, probe_egress
 from asip import ledger_policy
 from asip.redact import redact_secrets as _redact_secrets
+# opencode 专属闸口（kind="opencode"）：rotate 与槽位产出全部委托该模块，
+# daemon 只做 /rotate-opencode-gate 的接线与「非 WARP 线槽位」分类跳过。
+from asip import opencode_gate
 
 # WARP 渠道模型（块 = colo）与夜间锁策略。两者都是纯函数模块，import 它们不会
 # 触发任何 IO；daemon 只在这里取策略，不再自己算窗口与白名单。
@@ -3493,16 +3496,16 @@ def _lines_in_use() -> set[str]:
     a = active_warp_tag()
     if a:
         used.add(a)
-    # 第七闸口没有线台账（tag 恒 None），不把它摘出去的话 missing 恒真，
-    # 每次都退化成全槽 HTTP 兜底。
-    gate_name = (_proxy_gate_slot() or {}).get("name")
+    # 池型闸口（第七闸口 / opencode 闸口）没有线台账（tag 恒 None），不把
+    # 它们摘出去的话 missing 恒真，每次都退化成全槽 HTTP 兜底。
+    gate_names = {s["name"] for s in consumer_slots() if _is_pool_gate(s)}
     with _SLOT_STATE_LOCK:
-        hs = [h for n, h in _SLOT_HEALTH.items() if n != gate_name]
+        hs = [h for n, h in _SLOT_HEALTH.items() if n not in gate_names]
         tags = {h["tag"] for h in hs if h.get("tag")}
         missing = any(not h.get("tag") for h in hs)
     if missing:
         for s in consumer_slots():
-            if s["name"] == gate_name:
+            if s["name"] in gate_names:
                 continue
             t, _ip = _slot_current(s)
             if t:
@@ -10783,7 +10786,7 @@ def _reload_config_set(changed: list[tuple[str, str]]) -> bool:
                 CFG["singbox"]["config_file"], i)
             if final not in changed_finals:
                 continue
-            if _is_proxy_gate(slot):
+            if _is_pool_gate(slot):
                 continue  # 池闸与方二同口径：成员归池管线管，不在此重启
             drift = _slot_drift_after_reload(slot)
             _SLOT_DRIFT["checked"] += 1
@@ -12496,6 +12499,14 @@ def _is_proxy_gate(slot) -> bool:
     return bool(slot) and slot.get("kind") == "proxy"
 
 
+def _is_pool_gate(slot) -> bool:
+    """「线」是池节点而非 WARP 线的槽位：第七闸口（kind=proxy）与 opencode
+    专属闸口（kind=opencode）。daemon 的 WARP 线认领/修整/补闸/热载漂移
+    一律跳过它们 —— 给它们 claim WARP 线会把池闸变成线闸。
+    分类接线：对 kind=proxy 的既有行为零变化。"""
+    return bool(slot) and slot.get("kind") in ("proxy", "opencode")
+
+
 def _proxy_gate_slot():
     for s in consumer_slots():
         if s.get("kind") == "proxy":
@@ -12508,12 +12519,13 @@ def _pool_selector_name() -> str:
 
 
 def _proxy_gate_current(slot):
-    """第七闸口当前挂的池节点 (tag, None)。进程挂/读不到返回 (None, None)。
+    """池型闸口（第七闸口 / opencode 闸口）当前挂的池节点 (tag, None)。
+    进程挂/读不到返回 (None, None)。
 
     ip 一栏刻意为 None：池节点的出口地址由 node_info 台账按需实测，不像
     WARP 线那样有线级 ip 缓存可读；调用方拿 tag 已足够记账与展示。
     """
-    if not _is_proxy_gate(slot):
+    if not _is_pool_gate(slot):
         return None, None
     _, data = slot_singbox_api(slot, "/proxies/" + slot["pool_selector"],
                                 silent=True)
@@ -12772,9 +12784,9 @@ def assign_consumer_slots(force=False):
             used.add(tag)
     for s in slots:
         name = s["name"]
-        if _is_proxy_gate(s):
-            # 第七闸口的「线」是池节点，不参与 WARP 线认领；健康与轮换由
-            # _proxy_gate_keeper 维护。
+        if _is_pool_gate(s):
+            # 第七闸口/opencode 闸口的「线」是池节点，不参与 WARP 线认领；
+            # 健康与轮换各自维护（_proxy_gate_keeper / opencode_gate 模块）。
             continue
         if name == serving:
             continue  # 它的线在服务主出口，别动
@@ -13039,7 +13051,7 @@ def _slot_drift_maybe_heal(reason="keeper") -> None:
     serving = _slot_serving_name()
     drifted = []
     for s in consumer_slots():
-        if _is_proxy_gate(s) or s["name"] == serving:
+        if _is_pool_gate(s) or s["name"] == serving:
             continue
         if _slot_health(s["name"])["status"] not in ("bad", "unknown"):
             continue
@@ -13137,7 +13149,7 @@ def _refill_slots_from_probe(preferred=None, probed=None, reason="probe",
         active = active_warp_tag()
         need = []
         for s in consumer_slots():
-            if _is_proxy_gate(s) or s["name"] == serving:
+            if _is_pool_gate(s) or s["name"] == serving:
                 continue
             if _slot_health(s["name"])["status"] not in ("bad", "unknown"):
                 continue
@@ -13330,7 +13342,7 @@ def _slot_snapshot():
     serving = _slot_serving_name()
     out = []
     for s in consumer_slots():
-        if _is_proxy_gate(s):
+        if _is_pool_gate(s):
             # 池闸的「当前线」是它挂的池节点；9router 侧的 /slots 解析只读
             # name/port/tag/egress，多出来的 kind 是给人看的。
             tag, ip = _proxy_gate_current(s)
@@ -14325,7 +14337,10 @@ def _slot_no_usable_gate():
     slots = consumer_slots()
     if not slots:
         return False
-    statuses = [_slot_health(s["name"])["status"] for s in slots]
+    # opencode 专属闸口不参与重启信号判据：它的健康不由 daemon 维护
+    # （状态恒 unknown 会把宽限期拖满），第七闸口仍按原判据参与。
+    statuses = [_slot_health(s["name"])["status"] for s in slots
+                if s.get("kind") != "opencode"]
     grace = float(_api_cfg().get("slot_boot_grace_sec", 60))
     if time.time() - _SLOT_BOOT_TS < grace:
         if any(st == "unknown" for st in statuses):
@@ -14759,6 +14774,26 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                              name="manual-sub-refresh").start()
             self._send(200, {"ok": True, "started": True})
             return
+        if self.path == "/rotate-opencode-gate":
+            # opencode 专属闸口（契约 C1）：与 /rotate 同一 UDS、同一 token，
+            # 独立路径。业务逻辑全部在 asip/opencode_gate.py，这里只接线。
+            if not self._authed():
+                self._send(401, {"ok": False, "reason": "unauthorized"})
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n > 0 else b"{}"
+                req = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                req = {}
+            try:
+                payload = opencode_gate.handle_rotate(req)
+            except Exception as e:
+                log("✗ /rotate-opencode-gate 异常: %s" % e)
+                self._send(500, {"ok": False, "reason": "internal_error"})
+                return
+            self._send(200, payload)
+            return
         if self.path != "/rotate":
             self._send(404, {"ok": False, "reason": "not_found"})
             return
@@ -14859,7 +14894,7 @@ def _slot_keeper() -> None:
         # 第七闸口由 _proxy_gate_keeper 维护，这里的补闸/就绪判断只看常规
         # 闸口：给它 claim WARP 线会把它从池闸变成线闸。
         bad = [s for s in slots
-               if not _is_proxy_gate(s)
+               if not _is_pool_gate(s)
                and s["name"] != serving
                and _slot_health(s["name"])["status"] != "ok"]
         if not bad:
