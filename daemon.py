@@ -10661,6 +10661,31 @@ def _reload_config_set(changed: list[tuple[str, str]]) -> bool:
             ok = False
     if not slots and changed:
         ok = reload_singbox_config(path=changed[0][0])
+    # 方一（源头校验）：热载 204 ≠ selector 成员生效。校验漂移，滚动单槽
+    # 重启；serving / repairing 槽只告警不重启，绝不主动制造出口空窗
+    # （三方审查修订 #3）。重启失败不改 ok 语义：整组重启兜底是刷新路径
+    # 已有的行为，这里失败交给方二 keeper 兜底。
+    if ok:
+        for i, slot in enumerate(slots or []):
+            final = slot.get("config_file") or consumer_slot_config_path(
+                CFG["singbox"]["config_file"], i)
+            if final not in changed_finals:
+                continue
+            drift = _slot_drift_after_reload(slot)
+            _SLOT_DRIFT["checked"] += 1
+            if not drift:
+                continue
+            h = _slot_health(slot["name"])
+            if (slot["name"] == _slot_serving_name()
+                    or h["status"] == "repairing"):
+                _SLOT_DRIFT["warn_only"] += 1
+                log("⚠ %s 热载后 selector 漂移 %d 条（在役/修复中，"
+                    "只告警不重启）" % (slot["name"], len(drift)))
+                continue
+            if _restart_slot_process(slot):
+                _SLOT_DRIFT["healed"] += 1
+            else:
+                _SLOT_DRIFT["fail"] += 1
     return ok
 
 
@@ -12662,6 +12687,174 @@ def _refill_warn_config_drift(skipped: int) -> None:
         "或让订阅刷新重载配置" % skipped)
 
 
+# ============ 配置漂移自愈 ============
+# sing-box 的 `PUT /configs?force=true` 热重载不会重建 outbound：磁盘配置
+# 更新后槽位进程里的 selector 成员仍是旧的，往新线上 PUT 只会拿到
+# 400 `Selector update error: not found`（实测 2026-11-13：磁盘 7 份配置
+# 均含 147 条成员，运行时却只有 108 条，10 条新鲜 OK 线一条都塞不进）。
+# 只有整进程重启才会加载新成员。这里提供：统一判据（_slot_members_drift）、
+# 单槽进程重启（_restart_slot_process）、刷新后校验（方一，挂在
+# _reload_config_set）、keeper 兜底自愈（方二，_slot_drift_maybe_heal）。
+
+_SLOT_DRIFT = {
+    "checked": 0, "healed": 0, "warn_only": 0, "fail": 0,
+    "last_heal_ts": 0.0,
+    "skip_since": 0.0,        # skipped_not_member 首次连续出现的时刻
+    "slot_last_restart": {},  # name -> ts，每槽 10min 限速
+}
+_SLOT_DRIFT_MIN_GAP = 180.0    # 补闸连续被挡多久才值得动进程（3min）
+_SLOT_DRIFT_COOLDOWN = 900.0   # 自愈全局冷却 15min，失败指数退避
+
+
+def _slot_disk_selector_members(slot) -> set:
+    """磁盘配置里该槽 selector 声明的成员集；读不到/解析失败返回空集。"""
+    try:
+        with open(slot["config_file"]) as f:
+            cfg = json.load(f)
+        return next(
+            (set(o.get("outbounds") or []) for o in cfg["outbounds"]
+             if o.get("tag") == slot.get("selector")),
+            set())
+    except Exception:
+        return set()
+
+
+def _slot_members_drift(slot):
+    """磁盘 selector 有、运行时 all 里没有的「真实 WARP 线」集合。
+
+    运行时读不到（进程死 / Clash API 断）返回 None —— 调用方按「无法判定」
+    处理，不得当成漂移去重启进程。缺失集只保留台账里的真实线
+    （_warp_member 命中）：disk 里合法存在的休眠 tag / 占位 tag 不构成
+    漂移，避免误杀（三方审查修订 #1）。
+    """
+    rt = _slot_selector_members(slot)
+    if rt is None:
+        return None
+    missing = _slot_disk_selector_members(slot) - rt
+    return {t for t in missing if _warp_member(t)}
+
+
+def _slot_drift_after_reload(slot):
+    """热载刚返回时给 sing-box 一点加载时间：最多 3 次、每次间隔 1s。
+
+    返回值语义同 _slot_members_drift（None=无法判定，空集=无漂移）。
+    """
+    drift = None
+    for _ in range(3):
+        drift = _slot_members_drift(slot)
+        if not drift:
+            return drift
+        time.sleep(1)
+    return drift
+
+
+def _restart_slot_process(slot) -> bool:
+    """单槽 sing-box 进程重启：只有整进程重启才会重建 selector 成员。
+
+    与 restart_singbox 全套互斥（_restart_lock 非阻塞）—— 看门狗正在
+    fuser -k 全部槽位端口时绝不能拉新进程（三方审查修订 #2）。
+    拉起后验证 Clash API 就绪（≤10s），失败整体重试一次。
+    每槽 10min 限速，由 _SLOT_DRIFT["slot_last_restart"] 记账。
+    """
+    if not _restart_lock.acquire(blocking=False):
+        log("  ⚠ 漂移重启 %s：restart_singbox 持锁中，放弃本轮"
+            % slot["name"])
+        return False
+    try:
+        name = slot["name"]
+        now = time.time()
+        if now - _SLOT_DRIFT["slot_last_restart"].get(name, 0.0) < 600:
+            return False
+        _SLOT_DRIFT["slot_last_restart"][name] = now
+        log("⚠ 配置漂移自愈：重启 %s sing-box（config=%s）"
+            % (name, slot["config_file"]))
+        binp = CFG["singbox"]["binary"]
+        log_path = os.path.join(os.path.dirname(CFG["log_file"]),
+                                "singbox.log")
+        for attempt in (1, 2):
+            try:
+                subprocess.run(["fuser", "-k", "%d/tcp" % slot["port"]],
+                               capture_output=True, timeout=5)
+            except Exception:
+                pass
+            time.sleep(1.5)
+            try:
+                log_fd = os.open(log_path,
+                                 os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                                 0o600)
+                with os.fdopen(log_fd, "a") as lf:
+                    subprocess.Popen(
+                        [binp, "run", "-c", slot["config_file"]],
+                        stdout=lf, stderr=subprocess.STDOUT,
+                        start_new_session=True)
+            except Exception as e:
+                log("  ✗ %s 拉起失败: %s" % (name, e))
+                continue
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                st, _d = slot_singbox_api(slot, "/version", silent=True)
+                if st == 200:
+                    log("  ✓ %s 已重启并就绪（第 %d 次尝试）" % (name, attempt))
+                    return True
+                time.sleep(1)
+        log("  ✗ %s 重启后 Clash API 未就绪（漂移未修复，交由 keeper 兜底）"
+            % name)
+        return False
+    finally:
+        _restart_lock.release()
+
+
+def _slot_drift_maybe_heal(reason="keeper") -> None:
+    """方二兜底：补闸连续被挡 ≥3min 且台账确有 OK 候选时，对漂移的坏槽
+    做单槽进程自愈。全局冷却 15min，连续失败退避 15→30→60min。
+
+    serving 槽、池闸、repairing 槽一律不动；台账没有 OK 候选时（上游
+    额度耗尽之类）不白重启 —— 重启解决不了无线可补。
+    """
+    if not CFG["singbox"].get("slot_drift_heal", True):
+        return
+    now = time.time()
+    if _SLOT_REFILL_STATS.get("skipped_not_member"):
+        if not _SLOT_DRIFT["skip_since"]:
+            _SLOT_DRIFT["skip_since"] = now
+        pending_for = now - _SLOT_DRIFT["skip_since"]
+    else:
+        _SLOT_DRIFT["skip_since"] = 0.0
+        return
+    cooldown = _SLOT_DRIFT_COOLDOWN * (2 ** min(_SLOT_DRIFT["fail"], 2))
+    if pending_for < _SLOT_DRIFT_MIN_GAP:
+        return
+    if now - _SLOT_DRIFT["last_heal_ts"] < cooldown:
+        return
+    if not _warp_line_fresh_candidates(None, now):
+        return
+    serving = _slot_serving_name()
+    drifted = []
+    for s in consumer_slots():
+        if _is_proxy_gate(s) or s["name"] == serving:
+            continue
+        if _slot_health(s["name"])["status"] not in ("bad", "unknown"):
+            continue
+        d = _slot_members_drift(s)
+        if d:
+            drifted.append((s, d))
+    if not drifted:
+        return
+    log("⚠ 漂移自愈触发（%s）：%d 槽 selector 漂移且补闸被挡 %.0fs"
+        % (reason, len(drifted), pending_for))
+    any_ok = False
+    for s, d in drifted:
+        if _restart_slot_process(s):
+            _SLOT_DRIFT["healed"] += 1
+            any_ok = True
+        else:
+            _SLOT_DRIFT["fail"] += 1
+    _SLOT_DRIFT["last_heal_ts"] = time.time()
+    _SLOT_DRIFT["skip_since"] = 0.0
+    if any_ok:
+        _SLOT_REFILL_EVENT.set()
+
+
 def _note_probe_ok_for_refill() -> None:
     """探测/成功流量写出 OK 结论后唤醒补闸（无 IO，可在台账锁内调用）。"""
     _SLOT_REFILL_EVENT.set()
@@ -12690,6 +12883,8 @@ def _slot_refill_keeper() -> None:
                 time.sleep(gap)
             last_scan = time.time()
             _refill_slots_from_probe(reason="keeper")
+            # 方二兜底：补闸连续被挡（配置漂移）时对坏槽做单槽进程自愈。
+            _slot_drift_maybe_heal(reason="keeper")
         except Exception as e:
             log("⚠ 探测补闸线程异常: %s" % e)
             time.sleep(2)
@@ -13193,6 +13388,7 @@ def _egress_recheck_run(ip, tag, reason="transport"):
         # 复测本身炸了不能当成「线路没问题」：维持原逻辑冷却。
         _mark_egress_cooling(ip)
         log("✗ 出口 %s 复测异常（%s），按原逻辑冷却" % (ip, e))
+        _api_stats["recheck_err"] = _api_stats.get("recheck_err", 0) + 1
     finally:
         # 不摘条目：从结论落定起再算一个窗口，窗口内重复报障不再复测。
         with _EGRESS_RECHECK_LOCK:
@@ -13216,6 +13412,10 @@ def _cool_egress_after_recheck(ip, tag, reason="transport"):
     只有 2s）。所以这一步只起线程；复测期间该地址暂不冷却 —— 代价是这几秒
     内它仍可能被选给别人。
     """
+    # 这里的 _egress_cooling_sec() <= 0 直接 return（A6）意味着：
+    # egress_cooling_sec 配成 0 时，429/transport 报障将零惩罚静默放行
+    # （既不复测也不冷却）—— 整个「先复测再定性」机制建立在这一档冷却
+    # 之上，配置时不可设 0。
     if not ip or _egress_cooling_sec() <= 0:
         return
     if not tag:
@@ -13820,6 +14020,8 @@ def _api_debug_state() -> dict:
         "blocked_ips": blocked,
         "probe_stats": dict(_PROBE_STATS),
         "slot_refill": dict(_SLOT_REFILL_STATS),
+        "config_drift": {k: (dict(v) if isinstance(v, dict) else v)
+                         for k, v in _SLOT_DRIFT.items()},
         "active_ip": _ACTIVE_WARP_IP,
         "line_ip": {m["tag"]: _warp_line_ip(m["tag"])
                     for m in _warp()["members"]},
@@ -14125,14 +14327,20 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         # 必须复测），不受这个开关影响。
         _mode429 = _rate429_recheck_mode()
         if _mode429 == "all":
-            defer_verdict = reason in ("rate429", "abuse403")
+            # 只延后 rate429 的定性（F3）。abuse403 不延后：它是出口 IP 的
+            # 指纹/信誉级惩罚（blocked_guard_sec=21600 的 6h 恢复期），复测
+            # 探针一发 OK 覆盖不了这个口径 —— 若延后，CF flagged IP 在 all
+            # 档下只吃 90s 短冷却就回池，等于绕过 6h 信誉惩罚。
+            defer_verdict = reason == "rate429"
         elif _mode429 == "off":
             defer_verdict = False
         else:
             defer_verdict = borrowed
-        if defer_verdict and not borrowed and reason in ("rate429", "abuse403"):
+        if defer_verdict and not borrowed and reason == "rate429":
             # all 模式下被延后定性的原地 429：只计数，不影响下面的换线决策 ——
             # 请求已经 429 了必须换，延后的只是「判死」这一步。
+            # F3 之后 defer_verdict 只可能因 rate429 为真（abuse403 不延后），
+            # 403 不会混入这个计数。
             _api_stats["deferred_429"] += 1
 
         if cur_ip and reason == "transport":
