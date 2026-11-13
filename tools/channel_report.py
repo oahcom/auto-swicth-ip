@@ -18,6 +18,7 @@
     python3 tools/channel_report.py --html /tmp/chan.html
     python3 tools/channel_report.py --json
     python3 tools/channel_report.py --by colo        # colo / source / carrier
+    python3 tools/channel_report.py --blocked-ips    # 出口 IP 惩罚期概览
 """
 from __future__ import annotations
 
@@ -1190,6 +1191,95 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
     print(f"→ {out}（{len(rows)} 条渠道，浏览器打开）")
 
 
+def blocked_ip_summary(now: float | None = None,
+                       path: Path | None = None) -> dict:
+    """出口 IP 惩罚期概览（只读）：区分「台账标记」与「当前仍判 blocked」。
+
+    口径与 `daemon._warp_ip_is_blocked` 一致：只有 blocked=True **且**剩余
+    惩罚期 > 0 才算「生效中」。直接数 blocked=True 会把已过惩罚期、此刻正作为
+    次级优质复用的地址也算成被封 —— 实测 4.2 万条标记里约 1.6 万条是这种
+    残留，按它判断「池子还有多少能用的 IP」会严重偏保守。
+
+    这里不 import daemon（它有 import 期副作用），按同一套规则本地重算：
+      TTL  = abuse403: blocked_guard_sec / rate429: rate429_guard_sec /
+             legacy(kind 缺失): blocked_ttl_sec
+      ban_until 只在 ban_kind=="rate429" 且晚于该类起点时覆盖默认窗口
+      多类标记各算各的，解除时间取最晚
+    daemon 的判定规则若改动，本函数必须同步，否则报表又会和选线口径分家。
+    """
+    now = time.time() if now is None else float(now)
+    w = CFG["warp"]
+    ttl = {"abuse403": float(w.get("blocked_guard_sec", 21600)),
+           "rate429": float(w.get("rate429_guard_sec", 60)),
+           "legacy": float(w.get("blocked_ttl_sec", 86400))}
+    raw = _read_json(path or PROJECT / ".warp_ip_used.json") or {}
+    used = raw.get("used") if isinstance(raw, dict) and isinstance(
+        raw.get("used"), dict) else raw
+    if not isinstance(used, dict):
+        used = {}
+    out = {"now": now, "total": len(used), "marked": 0, "active": 0,
+           "expired": 0, "ban_until_active": 0,
+           "earliest_release": None, "latest_release": None,
+           "by_kind": defaultdict(int)}
+    releases: list[float] = []
+    for entry in used.values():
+        if not isinstance(entry, dict) or not entry.get("blocked"):
+            continue
+        out["marked"] += 1
+        stamps = entry.get("blocked_ts_by_kind")
+        if not isinstance(stamps, dict) or not stamps:
+            # 旧格式回退链，与 _warp_block_stamps 一致。
+            t = (entry.get("blocked_ts") or entry.get("last_ok_ts")
+                 or entry.get("ts") or 0)
+            k = entry.get("blocked_kind")
+            stamps = {(k if k in ("abuse403", "rate429") else "legacy"): float(t)}
+        ban_until = entry.get("ban_until")
+        ban_kind = entry.get("ban_kind")
+        ban_until = (float(ban_until)
+                     if isinstance(ban_until, (int, float)) and ban_kind == "rate429"
+                     else None)
+        release = now
+        for kind, start in stamps.items():
+            kind = kind if kind in ttl else "legacy"
+            start = float(start)
+            end = (ban_until if (ban_until and kind == ban_kind
+                                 and ban_until > start)
+                   else start + ttl[kind])
+            release = max(release, end)
+        out["by_kind"]["+".join(sorted(stamps))] += 1
+        if release > now:
+            out["active"] += 1
+            releases.append(release)
+            if ban_until and ban_until > now and release == ban_until:
+                out["ban_until_active"] += 1
+        else:
+            out["expired"] += 1
+    out["by_kind"] = dict(sorted(out["by_kind"].items()))
+    if releases:
+        out["earliest_release"] = min(releases)
+        out["latest_release"] = max(releases)
+    return out
+
+
+def print_blocked_ips(s: dict) -> None:
+    """终端输出：把「标记数」和「实际还封着」并排印出来。"""
+    def _ts(t):
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(t)) if t else "-"
+
+    print()
+    print(f"出口 IP 惩罚期概览（口径 _warp_ip_is_blocked，{_ts(s['now'])}）")
+    print(f"  台账 {s['total']} 条 / 带 blocked 标记 {s['marked']} 条")
+    print(f"  仍在惩罚期 {s['active']} 条"
+          f"（其中 ban_until 生效 {s['ban_until_active']} 条）")
+    print(f"  已到期、标记残留 {s['expired']} 条"
+          " —— 这些实际可复用，别按 blocked 字段数被封 IP")
+    if s["earliest_release"]:
+        print(f"  解禁：最早 {_ts(s['earliest_release'])}，"
+              f"最晚 {_ts(s['latest_release'])}")
+    if s["by_kind"]:
+        print("  按类型：" + "，".join(f"{k} {v}" for k, v in s["by_kind"].items()))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="渠道健康总览（只读）")
     ap.add_argument("--hours", type=float, default=6.0, help="统计窗口（小时）")
@@ -1197,7 +1287,18 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--by", choices=("colo", "source", "carrier"),
                     help="按维度汇总")
+    ap.add_argument("--blocked-ips", action="store_true",
+                    help="只输出出口 IP 惩罚期概览（区分标记残留与实际生效）")
     args = ap.parse_args()
+
+    if args.blocked_ips:
+        # 早退：这条路径只读 13MB 台账，不必再算渠道窗口/段/订阅源。
+        s = blocked_ip_summary()
+        if args.json:
+            print(json.dumps(s, ensure_ascii=False, indent=1))
+        else:
+            print_blocked_ips(s)
+        return 0
 
     state = (_read_json(PROJECT / ".warp_line_state.json") or {}).get("lines") or {}
     segs = channel_segments()

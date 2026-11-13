@@ -48,6 +48,9 @@ class _CountingThread:
 
 @pytest.fixture
 def env(monkeypatch):
+    # 这个文件测的是「默认生产语义」：只有 transport 走复测，429 立即定性。
+    # 不 pin 住就会被 config.py 里临时切换的实验档位带跑偏（2026-11-13 踩过）。
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "borrowed")
     monkeypatch.setattr(daemon, "log", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "consumer_slots", lambda: SLOTS)
     monkeypatch.setattr(daemon, "_slot_current",
@@ -90,12 +93,12 @@ def test_transport_with_failed_recheck_still_cools(env, monkeypatch):
 
 
 def test_rate429_keeps_immediate_cooling_without_recheck(env, monkeypatch):
-    """非超时失败不走复测：429 就是配额/限流的直接证据，原行为不变。"""
+    """borrowed 模式下原地 429 不走复测：它是配额的直接证据，立即定性。"""
     calls = []
     monkeypatch.setattr(daemon, "_cool_egress_after_recheck",
-                        lambda ip, tag: calls.append((ip, tag)))
+                        lambda *a, **k: calls.append(a))
     daemon._rotate_slot_once(SLOTS[0], "rate429", req_id="REQ-429")
-    assert not calls, "429 不该起复测"
+    assert not calls, "429 不该起复测：%s" % (calls,)
     assert daemon._egress_cooling_left("2606:a::1") > 80
 
 
@@ -103,10 +106,11 @@ def test_transport_report_goes_through_recheck_not_direct_cool(env, monkeypatch)
     """接线：transport 报障不再直接冷却，而是交给复测决策。"""
     calls = []
     monkeypatch.setattr(daemon, "_cool_egress_after_recheck",
-                        lambda ip, tag: calls.append((ip, tag)))
+                        lambda *a, **k: calls.append(a))
     monkeypatch.setattr(daemon.threading, "Thread", _CountingThread)
     daemon._rotate_slot_once(SLOTS[0], "transport", req_id="REQ-T")
-    assert calls == [("2606:a::1", "WARP-A")], calls
+    assert calls == [("2606:a::1", "WARP-A", "transport")], \
+        "复测函数必须收到原始 reason，否则日志分不清报的是 transport 还是 429：%s" % (calls,)
     assert daemon._egress_cooling_left("2606:a::1") == 0.0
 
 

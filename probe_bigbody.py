@@ -194,7 +194,7 @@ def main() -> int:
                 body = make_body(n, fill)
                 # 每档一个全新会话：体量是唯一变量，也避免小请求先把这个
                 # session 的配额吃掉、让后面的大请求被动 429。
-                sid = pw._session_id()
+                sid = pw._pick_session()
                 ts0 = time.strftime("%H:%M:%S")
                 ip0 = (pw.egress_ip(port, timeout=3.0)
                        if args.no_abort else egress)

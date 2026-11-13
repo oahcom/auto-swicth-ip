@@ -37,6 +37,86 @@ def _chans(**kw):
     return {"WARP-WG-1": base}
 
 
+def _blocked_ledger(mod, monkeypatch, tmp_path, entries, now=1_800_000_000.0):
+    """喂一份临时 IP 台账并固定 TTL，不碰生产 13MB 台账。"""
+    import json
+
+    for key, val in (("blocked_guard_sec", 21600),
+                     ("rate429_guard_sec", 60),
+                     ("blocked_ttl_sec", 86400)):
+        monkeypatch.setitem(mod.CFG["warp"], key, val)
+    p = tmp_path / "used.json"
+    p.write_text(json.dumps({"used": entries}))
+    return mod.blocked_ip_summary(now=now, path=p)
+
+
+def test_blocked_summary_separates_active_from_residual(mod, monkeypatch, tmp_path):
+    """blocked=True 不等于「还封着」：过期标记必须单独计数。"""
+    now = 1_800_000_000.0
+    s = _blocked_ledger(mod, monkeypatch, tmp_path, {
+        "ip-403": {"blocked": True,
+                   "blocked_ts_by_kind": {"abuse403": now - 3600}},
+        "ip-429-default": {"blocked": True,
+                           "blocked_ts_by_kind": {"rate429": now - 120}},
+        "ip-429-ban": {"blocked": True,
+                       "blocked_ts_by_kind": {"rate429": now - 3600},
+                       "ban_until": now + 7200, "ban_kind": "rate429"},
+        "ip-legacy": {"blocked": True, "blocked_ts": now - 3600,
+                      "blocked_kind": None},
+        "ip-clean": {"blocked": False},
+    }, now)
+    assert (s["total"], s["marked"]) == (5, 4)
+    assert s["active"] == 3, "403 / ban_until / legacy 三档都还在惩罚期"
+    assert s["expired"] == 1, "只过了 60s 默认档的 429 应算残留"
+    assert s["ban_until_active"] == 1
+    assert s["by_kind"] == {"abuse403": 1, "legacy": 1, "rate429": 2}
+    assert s["earliest_release"] == now + 7200
+    assert s["latest_release"] == now - 3600 + 86400
+
+
+def test_blocked_summary_rejects_untrusted_ban_until(mod, monkeypatch, tmp_path):
+    """ban_kind 不是 rate429 的 ban_until 与 daemon._warp_ban_until 一样不采信。"""
+    now = 1_800_000_000.0
+    s = _blocked_ledger(mod, monkeypatch, tmp_path, {
+        "no-kind": {"blocked": True,
+                    "blocked_ts_by_kind": {"rate429": now - 3600},
+                    "ban_until": now + 99999, "ban_kind": None},
+        "wrong-kind": {"blocked": True,
+                       "blocked_ts_by_kind": {"rate429": now - 3600},
+                       "ban_until": now + 99999, "ban_kind": "abuse403"},
+    }, now)
+    assert s["active"] == 0 and s["expired"] == 2
+    assert s["ban_until_active"] == 0
+
+
+def test_blocked_summary_multi_kind_takes_latest(mod, monkeypatch, tmp_path):
+    """多类惩罚并行取最晚解禁，不能被 429 的 60s 短窗口盖掉。"""
+    now = 1_800_000_000.0
+    s = _blocked_ledger(mod, monkeypatch, tmp_path, {
+        "ip": {"blocked": True, "blocked_ts_by_kind": {
+            "abuse403": now - 100,     # 6h 还剩 21500s
+            "rate429": now - 10}},     # 60s 还剩 50s
+        "expired": {"blocked": True,
+                    "blocked_ts_by_kind": {"abuse403": now - 21700}},
+    }, now)
+    assert s["active"] == 1 and s["expired"] == 1
+    assert s["latest_release"] == now - 100 + 21600
+    assert s["by_kind"] == {"abuse403": 1, "abuse403+rate429": 1}
+
+
+def test_blocked_ips_cli_prints_both_counts(mod, monkeypatch, capsys):
+    """--blocked-ips 只走早退分支，输出必须同时给出「生效」与「残留」。"""
+    monkeypatch.setattr(sys, "argv", ["channel_report.py", "--blocked-ips"])
+    monkeypatch.setattr(mod, "blocked_ip_summary", lambda: {
+        "now": 1_800_000_000.0, "total": 10, "marked": 8, "active": 3,
+        "expired": 5, "ban_until_active": 2, "earliest_release": None,
+        "latest_release": None, "by_kind": {"rate429": 8}})
+    assert mod.main() == 0
+    out = capsys.readouterr().out
+    assert "仍在惩罚期 3 条" in out
+    assert "标记残留 5 条" in out
+
+
 def test_rates_count_only_ban_verdicts_and_ok(mod, tmp_path):
     now = 1_800_000_000.0
     (tmp_path / "hist.jsonl").write_text("")

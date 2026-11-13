@@ -926,13 +926,15 @@ _WARP_REFRESH_PENDING: set[str] = set()
 #   未烧段里的**全新** /128   n=152   OK=3   (2.0%)   ← 决定性的反例
 # 段本身不是充分条件；真正判死的是那个地址自己。
 #
-# TTL 按结论的**持久性**分两档，不是按好坏分：
+# TTL 按结论的**持久性**分三档，不是按好坏分（见 _probe_ttl）：
 #   地址级持久（quota / flagged）：重探同一 /128 有 99.2% 仍 quota，30h 内只出现
-#     过 1 次恢复（间隔 56min）—— 留 6h，与生产 403 惩罚期同量级。
-#   其余（OK / unreachable / err）：OK 的重探复现率 <10s 97.9% → <1h 76.5% →
-#     ≥1h 43.2%；unreachable 与 err 更是探测侧的瞬时故障（日志实测同一地址 err
-#     后 66s 就 OK）—— 这一档只留 2min。
-# 后三个若套用长 TTL，一次探测抖动就把健康线路锁死 6h：重连已不作废台账，
+#     过 1 次恢复（间隔 56min）—— 早期按 6h 留；当前 probe_persistent_ttl_sec
+#     =600s，因为真正决定解禁的是 ban_until（Retry-After），缓存只需挡住重复探测。
+#   OK 一档（probe_ok_ttl_sec=1800）：OK 的重探复现率 <10s 97.9% → <1h 76.5%
+#     → ≥1h 43.2%；独立成档才不会每轮都重探同一地址。
+#   其余（unreachable / err / unknown）：探测侧的瞬时故障（日志实测同一地址 err
+#     后 66s 就 OK）—— 这一档只留 2min（probe_transient_ttl_sec=120）。
+# 后两档若套用长 TTL，一次探测抖动就把健康线路锁死半小时：重连已不作废台账，
 # 期间 `_warp_model_usable` 一直跳过实测返回 False，刷新守卫还会反复重启它。
 #
 # 这是「脏 IP 预检查」的探测侧采样，与 `_WARP_IP_USED` 的生产侧采样是同一个概念
@@ -975,7 +977,11 @@ _PROBE_STATS = {"hit": 0, "miss": 0, "cross_tag_reuse": 0, "expired": 0,
 def _probe_ttl(verdict: str) -> float:
     w = _warp()
     if verdict in _WARP_PROBE_PERSISTENT:
-        return float(w.get("probe_persistent_ttl_sec", 21600))
+        # 兜底与 config.probe_persistent_ttl_sec 同值（600s）。旧兜底 21600
+        # 是 6h 时代留下的：配置键一旦缺失，缓存会突然把地址锁死 6h，
+        # 且 _warp_model_usable 只在 _warp_ip_is_blocked 为真时才跳过重探，
+        # 精确解禁到期后仍可能被旧结论多压几个小时。
+        return float(w.get("probe_persistent_ttl_sec", 600))
     if verdict in _WARP_PROBE_OK:
         return float(w.get("probe_ok_ttl_sec", 1800))
     return float(w.get("probe_transient_ttl_sec", 120))
@@ -5864,6 +5870,10 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             else:
                 st["next_probe_ts"] = ts + _line_probe_cadence()
         _WARP_LINE_CV.notify_all()
+    # 探测器刚判 OK：立刻唤醒补闸，把这条游离线塞进坏闸。补闸不能在这里
+    # 同步做 —— 此处持有 _WARP_LINE_CV，而 _slot_put 要走各槽 Clash API。
+    if verdict == "OK":
+        _note_probe_ok_for_refill()
     _record_line_ip_drift(tag, old_ip, ip)
     _save_warp_line_state()
     return True
@@ -5887,6 +5897,7 @@ def _warp_line_note_ok(tag: str, ip: str, ts: float) -> None:
         st["fail_streak"] = 0
         st["next_probe_ts"] = 0
         _WARP_LINE_CV.notify_all()
+    _note_probe_ok_for_refill()
     _record_line_ip_drift(tag, old_ip, ip)
 
 
@@ -6970,9 +6981,10 @@ def _warp_block_stamps(entry: dict) -> dict[str, float]:
 
     WHY 按类型分开存：同一 IP 可能先被 403 烧、几小时后再被 429 烧，两类
     惩罚各算各的，解除时间取较晚的那个。只留一个 (kind, start) 会让后一次
-    标记覆盖前一次 —— 403 之后再烧成 429，仍按 6h 解禁，提前 18h 放回。
+    标记覆盖前一次 —— 403 之后再烧成 429，只剩 429 的 60s（或 ban_until）
+    时钟，403 那 6h 的信誉惩罚会被提前抹掉。
     旧记录只有 blocked_ts + blocked_kind：按 kind 归到对应一类，kind 缺失
-    归到 rate429（24h 保守）。
+    归到 legacy（blocked_ttl_sec 的 24h 保守档），不冒充 rate429。
     """
     stamps = entry.get("blocked_ts_by_kind")
     if isinstance(stamps, dict) and stamps:
@@ -7055,10 +7067,13 @@ def _warp_ip_is_blocked(ip: str | None, now: float | None = None) -> bool:
 
     两类拦截的恢复期不同，各自计时后取**最晚解除**的那一类：
       - abuse403：出口 IP 信誉标记，6 小时后刷新（blocked_guard_sec）；
-      - rate429：出口 IP 级限流，24 小时后刷新（rate429_guard_sec）；
+      - rate429：出口 IP 级限流，默认 60s 冷却（rate429_guard_sec）；上游给出
+        Retry-After 时由 ban_until 覆盖（钳制 1s~24h，生产缺失时兜底 12h）；
       - kind 缺失（旧记录）：按 24 小时保守处理（blocked_ttl_sec）。
     同一 IP 先 403 后 429 时两条惩罚线并行，解除时间取晚的（用户规则「按多的来」）。
     满期即视为已恢复，降级为**次级优质**地址、可以复用 —— 惩罚期结束不是永久报废。
+    注意 `blocked` 字段本身从不复位为 False：满期只是本函数返回 False，条目要等
+    _mark_warp_ip_used 的 24h cutoff（或 ban_until 到期）才会从台账整条删除。
 
     `now` 由调用方传入以便同一函数体内多次判定用同一时刻；缺省取当前时间。
     """
@@ -7482,9 +7497,10 @@ def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
                        ban_after: float | None = None) -> None:
     """记录出口 IP 的本次使用；blocked=True 表示该 IP 已被 403/429 标记。
 
-    `kind` 为 "abuse403" / "rate429"，决定惩罚期是 6h 还是 24h；缺省时
-    该条记录按 24h 保守处理。`ban_after` 是上游 429 响应给出的确切剩余秒数
-    （Retry-After），有它时替换该类型的默认惩罚期，见 `_warp_block_remaining`。
+    `kind` 为 "abuse403" / "rate429"，决定惩罚期是 6h 还是默认 60s；kind
+    缺失的旧记录按 blocked_ttl_sec 的 24h 保守档处理。`ban_after` 是上游 429
+    响应给出的确切剩余秒数（Retry-After），有它时写进 ban_until、替换该类型的
+    默认 60s，见 `_warp_block_remaining`；403 不认 Retry-After，仍走 6h。
 顺手清理已出窗口的条目（表长恒定为窗口内 IP 数）。
 
     `forget_probe=False` 供模型探测自己记账时用：那是**同一次观测**的产物，
@@ -7558,7 +7574,7 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
         eff_kind = kind if kind in ("abuse403", "rate429") else "rate429"
         # 必须在 setdefault 之前判断：否则本轮新写入的 rate429 stamp 会让
         # 「上一轮 ban_kind 已不在 stamps」永远为假，过期 ban_until 留在原地
-        # 直接盖掉新 429 的 24h 默认窗口（实测：Retry-After 到期后再烧，
+        # 直接盖掉新 429 的默认窗口（实测：Retry-After 到期后再烧，
         # `_warp_ip_is_blocked` 立刻返回 False）。
         if prev_ban_kind is not None and prev_ban_kind not in stamps:
             entry["ban_until"] = None
@@ -9047,7 +9063,8 @@ def reconnect_warp(reason: str, interrupt: bool = True) -> bool:
 
     # 选线四级优先：
     #   1) 从未用过的地址 —— 必然没被 opencode 见过，优先级最高；
-    #   2) 次级优质：真撑过生产流量、且已过对应惩罚期的地址（403 6h / 429 24h），
+    #   2) 次级优质：真撑过生产流量、且已过对应惩罚期的地址（403 6h / 429 默认
+    #      60s，解析到 Retry-After 则以 ban_until 为准），
     #      可复用，不是废址；档内按距上次成功的时长排先后；
     #   3) 探针验过但一次生产流量都没撑过 —— 此刻能服务，只是还没轮到它上场；
     #   4) 都不满足时兜底复用最久未用的（见下面 elif probes 分支）。
@@ -12131,7 +12148,8 @@ _API_TOKEN = ""
 _last_rotate_ts: float = 0.0
 _api_stats = {"calls": 0, "switched": 0, "coalesced": 0, "retired": 0,
               "too_frequent": 0, "no_standby": 0, "failed": 0, "line_ok": 0,
-              "divergence": 0, "borrowed": 0}
+              "divergence": 0, "borrowed": 0, "stale_ok_pick": 0,
+              "deferred_429": 0, "recheck_ok": 0, "recheck_bad": 0}
 
 # 换线前实测台账：tag|ip -> 结论。9router 一次 429 风暴会连着打几十个 /rotate，
 # 每个都实测会把换线拖到几分钟，而同一地址同一时刻的结论不会变。
@@ -12604,6 +12622,132 @@ def _channel_verdict_snapshot(tag: str, ip: str | None) -> dict:
             "cached": True, "source": "channel"}
 
 
+# ── 探测驱动的补闸 ──────────────────────────────────────────────────────
+# 旧实现把「探测到 OK 的游离线 → 塞进坏闸」挂在 _probe_line_for_slots(tag)
+# 的副作用里。但它的全部生产调用点（assign_consumer_slots / _repair_slot_impl
+# / _slot_keeper）传进来的都是刚被 _slot_claim PUT 进槽的线，holder 恒不为
+# None，补闸分支结构上不可达。2026-11-13 实测：生产日志「探测补闸」0 次、
+# 六个槽全 bad（no_candidate），同时 /debug/state 里有 10 条新鲜 OK 的游离
+# 线 —— 探测器一直在出 OK，就是没人把它们塞回槽位。
+#
+# 现在补闸由探测台账直接驱动：探测器写 OK 结论时 _note_probe_ok_for_refill()
+# 唤醒常驻 keeper，keeper 读 _warp_line_fresh_candidates 把游离 OK 线回填。
+_SLOT_REFILL_EVENT = threading.Event()
+_SLOT_REFILL_LOCK = threading.Lock()
+_SLOT_REFILL_STATS = {"rounds": 0, "filled": 0, "last_ts": 0.0}
+
+
+def _note_probe_ok_for_refill() -> None:
+    """探测/成功流量写出 OK 结论后唤醒补闸（无 IO，可在台账锁内调用）。"""
+    _SLOT_REFILL_EVENT.set()
+
+
+def _slot_refill_scan_sec() -> float:
+    try:
+        return max(2.0, float(CFG["intervals"].get("slot_refill_scan_sec", 15)))
+    except (TypeError, ValueError, KeyError):
+        return 15.0
+
+
+def _slot_refill_keeper() -> None:
+    """常驻：OK 结论一到就补闸；另有周期兜底扫描，防止唤醒丢失。"""
+    min_gap = 3.0
+    last_scan = 0.0
+    while True:
+        try:
+            _SLOT_REFILL_EVENT.wait(timeout=_slot_refill_scan_sec())
+            _SLOT_REFILL_EVENT.clear()
+            # 探测风暴时 Event 会被连续 set：补闸要读 7 个槽的 selector，
+            # 不做最小间隔会把 Clash API 打满，且反复抢 _SLOT_PICK_LOCK
+            # 反而拖慢错误切换。
+            gap = min_gap - (time.time() - last_scan)
+            if gap > 0:
+                time.sleep(gap)
+            last_scan = time.time()
+            _refill_slots_from_probe(reason="keeper")
+        except Exception as e:
+            log("⚠ 探测补闸线程异常: %s" % e)
+            time.sleep(2)
+
+
+def _refill_slots_from_probe(preferred=None, probed=None, reason="probe",
+                             now=None):
+    """把「新鲜 OK 且没被任何闸口占用」的线回填到坏闸 / 未知闸。
+
+    只读探测台账，不额外发探测请求：候选来自 _warp_line_fresh_candidates
+    （已要求当前地址有新鲜 OK、未 blocked、不在 refreshing）。
+    preferred=(tag, ip) 用于 _probe_line_for_slots 刚实测到的游离线，让它
+    优先入闸，其余候选照常补齐其它坏闸。
+    与 _slot_claim 共用 _SLOT_PICK_LOCK，锁内重查占用，避免和错误切换抢线。
+    """
+    now = now or time.time()
+    if not _SLOT_REFILL_LOCK.acquire(blocking=False):
+        return []
+    try:
+        _SLOT_REFILL_STATS["rounds"] += 1
+        _SLOT_REFILL_STATS["last_ts"] = now
+        pairs = []
+        confirmed = set()
+        if preferred and preferred[0]:
+            pairs.append(({"tag": preferred[0]}, preferred[1]))
+            if isinstance(probed, dict) and probed.get("verdict") == "OK":
+                confirmed.add(preferred[0])
+        try:
+            pairs.extend(_warp_line_fresh_candidates(None, now))
+        except Exception as e:
+            log("⚠ 探测补闸读候选失败: %s" % e)
+        cands, seen = [], set()
+        for m, ip in pairs:
+            tag = (m or {}).get("tag")
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            cands.append((tag, ip))
+        if not cands:
+            return []
+        serving = _slot_serving_name()
+        active = active_warp_tag()
+        need = []
+        for s in consumer_slots():
+            if _is_proxy_gate(s) or s["name"] == serving:
+                continue
+            if _slot_health(s["name"])["status"] not in ("bad", "unknown"):
+                continue
+            need.append(s)
+        if not need:
+            return []
+        filled = []
+        with _SLOT_PICK_LOCK:
+            # 同一临界区内读一次占用表即可：其它 claim/put 共用这把锁，
+            # 期间不会有第三方改 selector；自己 PUT 进去的 tag 随手补进集合。
+            occupied = _slot_peers()
+            for s in need:
+                name = s["name"]
+                if _slot_health(name)["status"] not in ("bad", "unknown"):
+                    continue
+                for tag, ip in cands:
+                    if tag == active or tag in occupied:
+                        continue
+                    if ip and _warp_ip_is_blocked(ip, now):
+                        continue
+                    snap = probed if tag in confirmed else _channel_verdict_snapshot(tag, ip)
+                    if (snap or {}).get("verdict") != "OK":
+                        continue
+                    if not _slot_put(s, tag):
+                        continue
+                    _slot_mark(name, "ok", "OK")
+                    _slot_note_probe(name, snap)
+                    occupied.add(tag)
+                    filled.append((tag, name))
+                    _SLOT_REFILL_STATS["filled"] += 1
+                    log("＋ 探测补闸：%s → %s（出口=%s，%s）"
+                        % (tag, name, ip or "未知", reason))
+                    break
+        return filled
+    finally:
+        _SLOT_REFILL_LOCK.release()
+
+
 def _probe_line_for_slots(tag, ip, fresh=False):
     """探测一条线，并把 OK 的结论用于补坏闸 / 同步闸状态。
 
@@ -12637,28 +12781,12 @@ def _probe_line_for_slots(tag, ip, fresh=False):
             want = "ok" if verdict == "OK" else "bad"
             if h["status"] != want:
                 _slot_mark(holder["name"], want, verdict)
-    # 补闸：OK、不在任何闸内、不是主出口 → 塞进一个坏闸
+    # 补闸：OK 且是游离线 → 交给补闸器把这条线（连同台账里其它新鲜 OK 的
+    # 游离线）回填坏闸。旧写法在这里只内联塞一条，但生产调用点传的都是刚
+    # claim 进槽的线，holder 恒不为空，分支从未触发过。
     if verdict == "OK" and holder is None and tag != active_warp_tag():
-        for s in consumer_slots():
-            if _is_proxy_gate(s):
-                continue  # 池闸不收 WARP 线：塞了线它就不再是纯池闸
-            if s["name"] == serving:
-                continue
-            if _slot_health(s["name"])["status"] != "bad":
-                continue
-            with _SLOT_PICK_LOCK:
-                # 锁内重查：这条线可能刚被别的闸口拿走，也可能主出口正在用。
-                busy = tag == active_warp_tag() or any(
-                    (_slot_current(x)[0] == tag)
-                    for x in consumer_slots() if x["name"] != s["name"])
-                if busy:
-                    break
-                if not _slot_put(s, tag):
-                    continue
-            _slot_mark(s["name"], "ok", "OK")
-            _slot_note_probe(s["name"], probed)
-            log("＋ 探测补闸：%s → %s" % (tag, s["name"]))
-            break
+        _refill_slots_from_probe(preferred=(tag, ip), probed=probed,
+                                 reason="probe_line")
     return probed
 
 
@@ -13005,7 +13133,7 @@ _EGRESS_RECHECK: dict[str, float] = {}
 _EGRESS_RECHECK_LOCK = threading.Lock()
 
 
-def _egress_recheck_run(ip, tag):
+def _egress_recheck_run(ip, tag, reason="transport"):
     """对报障出口真打一次探针，只有真不通才冷却。
 
     WHY 必须复测：固定小 payload 的探针代表不了真实流量（本段注释里那条
@@ -13018,12 +13146,16 @@ def _egress_recheck_run(ip, tag):
         probed = _probe_line_before_rotate(tag, ip, fresh=True)
         verdict = (probed or {}).get("verdict")
         if verdict == "OK":
-            log("· 出口 %s 报 transport 但复测 OK（%ss），不打冷却"
-                % (ip, (probed or {}).get("sec", "?")))
+            # reason 写进日志：同一个出口既可能因 transport 进这里，也可能因
+            # rate429（all 模式）进这里，事后要靠它分开两类样本。
+            log("· 出口 %s 报 %s 但复测 OK（%ss），不打冷却"
+                % (ip, reason, (probed or {}).get("sec", "?")))
+            _api_stats["recheck_ok"] = _api_stats.get("recheck_ok", 0) + 1
             return
         _mark_egress_cooling(ip)
-        log("· 出口 %s 报 transport 且复测 %s，按原逻辑冷却 %.0fs"
-            % (ip, verdict or "无结论", _egress_cooling_sec()))
+        log("· 出口 %s 报 %s 且复测 %s，按原逻辑冷却 %.0fs"
+            % (ip, reason, verdict or "无结论", _egress_cooling_sec()))
+        _api_stats["recheck_bad"] = _api_stats.get("recheck_bad", 0) + 1
     except Exception as e:
         # 复测本身炸了不能当成「线路没问题」：维持原逻辑冷却。
         _mark_egress_cooling(ip)
@@ -13034,7 +13166,17 @@ def _egress_recheck_run(ip, tag):
             _EGRESS_RECHECK[ip] = time.time()
 
 
-def _cool_egress_after_recheck(ip, tag):
+def _rate429_recheck_mode() -> str:
+    """生产侧 429 的定性方式，见 config.rate429_recheck_mode。
+
+    取值非法时退回 "borrowed"（当前生产行为）：打错一个字不该把借道保护关掉，
+    那是目前唯一验证过有效的改动。
+    """
+    v = str(_warp().get("rate429_recheck_mode", "borrowed") or "").strip().lower()
+    return v if v in ("off", "borrowed", "all") else "borrowed"
+
+
+def _cool_egress_after_recheck(ip, tag, reason="transport"):
     """transport 类失败：先复测再决定冷却，不阻塞 HTTP 线程。
 
     复测要 4~12s，不能在 _API_LOCK 内同步跑（9router 的 ASIP_TIMEOUT_MS
@@ -13059,7 +13201,7 @@ def _cool_egress_after_recheck(ip, tag):
             log("· 出口 %s 复测窗口内已探过，重复报障不再起线程" % ip)
             return
         _EGRESS_RECHECK[ip] = now
-    threading.Thread(target=_egress_recheck_run, args=(ip, tag),
+    threading.Thread(target=_egress_recheck_run, args=(ip, tag, reason),
                      daemon=True, name="egress-recheck").start()
 
 
@@ -13129,6 +13271,27 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
     # 候选仍按游标轮换 —— 不会永远压同一个槽位。
     candidates.sort(key=lambda c: _slot_pick_key(c[0], c[1], c[2], t0, serving))
     chosen = candidates[0]
+    # 只观测，不改选择：这台备槽的「OK 证明」有多旧、以及它在证明之后有没有
+    # 被当过出口。被切过去就是在服务真实流量，额度在消耗，而探针下一轮可能
+    # 还没到 —— 这段窗口里台账上的 OK 已经是事实上的过期结论。
+    # 不直接收紧选择条件，是因为没有任何数据说明窗口该多宽；先量出来。
+    # 注意不能调 _probe_cache_lookup：它会 +_PROBE_STATS["hit"]，污染探测命中率。
+    try:
+        _c_tag, _c_ip = chosen[1], chosen[2]
+        if _c_ip:
+            with _WARP_REFRESH_LOCK:
+                _raw = _WARP_PROBE_SEEN.get((_c_tag, _c_ip))
+            if _raw and _raw[0] in _WARP_PROBE_OK:
+                _ok_ts = float(_raw[1])
+                _used_ts = _warp_ip_last_ts(_c_ip)
+                if _used_ts and _used_ts > _ok_ts:
+                    _api_stats["stale_ok_pick"] = (
+                        _api_stats.get("stale_ok_pick", 0) + 1)
+                    log("· 选槽 %s 出口=%s 的 OK 证明（%.0fs 前）早于它上次被切"
+                        "（%.0fs 前），期间未复验"
+                        % (chosen[0]["name"], _c_ip, t0 - _ok_ts, t0 - _used_ts))
+    except Exception as _e:
+        log("· 选槽证据年龄观测失败（不影响选择）：%s" % _e)
     if len(candidates) > 1:
         def _brief(c):
             rank = _warp_ip_rank(c[2], t0, _warp_guard_for_reason("rate429"))
@@ -13623,6 +13786,7 @@ def _api_debug_state() -> dict:
         "fresh_candidates": cands,
         "blocked_ips": blocked,
         "probe_stats": dict(_PROBE_STATS),
+        "slot_refill": dict(_SLOT_REFILL_STATS),
         "active_ip": _ACTIVE_WARP_IP,
         "line_ip": {m["tag"]: _warp_line_ip(m["tag"])
                     for m in _warp()["members"]},
@@ -13920,19 +14084,37 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         # 唯一例外是 transport：它同时覆盖「线路真断」和「大 body 首字节慢」，
         # 后者探针复测就是好的，直接冷却会把六条闸一条条抽干。这类先异步复测
         # 一次再决定（见 _cool_egress_after_recheck）。
+        # rate429 是否「先复测再定性」：
+        #   borrowed 模式只为借道开 —— 借道那一发不是本槽发起的，证据从来不足；
+        #   all 模式对所有 429 开 —— 用来实测「原地 429 里有多少是假 429」；
+        #   off 模式全关 —— P0-1 之前的旧行为，仅作回退开关。
+        # transport 单独走（它同时覆盖「线路真断」和「大 body 首字节慢」，本来就
+        # 必须复测），不受这个开关影响。
+        _mode429 = _rate429_recheck_mode()
+        if _mode429 == "all":
+            defer_verdict = reason in ("rate429", "abuse403")
+        elif _mode429 == "off":
+            defer_verdict = False
+        else:
+            defer_verdict = borrowed
+        if defer_verdict and not borrowed and reason in ("rate429", "abuse403"):
+            # all 模式下被延后定性的原地 429：只计数，不影响下面的换线决策 ——
+            # 请求已经 429 了必须换，延后的只是「判死」这一步。
+            _api_stats["deferred_429"] += 1
+
         if cur_ip and reason == "transport":
-            _cool_egress_after_recheck(cur_ip, cur_tag)
+            _cool_egress_after_recheck(cur_ip, cur_tag, reason)
         elif cur_ip and reason in ("rate429", "abuse403"):
-            if borrowed:
+            if defer_verdict:
                 # 借道（9router 把别的线的请求改投到本端口）失败：这一发不是
                 # 本槽发起的，body/session 全是原线的，单发 429 不足以证明本槽
                 # 出口额度耗尽。与 transport 同规格：先复测，复测仍 quota 才
                 # 冷却，且**不写 24h 标脏**（_egress_recheck_run 只打短冷却）。
-                _cool_egress_after_recheck(cur_ip, cur_tag)
+                _cool_egress_after_recheck(cur_ip, cur_tag, reason)
             else:
                 _mark_egress_cooling(cur_ip, t0)
         if (reason not in ("proactive", "transport") and cur_ip
-                and not borrowed):
+                and not defer_verdict):
             _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason,
                                ban_after=ban_after)
             # 只观测：标脏后台账里还剩什么，留在 ⇢ 那一行做运行时证据。
@@ -14204,7 +14386,13 @@ def _slot_keeper() -> None:
         if not bad:
             log("✓ 所有槽位就绪")
             return
+        # 启动期补闸的主力：先把探测器已判 OK 的游离线回填坏闸。
+        # 旧写法只靠 _probe_line_for_slots(pick, ip) 的副作用，可 pick 是刚
+        # claim 进槽的线、holder 恒不为空，那个分支一次都没触发过。
+        _refill_slots_from_probe(reason="startup")
         for s in bad:
+            if _slot_health(s["name"])["status"] == "ok":
+                continue
             pick, ip = _slot_claim(s)
             if not pick:
                 continue
@@ -14806,6 +14994,11 @@ def main():
     if consumer_slots():
         threading.Thread(target=_slot_keeper, daemon=True,
                          name="slot-keeper").start()
+        # 探测驱动的常驻补闸：探测器写出 OK 结论就立刻把游离线回填坏闸。
+        # _slot_keeper 只在启动期跑 60 轮就退出，之后六个槽没人主动补 ——
+        # 实测 2026-11-13 六槽全 bad，而台账里同时有 10 条新鲜 OK 游离线。
+        threading.Thread(target=_slot_refill_keeper, daemon=True,
+                         name="slot-refill").start()
 
     # 第七闸口（代理池兜底）：与常规槽位 keeper 并行的独立维护线程 ——
     # 常规 keeper 只管 WARP 线，池闸的健康与池内轮换都归它。

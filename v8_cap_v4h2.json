@@ -1,14 +1,14 @@
 {
  "mode": "v4h2",
  "entry": "v4",
- "ip": "2a09:bac5:1ef9:78::c:3c1",
+ "ip": "2a09:bac5:1efc:1846::26b:7",
  "ok": 0,
  "trans": 0,
  "death": {
   "verdict": "quota",
   "head": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Free usage limit reached. Free mode",
-  "ra": 28215
+  "ra": 69033
  },
- "dur_sec": 6.3,
- "ip_end": "2a09:bac5:1ef9:78::c:3c1"
+ "dur_sec": 6.9,
+ "ip_end": "2a09:bac5:1efc:1846::26b:7"
 }

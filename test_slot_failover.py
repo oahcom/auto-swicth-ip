@@ -33,6 +33,9 @@ class _NoopThread:
 
 @pytest.fixture
 def isolated(monkeypatch):
+    # 固定默认档位，避免测试随 config.py 的生产实验值漂移。
+    # 需要测 all / off 的用例自己在函数内 setitem 覆盖（monkeypatch 后设先生效）。
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "borrowed")
     monkeypatch.setattr(daemon.threading, "Thread", _NoopThread)
     monkeypatch.setattr(daemon, "consumer_slots", lambda: SLOTS)
 
@@ -665,3 +668,131 @@ def test_pick_same_key_still_rotates(isolated, monkeypatch):
         s, _tag, _ip = daemon._pick_healthy_slot("slot-1")
         picked.add(s["name"])
     assert len(picked) >= 2, "同分候选应轮换：%s" % picked
+
+
+# ===== 借道（borrowed）语义 =====
+#
+# 四个必须一起防的失效模式（来自 2026-11-13 生产取证）：
+#   错误归因   —— 借道请求的失败记在被借线头上，而不是请求来源
+#   状态污染   —— 一次借道失败就 _mark_warp_ip_used + _probe_cache_forget
+#                 + _warp_line_invalidate，把健康线打进脏名单
+#   标准不一致 —— 同一错误码，探针侧要换 session 复测，生产侧零复测
+#   不可观测   —— 重试请求是克隆，B 侧无法识别；日志里 A 消失
+# 下面两条用例分别锁住「不归因到 B」和「原地 429 仍然归因」。
+
+
+def test_borrowed_429_does_not_dirty_lended_line(isolated, monkeypatch):
+    """借道重试的 429：不标脏、不冷却被借线、不换它的线，但仍给出下一个备槽。"""
+    touched = []
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, **kw: touched.append(("dirty", ip, kw)))
+    monkeypatch.setattr(daemon, "_mark_egress_cooling",
+                        lambda ip, ts=None: touched.append(("cool", ip, ts)))
+
+    r = daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "rate429", egress_ip="2606:b::2", borrowed=True)
+
+    assert r["reason"] == "borrowed_skip", r
+    assert touched == [], "借道失败不得给被借线标脏/冷却：%s" % (touched,)
+    assert not any(name == "slot-2" for name, _ in isolated.puts), \
+        "不得换掉被借线的线（它没坏）：%s" % (isolated.puts,)
+    assert daemon._slot_health("slot-2")["status"] == "ok", \
+        "被借线状态必须保持 ok"
+    assert r["switch_to_url"], "仍要给出下一个健康备槽，让请求继续递下去"
+
+
+def test_direct_429_still_dirties_own_line(isolated, monkeypatch):
+    """原地 429（非借道）仍然按原逻辑标脏并换线 —— 回归保护。"""
+    touched = []
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, **kw: touched.append(ip))
+
+    r = daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "rate429", egress_ip="2606:b::2")
+
+    assert touched == ["2606:b::2"], "原地 429 必须标脏本线：%s" % (touched,)
+    assert r["reason"] in ("ok", "coalesced", "too_frequent"), r
+
+
+# ===== rate429 定性开关（config.rate429_recheck_mode）=====
+#
+# 三档语义，下面四条用例分别锁住：
+#   borrowed —— 只借道复测（默认，当前生产）
+#   all      —— 所有 429 都先复测再判死（用来实测「原地 429 有多少是假 429」）
+#   off      —— 全关，回到 P0-1 之前（kill switch）
+# 关键约束：all 只延后「判死」，**不延后换线** —— 请求已经 429 了必须换，
+# 否则它只能原地重试死端口。
+
+
+def test_rate429_recheck_mode_defaults_to_borrowed(monkeypatch):
+    monkeypatch.delitem(daemon.CFG["warp"], "rate429_recheck_mode", raising=False)
+    assert daemon._rate429_recheck_mode() == "borrowed"
+
+
+def test_rate429_recheck_mode_rejects_junk(monkeypatch):
+    """写错一个字不能让借道保护静默消失 —— 它是目前唯一验证过有效的改动。"""
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "al")
+    assert daemon._rate429_recheck_mode() == "borrowed"
+
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", " ALL ")
+    assert daemon._rate429_recheck_mode() == "all", "大小写/空格不该让配置失效"
+
+
+def test_all_mode_defers_own_429_verdict(isolated, monkeypatch):
+    """all 模式：原地 429 不写 24h 标脏、改走异步复测，但换线照旧。"""
+    touched = []
+    rechecked = []
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "all")
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, **kw: touched.append(ip))
+    monkeypatch.setattr(daemon, "_cool_egress_after_recheck",
+                        lambda *a, **k: rechecked.append(a))
+
+    r = daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "rate429", egress_ip="2606:b::2")
+
+    assert touched == [], "all 模式不得直接标脏这条线：%s" % (touched,)
+    assert rechecked == [("2606:b::2", "WARP-B", "rate429")], \
+        "all 模式必须转异步复测且带对 reason：%s" % (rechecked,)
+    assert r["reason"] in ("ok", "coalesced", "too_frequent"), \
+        "延后的只是判死，换线必须照常：%s" % (r,)
+    assert daemon._api_stats.get("deferred_429", 0) >= 1
+
+
+def test_borrowed_mode_still_dirties_own_429(isolated, monkeypatch):
+    """默认（borrowed）模式下，原地 429 行为不变 —— 回归保护。"""
+    touched = []
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "borrowed")
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, **kw: touched.append(ip))
+
+    daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "rate429", egress_ip="2606:b::2")
+
+    assert touched == ["2606:b::2"]
+
+
+def test_off_mode_is_a_full_rollback(isolated, monkeypatch):
+    """off 是 kill switch：连借道失败也重新标脏被借线（P0-1 之前的行为）。"""
+    touched = []
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_recheck_mode", "off")
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda ip, now, **kw: touched.append(ip))
+    monkeypatch.setattr(daemon, "_mark_egress_cooling", lambda ip, ts=None: None)
+
+    daemon._rotate_slot_once(
+        {"name": "slot-2", "selector": "opencode-out-2", "port": 7892},
+        "rate429", egress_ip="2606:b::2", borrowed=True)
+
+    assert touched == ["2606:b::2"], \
+        "off 模式下借道也必须标脏 —— 否则这个开关回退不掉 P0-1"
+
+
+def test_api_stats_has_observation_keys():
+    """P0-4 是纯观测：这些键必须存在，否则 /debug/state 上读不到数据。"""
+    for k in ("stale_ok_pick", "deferred_429"):
+        assert k in daemon._api_stats, "缺少观测键 %s" % k
