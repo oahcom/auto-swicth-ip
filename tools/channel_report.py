@@ -666,7 +666,10 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             # 这条线在不在 daemon 的探测名单。判定用两个源的并集：声明
             # （members）与渲染产物（sing-box outbound）。只用 members 会
             # 在环境变量缺失时把全部 WG 线误判成「不在名单」。
-            "in_members": tag in online_tags,
+            # 有探测数据(ban_probes/last_probe_ts)的线也算在名单——
+            # 有过探测历史 = daemon 知道它、探过它，只是当前渲染台账没覆盖。
+            # 「不在探测名单」只给从来没探过、也不在任何清单里的线(2026-11-15)。
+            "in_members": tag in online_tags or bool(st.get("last_probe_ts") or st.get("ban_probes")),
             # 报表的基准时刻。窗口外的样本由它裁掉，冻结时长也按它算 ——
             # 用 `time.time()` 自己取会与窗口口径不一致。
             "now": now,
@@ -953,9 +956,10 @@ def _probe_age(ts: float, now: float | None = None) -> str:
 def _no_sample_reason(r: dict) -> str:
     """「无样本」的成因标签。四种故障长得一模一样，处置完全不同。
 
-    - `不在探测名单` —— 线根本不在 daemon 的 `members` 里，daemon 不会去
-      探它；状态会永远冻在最后一次观测上。这是**配置问题**。
+    - `不在探测名单` —— 线不在 daemon 的 `members` 里且从未被探过。
+      有 `ban_probes` 或 `last_probe_ts` 的线**不算**「不在探测名单」。
     - `从未探测` —— 在名单里，但从来没探到过（单元没装/没跑/档位停用）。
+    - `窗口外样本` —— 被探过且入过账，只是样本在当前时间窗口之外。
     - `惩罚期短路` —— **探过**，拿到地址后发现该地址在台账惩罚期，在模型层
       实测之前就返回了，所以没有判据样本。这是正常的换址逻辑，不是故障。
     - `探测未入账` —— 探过、判了结论，但结论没进 `ban_probes`。这是**入账
@@ -964,17 +968,20 @@ def _no_sample_reason(r: dict) -> str:
     """
     last_probe = float(r.get("last_probe_ts") or 0)
     now = r.get("now")
+    _has_ban = bool((r.get("ip_svc") or {}).get("max"))
     if not last_probe:
         if not r.get("in_members", True):
+            if _has_ban:
+                return "窗口外样本"
             return "不在探测名单"
-        return "单元停用"
+        return "从未探测"
     n = int(r.get("blocked_notes") or 0)
     if n > 0:
         return "quota（惩罚期短路）"
     if r.get("no_addr_since"):
         return "隧道中断"
-    if not r.get("in_members", True):
-        return "不在探测名单"
+    if _has_ban:
+        return "窗口外样本"
     return "探测未入账"
 
 
@@ -1203,7 +1210,7 @@ def _display_state(r: dict, slot_health: dict, latency_map: dict, tunnel_latency
         _v = r['last_verdict']
         if _v == "blocked":
             _ban = float(r.get('quota_until', 0) or 0)
-            _v = "OK" if _ban <= time.time() else "quota"
+            _v = "待验" if _ban <= time.time() else "quota"
         if _v not in ("OK", "quota", "flagged"):
             _v = "待验" if _v in ("unknown", "") else _v
         pri = 0 if _v == "OK" else (1 if _v in ("quota", "flagged") else 2)
@@ -1216,9 +1223,11 @@ def _display_state(r: dict, slot_health: dict, latency_map: dict, tunnel_latency
         _v = r['last_verdict']
         if _v == "blocked":
             _ban = float(r.get('quota_until', 0) or 0)
-            _v = "OK" if _ban <= time.time() else "quota"
+            _v = "待验" if _ban <= time.time() else "quota"
         pri = 0 if _v == "OK" else (1 if _v in ("quota", "flagged") else 2)
         return (_v, pri)
+    if r.get("in_members", True) or r.get("last_probe_ts"):
+        return ("无样本", 2)
     return ("不在探测名单", 3)
 
 
@@ -1286,7 +1295,7 @@ def print_table(rows: list[dict], hours: float) -> None:
             _v = r['last_verdict']
             if _v == "blocked":
                 _ban_until = float(r.get('quota_until', 0) or 0)
-                _v = "OK" if _ban_until <= time.time() else "quota"
+                _v = "待验" if _ban_until <= time.time() else "quota"
             # 红线：非探针实测 OK 不显示 OK（slot ok 不等于探测 OK）
             if _v not in ("OK", "quota", "flagged"):
                 _v = "待验" if _v in ("unknown", "") else _v
@@ -1320,7 +1329,7 @@ def print_table(rows: list[dict], hours: float) -> None:
                     _v = r['last_verdict']
                     if _v == "blocked":
                         _ban_until = float(r.get('quota_until', 0) or 0)
-                        _v = "OK" if _ban_until <= time.time() else "quota"
+                        _v = "待验" if _ban_until <= time.time() else "quota"
                     _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
                     _probe_age_min = (time.time() - float(r.get("last_probe_ts") or 0)) / 60
                     _stale = r["verdict_stale"] or _probe_age_min > 30
@@ -1334,19 +1343,13 @@ def print_table(rows: list[dict], hours: float) -> None:
                     _v = r['last_verdict']
                     if _v == "blocked":
                         _ban_until = float(r.get('quota_until', 0) or 0)
-                        _v = "OK" if _ban_until <= time.time() else "quota"
+                        _v = "待验" if _ban_until <= time.time() else "quota"
                     _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
                     _probe_age_min = (time.time() - float(r.get("last_probe_ts") or 0)) / 60
                     _stale = r["verdict_stale"] or _probe_age_min > 30
                     state = f"{_v}（旧地址·{_ts}判）" if _stale else f"{_v}（{_ts}判）"
-            elif r.get("in_members", True):
-                # 从未探测 -> 拆到具体原因
-                if not r.get("unit_ok", True):
-                    state = "单元停用"
-                elif r.get("no_addr_since"):
-                    state = "隧道中断"
-                else:
-                    state = "不在探测名单"
+            elif r.get("in_members", True) or r.get("last_probe_ts"):
+                state = _no_sample_reason(r)
             else:
                 state = "不在探测名单"
         okfail = f"{r['ok']}/{r['ban'] + r['err']}"
@@ -1532,6 +1535,10 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
             # 「无样本」进一步拆成三种成因（见 `_no_sample_reason`）。
             txt = (r["last_verdict"] if r["samples"]
                    else _no_sample_reason(r))
+            # 红线：blocked 解禁后不是 OK，是「待验」（2026-11-15）。
+            if txt == "blocked":
+                _ban = float(r.get('quota_until', 0) or 0)
+                txt = "待验" if _ban <= time.time() else "quota"
             pills.append(f'<span class="pill">'
                          f'{html.escape(txt)}'
                          f'</span>')
