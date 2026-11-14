@@ -80,6 +80,15 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 ## 文档索引（按用途）
 
+### opencode 独立闸口需求（2026-11，需求归档）
+
+| 文档 | 内容 |
+|---|---|
+| **[opencode需求全链归档-20261114.md](opencode需求全链归档-20261114.md)** | **整个 opencode 需求（7 大块）唯一入口**：全链总览 + 文档落位表 + 已知限制汇总 |
+| [opencode独立asip闸口-论证体计划书.md](opencode独立asip闸口-论证体计划书.md) | slot-8 专属闸口 + 原生直连 dsv4.1-flash-free + 429 换 IP 的论证体计划 |
+| [opencode独立asip闸口-派工契约与提示词.md](opencode独立asip闸口-派工契约与提示词.md) | `POST /rotate-opencode-gate` 冻结契约（C1–C7）与派工提示词 |
+| [opencode独立asip闸口-六维度终审裁决.md](opencode独立asip闸口-六维度终审裁决.md) | 4 提交改动清单、四条红线实证、L1–L8 已知限制、部署记录 |
+
 ### 要理解"为什么这么设计"
 
 | 文档 | 内容 |
