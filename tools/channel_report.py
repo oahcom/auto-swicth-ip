@@ -996,9 +996,11 @@ def print_table(rows: list[dict], hours: float) -> None:
     print("-" * (_w(head) + 40))
     tier_off = _tier_disabled()
     for r in rows:
-        flags = []
+        # 状态列只放线的当前状态（统一层级），不混流程解释
+        state = "-"
+        notes = []
         if r["tag"] in tier_off:
-            flags.append("档位停用")
+            notes.append("档位停用")
         if not r.get("unit_ok", True):
             # 主因，且**独占**：单元没在跑时，状态表里的 quota / 无地址 /
             # 取址失败全是停用前冻住的旧值，同时印出来会让人以为是配额问题。
@@ -1008,21 +1010,15 @@ def print_table(rows: list[dict], hours: float) -> None:
             # WG 线的单元是 disabled，状态冻在 `blocked` 上 26 小时，
             # 报表只印「档位停用 单元停用（线没跑）」—— 把「没人探它」
             # 显示成「它坏了」，正是主人说的「原因标错」。
-            flags.append("单元停用（线没跑）")
-            flags.append(_frozen_verdict_label(r))
-            if not r["samples"]:
-                # 「单元停用」说的是线不跑了；成因标签说的是**为什么没人探它**
-                # （不在探测名单 / 从未探测 / 惩罚期短路 / 未入账）。两回事，
-                # 都得印 —— 只印前者会把「配置裂了」读成「线坏了」。
-                flags.append(_no_sample_reason(r))
+            state = f"单元停用{_frozen_verdict_label(r)}"
         elif r["held"]:
-            flags.append(f"锁定至{_fmt_ts(r['hold_until'])}")
+            state = f"锁定至{_fmt_ts(r['hold_until'])}"
         elif r["quota_until"] > time.time():
-            flags.append(f"配额至{_fmt_ts(r['quota_until'])}")
+            state = f"限流惩罚中(至{_fmt_ts(r['quota_until'])})"
         elif r["no_addr_since"]:
-            flags.append("无地址")
+            state = "无地址"
         elif r.get("egress_error"):
-            flags.append(f"取址失败:{r['egress_error']}")
+            state = f"取址失败:{r['egress_error']}"
         else:
             # 窗口内一条样本都没有 → `last_verdict` 是**旧的**，不能当成
             # 现在的结论印出来。WARP-CF-C/G/H/I 的单元 2026-10-28 缩容时
@@ -1034,23 +1030,22 @@ def print_table(rows: list[dict], hours: float) -> None:
             #   从没探过      → 查探测名单（线根本不在名单里）
             #   探过但没入账  → 入账漏记的 bug（判了 blocked 却没进 ban_probes）
             #   探过但无地址  → 隧道取不到出口
-            if not r["samples"]:
-                flags.append(_no_sample_reason(r))
-            else:
-                # blocked ≠ 节点不可用（2026-11-14）：拆「限流惩罚中」/
-                # 「已解禁·旗标残留」，并加判定时间戳。
+            if r["samples"]:
                 _v = r['last_verdict']
                 if _v == "blocked":
-                    if r["quota_until"] > time.time() or r.get("held"):
-                        _v = f"限流惩罚中(至{_fmt_ts(max(r.get('quota_until',0), r.get('hold_until',0)))})"
-                    else:
-                        _v = "已解禁·旗标残留"
+                    _v = "已解禁·旗标残留"
+                elif _v == "quota":
+                    _v = "限流惩罚中"
                 _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
-                flags.append(f"{_v}（旧地址·{_ts}判）" if r["verdict_stale"]
-                             else f"{_v}（{_ts}判）")
+                state = f"{_v}（旧地址·{_ts}判）" if r["verdict_stale"] else f"{_v}（{_ts}判）"
+            elif r.get("in_members", True):
+                state = "从未探测"
+            else:
+                state = "不在探测名单"
         okfail = f"{r['ok']}/{r['ban'] + r['err']}"
         _lat = latency_map.get(r.get("node", "-"), "—")
         _lat_style = "不可达" if _lat == "不可达" else _lat
+        _note = (' ' + ' '.join(notes)) if notes else ''
         print(f"{_pad(r['tag'], 18)} {_pad(r['carrier'], 5)} "
               f"{_pad(r['colo'], 4)} {_pad(r['loc'], 8)} "
               f"{_pad(_pct(r['success_rate']), 6, False)} "
@@ -1060,7 +1055,7 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
               f"{_pad(_lat_style, 7, False)} "
-              f"{' '.join(flags)}")
+              f"{state}{_note}")
     print("-" * (_w(head) + 40))
     tot = sum(r["samples"] for r in rows)
     ok = sum(r["ok"] for r in rows)
