@@ -1361,6 +1361,9 @@ def print_table(rows: list[dict], hours: float) -> None:
                     if _v == "blocked":
                         _ban_until = float(r.get('quota_until', 0) or 0)
                         _v = "待验" if _ban_until <= time.time() else "quota"
+                    # 与 slot-ok 主分支同口径：裸 unknown 不出现（2026-11-15）
+                    if _v not in ("OK", "quota", "flagged"):
+                        _v = "待验" if _v in ("unknown", "") else _v
                     _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
                     _probe_age_min = (time.time() - float(r.get("last_probe_ts") or 0)) / 60
                     _stale = r["verdict_stale"] or _probe_age_min > 30
@@ -1375,6 +1378,9 @@ def print_table(rows: list[dict], hours: float) -> None:
                     if _v == "blocked":
                         _ban_until = float(r.get('quota_until', 0) or 0)
                         _v = "待验" if _ban_until <= time.time() else "quota"
+                    # 与 slot-ok 主分支同口径：裸 unknown 不出现（2026-11-15）
+                    if _v not in ("OK", "quota", "flagged"):
+                        _v = "待验" if _v in ("unknown", "") else _v
                     _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
                     _probe_age_min = (time.time() - float(r.get("last_probe_ts") or 0)) / 60
                     _stale = r["verdict_stale"] or _probe_age_min > 30
