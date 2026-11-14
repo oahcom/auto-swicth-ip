@@ -3391,6 +3391,33 @@ def _h2_members_from_ledger() -> list[dict]:
             })
         except (KeyError, TypeError, ValueError):
             continue
+    # 自动补全：状态台账里有 probe 数据但不在 channels.json 的线
+    # 也加入探测名单，避免「不在探测名单」永远无人探（2026-11-15 用户反馈）
+    try:
+        _declared = {m["tag"] for m in out}
+        for _tag, _st in _WARP_LINE_STATE.items():
+            if _tag in _declared or not isinstance(_st, dict):
+                continue
+            if _tag.startswith("WARP-WG-"):  # WG 补位池不自动补
+                continue
+            _bp = _st.get("ban_probes") or []
+            _has_data = bool(_bp) or bool(_st.get("last_probe_ts"))
+            if _has_data:
+                # 从 tag 推算端口（与 _service_of_tag 同契约）
+                import re as _re
+                _m = _re.fullmatch(r"WARP-H2-(?:[A-Z]+)-(\d+)", _tag)
+                if _m:
+                    _idx = int(_m.group(1))
+                    out.append({
+                        "tag": _tag,
+                        "port": 20000 + _idx,  # 临时端口，实际由 render 决定
+                        "service": f"usque-h2-{_idx}.service",
+                        "kind": "h2",
+                        "index": _idx,
+                        "colo": None,
+                    })
+    except Exception:
+        pass
     return out
 
 def _refresh_h2_members() -> bool:
