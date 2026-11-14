@@ -18,7 +18,9 @@
 样本全部取自 2026-11-13 真实日志，不是构造的。
 """
 import importlib.util
+import io
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -153,9 +155,12 @@ def test_rotate_without_done_is_not_success(mod):
 
 # ── ⑤ seg64 ───────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("ip,expect", [
+    # ipaddress 解析成功：展开后取前 4 个 hextet（:: 压缩靠前的地址这才是 /64）
     ("2a09:bac5:58c3:d2d::150:78", "2a09:bac5:58c3:d2d"),
     ("2a09:bac1:72e0:18::150:fb", "2a09:bac1:72e0:18"),
-    ("2606:4700::6812:a42", "2606:4700::6812"),
+    ("2606:4700::6812:a42", "2606:4700:0:0"),
+    ("::1", "0:0:0:0"),               # 解析成功，展开取前 4
+    # 解析失败：回退旧逻辑（按冒号切）
     ("45.95.212.167", "45.95.212.167"),   # IPv4 原样返回
     ("pq.us07.yydjc.top:443-vl", "pq.us07.yydjc.top:443-vl"),
 ])
@@ -170,6 +175,8 @@ def test_is_ip6_rejects_hostname_with_colon(mod):
     assert not mod.is_ip6("ttll20-ooi.dankenet.help:64657-any")
     assert not mod.is_ip6("pq.us07.yydjc.top:443-vl")
     assert not mod.is_ip6("")
+    assert mod.is_ip6("::1"), "字符集判会漏判 ::1"
+    assert not mod.is_ip6("deadbeef01"), "全 hex 无点主机名不能误判成 IPv6"
 
 
 # ── ⑤c req id 被括号污染（真实踩过的坑） ──────────────────────────────────
@@ -184,16 +191,21 @@ def test_req_id_not_polluted_by_trailing_paren(mod):
 
 
 # ── ⑤d retry 记账挂到对应的 hop 上 ────────────────────────────────────────
+def _retry_line(n, req, port="http://127.0.0.1:7897", code="429", status="ok"):
+    return ("[03:41:34] ⚠️  [EGRESS] retry %s/2 %s -> accounted on %s (%s) (req=%s)"
+            % (n, code, port, status, req))
+
+
 def test_retry_accounting_attached_to_hop(mod):
     """retry 行说「这次 429 记在哪个端口」—— 归因排查的关键证据，
     必须挂到它前一个 rotate 上。"""
     hop = SAMPLE_POOL_HOP.replace("req=wdxev0999", "req=y1")
-    retry = ("[03:41:34] ⚠️  [EGRESS] retry 1/2 429 -> accounted on "
-             "http://127.0.0.1:7897 (ok) (req=y1)")
+    retry = _retry_line(1, "y1")
     tr = _feed(mod, [hop, retry])["y1"]
-    assert tr.hops[0]["acct_port"] == "http://127.0.0.1:7897"
-    assert tr.hops[0]["acct_status"] == "ok"
-    assert tr.hops[0]["acct_try"] == "1/2"
+    a = tr.hops[0]["acct"][0]
+    assert a["port"] == "http://127.0.0.1:7897"
+    assert a["status"] == "ok"
+    assert a["try"] == "1/2"
 
 
 def test_rotated_event_recorded(mod):
@@ -247,3 +259,123 @@ def test_resession_event_is_captured_without_req_suffix(mod):
     detail = tr.events[0]["detail"]
     assert "200" in detail and "false positive" in detail, detail
     assert "req=" not in detail, "关联键不该出现在结论里：%s" % detail
+
+
+# ── ⑧ F1：--since 前缀判定与 journalctl 失败处理 ──────────────────────────
+def test_normalize_since_relative_gets_dash(mod):
+    """相对时间窗必须加 - 前缀，否则 journalctl 按「未来的绝对时间」解析失败。"""
+    assert mod.normalize_since("25m") == "-25m"
+    assert mod.normalize_since("3h") == "-3h"
+    assert mod.normalize_since("6h") == "-6h"
+    assert mod.normalize_since("2d") == "-2d"
+    assert mod.normalize_since("3H") == "-3H"      # 大小写不限
+
+
+def test_normalize_since_absolute_untouched(mod):
+    """绝对时间绝不能加 - 前缀（之前 --since 2026-11-13 被传成 -2026-11-13）。"""
+    assert mod.normalize_since("2026-11-13") == "2026-11-13"
+    assert mod.normalize_since("2026-11-13 13:00:00") == "2026-11-13 13:00:00"
+
+
+def test_normalize_since_no_double_dash(mod):
+    """用户已自带 - 前缀时不能再加，否则变成 --25m。"""
+    assert mod.normalize_since("-25m") == "-25m"
+
+
+def test_read_lines_applies_prefix_in_command(mod, monkeypatch):
+    """read_lines 实际下发的命令：相对时间带 - 前缀。"""
+    cmds = []
+
+    class FakeProc:
+        def __init__(self, cmd, **kw):
+            cmds.append(cmd)
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(mod.subprocess, "Popen", FakeProc)
+    lines = list(mod.read_lines(SimpleNamespace(file=None, since="25m")))
+    assert lines == []
+    assert "--since" in cmds[0] and cmds[0][cmds[0].index("--since") + 1] == "-25m"
+
+
+def test_read_lines_streams_lines(mod, monkeypatch):
+    class FakeProc:
+        def __init__(self, cmd, **kw):
+            self.stdout = io.BytesIO(b"line1\nline2\n")
+            self.stderr = io.BytesIO(b"")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(mod.subprocess, "Popen", FakeProc)
+    lines = list(mod.read_lines(SimpleNamespace(file=None, since="3h")))
+    assert lines == ["line1", "line2"]
+
+
+def test_read_lines_fails_loudly_on_journalctl_error(mod, monkeypatch, capsys):
+    """journalctl 失败必须打印 stderr + 实际命令并以非零退出码结束，
+    绝不能静默成「窗口内没有可识别的 req」。"""
+    class FakeProc:
+        def __init__(self, cmd, **kw):
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"Failed to parse timestamp")
+
+        def wait(self):
+            return 2
+
+    monkeypatch.setattr(mod.subprocess, "Popen", FakeProc)
+    with pytest.raises(SystemExit) as exc:
+        list(mod.read_lines(SimpleNamespace(file=None, since="bogus!!!")))
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "Failed to parse timestamp" in err, "journalctl 的 stderr 必须透传"
+    assert "journalctl" in err, "实际执行的命令必须打出来"
+
+
+def test_read_lines_fails_on_stderr_even_with_rc0(mod, monkeypatch, capsys):
+    """stderr 非空也算失败（即使 returncode == 0）。"""
+    class FakeProc:
+        def __init__(self, cmd, **kw):
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"some warning")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(mod.subprocess, "Popen", FakeProc)
+    with pytest.raises(SystemExit) as exc:
+        list(mod.read_lines(SimpleNamespace(file=None, since="3h")))
+    assert exc.value.code != 0
+
+
+# ── ⑨ M1：retry 按 attempt 序号挂载 / 孤立记账 ────────────────────────────
+def test_retry_attempts_attach_to_same_hop(mod):
+    """rotate(B) → retry 1/2 → retry 2/2：两发都记在 B 上。
+    旧逻辑把 2/2 错挂到更早的 hop A 上（「最近一个还没记账的 hop」）。"""
+    hopA = SAMPLE_WARP_HOP.replace("req=wdweyqd0m", "req=y3")
+    hopB = (SAMPLE_WARP_HOP.replace("req=wdweyqd0m", "req=y3")
+            .replace("2a09:bac5:58c3:d2d::150:78", "2a09:bac5:495e:e6::17:341"))
+    tr = _feed(mod, [hopA, hopB,
+                     _retry_line(1, "y3"), _retry_line(2, "y3")])["y3"]
+    assert tr.hops[0].get("acct") is None, "2/2 不能反向错挂到更早的 hop A"
+    assert [a["try"] for a in tr.hops[1]["acct"]] == ["1/2", "2/2"]
+
+
+def test_orphan_retry_is_kept_and_rendered(mod):
+    """相同 N 重复到来且没有可挂载的 hop：不能静默丢弃，要进孤立记账并显示。"""
+    hop = SAMPLE_POOL_HOP.replace("req=wdxev0999", "req=y4")
+    tr = _feed(mod, [hop, _retry_line(1, "y4"), _retry_line(1, "y4")])["y4"]
+    assert len(tr.hops[0]["acct"]) == 1
+    assert [e["_kind"] for e in tr.events].count("orphan_retry") == 1
+    out = tr.render()
+    assert "孤立记账" in out
+
+
+def test_retry_without_rotate_is_orphan(mod):
+    """retry 先于任何 rotate 出现：孤立记账，绝不静默丢弃。"""
+    tr = _feed(mod, [_retry_line(1, "y5")])["y5"]
+    assert tr.events[-1]["_kind"] == "orphan_retry"
+    assert "孤立记账" in tr.render()

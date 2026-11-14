@@ -321,6 +321,11 @@ CFG = {
         # slot-8 专属流量日志（sing-box log.output）：连接日志不再混写公共
         # singbox.log，`asip oc log` 按这个文件看原生请求（出站连接粒度）。
         "log_path": os.path.join(PROJECT_DIR, "opencode-gate.log"),
+        # opencode CLI 应用级日志（429/错误/语义事件，连接级流量日志的互补面）。
+        # `asip oc app` / `oc st` 读它（能读就读，缺位优雅降级）；
+        # env OPENCODE_LOG 可覆盖，解析在 opencode_gate.opencode_log_path()。
+        "opencode_log": os.path.expanduser(
+            "~/.local/share/opencode/log/opencode.log"),
     },
 
     "warp": {
@@ -500,6 +505,8 @@ CFG = {
         "ledger_retention_sec": 86400,
         # 清理判据模式："legacy" 走旧规则（ts cutoff + ban_until 豁免），
         # "expires_at" 只看 expires_at < now（INV-4）。P2 切换，回滚只需改配置。
+        # expires_at 模式下「缺 expires_at」= 未迁移，先按最近事件补齐再判；
+        # 补齐也定不出值的条目保留并计入 ledger_shadow.missing_expires，绝不静默删。
         "ledger_cleanup_mode": "legacy",
         # 生产侧 429 的**定性方式**：单发 429 就判死这条线，还是先复测再判死。
         #   off      —— 不复测，直接冷却 + 24h 标脏（P0-1 之前的旧行为，仅作回退）

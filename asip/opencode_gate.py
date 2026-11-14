@@ -25,6 +25,8 @@
   ledger_path    专属账本路径（JSONL）；缺失时只记内存，不静默改写别处
   log_path       专属流量日志路径（slot-8 sing-box 的 log.output）；
                  缺键时回退常量 PROJECT_DIR/opencode-gate.log
+  opencode_log   opencode CLI 应用级日志路径（asip oc app；env OPENCODE_LOG
+                 可覆盖，缺键回退 ~/.local/share/opencode/log/opencode.log）
 """
 import json
 import os
@@ -94,6 +96,50 @@ def log_path() -> str | None:
         return str(p)
     from config import PROJECT_DIR
     return os.path.join(PROJECT_DIR, "opencode-gate.log")
+
+
+def opencode_log_path() -> str:
+    """opencode CLI 应用级日志路径（asip oc app 读它；连接级流量日志的互补面）。
+
+    解析顺序：env OPENCODE_LOG > CFG["opencode_gate"]["opencode_log"] >
+    常量默认 ~/.local/share/opencode/log/opencode.log。文件缺位/不可读由
+    调用方按「能读就读」优雅降级（opencode_log_info() 给结构化状态）。
+    """
+    p = os.environ.get("OPENCODE_LOG") or _cfg().get("opencode_log")
+    if p:
+        return str(p)
+    return os.path.expanduser("~/.local/share/opencode/log/opencode.log")
+
+
+def opencode_log_info() -> dict:
+    """只读摘要：应用日志的可读性 + 最近一条异常行（供 asip oc st/app）。
+
+    「能读就读」：文件缺失/不可读/读中出错都降级成结构化字段，绝不抛
+    异常 —— 诊断命令不能因日志文件缺位崩掉。last_alert = 最近一条含
+    ERROR 或 Free usage limit 的行（429 监测同口径），没有则 None。
+    """
+    path = opencode_log_path()
+    info = {"path": path, "exists": False, "readable": False,
+            "lines": None, "size": None, "last_alert": None}
+    try:
+        info["size"] = os.stat(path).st_size
+        info["exists"] = True
+    except OSError:
+        return info
+    try:
+        n = 0
+        last_alert = None
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                n += 1
+                if "ERROR" in line or "Free usage limit" in line:
+                    last_alert = line.rstrip()
+        info["readable"] = True
+        info["lines"] = n
+        info["last_alert"] = last_alert
+    except OSError:
+        pass
+    return info
 
 
 def _client(slot) -> ClashClient:
@@ -192,24 +238,31 @@ def _normalize_reason(raw) -> str:
 
 # ── 轮换（契约 C1）────────────────────────────────────────────────────
 
-def _rotate_node(slot, cur):
-    """池内换节点：独立冷却过滤 + 换一个非当前节点；失败返回 None。
+def _rotate_node(slot, cur, picker=None):
+    """池内换节点：独立冷却过滤 + 选一个非当前节点；失败返回 None。
 
     裁剪自 daemon._proxy_gate_rotate_node 的骨架，但：
       - 候选过滤只用**本模块自己的**冷却表（不读 daemon._DEAD_NODES /
         _COOLDOWN_NODES —— 冷却独立）；
-      - 不预检/不延迟择优（那是 daemon 私有状态，模块红线禁止 import），
-        只做「冷却排除 + 均匀随机」；
+      - 选点：picker 优先（依赖注入点，daemon 委托传 pick_next_node 的
+        P2C + 自适应分数，签名 (current, all_nodes, fail_set) -> str|None，
+        冷却中的节点经 fail_set 交出去）；缺省 None 回退均匀随机（单测
+        独立可跑，不依赖 daemon 私有状态）。两条路的返回都必须落在池内
+        候选（非当前、不在冷却中），不然宁可不换；
+      - 不预检/不延迟择优（那是 daemon 私有状态，模块红线禁止 import）；
       - 换节点 = PUT 自己的 pool selector + 回读验证（不中断在途）；
       - 记账进本模块账本，绝不调 daemon.update_node_info_async。
     """
     now = time.time()
     cooled = {n for n, until in _STATE["cooldown"].items() if until > now}
-    elig = [n for n in _pool_candidates(slot)
-            if n != cur and n not in cooled]
+    pool = _pool_candidates(slot)
+    elig = [n for n in pool if n != cur and n not in cooled]
     if not elig:
         return None
-    nxt = random.choice(elig)
+    nxt = picker(cur or "", pool, cooled) if picker is not None \
+        else random.choice(elig)
+    if nxt not in elig:
+        return None
     c = _client(slot)
     if not c.select(slot["pool_selector"], nxt):
         return None
@@ -251,7 +304,7 @@ def _note_ledger(entry: dict) -> None:
     _STATE["ledger_entries"] += 1
 
 
-def handle_rotate(req: dict) -> dict:
+def handle_rotate(req: dict, picker=None) -> dict:
     """POST /rotate-opencode-gate 的处理（契约 C1）。
 
     请求：{"req_id","reason"(rate429|abuse403|transport|proactive),
@@ -261,6 +314,12 @@ def handle_rotate(req: dict) -> dict:
            "reason":"ok|coalesced|borrowed_skip|no_healthy_node",
            "switch_to_node":str|null,"switched_at":float,
            "active_egress":str|null,"ms":0}
+
+    picker：选点策略的依赖注入点（守模块红线的接线缝）。签名
+          (current, all_nodes, fail_set) -> str | None。daemon 的委托点传
+          pick_next_node（P2C + 自适应分数，count_call=False，与
+          _proxy_gate_rotate_node 同用法）；None 回退均匀随机（单测独立
+          可跑，不依赖 daemon 私有状态）。
 
     语义硬约束：
       1. 只动本闸口自己的 pool selector —— 不 _pick_healthy_slot、不指回
@@ -315,10 +374,11 @@ def handle_rotate(req: dict) -> dict:
             outcome = "coalesced"
         else:
             _STATE["last_attempt_ts"] = t0
-            if cur and reason != "proactive":
-                # 报障换节点才冷却旧节点；proactive 不冷却（与 slot-7 同口径）。
+            if cur and reason not in ("proactive", "dead"):
+                # 报障换节点才冷却旧节点（与第七闸口同口径）：proactive 不冷；
+                # dead 已是终态判定，再冷却无意义。独立冷却表，不写公共表。
                 _STATE["cooldown"][cur] = t0 + _cooldown_sec()
-            switched_node = _rotate_node(slot, cur)
+            switched_node = _rotate_node(slot, cur, picker)
             if switched_node:
                 outcome = "ok"
                 _STATE["current"] = switched_node

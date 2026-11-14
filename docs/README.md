@@ -84,11 +84,11 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 
 | 文档 | 内容 |
 |---|---|
-| **[established-facts.md](established-facts.md)** | **既定事实（52 条），先读这个** |
+| **[established-facts.md](established-facts.md)** | **既定事实（63 条），先读这个** |
 | [glossary.md](glossary.md) | **名词表**：节点/线路/渠道/成员的确切定义 |
 | [BUILD-PLAN.md](BUILD-PLAN.md) | 文档构建计划与更新规范 |
 
-**新增的三条容易踩的**（都在 established-facts 里）：
+**新增的容易踩的**（都在 established-facts 里）：
 
 - **第 25 条** `fail_streak` 只数「拿不到出口地址」，不数「地址被封」——
   看到「连续 N 次取不到出口地址」先查该线最近一次 `模型层:` 结论。
@@ -120,6 +120,9 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 - **第 13h 条（第二半）** 新线「一直没出过口」先查 `last_probe_ts`：**是 0 表示
   「没探过」，不是「探了不行」**。探测排期原先按 `now` 排序、键全相同，尾部新线
   永远抢不到并发槽位（已修，见 TEST_PLAN §20c）。
+- **第 34 条** 写入口缺口是**动态再生**的（探针建账曾绕过 `expires_at` 双写）；P2 清理把「缺字段」当**未迁移**（先补齐再判、补不出跳过告警），不当「已过期」。
+- **第 35 条** 影子计数必须落盘带起点戳，否则「violations==0 连续 ≥24h」永远无法证明；偏差必须分人群（干净条目会把时间戳计成偏差）；P2 门槛靠 would-delete 干跑排演误删。
+- **第 36 条** 引入 import 的提交必须把被引文件带进同一笔——F-7 断头（c819e4a 漏 add）期间 stash / 新检出即 ImportError，而工作区正常会掩盖问题。
 
 **架构层**（看代码看不出来的设计）
 
@@ -128,6 +131,9 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | [architecture/tunnel-types.md](architecture/tunnel-types.md) | 四种隧道类型：协议、路径、能拿到什么出口 |
 | [architecture/ip-pools.md](architecture/ip-pools.md) | WARP IP 从哪来、v4/v6 分布、共享池的影响 |
 | [architecture/provisioning.md](architecture/provisioning.md) | 一条隧道从零建起来：每一步做什么、漏了会怎样 |
+| [design-20261113-per-egress-session-pool.md](design-20261113-per-egress-session-pool.md) | 按出口 IP 的会话池：15×10、IP 变重建、150 回绕、slot-7 tag |
+| [design-20261113-ledger-lifecycle.md](design-20261113-ledger-lifecycle.md) | 台账生命周期：`expires_at` 单一事实源、P0–P3 灰度、INV-1~4、P2 切换与回滚 |
+| [design-20261113-config-drift.md](design-20261113-config-drift.md) | 配置漂移复发治理：六面对账（含生效面）、自检分类七、doc-drift 关卡 |
 
 **子系统层**
 
@@ -157,6 +163,8 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 | [ban-survey-20261103.md](ban-survey-20261103.md) | 18:00 后各渠道/colo ban 率与报错指标 |
 | [analysis-20261105-h2-selection-bias.md](analysis-20261105-h2-selection-bias.md) | **H2 为何几乎不被选**：档 1 无时效 + 档内「验得久优先」；含供给侧的 /64 与低产线测量 |
 | [review-5d-20261027.md](review-5d-20261027.md) / [review-5d-20261028-audit.md](review-5d-20261028-audit.md) | 五日实测复盘与审计 |
+| [report-20261113-ledger-lifecycle-verify.md](report-20261113-ledger-lifecycle-verify.md) | 台账生命周期实施验证报告（逐项核验 + 3 处补修 + 六维自查） |
+| [review-20261113-impl-3x6.md](review-20261113-impl-3x6.md) | 三方×六维实施监督报告（台账 + 漂移两路并行实施） |
 
 ### 出了事要查
 
@@ -181,6 +189,7 @@ python3 -m py_compile daemon.py config.py warp_wg.py warp_blocks.py
 |---|---|
 | [runbook/add-tunnel.md](runbook/add-tunnel.md) | 加隧道速查清单 + 症状对照表 |
 | [runbook/troubleshoot.md](runbook/troubleshoot.md) | 7 条排查树：429 风暴 / selector 打空 / 线不通 / 单元假活 / 9router 假健康 / 两台机器不一致 / 日志无线索 |
+| [runbook/ledger-cleanup-switch.md](runbook/ledger-cleanup-switch.md) | P2 清理判据切换：四门槛、观测口径、失败处置表、回滚（改配置即回滚） |
 | `deploy/remote-deploy.sh` | **一键复刻本机拓扑到远端**（代码/状态表/设备/单元/验收） |
 | [ops-20261028-security-changes.md](ops-20261028-security-changes.md) | 安全变更操作记录 |
 | [9router-task-book-20261028.md](9router-task-book-20261028.md) | 9router 任务书 |

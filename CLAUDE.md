@@ -33,7 +33,7 @@ daemon.py
     ← 或经 Clash API 切 selector（pool 节点轮换 / opencode-out 换线）
     → 403/429 各达阈值 1 后，还要连错 ≥3 条才换（consec_err 门控，采样/标脏之后）
     → 换线冷却 5s；整窗全为出口级错误（full_err）时绕过冷却
-    → 主动轮换（池）：proactive_mode 二选一 —— requests 满 150 格 dsv4（当前）/ fixed 每 60s
+    → 主动轮换（池）：proactive_mode 二选一 —— requests 满 300 格 dsv4（当前）/ fixed 每 60s
     → 自适应策略：normal=延迟优先 / pressure=均匀分散
     → 节点健康检查：每 300s 并发测试（_health_pool, _DEAD_TTL_STAGES）
     → sing-box watchdog：探活连续 3 次失败才重启（`_probe_singbox_with_retry`，

@@ -1,0 +1,5 @@
+
+=========================== short test summary info ============================
+ERROR test_node_rotation.py - AssertionError: 端口接受但不转发时结论应是 Fals...
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.40s

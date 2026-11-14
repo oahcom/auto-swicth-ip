@@ -1,0 +1,6 @@
+  1337 parse_subscription.py
+   787 dormant_probe.py
+   177 test_dormant_probe_checkpoint.py
+   853 test_subscription_parse.py
+    14 asip/__init__.py
+  3168 total

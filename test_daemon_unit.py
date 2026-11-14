@@ -4660,7 +4660,7 @@ def test_cached_ok_verdict_skips_probe_within_ttl(monkeypatch):
                         {("tag-a", "1.2.3.4"): ("OK", time.time())})
     called = []
     import probe_warp
-    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: (
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout, ip=None: (
         called.append(port) or ("err", 0.1, "boom", None)))
     ok = daemon._warp_model_usable({"tag": "tag-a", "port": 10001}, "1.2.3.4")
     assert called == [], f"TTL 内的 OK 不该重探，实际探测 {len(called)} 次"
@@ -4678,7 +4678,7 @@ def test_cached_quota_verdict_skips_probe(monkeypatch):
         "5.6.7.8": {"ts": now, "blocked": True,
                     "blocked_ts_by_kind": {"rate429": now}}})
     import probe_warp
-    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: (
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout, ip=None: (
         (_ for _ in ()).throw(AssertionError("持久负结论命中时不应再探测"))))
     assert daemon._warp_model_usable(
         {"tag": "tag-b", "port": 10002}, "5.6.7.8") is False
@@ -4701,7 +4701,7 @@ def test_cached_persistent_verdict_reprobes_after_exact_ban(monkeypatch):
                     "ban_until": now - 1800, "ban_kind": "rate429"}})
     called = []
     import probe_warp
-    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: (
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout, ip=None: (
         called.append(port) or ("OK", 0.2, "ok", None)))
     assert daemon._warp_model_usable(
         {"tag": "tag-c", "port": 10003}, "9.9.9.9") is True

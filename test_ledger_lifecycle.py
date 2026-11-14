@@ -21,9 +21,10 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     monkeypatch.setattr(daemon, "_LEDGER_ALLOW_EMPTY_WRITE", False)
     monkeypatch.setattr(daemon, "_LEDGER_SHADOW",
-                        {"checked": 0, "violations": 0, "exact_match": 0,
-                         "deviation_sum": 0.0, "deviation_max": 0.0,
-                         "deviation_min": 0.0})
+                        dict(daemon._LEDGER_SHADOW_DEFAULTS))
+    # 影子落盘路径也隔离到 tmp：pytest 进程里的任何 tick 都不得写仓库根文件。
+    monkeypatch.setattr(daemon, "_LEDGER_SHADOW_FILE",
+                        str(tmp_path / "ledger_shadow.json"))
 
 
 def _ttl():
@@ -295,3 +296,255 @@ def test_inv1_monotonic_no_decrease(monkeypatch):
     daemon._mark_warp_ip_used("ip-mono", now + 9000, blocked=True, kind="rate429")
     exp2 = daemon._WARP_IP_USED["ip-mono"]["expires_at"]
     assert exp2 >= exp1, "expires_at 单调不减"
+
+
+# ---- W1: 探针建账必须产 expires_at（写入口收敛） ----
+
+def test_w1_probe_ok_creates_expires_at(monkeypatch):
+    """探针 OK 建账走收敛入口：新条目必带 expires_at，且不冒充 last_ok_ts。"""
+    now = 1_000_000.0
+    monkeypatch.setattr(daemon.time, "time", lambda: now)
+
+    daemon._ledger_mark_probe_ok("ip-probe-new", now)
+
+    entry = daemon._WARP_IP_USED["ip-probe-new"]
+    assert entry["expires_at"] == pytest.approx(now + _retention()), \
+        "探针建账必须产生 expires_at（原直写路径缺字段 → P2 会秒删）"
+    assert entry["probe_ok_ts"] == pytest.approx(now)
+    assert entry["last_ok_ts"] is None, "探针 OK 不得冒充生产成功"
+    assert entry["blocked"] is False
+    assert "blocked_ts_by_kind" in entry, "必须带完整字段集（下游档位/判定依赖）"
+
+
+def test_w1_probe_ok_backfills_legacy_entry(monkeypatch):
+    """已存在的旧式条目（只有 ts）被探针记账后补齐 expires_at。"""
+    now = 2_000_000.0
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {"ip-old": {"ts": 1_000_000.0}})
+
+    daemon._ledger_mark_probe_ok("ip-old", now)
+
+    entry = daemon._WARP_IP_USED["ip-old"]
+    assert entry["expires_at"] == pytest.approx(1_000_000.0 + _retention()), \
+        "EVENT_PROBE 不续命，但缺字段时按最近事件补初值"
+    assert entry["probe_ok_ts"] == pytest.approx(now)
+
+
+# ---- W2: 载入补齐（含旧 float 格式 / ts 缺失但有成功记录） ----
+
+def test_w2_load_float_entry_backfilled(tmp_path, monkeypatch):
+    """旧 float 格式（值为最后使用时刻）载入后同样补齐 expires_at。"""
+    p = tmp_path / "warp_ip_used.json"
+    ts = 1_800_000_000.0
+    p.write_text(json.dumps({"used": {"ip-float": ts}}))
+    monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(p))
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+
+    daemon._load_warp_ip_used()
+
+    entry = daemon._WARP_IP_USED["ip-float"]
+    assert isinstance(entry, dict)
+    assert entry["expires_at"] == pytest.approx(ts + _retention()), \
+        "旧 float 条目必须补齐，否则 P2 把它当未迁移"
+
+
+def test_w2_load_backfill_uses_last_ok_when_ts_missing(tmp_path, monkeypatch):
+    """ts 坏值但有 last_ok_ts：补齐锚点用 last_ok_ts（INV-2 不跌破）。"""
+    p = tmp_path / "warp_ip_used.json"
+    now = 1_800_000_000.0
+    p.write_text(json.dumps({"used": {
+        "ip-okonly": {"ts": "bad", "blocked": False,
+                      "last_ok_ts": now - 5000},
+    }}))
+    monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(p))
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+
+    daemon._load_warp_ip_used()
+
+    entry = daemon._WARP_IP_USED["ip-okonly"]
+    assert entry["expires_at"] == pytest.approx(now - 5000 + _retention()), \
+        "INV-2：expires_at ≥ 最近成功时刻 + 复用窗口"
+
+
+def test_w2_load_unfixable_entry_kept_without_expires(tmp_path, monkeypatch):
+    """时间戳全坏且无解禁时刻：不造值、不删条目（留给 P2 跳过并告警）。"""
+    p = tmp_path / "warp_ip_used.json"
+    p.write_text(json.dumps({"used": {"ip-bad": {"ts": None, "blocked": True}}}))
+    monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(p))
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+
+    daemon._load_warp_ip_used()
+
+    entry = daemon._WARP_IP_USED["ip-bad"]
+    assert entry.get("expires_at") is None, "不许凭空造生命周期值"
+    assert entry["blocked"] is True, "标记保留，绝不因缺字段丢掉封禁信息"
+    assert daemon._LEDGER_SHADOW["unmigrated"] == 1, \
+        "启动即在影子计数暴露（不等第一次干跑）"
+
+
+# ---- W3: P2 清理谓词不误删（INV-2 排演） ----
+
+def test_w3_p2_cleanup_backfills_instead_of_deleting(monkeypatch):
+    """expires_at 模式下缺字段 = 未迁移 → 先补齐再判，不得秒删。"""
+    now = 1_000_000.0
+    monkeypatch.setitem(daemon.CFG["warp"], "ledger_cleanup_mode", "expires_at")
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "ip-missing": {"ts": now - 10, "blocked": False,
+                       "probe_ok_ts": now - 10},
+    })
+
+    # 任意一次写入触发全表清理
+    daemon._mark_warp_ip_used("ip-trigger", now)
+
+    assert "ip-missing" in daemon._WARP_IP_USED, \
+        "未迁移条目必须补齐后保留（原实现无字段即删）"
+    assert daemon._WARP_IP_USED["ip-missing"]["expires_at"] == pytest.approx(
+        now - 10 + _retention())
+    assert daemon._LEDGER_SHADOW["missing_expires"] == 1
+    assert daemon._LEDGER_SHADOW["backfilled_total"] >= 1
+
+
+def test_w3_p2_cleanup_skips_entry_without_anchor(monkeypatch):
+    """补齐也定不出值的条目：保留 + 计数，不静默删。"""
+    now = 1_000_000.0
+    monkeypatch.setitem(daemon.CFG["warp"], "ledger_cleanup_mode", "expires_at")
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {"ip-noanchor": {"blocked": True}})
+
+    daemon._mark_warp_ip_used("ip-trigger", now)
+
+    assert "ip-noanchor" in daemon._WARP_IP_USED, "无锚点条目绝不删除"
+    assert daemon._LEDGER_SHADOW["unmigrated"] == 1
+
+
+def test_w3_p2_cleanup_deletes_only_expired(monkeypatch):
+    """有 expires_at 的条目仍按 INV-4 唯一判据删除。"""
+    now = 1_000_000.0
+    monkeypatch.setitem(daemon.CFG["warp"], "ledger_cleanup_mode", "expires_at")
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "ip-expired": {"ts": now - 99999, "blocked": False,
+                       "expires_at": now - 1},
+        "ip-alive": {"ts": now - 10, "blocked": False,
+                     "expires_at": now + 100},
+    })
+
+    daemon._mark_warp_ip_used("ip-trigger", now)
+
+    assert "ip-expired" not in daemon._WARP_IP_USED
+    assert "ip-alive" in daemon._WARP_IP_USED
+
+
+def test_w3_legacy_mode_unchanged(monkeypatch):
+    """legacy 模式行为不变：缺 expires_at 仍按 ts 窗口清理。"""
+    now = 1_000_000.0
+    monkeypatch.setitem(daemon.CFG["warp"], "ledger_cleanup_mode", "legacy")
+    monkeypatch.setitem(daemon.CFG["warp"], "ip_reuse_guard_sec", 300)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "ip-stale": {"ts": now - 1000, "blocked": False},
+    })
+
+    daemon._mark_warp_ip_used("ip-trigger", now)
+
+    assert "ip-stale" not in daemon._WARP_IP_USED
+
+
+# ---- W4: would-delete 试算（P2 误删风险的运行证据） ----
+
+def test_w4_would_delete_dry_run(monkeypatch):
+    """干跑统计与 P2 实删同谓词：计数正确、样例脱敏、不改表。"""
+    now = 1_000_000.0
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        "203.0.113.9": {"ts": now - 99999, "blocked": False,
+                        "expires_at": now - 1},
+        "203.0.113.10": {"ts": now - 10, "blocked": False,
+                         "expires_at": now + 1000},
+        "203.0.113.11": {"ts": now - 99999, "blocked": False},
+        "203.0.113.12": {"blocked": True},
+    })
+
+    out = daemon._ledger_shadow_sweep(now)
+
+    assert out["would_delete"] == 2, "过期 1 条 + 补齐后过期 1 条"
+    assert out["missing_expires"] == 1
+    assert out["unmigrated"] == 1
+    samples = daemon._LEDGER_SHADOW["would_delete_samples"]
+    assert len(samples) == 2
+    assert all(s["ip"] == "203.0.x.x" for s in samples), "样例必须脱敏"
+    assert "expires_at" not in daemon._WARP_IP_USED["203.0.113.11"], \
+        "干跑只读，不得把补齐结果写回表"
+
+
+def test_w4_would_delete_clean_table(monkeypatch):
+    """全表都未过期 → would_delete == 0（切 P2 的直接门槛）。"""
+    now = 1_000_000.0
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {
+        f"ip-{i}": {"ts": now, "blocked": False, "expires_at": now + 100}
+        for i in range(20)
+    })
+
+    out = daemon._ledger_shadow_sweep(now)
+
+    assert out == {"would_delete": 0, "missing_expires": 0,
+                   "unmigrated": 0, "at": now}
+
+
+# ---- W5: 影子落盘续计 + 起点戳 ----
+
+def test_w5_shadow_persist_resume_and_started_at(tmp_path, monkeypatch):
+    """重启续计：计数累加、起点戳保留（否则「连续≥24h」无法证明）。"""
+    monkeypatch.setattr(daemon, "_LEDGER_SHADOW",
+                        dict(daemon._LEDGER_SHADOW_DEFAULTS))
+    s = daemon._LEDGER_SHADOW
+    s["started_at"] = 1000.0
+    s["checked"] = 10
+    s["violations"] = 2
+    s["would_delete"] = 3
+    daemon._persist_ledger_shadow()
+
+    # 模拟重启：内存清零后从盘上续计
+    monkeypatch.setattr(daemon, "_LEDGER_SHADOW",
+                        dict(daemon._LEDGER_SHADOW_DEFAULTS))
+    daemon._load_ledger_shadow_boot()
+
+    s2 = daemon._LEDGER_SHADOW
+    assert s2["checked"] == 10
+    assert s2["violations"] == 2
+    assert s2["started_at"] == 1000.0, "起点戳不得被重启重置"
+    assert s2["would_delete"] == 3
+
+
+def test_w5_shadow_boot_creates_started_at(tmp_path, monkeypatch):
+    """无落盘文件时，启动即建立观察起点戳。"""
+    monkeypatch.setattr(daemon, "_LEDGER_SHADOW",
+                        dict(daemon._LEDGER_SHADOW_DEFAULTS))
+    daemon._load_ledger_shadow_boot()
+    assert daemon._LEDGER_SHADOW["started_at"] > 0
+
+
+# ---- W6: 偏差分人群 ----
+
+def test_w6_shadow_buckets_do_not_pollute(monkeypatch):
+    """干净条目不进惩罚期偏差统计；惩罚期条目单独计数。"""
+    now = 1_000_000.0
+    monkeypatch.setitem(daemon.CFG["warp"], "rate429_guard_sec", 60)
+    shadow = daemon._LEDGER_SHADOW
+
+    # 干净条目：只进 clean 档，不污染 deviation_*（原口径会把时间戳当偏差）
+    daemon._mark_warp_ip_used("ip-clean", now)
+    assert shadow["checked_clean"] == 1
+    assert shadow["checked_blocked"] == 0
+    assert shadow["deviation_sum"] == 0.0
+    assert shadow["deviation_max"] == 0.0
+
+    # 惩罚期条目：expires_at = 解禁 + 窗口 → 偏差恰为 0（精确命中）
+    daemon._mark_warp_ip_used("ip-burn", now + 10, blocked=True, kind="rate429")
+    assert shadow["checked_blocked"] == 1
+    assert shadow["exact_match"] == 1
+    assert shadow["deviation_max"] == 0.0
+
+    # 惩罚期内又打成功流量：锚点 = 成功时刻 > 解禁时刻 → 偏差为正且非零
+    entry = daemon._WARP_IP_USED["ip-burn"]
+    t_ok = now + 300
+    entry["last_ok_ts"] = t_ok
+    daemon._ledger_apply_event_locked(entry, ledger_policy.EVENT_SUCCESS, t_ok)
+    assert shadow["checked_blocked"] == 2
+    assert shadow["deviation_max"] == pytest.approx(t_ok - (now + 10 + 60))
+    assert shadow["violations"] == 0

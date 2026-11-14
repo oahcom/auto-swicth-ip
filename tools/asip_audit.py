@@ -41,6 +41,20 @@ WHY 需要这个工具（为什么不能继续放在 daemon 的启动关键路�
     python3 tools/asip_audit.py --json          # 机器可读 JSON
     python3 tools/asip_audit.py --project /path # 指定项目根（默认脚本的父目录）
     python3 tools/asip_audit.py --max-list 30   # 文本报告里每类列举几个（默认 10）
+    python3 tools/asip_audit.py --doc-drift     # 文档数值声明 vs 运行值（E 项文档关卡）
+    python3 tools/asip_audit.py --runtime-drift # 产物面 vs 生效面（selector 成员）对账
+
+E 项（配置漂移复发方案，docs/design-20261113-config-drift.md）：
+    - `--doc-drift`：活文档散文里的关键配置数值声明与运行值比对。不一致
+      打印明细并**退出 1**（已拍板 = 阻断）。比对对象不是配置表 ——
+      CLAUDE.md:766 明言「手抄副本必然过期，不再维护第二份」，FR-12/R-9
+      两次复发的正是散文里的过期数值。
+    - `--runtime-drift`：产物面（磁盘 selector 成员）vs 生效面（进程内
+      selector 成员，Clash API `all`）差集。热重载 ≠ 生效（INC-017：204
+      不代表 outbound 已重建），这是六面对账里唯一的盲区。API 读不到时
+      明确输出「无法判定」，**不算通过**（退出 1）—— 绝不假阴性。
+    - 比对判据只有 `asip.config_projection` 一份（D-1 单一事实源），与
+      daemon 闭环 `_slot_members_drift` 同语义。
 """
 from __future__ import annotations
 
@@ -127,12 +141,17 @@ except OSError as _env_err:
 
 try:
     import warp_blocks  # noqa: E402
-    from config import CFG  # noqa: E402
+    from config import CFG, consumer_slots, get_singbox_secret  # noqa: E402
+    from asip.clash_client import ClashClient  # noqa: E402
+    from asip.config_projection import (  # noqa: E402
+        VERDICT_CONSISTENT,
+        compare_members,
+    )
 except Exception as _imp_err:  # noqa: BLE001 — 工具自身出错 → 退出码 2
     # WHY 这里就退出而不是往上抛：退出码 2 = 「工具自身出错」，挂 timer
     # 的调用方要能把它和「查出了问题」（退出码 1）分开。import config 失败
     # 通常意味着项目路径不对（`--project` 指错了），不是「查出了问题」。
-    print(f"asip_audit: 工具自身出错：无法导入 config/warp_blocks："
+    print(f"asip_audit: 工具自身出错：无法导入 config/warp_blocks/asip："
           f"{_imp_err}", file=sys.stderr)
     sys.exit(2)
 
@@ -499,6 +518,460 @@ def read_h2_used_indexes(project: Path) -> set[str]:
         return set()
     return {str(r.get("index")) for r in rows
             if isinstance(r, dict) and r.get("index") is not None}
+
+
+# ---------------------------------------------------------------------------
+# E 项：生效面对账 + 文档漂移关卡
+# ---------------------------------------------------------------------------
+def read_runtime_members(base_url: str, selector: str, secret_getter
+                         ) -> set[str] | None:
+    """运行时 selector 的实际成员集（生效面）；失败/不可达/空 → None。
+
+    复用 `asip.clash_client.ClashClient.proxy_names`（GET /proxies/<sel> 的
+    `all` 列表）。**空 `all` 也算读不到** —— 与 `daemon._slot_selector_members`
+    同约定：判不了就不判，绝不返回空集让调用方误以为「一条成员都没有」。
+    只发 GET，不改任何状态（只读契约）。
+    """
+    try:
+        names = ClashClient(base_url, secret_getter).proxy_names(selector)
+    except Exception:  # noqa: BLE001 — 读不到就是读不到，不算工具出错
+        return None
+    if not names:
+        return None
+    return set(names)
+
+
+def read_disk_selector_members(config_file: str | None, selector: str
+                               ) -> set[str] | None:
+    """产物面：磁盘配置里该 selector 声明的成员集。
+
+    读不到/解析失败/文件未声明 → None（**无法判定**，防假阴性）；
+    selector 在配置里不存在 → 空集（产物面确实没有这个 selector）。
+    WHY 与 daemon `_slot_disk_selector_members` 的差异：它失败返回空集
+    （旧行为保留，委托后不变）；审计层把「读不到」如实报成无法判定，
+    绝不拿空集去和运行时比出一堆假的多余/缺失。
+    """
+    if not config_file:
+        return None
+    try:
+        with open(config_file, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    outs = cfg.get("outbounds") if isinstance(cfg, dict) else None
+    if not isinstance(outs, list):
+        return None
+    for o in outs:
+        if isinstance(o, dict) and o.get("tag") == selector:
+            members = o.get("outbounds")
+            return set(members) if isinstance(members, list) else set()
+    return set()
+
+
+def iter_selector_faces() -> list[dict]:
+    """要对账的 selector 面：主进程 + 每个消费槽位（含第七闸口）。
+
+    运行环境事实（配置路径、Clash API 端口）由 config 推导，不随 --project
+    走 —— 这是「本机此刻到底生效了什么」的对账，不是拿另一份数据做复盘。
+    """
+    faces = []
+    sb = CFG.get("singbox") or {}
+    w = CFG.get("warp") or {}
+    sel = w.get("selector") or "opencode-out"
+    faces.append({
+        "name": "main",
+        "selector": sel,
+        "config_file": sb.get("config_file"),
+        "base_url": sb.get("clash_api") or "http://127.0.0.1:9090",
+    })
+    for s in consumer_slots():
+        faces.append({
+            "name": s.get("name"),
+            "selector": s.get("selector") or sel,
+            "config_file": s.get("config_file"),
+            "base_url": "http://127.0.0.1:%d" % int(s.get("clash_api_port") or 0),
+        })
+    return faces
+
+
+# ---- 文档漂移关卡（--doc-drift）------------------------------------------------
+# 比对对象设计选择（详见报告里的 design_note）：
+#   CLAUDE.md:766 明言「手抄副本必然过期，不再维护第二份」—— 配置值表格
+#   不是比对对象。FR-12/R-9 两次复发的都是**散文里的过期数值**，所以这里
+#   扫描活文档散文里的数值声明：CLAUDE.md / README.md / TEST_PLAN.md 与
+#   docs/ 下全部 .md，排除文件名含 8 位日期戳的归档文档（事故/评审/设计/
+#   核对记录保留历史数值是其职责 —— docs/dev-design-* 里的 150 是史料，
+#   不算漂移）。声明语法见 `_DECL_PATTERNS`。
+DOC_DESIGN_NOTE = (
+    "比对对象 = 活文档散文里的数值声明（不是配置表）。"
+    "CLAUDE.md:766：「手抄副本必然过期，不再维护第二份」——"
+    "FR-12/R-9 两次复发的正是散文里的过期数值。"
+    "扫描集：CLAUDE.md / README.md / TEST_PLAN.md + docs/**/*.md；"
+    "排除文件名含 8 位日期戳的归档文档（事故/评审/设计/核对记录保留历史"
+    "数值是其职责）。声明语法：key=value / key：值 / （默认 N）/ 均为 N /"
+    " 表格 | N | / 满 N 格（proactive_after_dsv4_ok）/ fixed 每 Ns"
+    "（proactive_fixed_sec）/ requests|fixed（当前生效）（proactive_mode）。"
+)
+_DATE_IN_NAME_RE = re.compile(r"20\d{6}")
+_UNIT_SECONDS = {"": 1, "s": 1, "sec": 1, "秒": 1,
+                 "m": 60, "min": 60, "分钟": 60,
+                 "h": 3600, "小时": 3600}
+# (文档键名, CFG 取值路径, 声明值类型)；生产环境 429 封禁时长在 api 段
+DOC_KEYS: list[tuple[str, tuple[str, ...], str]] = [
+    ("rate429_guard_sec", ("warp", "rate429_guard_sec"), "int"),
+    ("blocked_guard_sec", ("warp", "blocked_guard_sec"), "int"),
+    ("blocked_ttl_sec", ("warp", "blocked_ttl_sec"), "int"),
+    ("ip_reuse_guard_sec", ("warp", "ip_reuse_guard_sec"), "int"),
+    ("production_429_ban_sec", ("api", "production_429_ban_sec"), "int"),
+    ("proactive_after_dsv4_ok", ("warp", "proactive_after_dsv4_ok"), "int"),
+    ("proactive_fixed_sec", ("warp", "proactive_fixed_sec"), "int"),
+    ("proactive_mode", ("warp", "proactive_mode"), "str"),
+]
+_NUM_UNIT = r"(\d+(?:\.\d+)?)\s*(s|sec|m|min|h|秒|分钟|小时)?"
+# 表格值单元专用：必须带时间单位或是 3 位以上裸秒数 ——
+# 「0=从未出现」「2=出现过」这类单元格里的小整数不是时间声明。
+_NUM_STRICT = r"(\d+\s*(?:s|sec|m|min|h|秒|分钟|小时)\b|\d{3,}(?![0-9A-Za-z]))"
+
+
+def _key_re(name: str) -> re.Pattern:
+    """键名整词匹配：`warp.ip_reuse_guard_sec` 能中，`proactive_modes` 不能中。"""
+    return re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])")
+
+
+def _to_seconds(num: str, unit: str | None) -> int | None:
+    u = (unit or "").lower()
+    if u not in _UNIT_SECONDS:
+        return None
+    return int(float(num) * _UNIT_SECONDS[u])
+
+
+def _decl(file: str, line: int, key: str, value, pattern: str, text: str) -> dict:
+    return {"file": file, "line": line, "key": key, "declared": value,
+            "pattern": pattern, "text": text.strip()[:160]}
+
+
+def _extract_key_decls(line: str, fname: str, lineno: int) -> list[dict]:
+    """key 锚定的声明：= / ：/ : 分隔、（默认 N）、均为 N、表格 | N |。
+
+    全部用 re.match 锚在键名正后方 —— 早期版本用 re.search 在窗口里找
+    分隔符，把「均为 86400：23h 前」的 23h、「三档：0=从未出现」的 0
+    都当成了声明值（实测假阳性）。键名后面的**第一个**声明形态才算数。
+    """
+    out: list[dict] = []
+    for name, _path, kind in DOC_KEYS:
+        for m in _key_re(name).finditer(line):
+            rest = line[m.end():]
+            # 归因安全：窗口在下一个键名处截断，隔壁键的值不算到本键头上
+            cut = len(rest)
+            for other, _p, _k in DOC_KEYS:
+                if other == name:
+                    continue
+                mo = _key_re(other).search(rest)
+                if mo:
+                    cut = min(cut, mo.start())
+            window = rest[:cut]
+            val = None
+            pat = None
+            if kind == "str":
+                mm = re.match(r"\s*`?\s*[=：:]\s*[\"'“]?"
+                              r"(fixed|requests)", window)
+                if mm:
+                    val, pat = mm.group(1), "key=value"
+            else:
+                mm = re.match(r"\s*`?\s*[=：:]\s*[^0-9\n]{0,20}" + _NUM_UNIT,
+                              window)
+                if mm:
+                    val = _to_seconds(mm.group(1), mm.group(2))
+                    pat = "key=value"
+                if val is None:
+                    mm = re.match(r"[^\n]{0,15}?默认[^0-9\n]{0,10}" + _NUM_UNIT,
+                                  window)
+                    if mm:
+                        val = _to_seconds(mm.group(1), mm.group(2))
+                        pat = "（默认 N）"
+                if val is None:
+                    mm = re.match(r"[^=\n]{0,40}?均为\s*\**" + _NUM_UNIT,
+                                  window)
+                    if mm:
+                        val = _to_seconds(mm.group(1), mm.group(2))
+                        pat = "均为 N"
+                if val is None:
+                    mm = re.match(r"(?:[^|\n]*[|｜]\s*){1,2}\s*\**"
+                                  + _NUM_STRICT, window)
+                    if mm:
+                        raw = mm.group(1)
+                        num = re.match(r"(\d+(?:\.\d+)?)\s*(.*)$", raw)
+                        val = _to_seconds(num.group(1), num.group(2).strip()
+                                          or None) if num else None
+                        pat = "表格 | N |"
+            if val is not None:
+                out.append(_decl(fname, lineno, name, val, pat, line))
+                break  # 同一行同一键只记第一条命中形态
+    return out
+
+
+def _extract_special_decls(line: str, fname: str, lineno: int) -> list[dict]:
+    """不与键名同现的散文声明：满 N 格 / fixed 每 Ns / requests|fixed（当前）。"""
+    out: list[dict] = []
+    # 满 N 格 → proactive_after_dsv4_ok 的阈值散文。
+    # 「138s/150 格」这类实测记录不含「满」直接接数字，不会被误抓。
+    for m in re.finditer(r"(?:累计|跑)?满\s*\**(\d+)\s*\**\s*格", line):
+        out.append(_decl(fname, lineno, "proactive_after_dsv4_ok",
+                         int(m.group(1)), "满 N 格", line))
+    # fixed 每 Ns → proactive_fixed_sec
+    for m in re.finditer(r"fixed[^\n]{0,30}?每\s*\**(\d+)\s*\**\s*(?:s|sec|秒)",
+                         line):
+        out.append(_decl(fname, lineno, "proactive_fixed_sec",
+                         int(m.group(1)), "fixed 每 Ns", line))
+    # requests|fixed（当前）→ proactive_mode。一行两种都带「当前」= 歧义，跳过
+    cands = {m.group(1) for m in
+             re.finditer(r"(requests|fixed)[^\n]{0,20}?（\*{0,2}当前", line)}
+    if len(cands) == 1:
+        out.append(_decl(fname, lineno, "proactive_mode", cands.pop(),
+                         "（当前生效）", line))
+    return out
+
+
+def living_doc_files(project: Path) -> tuple[list[Path], list[Path]]:
+    """活文档扫描集与归档排除集（见 DOC_DESIGN_NOTE）。"""
+    candidates: list[Path] = []
+    for name in ("CLAUDE.md", "README.md", "TEST_PLAN.md"):
+        p = project / name
+        if p.exists():
+            candidates.append(p)
+    docs = project / "docs"
+    if docs.is_dir():
+        candidates += sorted(docs.rglob("*.md"))
+    scanned, skipped = [], []
+    for p in candidates:
+        (skipped if _DATE_IN_NAME_RE.search(p.name) else scanned).append(p)
+    return scanned, skipped
+
+
+def read_doc_values() -> tuple[dict[str, object], list[str]]:
+    """运行值快照：{键名: 值}。读不到的键记进 warnings，不编造。"""
+    values: dict[str, object] = {}
+    warnings: list[str] = []
+    for name, path, _kind in DOC_KEYS:
+        node: object = CFG
+        try:
+            for seg in path:
+                node = node[seg]  # type: ignore[index]
+            values[name] = node
+        except (KeyError, TypeError):
+            warnings.append(f"运行值读不到：CFG{''.join('[%r]' % s for s in path)}")
+    return values, warnings
+
+
+def collect_doc_drift(project: Path) -> dict:
+    """文档数值声明 vs 运行值。mismatches 非空 = 文档漂移（阻断）。"""
+    values, warnings = read_doc_values()
+    scanned, skipped = living_doc_files(project)
+    declarations: list[dict] = []
+    for p in scanned:
+        rel = str(p.relative_to(project)) if str(p).startswith(str(project)) \
+            else str(p)
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as e:
+            warnings.append(f"读不到 {rel}：{e}")
+            continue
+        for i, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            declarations += _extract_key_decls(line, rel, i)
+            declarations += _extract_special_decls(line, rel, i)
+
+    mismatches: list[dict] = []
+    compared_keys: set[str] = set()
+    for d in declarations:
+        key = d["key"]
+        actual = values.get(key)
+        if actual is None:
+            continue
+        compared_keys.add(key)
+        if isinstance(d["declared"], str) or isinstance(actual, str):
+            ok = str(d["declared"]).lower() == str(actual).lower()
+        else:
+            ok = int(d["declared"]) == int(actual)
+        d["actual"] = actual
+        d["ok"] = ok
+        if not ok:
+            mismatches.append(d)
+
+    def _rel(p: Path) -> str:
+        return str(p.relative_to(project))
+
+    return {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "read_only": True,
+        "design_note": DOC_DESIGN_NOTE,
+        "values": values,
+        "scanned_files": [_rel(p) for p in scanned],
+        "skipped_files": [_rel(p) for p in skipped],
+        "declarations": declarations,
+        "declarations_total": len(declarations),
+        "mismatches": mismatches,
+        "uncompared_keys": [name for name, _p, _k in DOC_KEYS
+                            if name not in compared_keys],
+        "warnings": warnings,
+    }
+
+
+def render_doc_drift_text(rep: dict, max_list: int) -> str:
+    out: list[str] = []
+    out.append("=" * 68)
+    out.append(f"文档漂移关卡（--doc-drift）  {rep['generated_at']}")
+    out.append("=" * 68)
+    out.append(f"设计选择：{rep['design_note']}")
+    out.append("")
+    out.append(f"【扫描集】活文档 {len(rep['scanned_files'])} 个"
+               f"（跳过历史归档 {len(rep['skipped_files'])} 个）")
+    for f in rep["scanned_files"][:max_list]:
+        out.append(f"      {f}")
+    if len(rep["scanned_files"]) > max_list:
+        out.append(f"      …… 还有 {len(rep['scanned_files']) - max_list} 个")
+    if rep["skipped_files"]:
+        out.append("  跳过（历史归档，保留历史数值是其职责，不参与比对）：")
+        for f in rep["skipped_files"][:max_list]:
+            out.append(f"      {f}")
+        if len(rep["skipped_files"]) > max_list:
+            out.append(f"      …… 还有 {len(rep['skipped_files']) - max_list} 个")
+    out.append("")
+    out.append("【运行值】")
+    for k, v in rep["values"].items():
+        out.append(f"  {k:<26} = {v}")
+    out.append("")
+    if rep["warnings"]:
+        out.append("【警告】")
+        for w in rep["warnings"]:
+            out.append(f"  ⚠ {w}")
+        out.append("")
+    out.append(f"【声明比对】共 {rep['declarations_total']} 条声明")
+    if rep["mismatches"]:
+        out.append("  ✗ 与运行值不一致（阻断，退出 1）：")
+        for d in rep["mismatches"]:
+            out.append(f"    {d['file']}:{d['line']}  {d['key']}"
+                       f"  声明={d['declared']}"
+                       f"  实际={d['actual']}  （{d['pattern']}）")
+            out.append(f"        原文：{d['text']}")
+    else:
+        out.append("  全部一致。")
+    out.append("")
+    if rep["uncompared_keys"]:
+        out.append("【无声明可比对的键】（文档里没找到声明，跳过）")
+        for k in rep["uncompared_keys"]:
+            out.append(f"      {k}")
+        out.append("")
+    out.append("-" * 68)
+    if rep["mismatches"]:
+        out.append(f"结论：{len(rep['mismatches'])} 处文档漂移 —— 散文声明值与"
+                   f"运行值不一致（FR-12/R-9 复发形态），退出 1。")
+    else:
+        out.append("结论：文档声明与运行值一致（或无可比对声明），退出 0。")
+    return "\n".join(out)
+
+
+def collect_runtime_drift(project: Path | None = None) -> dict:
+    """产物面 vs 生效面差集（每 selector 面）。只读：只发 GET。
+
+    判据只有 `asip.config_projection.compare_members` 一份（D-1）。
+    API 未知 → verdict=unknown，明确输出「无法判定」，不算通过。
+    """
+    members, w = read_members()
+    warnings = list(w)
+    known = set(members)
+    faces_out: list[dict] = []
+    for face in iter_selector_faces():
+        expected = read_disk_selector_members(face["config_file"],
+                                              face["selector"])
+        runtime = read_runtime_members(face["base_url"], face["selector"],
+                                       get_singbox_secret)
+        if not known:
+            # 台账已知线读不到就分不清「休眠 tag」与「真线缺失」——
+            # 无法判定，绝不拿空名单去过滤出「无漂移」的假阴性。
+            verdict, missing, extra, note = (
+                "unknown", [], [], "探测名单（台账已知线）读不到，无法判定")
+        else:
+            res = compare_members(expected, runtime, known)
+            verdict = res.verdict
+            missing, extra = sorted(res.missing), sorted(res.extra)
+            if expected is None:
+                note = "产物面读不到（配置缺失/解析失败）"
+            elif runtime is None:
+                note = "生效面读不到（Clash API 不可达/未就绪/`all` 为空）"
+            else:
+                note = ""
+        faces_out.append({
+            "name": face["name"],
+            "selector": face["selector"],
+            "config_file": face["config_file"],
+            "base_url": face["base_url"],
+            "expected": None if expected is None else sorted(expected),
+            "runtime": None if runtime is None else sorted(runtime),
+            "verdict": verdict,
+            "missing": missing,
+            "extra": extra,
+            "note": note,
+        })
+    return {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "read_only": True,
+        "known_line_tags": len(known),
+        "faces": faces_out,
+        "warnings": warnings,
+    }
+
+
+def render_runtime_drift_text(rep: dict, max_list: int) -> str:
+    out: list[str] = []
+    out.append("=" * 68)
+    out.append(f"产物面 vs 生效面对账（--runtime-drift）  {rep['generated_at']}")
+    out.append("只读；判据 = asip.config_projection（与 daemon 闭环同语义）。"
+               "热重载 ≠ 生效（INC-017）：204 不代表 selector 成员已更新。")
+    out.append("=" * 68)
+    out.append(f"台账已知线：{rep['known_line_tags']} 条")
+    out.append("")
+    for f in rep["faces"]:
+        head = f"{f['name']}（selector={f['selector']}）"
+        if f["verdict"] == "consistent":
+            out.append(f"  ✓ {head}  一致"
+                       f"（产物 {len(f['expected'] or [])} / "
+                       f"生效 {len(f['runtime'] or [])}）")
+        elif f["verdict"] == "unknown":
+            out.append(f"  ? {head}  无法判定 —— {f['note']}（不算通过）")
+        else:
+            out.append(f"  ✗ {head}  漂移（{f['note']}）"
+                       if f["note"] else f"  ✗ {head}  漂移")
+            out.append(f"      产物面有、生效面缺（缺失集 {len(f['missing'])}）：")
+            for t in f["missing"][:max_list]:
+                out.append(f"        {t}")
+            if len(f["missing"]) > max_list:
+                out.append(f"        …… 还有 {len(f['missing']) - max_list} 条")
+            out.append(f"      生效面有、产物面缺（多余集 {len(f['extra'])}）：")
+            for t in f["extra"][:max_list]:
+                out.append(f"        {t}")
+            if len(f["extra"]) > max_list:
+                out.append(f"        …… 还有 {len(f['extra']) - max_list} 条")
+    if rep["warnings"]:
+        out.append("")
+        out.append("【警告】")
+        for w in rep["warnings"]:
+            out.append(f"  ⚠ {w}")
+    out.append("")
+    out.append("-" * 68)
+    bad = [f for f in rep["faces"] if f["verdict"] == "drift"]
+    unk = [f for f in rep["faces"] if f["verdict"] == "unknown"]
+    if bad:
+        out.append(f"结论：{len(bad)} 个面存在漂移"
+                   f"{'，%d 个面无法判定' % len(unk) if unk else ''} —— 退出 1。"
+                   f"整进程重启才会重建 selector 成员（热重载无效）。")
+    elif unk:
+        out.append(f"结论：{len(unk)} 个面无法判定（API 读不到）—— 不算通过，"
+                   f"退出 1。")
+    else:
+        out.append("结论：所有面对账一致，退出 0。")
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -998,13 +1471,19 @@ def render_text(rep: dict, max_list: int) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="跨源巡检：members / sing-box outbounds / systemd 单元 / "
-                    "状态台账 / 档位 五处对账（只读）")
+                    "状态台账 / 档位 五处对账（只读）；"
+                    "--doc-drift / --runtime-drift 为配置漂移关卡（E 项）")
     ap.add_argument("--json", action="store_true",
                     help="输出机器可读 JSON（每类的完整 tag 列表，不截断）")
     ap.add_argument("--project", default=None,
                     help="项目根目录（默认：脚本所在项目的父目录）")
     ap.add_argument("--max-list", type=int, default=10,
                     help="文本报告里每类列举几个（默认 10）")
+    ap.add_argument("--doc-drift", action="store_true",
+                    help="文档数值声明 vs 运行值；不一致退出 1（阻断）")
+    ap.add_argument("--runtime-drift", action="store_true",
+                    help="产物面 vs 生效面（selector 成员）对账；"
+                         "漂移或无法判定均退出 1")
     args = ap.parse_args()
 
     global PROJECT
@@ -1015,6 +1494,40 @@ def main() -> int:
             print(f"asip_audit: 工具自身出错：--project 路径无法解析：{e}",
                   file=sys.stderr)
             return 2
+
+    # ---- E 项模式：文档关卡 / 生效面对账（与五源巡检互斥）-----------------
+    if args.doc_drift or args.runtime_drift:
+        try:
+            exit_code = 0
+            reports: dict[str, dict] = {}
+            if args.doc_drift:
+                rep = collect_doc_drift(PROJECT)
+                reports["doc_drift"] = rep
+                if rep["mismatches"]:
+                    exit_code = 1
+            if args.runtime_drift:
+                rep = collect_runtime_drift(PROJECT)
+                reports["runtime_drift"] = rep
+                if any(f["verdict"] != VERDICT_CONSISTENT
+                       for f in rep["faces"]):
+                    exit_code = 1
+        except Exception as e:  # noqa: BLE001 — 工具自身出错 → 退出码 2
+            print(f"asip_audit: 工具自身出错：{e}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(reports if len(reports) > 1
+                             else next(iter(reports.values())),
+                             ensure_ascii=False, indent=2))
+        else:
+            if "doc_drift" in reports:
+                print(render_doc_drift_text(reports["doc_drift"],
+                                            max(0, args.max_list)))
+            if "runtime_drift" in reports:
+                if "doc_drift" in reports:
+                    print()
+                print(render_runtime_drift_text(reports["runtime_drift"],
+                                                max(0, args.max_list)))
+        return exit_code
 
     try:
         rep = collect(PROJECT)

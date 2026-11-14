@@ -402,3 +402,84 @@ def test_recent_rotations_reads_tail_of_ledger(gate_env):
     assert summ["last"]["to_node"] == "n2"
     assert summ["calls_in_window"] == 3
     assert summ["rotations_in_window"] == 2   # coalesced 不算真换节点
+
+
+# ── opencode 应用日志（asip oc app）：能读就读，缺位优雅降级 ──────────
+
+def test_opencode_log_readable(tmp_path, monkeypatch):
+    f = tmp_path / "opencode.log"
+    f.write_text("line1\nERROR something bad\nFree usage limit hit\nline4\n",
+                 encoding="utf-8")
+    monkeypatch.setenv("OPENCODE_LOG", str(f))
+    # env 覆盖优先（不许硬编码路径）
+    assert opencode_gate.opencode_log_path() == str(f)
+    info = opencode_gate.opencode_log_info()
+    assert info["path"] == str(f)
+    assert info["exists"] is True
+    assert info["readable"] is True
+    assert info["lines"] == 4
+    assert info["size"] == f.stat().st_size
+    # last_alert = 最近一条命中行（Free usage limit 晚于 ERROR）
+    assert "Free usage limit" in info["last_alert"]
+
+
+def test_opencode_log_unreadable(tmp_path, monkeypatch):
+    missing = tmp_path / "no-such-opencode.log"
+    monkeypatch.setenv("OPENCODE_LOG", str(missing))
+    info = opencode_gate.opencode_log_info()
+    # 不可读也给结构化结果，绝不抛异常（能读就读）
+    assert info["path"] == str(missing)
+    assert info["exists"] is False
+    assert info["readable"] is False
+    assert info["lines"] is None
+    assert info["last_alert"] is None
+
+
+# ── B1 选点注入：picker 对齐 pick_next_node（P2C），缺省均匀随机 ──────
+
+def test_picker_injected_chooses_picker_node(gate_env, monkeypatch):
+    """picker 说了算：返回谁就换谁（daemon 委托点注入 pick_next_node 同接线）。"""
+    _reset_coalesce(monkeypatch, 0)
+    seen = []
+
+    def picker(cur, all_nodes, fail_set):
+        seen.append((cur, set(all_nodes), set(fail_set)))
+        return "n2"
+
+    resp = opencode_gate.handle_rotate(_req(), picker=picker)
+    assert resp["switched"] is True
+    assert resp["switch_to_node"] == "n2"
+    assert gate_env.world.puts[0][2] == "n2"
+    # 注入面：current=事发节点、all_nodes=池全体、fail_set=独立冷却中
+    cur, all_nodes, fail_set = seen[0]
+    assert cur == "n1"
+    assert all_nodes == {"n1", "n2", "n3"}
+    assert "n1" in fail_set   # 报障后旧节点先入独立冷却表，经 fail_set 交出去
+
+
+def test_picker_none_falls_back_to_uniform_random(gate_env, monkeypatch):
+    """picker 缺省回退均匀随机：仍换节点，落在池内且非当前。"""
+    _reset_coalesce(monkeypatch, 0)
+    resp = opencode_gate.handle_rotate(_req())
+    assert resp["switched"] is True
+    assert resp["switch_to_node"] in ("n2", "n3")
+    assert resp["switch_to_node"] != "n1"
+    assert len(gate_env.world.puts) == 1
+
+
+def test_fault_cools_old_node_but_proactive_does_not(gate_env, monkeypatch):
+    """冷却语义照第七闸口：报障冷却旧节点、proactive 不冷；独立冷却表。"""
+    _reset_coalesce(monkeypatch, 0)
+    resp = opencode_gate.handle_rotate(_req(reason="rate429"))
+    assert resp["switched"] is True
+    snap = opencode_gate.snapshot()
+    assert "n1" in snap["cooldown"]                    # 报障：旧节点入独立冷却
+    assert daemon._COOLDOWN_NODES.get("n1") is None    # 没写公共冷却表
+
+    cur = resp["switch_to_node"]
+    _reset_coalesce(monkeypatch, 0)
+    resp2 = opencode_gate.handle_rotate(
+        _req(reason="proactive", req_id="req-2"))
+    assert resp2["switched"] is True
+    assert cur not in opencode_gate.snapshot()["cooldown"]   # proactive 不冷
+    assert daemon._COOLDOWN_NODES == {}                      # 公共表始终没人写

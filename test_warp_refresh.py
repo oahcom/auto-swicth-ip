@@ -675,7 +675,7 @@ def test_refresh_model_check_disabled_keeps_old_mode(monkeypatch):
     import probe_warp
     called = []
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: (called.append(port), ("OK", 0.1, "", None))[1])
+                        lambda port, timeout, ip=None: (called.append(port), ("OK", 0.1, "", None))[1])
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", False)
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-a") is True
     assert called == [], "原模式下不得发探测请求"
@@ -689,7 +689,7 @@ def test_model_probe_maps_quota_to_unusable(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     verdict = {"v": "quota"}
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: (verdict["v"], 0.1, "", None))
+                        lambda port, timeout, ip=None: (verdict["v"], 0.1, "", None))
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip") is False
     verdict["v"] = "OK"
     assert daemon._warp_model_usable({"tag": "W2", "port": 1081}, "ip2") is True
@@ -702,7 +702,7 @@ def test_probe_runs_at_most_once_per_address_within_ttl(monkeypatch):
     monkeypatch.setitem(daemon.CFG["warp"], "probe_persistent_ttl_sec", 21600)
     calls = []
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: (calls.append(port), ("quota", 0.1, "", None))[1])
+                        lambda port, timeout, ip=None: (calls.append(port), ("quota", 0.1, "", None))[1])
     m = {"tag": "W1", "port": 1080}
     assert daemon._warp_model_usable(m, "2a09:bac5:1ef9:281e::1") is False
     assert daemon._warp_model_usable(m, "2a09:bac5:1ef9:281e::1") is False
@@ -745,7 +745,7 @@ def test_model_quota_verdict_marks_ip_blocked(monkeypatch):
                         lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: ("quota", 0.1, "", None))
+                        lambda port, timeout, ip=None: ("quota", 0.1, "", None))
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-q") is False
     entry = daemon._WARP_IP_USED.get("ip-q") or {}
     assert entry.get("blocked") is True, "quota 必须写进 blocked 台账"
@@ -766,7 +766,7 @@ def test_model_flagged_verdict_maps_to_abuse403(monkeypatch):
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: ("flagged", 0.1, "", None))
+                        lambda port, timeout, ip=None: ("flagged", 0.1, "", None))
     assert daemon._warp_model_usable({"tag": "W2", "port": 1081}, "ip-f") is False
     entry = daemon._WARP_IP_USED["ip-f"]
     assert "abuse403" in daemon._warp_block_stamps(entry)
@@ -781,7 +781,7 @@ def test_model_ok_verdict_does_not_mark_blocked(monkeypatch):
     monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: ("OK", 0.1, "", None))
+                        lambda port, timeout, ip=None: ("OK", 0.1, "", None))
     assert daemon._warp_model_usable({"tag": "W3", "port": 1082}, "ip-ok") is True
     entry = daemon._WARP_IP_USED["ip-ok"]
     assert entry.get("blocked") is False
@@ -800,7 +800,7 @@ def test_all_probe_exceptions_mark_channel_blind(monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
     import probe_warp
 
-    def _boom(port, timeout):
+    def _boom(port, timeout, ip=None):
         raise RuntimeError("bun gone")
 
     monkeypatch.setattr(probe_warp, "probe", _boom)
@@ -828,7 +828,7 @@ def test_blind_channel_falls_back_to_ip_history(monkeypatch):
     import probe_warp
     called = []
     monkeypatch.setattr(probe_warp, "probe",
-                        lambda port, timeout: (called.append(port), ("OK", 0.1, "", None))[1])
+                        lambda port, timeout, ip=None: (called.append(port), ("OK", 0.1, "", None))[1])
     assert daemon._warp_model_usable({"tag": "W1", "port": 1080}, "ip-a") is True
     assert called == [], "通道失明期间不该再探测"
 
@@ -977,7 +977,7 @@ def test_model_probe_ok_records_probe_ok_not_served(monkeypatch):
     """
     import probe_warp
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
-    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout: ("OK", 0.1, "", None))
+    monkeypatch.setattr(probe_warp, "probe", lambda port, timeout, ip=None: ("OK", 0.1, "", None))
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {"ip-a": {"ts": 1000.0}})
     monkeypatch.setattr(time, "time", lambda: 2000.0)
 

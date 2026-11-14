@@ -57,6 +57,7 @@ from asip.atomic_io import write_text as _atomic_write_text
 from asip.clash_client import ClashClient
 from asip.egress import TRACE_URL, probe_egress
 from asip import ledger_policy
+from asip import config_projection
 from asip.redact import redact_secrets as _redact_secrets
 # opencode 专属闸口（kind="opencode"）：rotate 与槽位产出全部委托该模块，
 # daemon 只做 /rotate-opencode-gate 的接线与「非 WARP 线槽位」分类跳过。
@@ -182,6 +183,54 @@ def _record_node_ip_used(ip: str | None, ts: float | None = None) -> None:
     with _NODE_IP_LOCK:
         _NODE_IP_USED[ip] = float(ts or time.time())
     _save_node_ip_used()
+
+
+def _save_slot_health() -> None:
+    """落盘槽位健康状态；重启后恢复结论，避免全 unknown 触发 transport 风暴
+    （2026-11-14 04:45 实测：daemon 重启后 6 槽全 unknown→bad→no_healthy_slot
+    级联 7 分钟，transport 报障 43 倍）。repairing 不持久化（没线程在修），
+    load 时降级为 unknown。"""
+    with _SLOT_STATE_LOCK:
+        snapshot = {
+            name: {k: v for k, v in h.items()}
+            for name, h in _SLOT_HEALTH.items()
+            if h.get("status") != "repairing"  # 不落 repairing：没有线程在修
+        }
+    try:
+        _write_json_atomic(_SLOT_HEALTH_FILE, snapshot)
+    except Exception as e:
+        log(f"✗ 落盘槽位状态失败: {e}")
+
+
+def _load_slot_health() -> None:
+    """启动时恢复槽位健康状态。repairing 降级为 unknown（无后台线程）；
+    坏文件当空表（全 unknown，走正常首轮探测）。"""
+    global _SLOT_HEALTH
+    try:
+        with open(_SLOT_HEALTH_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            now = time.time()
+            with _SLOT_STATE_LOCK:
+                for name, h in data.items():
+                    if not isinstance(h, dict):
+                        continue
+                    status = h.get("status", "unknown")
+                    if status == "repairing":
+                        status = "unknown"  # 没有线程在修，不能恢复 repairing
+                    _SLOT_HEALTH[name] = {
+                        "status": status,
+                        "verdict": h.get("verdict"),
+                        "ts": float(h.get("ts") or 0.0),
+                        "switched_at": float(h.get("switched_at") or 0.0),
+                        "tag": h.get("tag"),
+                        "egress": h.get("egress"),
+                    }
+            log(f"✓ 已恢复 {len(_SLOT_HEALTH)} 条槽位健康状态")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"✗ 读槽位状态失败（当空表）: {e}")
 
 def _egress_log_path() -> str:
     """egress_log 路径（EGRESS_LOG_FILE_PATH 可覆盖，测试用隔离；与 proxy-global.js
@@ -376,13 +425,48 @@ _warp_cooldown_until: float = 0     # 冷却截止，防重连风暴
 _WARP_IP_USED: dict[str, dict] = {}
 _WARP_IP_LOCK = threading.Lock()   # _WARP_IP_USED 跨线程读写（换线线程 + 主循环）
 _WARP_IP_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".warp_ip_used.json")
+# 槽位健康状态持久化：daemon 重启后恢复 status/verdict/switched_at/tag/egress。
+# 不持久化 repairing（没有后台线程在修，恢复了就永远卡住），load 时降级为 unknown。
+_SLOT_HEALTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".slot_health.json")
 # P0 影子统计（docs/design-20261113-ledger-lifecycle.md §3.8/§6.3）：
 # 每次写入时计算影子 expires_at 锚点与判定侧释放时刻的偏差，INV-1 监控。
 # 偏差恒 ≥0 说明「删除判据不会提前放回封禁中的地址」；负值即违例。
 # 暴露到 /debug/state 的 "ledger_shadow" 键。
-_LEDGER_SHADOW = {"checked": 0, "violations": 0, "exact_match": 0,
-                  "deviation_sum": 0.0, "deviation_max": 0.0,
-                  "deviation_min": 0.0}
+#
+# 落盘 + 起点戳（INC-019 同款教训）：纯内存计数重启即失忆，而 P2 门槛是
+# 「violations==0 持续 ≥24h」—— 没有起点戳就无法证明这 24h 从哪一刻算起
+# （18:20:58 重启已清零过一次）。参照 _API_STATS_FILE 模板持久化，重启续计。
+_LEDGER_SHADOW_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   ".ledger_shadow.json")
+_LEDGER_SHADOW_FILE_DEFAULT = _LEDGER_SHADOW_FILE
+# 计数口径：
+#   checked / violations / exact_match        —— 两档抽样合计（exact_match 仅惩罚期档）
+#   deviation_*                               —— **仅惩罚期档**（干净条目不计，见下）
+#   checked_blocked / checked_clean / exact_clean / deviation_clean_max
+#                                             —— 分人群统计
+#   missing_expires / unmigrated / would_delete —— 全表干跑（P2 试算，INV-2 排演）
+#   started_at                                —— 观察起点戳（跨重启保留）
+_LEDGER_SHADOW_DEFAULTS = {
+    "started_at": 0.0,
+    "checked": 0, "violations": 0, "exact_match": 0,
+    "deviation_sum": 0.0, "deviation_max": 0.0, "deviation_min": 0.0,
+    "checked_blocked": 0, "checked_clean": 0, "exact_clean": 0,
+    "deviation_clean_max": 0.0,
+    "missing_expires": 0, "unmigrated": 0, "would_delete": 0,
+    "would_delete_samples": [], "sweep_at": 0.0,
+    "backfilled_total": 0,
+}
+_LEDGER_SHADOW = dict(_LEDGER_SHADOW_DEFAULTS)
+
+
+def _ledger_shadow_reset_missing(s: dict | None = None) -> dict:
+    """补齐缺失键（测试会替换整个 dict，键集合可能是旧的）。"""
+    s = _LEDGER_SHADOW if s is None else s
+    for k, v in _LEDGER_SHADOW_DEFAULTS.items():
+        if k not in s:
+            s[k] = list(v) if isinstance(v, list) else v
+    return s
+
 # 清理到空表时显式放行一次写空（R-6/D-3），_save_warp_ip_used 读后复位。
 _LEDGER_ALLOW_EMPTY_WRITE = False
 # 出口 IP 历史日志：只追加、永不清理、启动不加载。与热表分开是因为热表每次
@@ -445,7 +529,7 @@ def _load_warp_ip_used() -> None:
     """启动时加载落盘的 IP 使用记录（旧版文件里的 `seen` 键直接忽略）。
 
     载入时归一化（§3.6）：老条目缺 expires_at → 保守补齐
-    `expires_at = max(ts, 该轮最晚解禁时刻) + ledger_retention_sec`；
+    `expires_at = max(ts, last_ok_ts, 该轮最晚解禁时刻) + ledger_retention_sec`；
     ban_until 类型非 rate429 或数值非法 → 置空并按默认窗口重算。
     归一化条数记入启动日志。
     """
@@ -458,6 +542,7 @@ def _load_warp_ip_used() -> None:
         retention = float(w.get("ledger_retention_sec", 86400))
         ttl = ledger_policy.make_ttl(w)
         normalized = 0
+        unmigratable = 0
         for ip, v in used.items():
             if isinstance(v, dict) and "ts" in v:
                 changed = _normalize_ledger_entry(v, retention, ttl)
@@ -465,10 +550,27 @@ def _load_warp_ip_used() -> None:
                     normalized += 1
                 _WARP_IP_USED[ip] = v
             elif isinstance(v, (int, float)):
-                _WARP_IP_USED[ip] = {"ts": float(v), "blocked": False}
+                # 旧 float 格式（值是最后使用时刻）。必须同样走归一化补齐
+                # expires_at，否则这类存量条目在 P2 下会被当「未迁移」。
+                entry = {"ts": float(v), "blocked": False}
+                _normalize_ledger_entry(entry, retention, ttl)
+                _WARP_IP_USED[ip] = entry
                 normalized += 1
+            else:
+                continue
+            if _as_ts(_WARP_IP_USED[ip].get("expires_at")) is None:
+                unmigratable += 1
         if normalized:
             log(f"  · 台账载入归一化 {normalized} 条（补 expires_at / 作废坏 ban_until）")
+        if unmigratable:
+            # 时间戳全坏、无解禁时刻：补齐定不出值。不删（可能带 blocked 标记），
+            # 启动日志 + 影子计数暴露，不静默。字段用 `unmigrated`（与全表干跑
+            # 同口径）：`missing_expires` 只计「可补齐」的缺字段条目，是写入口
+            # 收敛是否彻底的证据（runbook 门槛 1），不能被坏数据污染成常数。
+            log(f"  ⚠ 台账 {unmigratable} 条无可用时间锚点，无法补齐 expires_at"
+                f"（清理将跳过并计数）")
+            s = _ledger_shadow_reset_missing()
+            s["unmigrated"] = unmigratable
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -486,12 +588,12 @@ def _normalize_ledger_entry(entry: dict, retention: float, ttl: dict) -> bool:
             entry["ban_until"] = None
             entry["ban_kind"] = None
             changed = True
-    # 缺 expires_at → 保守补齐
+    # 缺 expires_at → 按最近事件补齐（口径与 P2 谓词共用 ledger_policy，见其 docstring）
     if _as_ts(entry.get("expires_at")) is None:
-        ts = _as_ts(entry.get("ts")) or 0.0
-        release = ledger_policy.block_release_ts(entry, ttl)
-        entry["expires_at"] = max(ts, release) + retention
-        changed = True
+        backfill = ledger_policy.backfill_expires_at(entry, retention, ttl)
+        if backfill is not None:
+            entry["expires_at"] = backfill
+            changed = True
     return changed
 
 
@@ -1154,6 +1256,57 @@ def _probe_verdict_for_ip(ip: str | None,
     return fallback[1] if fallback else None
 
 
+def _probe_ok_recent(ip: str | None, now: float, window_sec: float) -> bool:
+    """该地址是否在 window_sec 内被探针判过 OK（D1 的 line_ok 早退判据）。
+
+    只认地址级 OK 且只要「新近」：transport 报障后若探针刚说 OK，换下去的
+    多半是好线（实测 88.7% 会回来服务）。窗口默认 30s —— 再长就会把「探针
+    OK 后线才坏」的真故障也放行。查两张表（_WARP_PROBE_SEEN 与换线前实测的
+    _PROBE_BEFORE_ROTATE），与 _probe_verdict_for_ip 同源。
+    """
+    if not ip:
+        return False
+    with _WARP_REFRESH_LOCK:
+        for (_tag2, ip2), (v2, ts2) in list(_WARP_PROBE_SEEN.items()):
+            if ip2 == ip and v2 == "OK" and now - ts2 <= window_sec:
+                return True
+    try:
+        for key, rec in list(globals().get("_PROBE_BEFORE_ROTATE", {}).items()):
+            if (isinstance(key, str) and key.endswith("|" + ip)
+                    and isinstance(rec, dict)
+                    and rec.get("verdict") == "OK"
+                    and now - float(rec.get("ts") or 0) <= window_sec):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# D1 的二击出局台账：同地址 600s 内第 2 次 transport 报障起放弃 line_ok。
+_LINE_OK_STRIKES: dict[str, list[float]] = {}
+_LINE_OK_STRIKE_LOCK = threading.Lock()
+_LINE_OK_STRIKE_WINDOW = 600.0
+
+
+def _line_ok_strike_add(ip: str, now: float) -> int:
+    """记一次 transport 报障，返回该地址近 _LINE_OK_STRIKE_WINDOW 的累计次数。
+
+    3s 内的连发视为同一次突发（并发请求骑同一条慢线，实测同 IP 1s 内 2 连发），
+    只算一击 —— 否则一波并发瞬间烧穿二击出局，好线被误杀。
+    """
+    with _LINE_OK_STRIKE_LOCK:
+        hits = [t for t in _LINE_OK_STRIKES.get(ip, ())
+                if now - t <= _LINE_OK_STRIKE_WINDOW]
+        if not hits or now - hits[-1] > 3.0:
+            hits.append(now)
+        _LINE_OK_STRIKES[ip] = hits
+        if len(_LINE_OK_STRIKES) > 4096:
+            for k, v in list(_LINE_OK_STRIKES.items()):
+                if not v or now - v[-1] > _LINE_OK_STRIKE_WINDOW:
+                    _LINE_OK_STRIKES.pop(k, None)
+        return len(hits)
+
+
 def _probe_cache_put(tag: str, ip: str, verdict: str,
                      now: float | None = None,
                      started_at: float | None = None) -> bool:
@@ -1493,6 +1646,11 @@ def _cleanup_atexit():
     # ② 落盘自身失败不该挡住连接池的收尾。
     try:
         _persist_api_stats()
+    except Exception:
+        pass
+    # 影子统计同样补落一次：它承载 P2 门槛的「连续 ≥24h」证据，丢了要重计。
+    try:
+        _persist_ledger_shadow()
     except Exception:
         pass
     _health_pool.shutdown(wait=True)
@@ -7440,12 +7598,8 @@ def _record_active_ip_success(total: int, errors: int) -> None:
         entry["last_ok_ts"] = max(float(entry.get("last_ok_ts") or 0), max(fresh))
         # P1 双写：真实成功流量打点续命（§3.3 EVENT_SUCCESS）
         # 锚点 = 最近一次成功时刻（last_ok_ts），不是 time.time()
-        _w = _warp()
-        entry["expires_at"] = ledger_policy.compute_expires_at(
-            entry, ledger_policy.EVENT_SUCCESS,
-            float(entry["last_ok_ts"]),
-            float(_w.get("ledger_retention_sec", 86400)),
-            ledger_policy.make_ttl(_w))
+        _ledger_apply_event_locked(entry, ledger_policy.EVENT_SUCCESS,
+                                   float(entry["last_ok_ts"]))
         _save_warp_ip_used()
     tag = active_warp_tag()
     if tag:
@@ -7559,6 +7713,119 @@ def _warp_rest_time(ip: str | None, now: float) -> float:
     return now - _warp_ip_last_ts(ip) if ip else now
 
 
+# ---- 台账写入口收敛（expires_at 双写的唯一路径） ----
+# 根因：探针建账路径曾直接 `_WARP_IP_USED[ip] = {...}`，只写 ts/blocked/first_seen，
+# 不产生 expires_at。P2 判据「有 expires_at 且未到期才留」会把这种条目当可删，
+# 秒删刚验过的干净条目，丢掉档位 1/2 的选线证据（probe_ok_ts / last_ok_ts）；
+# 且影子对无字段条目返回 None、完全不计数，看不见这次误删。缺口还会动态再生
+# （每次探测建账一条），不是历史残留。因此所有建账/续命都必须走下面两个入口。
+
+def _ledger_new_entry(now: float, blocked: bool = False,
+                      kind: str | None = None) -> dict:
+    """台账条目的唯一构造入口，建账即带 `expires_at` 初值。
+
+    字段集与原 `_warp_ip_used_locked` 的 `fresh` 完全一致（下游 `_warp_ip_rank` /
+    `_warp_ip_needs_refresh` 依赖这些键存在）。初值按 EVENT_TOUCH 计算，随后由
+    调用方用 `_ledger_apply_event_locked` 按真实事件覆盖/续命。
+    """
+    entry = {"ts": now, "blocked": blocked,
+             "blocked_kind": kind if blocked else None, "first_seen": now,
+             "blocked_ts": now if blocked else None,
+             "blocked_ts_by_kind": {}, "served_sec": None, "last_ok_ts": None,
+             "probe_ok_ts": None, "ban_until": None, "ban_kind": None,
+             "expires_at": None}
+    w = _warp()
+    entry["expires_at"] = ledger_policy.compute_expires_at(
+        entry, ledger_policy.EVENT_TOUCH, now,
+        float(w.get("ledger_retention_sec", 86400)),
+        ledger_policy.make_ttl(w))
+    return entry
+
+
+def _ledger_shadow_sample(entry, retention: float | None = None,
+                          ttl: dict | None = None) -> None:
+    """P0 影子抽样（持锁调用）：按人群分档累计不变量偏差。
+
+    干净条目与惩罚期条目分开统计（见 `ledger_policy.shadow_bucket`）：干净条目
+    没有解禁时刻，旧口径把它的时间锚点当偏差，把 `deviation_max` 抬到 1.79e9 秒、
+    把 `exact_match` 稀释到 97% —— 观测被污染后 `violations == 0` 就没有证据力。
+    """
+    if retention is None:
+        retention = float(_warp().get("ledger_retention_sec", 86400))
+    if ttl is None:
+        ttl = ledger_policy.make_ttl(_warp())
+    sample = ledger_policy.shadow_bucket(entry, retention, ttl)
+    s = _ledger_shadow_reset_missing()
+    if sample["bucket"] == "unmigrated":
+        # 缺 expires_at 的条目由全表干跑计数（missing_expires / unmigrated），
+        # 不计入抽样。
+        return
+    s["checked"] += 1
+    if sample["bucket"] == "blocked":
+        s["checked_blocked"] += 1
+        dev = sample["deviation"]
+        if dev is not None:
+            s["deviation_sum"] += dev
+            s["deviation_max"] = max(s["deviation_max"], dev)
+            s["deviation_min"] = (dev if s["checked_blocked"] == 1
+                                  else min(s["deviation_min"], dev))
+            if sample["exact"]:
+                # exact_match 口径：惩罚期条目的 expires_at 锚点与判定侧释放时刻
+                # 精确对齐（dev == 0）。干净条目不计——它们锚在 now/last_ok_ts。
+                s["exact_match"] += 1
+    else:
+        s["checked_clean"] += 1
+        dev = sample["deviation"]
+        if dev is not None:
+            s["deviation_clean_max"] = max(s["deviation_clean_max"], dev)
+            if sample["exact"]:
+                s["exact_clean"] += 1
+    if sample["violation"]:
+        s["violations"] += 1
+
+
+def _ledger_apply_event_locked(entry: dict, event: str, now: float) -> None:
+    """续命写入口（调用方必须已持有 _WARP_IP_LOCK）。
+
+    事件语义全部由 `ledger_policy.compute_expires_at` 决定：只有 SUCCESS /
+    NEW_ROUND / BAN_EXTEND 续命，TOUCH / SAME_ROUND / PROBE 只保证字段存在。
+    缺字段时用 `backfill_expires_at` 按最近事件补齐（与载入归一化同口径，
+    不用 now 凭空续窗口）。同时做一次影子抽样，避免调用方各自复制统计代码
+    （旧写法就是在 `_warp_ip_used_locked` 里内联，探针路径绕过后连统计都没有）。
+    """
+    w = _warp()
+    retention = float(w.get("ledger_retention_sec", 86400))
+    ttl = ledger_policy.make_ttl(w)
+    if _as_ts(entry.get("expires_at")) is None:
+        # 缺字段（运行期才遇到的旧条目）：与载入归一化同一口径 —— 按该条目
+        # 最近事件补齐，不用 now 凭空续一个完整窗口（否则碰一下就续 24h）。
+        backfill = ledger_policy.backfill_expires_at(entry, retention, ttl)
+        entry["expires_at"] = (
+            backfill if backfill is not None
+            else ledger_policy.compute_expires_at(
+                entry, event, now, retention, ttl))
+    elif ledger_policy.is_extending(event):
+        entry["expires_at"] = ledger_policy.compute_expires_at(
+            entry, event, now, retention, ttl)
+    _ledger_shadow_sample(entry, retention, ttl)
+
+
+def _ledger_mark_probe_ok(ip: str, now: float) -> None:
+    """探针 OK 记账（收敛入口）：建账带 expires_at，只写 probe_ok_ts。
+
+    与生产成功严格区分：不写 `last_ok_ts`（那是档位 2 的语义，由
+    `_record_active_ip_success` 独占），见 `_warp_model_usable` 的注释。
+    EVENT_PROBE 不续命，但条目不存在时按建账补初值 —— 这正是原直写路径缺的。
+    """
+    with _WARP_IP_LOCK:
+        entry = _WARP_IP_USED.get(ip)
+        if not isinstance(entry, dict):
+            entry = _WARP_IP_USED[ip] = _ledger_new_entry(now)
+        entry["probe_ok_ts"] = max(float(entry.get("probe_ok_ts") or 0), now)
+        _ledger_apply_event_locked(entry, ledger_policy.EVENT_PROBE, now)
+        _save_warp_ip_used()
+
+
 def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
                        kind: str | None = None,
                        forget_probe: bool = True,
@@ -7612,13 +7879,12 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
 
     `ban_until` 来自上游 429 的 Retry-After（探针实测）：它是**确切**恢复
     时刻，优先于该类型的默认窗口；没有观测时仍用 6h/24h 保守值。
+
+    建账统一走 `_ledger_new_entry`（带 expires_at 初值），续命/抽样统一走
+    `_ledger_apply_event_locked` —— 本函数不再内联生命周期计算，避免探针等
+    旁路再写出一批「缺 expires_at」的条目（P2 会误删）。
     """
-    fresh = {"ts": now, "blocked": blocked,
-             "blocked_kind": kind if blocked else None, "first_seen": now,
-             "blocked_ts": now if blocked else None,
-             "blocked_ts_by_kind": {}, "served_sec": None, "last_ok_ts": None,
-             "probe_ok_ts": None, "ban_until": None, "ban_kind": None,
-             "expires_at": None}
+    fresh = _ledger_new_entry(now, blocked, kind)
     entry = _WARP_IP_USED.setdefault(ip, fresh)
     if not isinstance(entry, dict):
         # 兼容旧格式（float）
@@ -7672,9 +7938,6 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
                 entry["ban_kind"] = "rate429"
     entry["blocked"] = entry.get("blocked", False) or blocked
     # ---- P1 双写 expires_at + P0 影子统计（§3.3 事件契约） ----
-    w = _warp()
-    retention = float(w.get("ledger_retention_sec", 86400))
-    ttl = ledger_policy.make_ttl(w)
     if not blocked:
         event = ledger_policy.EVENT_TOUCH
     elif new_round:
@@ -7683,53 +7946,78 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
         event = ledger_policy.EVENT_BAN_EXTEND
     else:
         event = ledger_policy.EVENT_SAME_ROUND
-    old_expires = _as_ts(entry.get("expires_at"))
-    if old_expires is None or ledger_policy.is_extending(event):
-        entry["expires_at"] = ledger_policy.compute_expires_at(
-            entry, event, now, retention, ttl)
-    # P0 影子偏差监控（INV-1）：expires_at 锚点 ≥ 判定侧释放时刻
-    dev = ledger_policy.shadow_deviation(entry, retention, ttl)
-    if dev is not None:
-        s = _LEDGER_SHADOW
-        s["checked"] += 1
-        s["deviation_sum"] += dev
-        if dev < 0:
-            s["violations"] += 1
-        if dev == 0:
-            s["exact_match"] += 1
-        s["deviation_max"] = max(s["deviation_max"], dev)
-        s["deviation_min"] = min(s["deviation_min"], dev)
+    _ledger_apply_event_locked(entry, event, now)
     # ---- 清理（P2 起由 ledger_cleanup_mode 控制判据） ----
-    cleanup_mode = w.get("ledger_cleanup_mode", "legacy")
-    if cleanup_mode == "expires_at":
-        for k in list(_WARP_IP_USED):
-            v = _WARP_IP_USED[k]
-            exp = _as_ts(v.get("expires_at")) if isinstance(v, dict) else None
-            if exp is not None and exp >= now:
-                continue
-            del _WARP_IP_USED[k]
-    else:
-        cutoff = now - w["ip_reuse_guard_sec"]
-        # 被标记过的 IP 保留到惩罚期结束：取两档恢复期（403 6h）与 blocked_ttl_sec
-        # 的最大值兜底；解析到精确封禁的条目由下方 ban_until > now 单独保护，
-        # 不会因默认窗口缩短（429 现在 60s）被提前清掉放回候选池。
-        blocked_cutoff = now - max(w.get("blocked_guard_sec", 86400),
-                                   w.get("rate429_guard_sec", 86400),
-                                   w.get("blocked_ttl_sec", 86400))
-        for k in list(_WARP_IP_USED):
-            v = _WARP_IP_USED[k]
-            # 上游给出长于默认窗口的确切封禁时，条目必须留到 ban_until。
-            ban_until = _as_ts(v.get("ban_until")) if isinstance(v, dict) else None
-            if ban_until is not None and ban_until > now:
-                continue
-            ts = v.get("ts") if isinstance(v, dict) else v
-            keep = blocked_cutoff if (isinstance(v, dict) and v.get("blocked")) else cutoff
-            if ts < keep:
-                del _WARP_IP_USED[k]
+    w = _warp()
+    _ledger_cleanup_locked(now, w)
     global _LEDGER_ALLOW_EMPTY_WRITE
     if not _WARP_IP_USED:
         _LEDGER_ALLOW_EMPTY_WRITE = True
     _save_warp_ip_used()
+
+
+def _ledger_cleanup_locked(now: float, w: dict) -> None:
+    """全表清理（调用方持锁，并在本函数后落盘）。
+
+    `legacy`：`ts` + 窗口口径，行为与改造前逐字节一致（保留 24h 内被碰过的
+    条目；被标脏条目按最长惩罚期兜底；ban_until 未到期单独保护）。
+
+    `expires_at`（P2，INV-4 唯一判据）：`expires_at < now` 才删。**缺字段不再是
+    「可删」**——那是「未迁移」：先用 `cleanup_verdict` 按最近事件补齐再判；
+    补齐也定不出值（时间戳全坏）的条目保留并计数告警，绝不静默删除 ——
+    否则探针建账的干净条目会被秒删，档位 1/2 的选线证据（probe_ok_ts /
+    last_ok_ts）随之丢失，而影子对无字段条目不计数、根本看不见。
+    """
+    mode = w.get("ledger_cleanup_mode", "legacy")
+    if mode == "expires_at":
+        retention = float(w.get("ledger_retention_sec", 86400))
+        ttl = ledger_policy.make_ttl(w)
+        s = _ledger_shadow_reset_missing()
+        missing = unmigrated = 0
+        for k in list(_WARP_IP_USED):
+            v = _WARP_IP_USED[k]
+            if not isinstance(v, dict):
+                # 旧 float 格式残留（载入已转 dict，这里只防御运行期外部注入）。
+                # 保留原值当 ts；坏值走 unmigrated 分支保留而不是删。
+                v = _WARP_IP_USED[k] = {"ts": _as_ts(v), "blocked": False}
+            delete, why = ledger_policy.cleanup_verdict(v, now, retention, ttl)
+            if why == "unmigrated":
+                unmigrated += 1
+                continue
+            if why == "backfilled":
+                missing += 1
+                # 补齐结果落回条目：之后不再重复推算，也与载入归一化同口径。
+                v["expires_at"] = ledger_policy.backfill_expires_at(
+                    v, retention, ttl)
+                s["backfilled_total"] += 1
+            if delete:
+                del _WARP_IP_USED[k]
+        s["missing_expires"] = missing
+        s["unmigrated"] = unmigrated
+        if unmigrated:
+            log(f"  ⚠ 台账 P2 清理跳过 {unmigrated} 条无时间锚点条目（无法补齐）")
+        return
+    cutoff = now - w["ip_reuse_guard_sec"]
+    # 被标记过的 IP 保留到惩罚期结束：取两档恢复期（403 6h）与 blocked_ttl_sec
+    # 的最大值兜底；解析到精确封禁的条目由下方 ban_until > now 单独保护，
+    # 不会因默认窗口缩短（429 现在 60s）被提前清掉放回候选池。
+    blocked_cutoff = now - max(w.get("blocked_guard_sec", 86400),
+                               w.get("rate429_guard_sec", 86400),
+                               w.get("blocked_ttl_sec", 86400))
+    for k in list(_WARP_IP_USED):
+        v = _WARP_IP_USED[k]
+        # 上游给出长于默认窗口的确切封禁时，条目必须留到 ban_until。
+        ban_until = _as_ts(v.get("ban_until")) if isinstance(v, dict) else None
+        if ban_until is not None and ban_until > now:
+            continue
+        ts = v.get("ts") if isinstance(v, dict) else v
+        if ts is None:
+            # 无 ts 的畸形条目：legacy 口径下原代码会 TypeError（None < float），
+            # 这里显式保留 —— 清理不负责修数据，静默删更危险（可能带 blocked）。
+            continue
+        keep = blocked_cutoff if (isinstance(v, dict) and v.get("blocked")) else cutoff
+        if ts < keep:
+            del _WARP_IP_USED[k]
 
 def _warp_model_usable(member: dict, ip: str) -> bool:
     """刷新后的模型层验收：这条线此刻能否真正服务 opencode 免费层。
@@ -7800,7 +8088,7 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         import probe_warp
         try:
             verdict, _sec, _detail, retry_after = probe_warp.probe(
-                member["port"], w.get("refresh_model_timeout_sec", 30))
+                member["port"], w.get("refresh_model_timeout_sec", 30), ip=ip)
         finally:
             # 必须 finally：探测抛异常时也要把登记清掉，否则这条 tag 的
             # `_PROBING_IP` 永远留着旧地址，之后同址的别的线会被误记成并发重复。
@@ -7841,18 +8129,17 @@ def _warp_model_usable(member: dict, ip: str) -> bool:
         now = time.time()
         # 字典改动与落盘必须在同一把锁内：`_warp_model_test_many` 会并发调
         # 本函数，放锁后再写会让较旧的快照覆盖较新的台账。
-        with _WARP_IP_LOCK:
-            entry = _WARP_IP_USED.get(ip)
-            if not isinstance(entry, dict):
-                entry = _WARP_IP_USED[ip] = {"ts": now, "blocked": False,
-                                             "first_seen": now}
-            # WHY 不写 `last_ok_ts`：那个字段的语义是「该地址真的撑过生产流量」，
-            # 由 `_record_active_ip_success` 独占。探针 OK 只说明「此刻配额还没
-            # 耗尽」，下一个请求就可能被烧，也可能永远轮不到它上场。混写会让
-            # `_warp_ip_rank` 把「只在空跑里验过」的地址排进次级优质档，与真正
-            # 撑过流量的地址同权 —— 实测台账 2945 条里 738 条属于这种「验过没用过」。
-            entry["probe_ok_ts"] = max(float(entry.get("probe_ok_ts") or 0), now)
-            _save_warp_ip_used()
+        #
+        # 建账走收敛入口 `_ledger_mark_probe_ok`：原实现直接 `_WARP_IP_USED[ip]
+        # = {"ts", "blocked", "first_seen"}`，不产生 expires_at（P2 判据下等于
+        # 刚建就「可删」），也不带 blocked_ts_by_kind 等字段。此路径每次探测
+        # 都可能建账，缺口会动态再生，不是历史残留。
+        # WHY 不写 `last_ok_ts`：那个字段的语义是「该地址真的撑过生产流量」，
+        # 由 `_record_active_ip_success` 独占。探针 OK 只说明「此刻配额还没
+        # 耗尽」，下一个请求就可能被烧，也可能永远轮不到它上场。混写会让
+        # `_warp_ip_rank` 把「只在空跑里验过」的地址排进次级优质档，与真正
+        # 撑过流量的地址同权 —— 实测台账 2945 条里 738 条属于这种「验过没用过」。
+        _ledger_mark_probe_ok(ip, now)
     elif verdict in _MODEL_VERDICT_BLOCK_KIND:
         # 模型层判 quota/flagged 与生产侧 429/403 是同一件事（前者是
         # FreeUsageLimitError，后者是 abusive traffic），都该落进 blocked 台账：
@@ -10727,6 +11014,17 @@ def reload_singbox_config(path: str | None = None, slot: dict | None = None) -> 
     期间 9router 的每个请求都 ECONNREFUSED → 503。订阅刷新、节点并入这类
     「配置级」动作根本不值得拿出口可用性去换这 13 秒。
 
+    **204 ≠ selector 成员已生效**（INC-017）：热重载不重建 outbound，进程内
+    selector 的 `all` 仍是旧成员 —— 2026-11-13 实测磁盘 7 份配置各 147 条
+    成员、运行时只有 108 条，新线 PUT 进 selector 只拿 400 `Selector update
+    error: not found`。「7890 全程 0 失败」只证明**热载不断流**，不证明
+    配置内容生效；204 只代表配置文件被接受并加载。只有整进程重启
+    （`_restart_slot_process` / `restart_singbox`）才会重建 selector 成员。
+    生效性由两级校验兜底（bc89daa）：`_reload_config_set` 热载后置
+    `_slot_drift_after_reload`（3 次 × 1s）逐槽校验，发现漂移滚动单槽
+    重启；keeper 兜底 `_slot_drift_maybe_heal` 补闸自愈。成员漂移判据只有
+    `asip.config_projection` 一份（D-1 单一事实源）。
+
     只在**确认进程活着**时用；进程死了必须走 restart_singbox（那才是看门狗的活）。
     """
     if slot is None:
@@ -12380,6 +12678,163 @@ def _persist_api_stats() -> None:
         log(f"· _api_stats 落盘失败（忽略）: {e}")
 
 
+# ── 台账影子：落盘续计 + P2 清理谓词干跑（INV-2 排演） ───────────────
+# 为什么必须落盘：P2 门槛是「violations == 0 连续 ≥24h」，纯内存计数一重启
+# 就清零（18:20:58 已清零一次），门槛永远无法证明起点。这里沿用 _api_stats
+# 的模板：周期快照 + 退出补写 + 启动合并，起点戳 started_at 跨重启保留。
+# pytest 隔离同款：只拦「跑在 pytest 里且路径仍是默认真实路径」，用例
+# monkeypatch 成 tmp 路径后照常读写，生产行为不变。
+_LEDGER_SHADOW_SUM_KEYS = ("checked", "violations", "exact_match",
+                           "deviation_sum", "checked_blocked", "checked_clean",
+                           "exact_clean", "backfilled_total")
+_LEDGER_SHADOW_MAX_KEYS = ("deviation_max", "deviation_clean_max")
+_LEDGER_SHADOW_MIN_KEYS = ("deviation_min",)
+_LEDGER_SHADOW_GAUGE_KEYS = ("missing_expires", "unmigrated", "would_delete",
+                             "sweep_at")
+
+
+def _ledger_shadow_io_blocked() -> bool:
+    return _IN_PYTEST and _LEDGER_SHADOW_FILE == _LEDGER_SHADOW_FILE_DEFAULT
+
+
+def _merge_ledger_shadow(persisted: dict) -> None:
+    """把盘上的影子累计值并进当前 dict（计数相加、极值取极值、瞬时量取较大者）。"""
+    if not isinstance(persisted, dict):
+        return
+    s = _ledger_shadow_reset_missing()
+    for k in _LEDGER_SHADOW_SUM_KEYS:
+        v = persisted.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            s[k] += v
+    for k in _LEDGER_SHADOW_MAX_KEYS:
+        v = persisted.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            s[k] = max(s[k], v)
+    for k in _LEDGER_SHADOW_MIN_KEYS:
+        v = persisted.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            # 0.0 是初值哨兵；重启后既无存量也无新样本时保留 0。
+            if s["checked_blocked"] == 0:
+                s[k] = v
+            else:
+                s[k] = min(s[k], v)
+    for k in _LEDGER_SHADOW_GAUGE_KEYS:
+        v = persisted.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            s[k] = max(s[k], v)
+    started = _as_ts(persisted.get("started_at"))
+    if started and started > 0:
+        s["started_at"] = started
+    samples = persisted.get("would_delete_samples")
+    if isinstance(samples, list) and samples and not s["would_delete_samples"]:
+        s["would_delete_samples"] = samples[:5]
+
+
+def _load_ledger_shadow_boot() -> None:
+    """启动合并：读 .ledger_shadow.json 续计，并保证有起点戳。
+
+    文件不存在 / 损坏 / 非 dict → 静默从零（观测数据丢得起，启动不能停）。
+    """
+    s = _ledger_shadow_reset_missing()
+    if not _ledger_shadow_io_blocked():
+        try:
+            with open(_LEDGER_SHADOW_FILE, "r", encoding="utf-8") as f:
+                _merge_ledger_shadow(json.load(f))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log(f"· .ledger_shadow.json 损坏，影子统计从零开始: {e}")
+    if not s.get("started_at"):
+        # 首次运行（或盘上文件缺失）：此刻即观察起点。之后每次重启都从这里续。
+        s["started_at"] = time.time()
+
+
+def _persist_ledger_shadow() -> None:
+    """原子落盘影子统计（周期快照 / 退出钩子共用）；失败只 log。"""
+    if _ledger_shadow_io_blocked():
+        return
+    try:
+        snap = dict(_LEDGER_SHADOW)
+        snap["persisted_at"] = time.time()
+        tmp = _LEDGER_SHADOW_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+        os.replace(tmp, _LEDGER_SHADOW_FILE)
+    except Exception as e:
+        log(f"· 影子统计落盘失败（忽略）: {e}")
+
+
+def _mask_ledger_ip(ip: str) -> str:
+    """样例脱敏：IPv4 留前两段、IPv6 留前两组。只用于看特征，不用于定位。"""
+    try:
+        if ":" in ip:
+            return ":".join(ip.split(":")[:2]) + "::x"
+        parts = ip.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.x.x"
+    except Exception:
+        pass
+    return "x"
+
+
+def _ledger_sample_row(ip: str, entry, now: float) -> dict:
+    """would-delete 样例特征（脱敏）：看的是「哪些类型的条目会被删」。"""
+    e = entry if isinstance(entry, dict) else {}
+    exp = _as_ts(e.get("expires_at"))
+    return {
+        "ip": _mask_ledger_ip(ip),
+        "blocked": bool(e.get("blocked")),
+        "rank_probe": bool(e.get("probe_ok_ts")),
+        "rank_ok": bool(e.get("last_ok_ts")),
+        "expired_s": round(now - exp, 1) if exp is not None else None,
+    }
+
+
+def _ledger_shadow_sweep(now: float | None = None) -> dict:
+    """P2 清理谓词干跑：全表算「若此刻切 expires_at 会删谁」（INV-2 排演）。
+
+    只读、不改表：缺 expires_at 的条目用 `ledger_policy.cleanup_verdict` 的
+    补齐口径试算（不写回），仍定不出值的计入 unmigrated 并视为「不删」。
+    与 P2 实删共用同一个谓词，所以 `would_delete == 0` 就是「此刻切换不会
+    误删任何条目」的运行证据，而不只是设计推演。
+    """
+    now = time.time() if now is None else now
+    w = _warp()
+    retention = float(w.get("ledger_retention_sec", 86400))
+    ttl = ledger_policy.make_ttl(w)
+    would = missing = unmigrated = 0
+    samples: list[dict] = []
+    with _WARP_IP_LOCK:
+        for ip, v in list(_WARP_IP_USED.items()):
+            delete, why = ledger_policy.cleanup_verdict(v, now, retention, ttl)
+            if why == "unmigrated":
+                unmigrated += 1
+                continue
+            if why == "backfilled":
+                missing += 1
+            if delete:
+                would += 1
+                if len(samples) < 5:
+                    samples.append(_ledger_sample_row(ip, v, now))
+    s = _ledger_shadow_reset_missing()
+    s["would_delete"] = would
+    s["missing_expires"] = missing
+    s["unmigrated"] = unmigrated
+    s["sweep_at"] = now
+    s["would_delete_samples"] = samples
+    return {"would_delete": would, "missing_expires": missing,
+            "unmigrated": unmigrated, "at": now}
+
+
+def _ledger_shadow_tick() -> None:
+    """主循环节拍（60s）：干跑一次 P2 谓词 + 落盘续计。"""
+    try:
+        _ledger_shadow_sweep()
+    except Exception as e:
+        log(f"· 台账影子干跑失败（忽略）: {e}")
+    _persist_ledger_shadow()
+
+
 # 换线前实测台账：tag|ip -> 结论。9router 一次 429 风暴会连着打几十个 /rotate，
 # 每个都实测会把换线拖到几分钟，而同一地址同一时刻的结论不会变。
 _PROBE_BEFORE_ROTATE = {}
@@ -12419,7 +12874,7 @@ def _probe_line_before_rotate(tag, ip, fresh=False):
     try:
         import probe_warp
         verdict, sec, detail, retry_after = probe_warp.probe(
-            member["port"], float(cfg.get("pre_rotate_probe_timeout_sec", 4)))
+            member["port"], float(cfg.get("pre_rotate_probe_timeout_sec", 4)), ip=ip)
     except Exception as e:
         verdict, sec, detail = "unreachable", 0.0, str(e)[:100]
     out = {"tag": tag, "ip": ip, "verdict": verdict, "sec": sec,
@@ -12757,6 +13212,7 @@ def _slot_mark(name, status, verdict=None):
         log("· 槽位 %s 状态 %s → %s%s"
             % (name, prev or "unknown", status,
                ("（%s）" % verdict) if verdict else ""))
+    _save_slot_health()
 
 
 def _slot_serving_name():
@@ -12940,12 +13396,22 @@ def _slot_members_drift(slot):
     处理，不得当成漂移去重启进程。缺失集只保留台账里的真实线
     （_warp_member 命中）：disk 里合法存在的休眠 tag / 占位 tag 不构成
     漂移，避免误杀（三方审查修订 #1）。
+
+    比对委托 `asip.config_projection.compare_members`（D-1 单一事实源，
+    禁止第二份集合比较）。这里只做三态映射：unknown → None；其余 →
+    `set(res.missing)`（多余集丢弃 —— 自愈只按缺失集触发，与委托前
+    逐条等价）。expected 传读函数原值：读不到=空集（不传 None），保持
+    「读不到=无漂移」的旧行为。known 集经 `_warp_member` 构造（生产上与
+    `{m["tag"] for m in _warp()["members"]}` 等价；缺失/多余集都是它的
+    子集，先过一遍候选再交纯函数过滤结果不变），测试沙箱 monkeypatch
+    的正是 `_warp_member` 这条缝。
     """
     rt = _slot_selector_members(slot)
-    if rt is None:
-        return None
-    missing = _slot_disk_selector_members(slot) - rt
-    return {t for t in missing if _warp_member(t)}
+    expected = _slot_disk_selector_members(slot)
+    known = {t for t in set(expected) | set(rt or ()) if _warp_member(t)}
+    res = config_projection.compare_members(expected, rt, known)
+    return None if res.verdict == config_projection.VERDICT_UNKNOWN \
+        else set(res.missing)
 
 
 def _slot_drift_after_reload(slot):
@@ -13508,21 +13974,72 @@ def _slot_probe_sec(name):
     return float(sec)
 
 
+# ── 渠道原生延迟（保底测量，2026-11-14）────────────────────────────────
+# tools/native_channel_probe.py 产出 .warp/channel_latency.json：渠道端到端
+# TLS 建连耗时（含隧道全程，不依赖生产流量）。asip 未来可能脱离 9router，
+# 测量/状态/选择因此全部放 asip 侧。软偏好而非硬过滤：数据缺失或过期（>2h）
+# 一律当没有，回落探针延迟 —— 选择行为与没有这套测量时完全一致。
+_CHANNEL_LATENCY_LOCK = threading.Lock()
+_CHANNEL_LATENCY_CACHE = {"loaded_at": 0.0, "by_tag": {}}
+_CHANNEL_LATENCY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".warp", "channel_latency.json")
+_CHANNEL_LATENCY_MAX_AGE_SEC = 7200.0
+_CHANNEL_LATENCY_RELOAD_SEC = 300.0
+
+
+def _channel_latency_ms(tag, now=None):
+    """返回渠道原生延迟（ms）；无数据/文件过期返回 None（= 不参与排序）。
+
+    只读本地 JSON（channel_latency.json 的 ts 是探测时刻）；过期数据宁缺
+    勿滥 —— 拿两小时前的延迟做今天的选槽依据比不选更糟。
+    """
+    if not tag:
+        return None
+    now = time.time() if now is None else now
+    with _CHANNEL_LATENCY_LOCK:
+        cache = _CHANNEL_LATENCY_CACHE
+        if now - cache["loaded_at"] > _CHANNEL_LATENCY_RELOAD_SEC:
+            by_tag = {}
+            try:
+                with open(_CHANNEL_LATENCY_PATH, encoding="utf-8") as f:
+                    raw = json.load(f)
+                if now - float(raw.get("ts", 0)) <= _CHANNEL_LATENCY_MAX_AGE_SEC:
+                    for ch in raw.get("channels") or []:
+                        res = ch.get("result") or {}
+                        tls_ms = res.get("tls_ms")
+                        if ch.get("channel") and tls_ms is not None:
+                            by_tag[ch["channel"]] = float(tls_ms)
+            except (OSError, ValueError, TypeError):
+                by_tag = {}
+            cache["by_tag"] = by_tag
+            cache["loaded_at"] = now
+        return cache["by_tag"].get(tag)
+
+
 def _slot_pick_key(slot, tag, ip, now, serving):
     """选槽排序键（越小越优先）：新鲜度是主判据，延迟是次判据。
 
     两层不是加权重求和，而是先分档、档内再比延迟 —— 延迟再低也不能把一条
     没有任何成功记录的地址顶到刚验过 OK 的地址前面，那是拿稳定性换速度。
     「占比」体现在层级：档位决定胜负，延迟只在同档内起作用。
+
+    档内速度信号两个，原生渠道延迟在前、探针延迟兜底（2026-11-14）：
+    原生延迟是渠道端到端实测（保底测量，干净），探针延迟是 3KB 小请求的
+    往返（受当时网络波动影响）。分层语义不变 —— 两者都仍只在同档内起作用，
+    档位/新鲜度仍然压过速度；channel_latency.json 缺失/过期时原生项全 None，
+    排序与旧键一致。
     """
     rank = _warp_ip_rank(ip, now, _warp_guard_for_reason("rate429"))
     delay = _slot_probe_sec(slot["name"])
+    chan = _channel_latency_ms(tag, now)
     return (
         0 if slot["name"] != serving else 1,
         rank[0],                                    # 新鲜度档位
         rank[1],                                    # 同档内避开刚烧过的 /64
-        0 if delay is not None else 1,              # 有延迟数据的优先
-        delay if delay is not None else 0.0,        # 延迟低者优先
+        0 if chan is not None else 1,               # 有渠道原生延迟的优先
+        chan if chan is not None else 0.0,          # 渠道延迟低者优先
+        0 if delay is not None else 1,              # 有探针延迟数据的优先
+        delay if delay is not None else 0.0,        # 探针延迟低者优先
         rank[2],                                    # 同档内越新越优先
     )
 
@@ -14046,7 +14563,16 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         # 那它打通的是一条已经下线的隧道，重连就能绕开 —— 再换一次线等于用旧
         # 证据烧掉一条干净的新线（实测 19:24~19:27 连续 8 次轮换里，多数是同一批
         # 迟到 429 在追已经换掉的地址）。放到最前面：下面的回溯与记账都不该执行。
-        if egress_ip and _rotate_ip_is_retired(
+        # 唯一否决：报障地址就是**当前**出口（IP 回收后同一个 /128 又回来、
+        # 台账旧记录还在）——「已换走」不成立，必须真换线（与 _rotate_slot_once
+        # 同款 veto，2026-11-14 04:58 实测）。「ip == 当前出口」只用于否定，
+        # 不用于肯定（见 _rotate_ip_is_retired 文档）。
+        if (egress_ip and old_ip and egress_ip == old_ip
+                and _rotate_ip_is_retired(
+                    egress_ip, request_started_at, egress_since)):
+            log("· /rotate: 报障地址 %s 仍是当前出口，否定「已换走」，走真换线"
+                % egress_ip)
+        elif egress_ip and _rotate_ip_is_retired(
                 egress_ip, request_started_at, egress_since):
             _api_stats["retired"] += 1
             log(f"· /rotate: 请求地址 {egress_ip} 在请求发出后被换走"
@@ -14351,12 +14877,22 @@ def _slot_no_usable_gate():
 def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
                            avoid_until=0.0, avoid_ips=None):
     """构造槽位轮换回包：当前槽身份 + 立即重试目标 + 原端口冷却截止。"""
-    payload = {"ok": True, "switched": False, "reason": reason,
+    payload = {"ok": reason != "too_frequent", "switched": False,
+               "reason": reason,
                "switched_at": switched_at, "ms": 0,
                "active_tag": cur_tag, "active_egress": cur_ip,
                "avoid_port_until": avoid_until, "switch_to_node": None}
-    other, ttag, tip = _pick_healthy_slot(
-        slot["name"], {cur_tag} if cur_tag else None, avoid_ips)
+    # D3/D6：already_retired 与 too_frequent 都是「本端口的线已经换过/刚换过」，
+    # line_ok 是「本端口的线实测还能用」，三者都应原地重连 —— 9router 对
+    # already_retired/line_ok 有特判，too_frequent 靠 switched_at 时间证据，
+    # 都放行同端口重试。给健康备槽会把请求白跳到第三条线：实测 357 次白跳
+    # 74.5% 落地仍 429，还烧掉目标槽的新绑定（trackC trackc5_retired_jump.py）。
+    # too_frequent 顺带与主路径回包对齐（ok=False）。
+    if reason in ("already_retired", "too_frequent", "line_ok"):
+        other, ttag, tip = None, None, None
+    else:
+        other, ttag, tip = _pick_healthy_slot(
+            slot["name"], {cur_tag} if cur_tag else None, avoid_ips)
     if other is not None:
         payload["switched"] = True
         payload["switch_to"] = other["name"]
@@ -14371,7 +14907,7 @@ def _slot_redirect_payload(slot, cur_tag, cur_ip, reason, switched_at,
     else:
         payload["switch_to"] = None
         payload["switch_to_url"] = None
-        if reason != "already_retired":
+        if reason not in ("already_retired", "too_frequent", "line_ok"):
             # 没有任何健康备槽能立刻接管这条请求。主链路不再同步探线/换线
             # 兜底：被报槽由后台线程修好，调用方重启自己重建连接池，等闸回来。
             # already_retired 不在此列 —— 线已经换走了，原地重连就够。
@@ -14435,7 +14971,8 @@ def _proxy_gate_rotate_node(slot, cur_node, reason):
 
 
 def _rotate_proxy_gate_once(slot, reason, request_started_at=None,
-                            egress_ip=None, req_id=None, ban_after=None):
+                            egress_ip=None, req_id=None, ban_after=None,
+                            borrowed=False):
     """第七闸口的 /rotate：常规闸口恢复了就立刻回去，否则池内换节点。
 
     严格兜底的另一半语义在这里：即便流量已经在第七闸口上，只要有任何常规
@@ -14454,8 +14991,17 @@ def _rotate_proxy_gate_once(slot, reason, request_started_at=None,
         cur_node, _cur_ip = _proxy_gate_current(slot)
         h = _slot_health(name)
         last_attempt = float(h.get("last_rotate_ts") or 0.0)
+        # D14：借道（9router 把别的线的请求改投到本闸）：body/session 都是
+        # 原线的，单发 429 不足以判本闸的池节点烧了。与常规闸口
+        # borrowed_skip 同语义：不冷节点、不换节点，只回健康备槽。
+        # 旧实现这里把 borrowed 丢了（闸口分支没透传），于是 3,313 次借道
+        # 429 全部按「闸口自身失败」冷节点+换节点（历史漏 74.5%、现行仍漏
+        # 40.2% 的根因）。
+        if borrowed:
+            _api_stats["borrowed"] += 1
+            reason_out = "borrowed_skip"
         # 与常规闸口同一套合并窗：一批并发 429 只换一次池节点。
-        if last_attempt and t0 - last_attempt < cfg.get("coalesce_ms", 800) / 1000.0:
+        elif last_attempt and t0 - last_attempt < cfg.get("coalesce_ms", 800) / 1000.0:
             _api_stats["coalesced"] += 1
             reason_out = "coalesced"
         else:
@@ -14523,8 +15069,11 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
     """
     if _is_proxy_gate(slot):
         # 第七闸口不走 WARP 修整链路：报障 = 池内换节点。
+        # borrowed 必须透传（D14）：借道那一发不是本闸发起的，丢了它就会把
+        # 别人的 429 记成池节点自己的失败。
         return _rotate_proxy_gate_once(
-            slot, reason, request_started_at, egress_ip, req_id, ban_after)
+            slot, reason, request_started_at, egress_ip, req_id, ban_after,
+            borrowed=borrowed)
     t0 = time.time()
     cfg = _api_cfg()
     name = slot["name"]
@@ -14543,18 +15092,57 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         if not retired and _slot_ip_is_retired(name, egress_ip,
                                                request_started_at):
             retired = True
+        # 事实否决推断：报障地址就是**当前**出口时，「已换走」不可能成立。
+        # 两条 retired 判据都会说谎：exit ledger 只看「这个地址曾经被换走
+        # 过」（IP 回收/原地重连后同一个 /128 又回来，旧记录还在）；
+        # switched_at > request_started_at 是时刻推断，重试发出晚于换线时
+        # 传进来的还是原请求的开始时间，恒判「已换走」。此时原地重连必然
+        # 还是同一个死地址（2026-11-14 04:58 wfgkef17a 实测：地址 3a3:55
+        # 被判已换走，但当前出口就是它，重放两发全撞死 IP 白烧 34s）。
+        # 「ip == 当前出口」只用来否定已换走，从不用来肯定（_rotate_once
+        # 同款口径）。判不出时保持原行为。
+        if retired and egress_ip and cur_ip and egress_ip == cur_ip:
+            log("· %s: 报障地址 %s 仍是当前出口，否定「已换走」，走真换线"
+                % (name, egress_ip))
+            retired = False
         if retired:
             _api_stats["retired"] += 1
             log("· %s: 请求地址 %s 在请求发出后被换走（当前 %s / %s），不换线"
                 % (name, egress_ip or "未知", cur_tag or "未知",
                    cur_ip or "地址未知"))
             # 同一端口的新线已经就位；调用方清连接后原地重试即可。这里不再
-            # 发起换线（有健康备槽时照样给出，让对端可以顺手合并连接）。
+            # 发起换线，也不再给备槽跳板（D3：白跳实测 74.5% 落地仍 429）。
             out = _slot_redirect_payload(
                 slot, cur_tag, cur_ip, "already_retired", switched_at, 0.0,
                 {egress_ip} if egress_ip else None)
             out["offending_verdict"] = verdict_before
             return out
+
+        # D1：transport 报障但该地址最新探针结论是 OK → 回 line_ok 不换线。
+        # 大 body 首字节慢 ≠ 线坏：实测 71.5% 的 transport 换线源 IP 事发前
+        # 探针 OK、88.7% 被换下后仍回来服务；换线只是白烧新绑定。
+        # 9router 的 ROTATED_REASONS 已支持 line_ok（同端口按更大预算重放）。
+        # 窗口对齐探针结论缓存 TTL（默认 1800s）：探针每线每 30min 至多一发，
+        # 旧默认 30s 等于永不命中（2026-11-13 21:05 部署后 21 例 transport
+        # 0 命中实测），放宽后以「二击出局」兜底。
+        # 二击出局：同地址 10min 内第 2 次 transport 报障不再 line_ok ——
+        # 防「小探针过、大请求挂」的坏线拿旧 OK 结论长期占坑，代价收敛为
+        # 最多牺牲 1 个请求（重放失败即 503，第 2 击正常换线）。
+        if reason == "transport" and cur_ip:
+            _okwin = float(cfg.get("transport_line_ok_window_sec", 1800))
+            _strikes = _line_ok_strike_add(cur_ip, t0)
+            if (_strikes <= int(cfg.get("transport_line_ok_max_strikes", 1))
+                    and _probe_ok_recent(cur_ip, t0, _okwin)):
+                log("· %s: transport 报障但 %s 最新探针 OK（第 %d 击/允许 %s），"
+                    "回 line_ok 不换线"
+                    % (name, cur_ip, _strikes,
+                       cfg.get("transport_line_ok_max_strikes", 1)))
+                _api_stats["line_ok"] = _api_stats.get("line_ok", 0) + 1
+                out = _slot_redirect_payload(
+                    slot, cur_tag, cur_ip, "line_ok", switched_at, 0.0,
+                    {egress_ip} if egress_ip else None)
+                out["offending_verdict"] = verdict_before
+                return out
 
         # 证据先记账，再判合并/限速：被拒掉的一次也不能把刚吃 429 的地址
         # 当干净地址放回候选。
@@ -14787,7 +15375,12 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 req = {}
             try:
-                payload = opencode_gate.handle_rotate(req)
+                # 选点接线：P2C + 自适应分数（count_call=False 照
+                # _proxy_gate_rotate_node 的用法）；模块侧冷却独立。
+                payload = opencode_gate.handle_rotate(
+                    req,
+                    picker=lambda cur, nodes, fail: pick_next_node(
+                        cur, nodes, fail, count_call=False))
             except Exception as e:
                 log("✗ /rotate-opencode-gate 异常: %s" % e)
                 self._send(500, {"ok": False, "reason": "internal_error"})
@@ -15418,6 +16011,49 @@ def _config_consistency_check_impl(now: float | None = None) -> dict:
                      if t not in spare_wg and t not in scan_unprobed
                      and _scan_unit_still_on_disk(t))
 
+    # 分类七：产物面 ⊄ 生效面 —— 磁盘渲染配置里 selector 声明的成员 vs
+    # 进程内 selector 实际成员（Clash API `all`）。热重载 204 ≠ 成员生效
+    # （INC-017）：`PUT /configs?force=true` 不重建 outbound，进程内 `all`
+    # 仍是旧成员，新线 PUT 进 selector 只拿 400 `Selector update error:
+    # not found`（2026-11-13 实测：磁盘 147 条成员、运行时只有 108 条）。
+    # 六面对账里「生效面」此前是唯一盲区，这里由巡检主动报出来。
+    #
+    # 纪律（两条硬约束）：
+    #   ① 只报告、不触发自愈 —— 自愈沿用 bc89daa 既有两级机制（方一
+    #      `_slot_drift_after_reload` / 方二 `_slot_drift_maybe_heal`，
+    #      含 `_SLOT_DRIFT_MIN_GAP`/`_SLOT_DRIFT_COOLDOWN` 限速），巡检
+    #      再触发一遍会打穿限速；分类七绝不调 `_restart_slot_process`。
+    #   ② 本段在 `_config_consistency_check` 的异常隔离壳内 —— 观测代码
+    #      失效 = 少一条告警，绝不掀翻服务（2026-11-11 17:22 事故先例）。
+    # 比对判据只有 `asip.config_projection.compare_members` 一份（D-1），
+    # 禁止在这里写第二份集合比较；输入复用现有读函数，不自己读文件。
+    known_line_tags = set(members)
+    selector_faces = []
+    faces = [("主配置", {"config_file": CFG["singbox"]["config_file"],
+                         "selector": CFG["warp"]["selector"]})]
+    faces += [(s["name"], s) for s in consumer_slots()]
+    for face, slot in faces:
+        expected = _slot_disk_selector_members(slot)
+        if face == "主配置":
+            _st, data = singbox_api("/proxies/" + slot["selector"],
+                                    silent=True)
+            all_ = (data or {}).get("all")
+            runtime = (set(all_) if isinstance(all_, list) and all_
+                       else None)
+        else:
+            runtime = _slot_selector_members(slot)
+        res = config_projection.compare_members(expected, runtime,
+                                                known_line_tags)
+        selector_faces.append({
+            "face": face, "verdict": res.verdict,
+            "missing": sorted(res.missing), "extra": sorted(res.extra),
+        })
+    selector_drift = [f for f in selector_faces if f["verdict"] == "drift"]
+    selector_unverifiable = [f["face"] for f in selector_faces
+                             if f["verdict"] == "unknown"]
+    drift_missing = sorted(t for f in selector_drift for t in f["missing"])
+    drift_extra = sorted(t for f in selector_drift for t in f["extra"])
+
     report = {
         "members": len(members),
         "outbounds": len(outs),
@@ -15428,6 +16064,8 @@ def _config_consistency_check_impl(now: float | None = None) -> dict:
         "spare_wg": spare_wg,
         "scan_unprobed": scan_unprobed,
         "retired": retired,
+        "selector_drift": selector_faces,
+        "selector_unverifiable": selector_unverifiable,
     }
     # 「问题」= 需要人来处理的不一致。三类都是：
     #   scan_unprobed  —— 单元在跑却不在探测名单（线在服务流量但没人探它）
@@ -15448,8 +16086,12 @@ def _config_consistency_check_impl(now: float | None = None) -> dict:
     # 遗留条数与真不一致条数分别给出，真问题在前、遗留在后，真问题不会被
     # 淹没。仍然排除的只有 `spare_wg`（WG 补位池）—— 它是设计上的闲置池，
     # 本来就不该被探测，不是问题。
+    # 分类七只把 verdict=drift 的差集计入 problems；verdict=unknown 不计
+    # 但也**绝不当一致** —— 单列 selector_unverifiable + 单独日志告警
+    # （T5 假阴性防护：「无法判定」绝不洗成通过）。
     problems = (len(scan_unprobed) + len(missing_out)
-                + len(tier_off_with_state) + len(retired))
+                + len(tier_off_with_state) + len(retired)
+                + len(drift_missing) + len(drift_extra))
     report["problems"] = problems
     if problems:
         detail = []
@@ -15465,6 +16107,11 @@ def _config_consistency_check_impl(now: float | None = None) -> dict:
                           f"（{', '.join(tier_off_with_state[:5])}）")
         if retired:
             detail.append(f"缩容遗留 {len(retired)} 条（单元已删、只剩状态残骸）")
+        if selector_drift:
+            detail.append(f"产物面 ⊄ 生效面：{len(selector_drift)} 个面漂移"
+                          f"（缺失 {len(drift_missing)} 条 / 多余 "
+                          f"{len(drift_extra)} 条："
+                          f"{', '.join((drift_missing + drift_extra)[:5])}）")
         log(f"  ⚠ 配置自检：{problems} 处跨源不一致 —— " + "；".join(detail))
         log(f"    · 真相源：members {len(members)} 条 / sing-box outbounds "
             f"{len(outs)} 条 / 状态台账 {len(state_tags)} 条")
@@ -15475,6 +16122,9 @@ def _config_consistency_check_impl(now: float | None = None) -> dict:
         if spare_wg:
             log(f"    · 另有 {len(spare_wg)} 条 WG 补位线（23+）不在探测名单，"
                 f"属闲置池，不计入不一致")
+    if selector_unverifiable:
+        log(f"  ⚠ 配置自检：{len(selector_unverifiable)} 个面无法判定"
+            f"（Clash API 读不到）：{', '.join(selector_unverifiable)}")
     return report
 
 
@@ -15484,6 +16134,8 @@ def main():
     # 之前 —— 9router 的 /rotate 一进来就会写统计，晚了基线会把最早一批事件
     # 误算成「历史值」，stats_boot 就少计了。
     _load_api_stats_boot()
+    # 影子统计续计 + 起点戳：P2 门槛要「violations==0 连续 ≥24h」，重启不能清零。
+    _load_ledger_shadow_boot()
     # Log first, then fetch (avoid hanging before any output)
     log("=" * 50)
     log("auto-switch-ip daemon v2 启动 (加固版)")
@@ -15531,6 +16183,7 @@ def main():
     _load_warp_ip_cycles()
     _load_warp_line_state()
     _load_node_ip_used()
+    _load_slot_health()
     # 档位对账：放在状态表加载**之后**。
     # WHY 这个顺序（2026-11-11 修正）：档位对账的解禁侧会清观测状态并落盘，
     # 而落盘写的是整个内存状态表。状态表没加载就落盘 = 把 156 条覆盖成
@@ -15594,6 +16247,8 @@ def main():
     last_config_check = 0.0
     # M10：_api_stats 周期落盘节拍（60s，见主循环 3b3）
     last_api_stats_persist = 0.0
+    # 台账影子节拍（60s）：P2 清理谓词干跑 + 落盘续计，见主循环 3b4
+    last_ledger_shadow_tick = 0.0
 
     global _RESTART_COUNT, _NODE_CALL_RESET_TS, _last_wal_checkpoint, _strategy_mode
     global _pool_delay_last
@@ -15836,6 +16491,13 @@ def main():
             if now - last_api_stats_persist > 60:
                 last_api_stats_persist = now
                 _submit_once("api-stats-persist", _persist_api_stats)
+
+            # ---- 3b4. 台账影子：P2 谓词干跑 + 落盘 (每 60s) ----
+            # 干跑要遍历全表（与清理同阶），放主循环会挡换线；丢后台。
+            # 落盘让「violations==0 连续 ≥24h」的起点戳跨重启可证。
+            if now - last_ledger_shadow_tick > 60:
+                last_ledger_shadow_tick = now
+                _submit_once("ledger-shadow-tick", _ledger_shadow_tick)
 
             # ---- 3c0. 双向兜底的反向：停在 proxy 上时池挂了才切回 ----
             # 内部要探测整池健康（最慢 15s），丢后台。

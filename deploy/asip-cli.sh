@@ -106,6 +106,7 @@ asip — auto-switch-ip 日志与出口诊断
 
 第八闸口（opencode 专属闸口 slot-8）
   asip oc              状态/专属流量日志/轮换账本（asip oc -h 看子命令）
+  asip oc app [N]      opencode 应用日志（429/错误；能读就读）
 
 诊断
   asip st              状态快照：出口模式 / 当前节点 / 近 1h 切换次数
@@ -149,6 +150,11 @@ WARP 控制
   asip inbox watch     每 5s 刷新，只为新到的消息打一行
   asip inbox cats      （全量）各分类未读计数；tail 只取最近 N 条
                        ASIP_INBOX_LIMIT=500 可减少拉取条数（默认 5000）
+
+台账（坏 IP / 线路锁 / 坏节点；清空会重启 daemon）
+  asip ledger          列出全部台账路径/大小/条目数
+  asip ledger clear -y 停止 daemon → 备份 → 清空全部台账 → 启动
+                       --keep-history 保留 .warp_ip_history.jsonl
 
   -h, --help           本帮助
 EOF
@@ -322,8 +328,17 @@ print(f"  健康:  {gate.get('status', '?')}  verdict={gate.get('verdict') or '-
       f"持续 {gate.get('status_age_s', '?')}s")
 print(f"  当前池节点: {gate.get('tag') or '-'}")
 print(f"  在役:  {'是' if gate.get('serving') else '否（待命）'}")
-print(f"  常规闸口可选: {len(ok)}/{len(warps)}  → "
-      + ("池闸应待命，严格兜底成立" if ok else "全部不可选，池闸是唯一兜底"))
+pool_status = gate.get("status") or ""
+if ok:
+    tail = "池闸应待命，严格兜底成立"
+elif pool_status == "ok":
+    tail = "全部不可选，池闸是唯一兜底"
+elif not pool_status or pool_status == "?":
+    tail = "⚠ 全部闸口不可选：池闸状态未知——无法确认兜底在位"
+else:
+    tail = (f"⚠ 全部闸口不可选：常规 {len(ok)}/{len(warps)}，"
+            f"池闸也不健康（verdict={gate.get('verdict') or '-'}）—— 无任何可用兜底")
+print(f"  常规闸口可选: {len(ok)}/{len(warps)}  → " + tail)
 print(f"  主出口: {d.get('active_tag') or '-'}")
 print(f"  服务:  {os.environ.get('GATE_SVC_STATE', '?')}  {svc}")
 # 近 1h 统计：独立账本 + 主日志的历史行。拆文件那一刻之前的池闸行还在
@@ -431,12 +446,16 @@ asip oc — 第八闸口（opencode 专属闸口）日志与状态
                        流量日志最近 N 行（默认 12）
   asip oc log [N] [-f] 回看专属流量日志 opencode-gate.log（默认 200 行；-f 跟随）
   asip oc rot [N]      轮换账本 .opencode_gate_ledger.jsonl（默认 30 行）
+  asip oc app [N] [-f] 回看 opencode 应用日志 opencode.log（429/错误/语义事件，
+                       连接日志的互补面；默认 50 行；-f 跟随）
   asip oc -h           本帮助
 
   流量日志 = slot-8 专属 sing-box 连接日志：每个出站连接一行（含目标域名）。
   HTTP 路径级日志 sing-box 给不了，不要按那个粒度找。日志/账本路径由
   config.CFG["opencode_gate"] 决定（asip/opencode_gate.py 解析），不写死在
-  本脚本。全部命令只读。
+  本脚本。应用日志路径 env OPENCODE_LOG 可覆盖；能读就读——缺位/无权限时
+  提示「opencode.log 不可读」后以 rc=1 退出，不 traceback、不静默空转。
+  全部命令只读。
 EOF
 }
 
@@ -446,6 +465,15 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from asip import opencode_gate
 print(opencode_gate.log_path() or "")
+PY
+}
+
+_oc_app_path() {  # 应用日志路径由模块解析（env OPENCODE_LOG 可覆盖）
+  "$ASIP_PY" - "$ASIP_DIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from asip import opencode_gate
+print(opencode_gate.opencode_log_path())
 PY
 }
 
@@ -512,6 +540,16 @@ else:
     print("  最近轮换: 无记录")
 print("  近1h: 轮换 %d 次 / 报障 %d 次"
       % (summ["rotations_in_window"], summ["calls_in_window"]))
+# 应用日志段：能读就读，缺位/不可读给明确提示（结构化降级，不抛异常）
+app = opencode_gate.opencode_log_info()
+if app["readable"]:
+    print("  应用日志: 可读  %s 行 / %s 字节  %s"
+          % (app["lines"], app["size"], app["path"]))
+    print("    最近异常: %s" % (app["last_alert"] or "近段无异常"))
+elif app["exists"]:
+    print("  应用日志: 存在但不可读（权限？）: %s" % app["path"])
+else:
+    print("  应用日志: 不可读（不存在或无权限）: %s" % app["path"])
 logp = opencode_gate.log_path()
 n = int(os.environ.get("OC_LINES", "12") or 12)
 rows = []
@@ -564,6 +602,33 @@ cmd_oc() {
     rot|rotate|ledger)
       n=${1:-30}; _gate_num "$n" || return 1
       _oc_rot "$n" ;;
+    app|opencode-log|ol)
+      # [N] 与 -f 可乱序（与 asip oc log 同交互）
+      n=""
+      for a in "$@"; do
+        case "$a" in
+          -f|follow) follow=1 ;;
+          *) n=$a ;;
+        esac
+      done
+      [ -n "$n" ] || n=50
+      _gate_num "$n" || return 1
+      logp=$(_oc_app_path) || return 1
+      if [ -z "$logp" ]; then
+        echo "✗ 解析不到应用日志路径（asip/opencode_gate.opencode_log_path()）" >&2
+        return 1
+      fi
+      # 能读就读：缺位/无权限提示一句后 rc=1 退出，不 traceback、不静默空转
+      if [ ! -r "$logp" ]; then
+        echo "✗ opencode.log 不可读（不存在或无权限）: $logp" >&2
+        return 1
+      fi
+      if [ "$follow" = 1 ]; then
+        _follow "" "$n" "$logp"
+      elif ! tail -n "$n" "$logp" 2>/dev/null; then
+        echo "✗ opencode.log 读取失败: $logp" >&2
+        return 1
+      fi ;;
     st|status|'')
       n=${1:-12}; _gate_num "$n" || return 1
       tmp=$(mktemp) || return 1
@@ -1102,6 +1167,194 @@ PY
   esac
 }
 
+cmd_ledger() {
+  local sub=${1:-list}
+  shift || true
+  case "$sub" in
+    ""|list) _ledger_list ;;
+    clear) _ledger_clear "$@" ;;
+    -h|--help|help) _ledger_usage ;;
+    *) echo "✗ 未知子命令: asip ledger $sub" >&2; _ledger_usage >&2; return 1 ;;
+  esac
+}
+
+_ledger_desc() {
+  case "$1" in
+    .warp_ip_used.json)
+      printf "    作用: 每个出口 IP 的 blocked/ban_until/首见/最近OK/服务时长；决定 IP 能否被再次选中、是否在封禁期、同 IP 去重与复用窗口\n"
+      printf "    清空: daemon 忘记哪些 IP 被烧/被封，会重探这些 IP（可能多耗配额）；能救回被 session bug 误标 429 的干净 IP\n" ;;
+    .warp_ip_history.jsonl)
+      printf "    作用: 换线/封禁事件 {ip,t,b,k}；派生各 /64 段与 colo 的 ban 率，影响候选排序与段基线\n"
+      printf "    清空: 历史 ban 率归零、段基线需重算；不再用旧脏数据惩罚段/colo，但失去历史证据\n" ;;
+    .warp_ip_cycles.json)
+      printf "    作用: 每段出口 IP 的 24h 可用周期样本 {ip,cycle,ended_at,ok}；估算可用周期、判断本段是否已采样、换线节奏\n"
+      printf "    清空: 周期统计清零，换线节奏按默认值重新学习；不直接解除封禁\n" ;;
+    .warp_line_state.json)
+      printf "    作用: 每线最近 1000 个探测样本、restart 计数、stop_probe、ban_hold_until、渠道锁（1000 全 quota 或 5h 无地址→锁到次日 08:00）\n"
+      printf "    清空: 解除所有渠道锁与 stop_probe，daemon 重探所有线；仍坏会再次被锁\n" ;;
+    .bad_nodes.json)
+      printf "    作用: {节点: 过期ts}，传输层失败的节点在过期前不再作为候选\n"
+      printf "    清空: 坏节点重新参与候选，可能再选到传输层已死节点、多花握手时间\n" ;;
+    .node_ip_used.json)
+      printf "    作用: {节点落地IP: ts}；blind/时间换线模式下窗口内用过该 IP 的节点跳过（唯一的 IP 反馈）\n"
+      printf "    清空: 脏 IP 避让失效，可能重选近期用过的 IP；不改封禁判定\n" ;;
+    .warp/udp_bad_nodes.json)
+      printf "    作用: WARP UDP 握手失败的节点，udp_capable 候选过滤时跳过\n"
+      printf "    清空: 重新尝试 UDP 握手；失败节点会再次被标记\n" ;;
+    .warp/udp_probe_state.json)
+      printf "    作用: 各节点 UDP 探测的时间/结果缓存，避免重复探测\n"
+      printf "    清空: 缓存重置，下一轮重新探测\n" ;;
+    .warp/h2_probe_state.json)
+      printf "    作用: 各节点 H2（TCP/MASQUE）探测的时间/结果缓存，供 H2 候选筛选\n"
+      printf "    清空: 缓存重置，下一轮重新探测\n" ;;
+    .warp_segment.json)
+      printf "    作用: 当前段起点 {ts,ip}；count_segment_requests() 以它统计本段成功数（150 格配额），决定何时换线\n"
+      printf "    清空: 段计时/计数从头开始，daemon 认为进入新段（可能推迟一次换线）\n" ;;
+    .warp/ipv6_segments.json)
+      printf "    作用: 由 history+used+wg_colo_map+日志派生的每 /64 段可用性/基线，供段选择与 ban 率使用\n"
+      printf "    清空: 下次需要时重算；旧基线不再影响决策\n" ;;
+    .probe_sessions.json)
+      printf "    作用: 旧版按端口固定 session 表（每天 15 个）；新逻辑已改为按出口 IP 内存维护 15 会话\n"
+      printf "    清空: 无影响（当前代码不读）\n" ;;
+    *)
+      printf "    作用: 未登记说明\n    清空: 未登记\n" ;;
+  esac
+}
+
+_ledger_usage() {
+  cat <<'EOF'
+asip ledger — 台账查看 / 清空
+
+  asip ledger               列出全部台账（路径/大小/条目数 + 作用/清空影响）
+  asip ledger clear -y      停止 daemon → 备份 → 清空 → 启动
+      --keep-history        保留 .warp_ip_history.jsonl（默认也清空）
+
+台账是 daemon 的“记忆”，直接影响它选哪个 IP / 节点 / 线路：
+  IP 层    .warp_ip_used.json      封禁与复用决策（ban_until）
+           .warp_ip_history.jsonl  段/colo ban 率与候选排序
+           .warp_ip_cycles.json    换线节奏与周期样本
+  线路层   .warp_line_state.json   渠道锁 / stop_probe / 每线样本
+  节点层   .bad_nodes.json         坏节点过滤
+           .node_ip_used.json      脏 IP 避让（blind 模式）
+           .warp/udp_bad_nodes.json / udp_probe_state.json / h2_probe_state.json
+                                   握手与探测缓存
+  段/会话  .warp_segment.json      150 格配额分段起点
+           .warp/ipv6_segments.json 段基线（派生缓存）
+           .probe_sessions.json    旧会话表（已废弃）
+
+清空范围（凡存在都会先备份为 <文件>.bak-<时间戳>）；每项的“作用 / 清空影响”
+用 `asip ledger` 查看。不会动：.warp/block-map.json（colo 拓扑）、
+.warp/tiers.json、.warp/backfill.json、.warp/ 下隧道子目录、订阅/配置、日志。
+EOF
+}
+
+_ledger_paths() {
+  printf '%s\n' \
+    "$ASIP_IP_USED_FILE" \
+    "${WARP_IP_HISTORY_FILE_PATH:-$ASIP_DIR/.warp_ip_history.jsonl}" \
+    "$ASIP_CYCLES_FILE" \
+    "$ASIP_LINE_STATE_FILE" \
+    "$ASIP_DIR/.bad_nodes.json" \
+    "$ASIP_DIR/.node_ip_used.json" \
+    "$ASIP_DIR/.warp/udp_bad_nodes.json" \
+    "$ASIP_DIR/.warp/udp_probe_state.json" \
+    "$ASIP_DIR/.warp/h2_probe_state.json" \
+    "${WARP_SEGMENT_FILE_PATH:-$ASIP_DIR/.warp_segment.json}" \
+    "$ASIP_DIR/.warp/ipv6_segments.json" \
+    "$ASIP_DIR/.probe_sessions.json"
+}
+
+_ledger_count() {
+  "$ASIP_PY" -c 'import json,sys
+p=sys.argv[1]
+try:
+    if p.endswith(".jsonl"):
+        print(sum(1 for _ in open(p, encoding="utf-8", errors="replace")))
+    else:
+        d=json.load(open(p, encoding="utf-8"))
+        if isinstance(d, dict):
+            for k in ("lines", "used", "cycles", "nodes"):
+                if k in d:
+                    d=d[k]; break
+        print(len(d))
+except Exception:
+    print("?")' "$1"
+}
+
+_ledger_list() {
+  echo "项目: $ASIP_DIR"
+  echo "服务: $ASIP_SERVICE ($(_sctl is-active "$ASIP_SERVICE" 2>/dev/null))"
+  printf '%-42s %10s  %s\n' "文件" "字节" "条目"
+  local f
+  while IFS= read -r f; do
+    if [ ! -e "$f" ]; then
+      printf '%-42s %10s  %s\n' "${f#$ASIP_DIR/}" "-" "缺失"
+    else
+      printf '%-42s %10s  %s\n' "${f#$ASIP_DIR/}" "$(stat -c%s "$f" 2>/dev/null)" "$(_ledger_count "$f")"
+    fi
+  done < <(_ledger_paths)
+  echo
+  echo "台账说明（作用 / 清空影响）："
+  while IFS= read -r f; do
+    echo "  ${f#$ASIP_DIR/}"
+    _ledger_desc "${f#$ASIP_DIR/}"
+  done < <(_ledger_paths)
+}
+
+_ledger_clear() {
+  local yes=0 keep_history=0 a
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes) yes=1 ;;
+      --keep-history) keep_history=1 ;;
+      *) echo "✗ 未知参数: $a" >&2; _ledger_usage >&2; return 1 ;;
+    esac
+  done
+  if [ "$yes" != 1 ]; then
+    echo "将停止 $ASIP_SERVICE，备份并清空以下台账（加 --yes 执行）："
+    while IFS= read -r f; do
+      echo "  ${f#$ASIP_DIR/}"
+      _ledger_desc "${f#$ASIP_DIR/}"
+    done < <(_ledger_paths)
+    return 2
+  fi
+  echo "将停止 $ASIP_SERVICE，备份并清空以下台账："
+  while IFS= read -r f; do
+    echo "  ${f#$ASIP_DIR/}"
+    _ledger_desc "${f#$ASIP_DIR/}"
+  done < <(_ledger_paths)
+  echo "▶ 停止 $ASIP_SERVICE"
+  _sctl stop "$ASIP_SERVICE" || { echo "✗ 停止失败" >&2; return 1; }
+  sleep 1
+  local stamp f
+  stamp=$(date +%Y%m%d-%H%M%S)
+  while IFS= read -r f; do
+    if [ -e "$f" ]; then
+      cp -a "$f" "$f.bak-$stamp" && echo "  备份 ${f#$ASIP_DIR/} -> .bak-$stamp"
+    fi
+  done < <(_ledger_paths)
+  mkdir -p "$ASIP_DIR/.warp"
+  printf '%s\n' '{"used":{}}'              > "$ASIP_IP_USED_FILE"
+  printf '%s\n' '{"version":1,"lines":{}}' > "$ASIP_LINE_STATE_FILE"
+  printf '%s\n' '{"cycles":[]}'            > "$ASIP_CYCLES_FILE"
+  printf '%s\n' '{}'                       > "$ASIP_DIR/.bad_nodes.json"
+  printf '%s\n' '{}'                       > "$ASIP_DIR/.node_ip_used.json"
+  printf '%s\n' '{}'                       > "$ASIP_DIR/.warp/udp_bad_nodes.json"
+  printf '%s\n' '{"nodes":{}}'             > "$ASIP_DIR/.warp/udp_probe_state.json"
+  printf '%s\n' '{"nodes":{}}'             > "$ASIP_DIR/.warp/h2_probe_state.json"
+  if [ "$keep_history" = 1 ]; then
+    echo "  保留 ${WARP_IP_HISTORY_FILE_PATH:-$ASIP_DIR/.warp_ip_history.jsonl}"
+  else
+    : > "${WARP_IP_HISTORY_FILE_PATH:-$ASIP_DIR/.warp_ip_history.jsonl}"
+  fi
+  rm -f "${WARP_SEGMENT_FILE_PATH:-$ASIP_DIR/.warp_segment.json}" \
+        "$ASIP_DIR/.warp/ipv6_segments.json" "$ASIP_DIR/.probe_sessions.json"
+  echo "▶ 启动 $ASIP_SERVICE"
+  _sctl start "$ASIP_SERVICE" || { echo "✗ 启动失败" >&2; return 1; }
+  sleep 2
+  echo "✓ 台账已清空；服务 $(_sctl is-active "$ASIP_SERVICE")；备份后缀 .bak-$stamp"
+}
+
 case "${1:-}" in
   -h|--help|help) _usage ;;
   warp) shift; cmd_warp "$@" ;;
@@ -1109,6 +1362,7 @@ case "${1:-}" in
   oc|slot8|g8) shift; cmd_oc "$@" ;;
   sub) shift; cmd_sub "$@" ;;
   inbox|inb) shift; cmd_inbox "$@" ;;
+  ledger|lg) shift; cmd_ledger "$@" ;;
   # Vercel 中继：子命令全在 python 里（argparse 管，别在 bash 里再抄一份参数表）。
   # 用 exec 而不是调用后返回：退出码要原样透出去（2 = 有 relay 不可用）。
   vercel) shift; exec "$ASIP_PY" "$ASIP_DIR/vercel_relay_cli.py" "$@" ;;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""probe_warp 纯单元测试（无网络）：env 块、每日会话集、错误分类。"""
+"""probe_warp 纯单元测试（无网络）：env 块、按 IP 会话池、错误分类。"""
 import json
 import re
 import time
@@ -54,27 +54,46 @@ def test_classify_quota_and_flagged():
     assert probe_warp.classify(500, "boom") == "err"
 
 
-def test_daily_sessions_fixed_15_and_cross_day_unique():
-    today = probe_warp._daily_sessions("20261112")
-    assert len(today) == 15
-    assert len(set(today)) == 15
-    assert all(re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", s) for s in today)
-    # 同一天重复调用恒定
-    assert probe_warp._daily_sessions("20261112") == today
-    # 跨天必然不重样
-    assert not set(today) & set(probe_warp._daily_sessions("20261113"))
-    # counter 落在 1..15（上游只接受 0..16，>=100 直接 403）
-    counters = sorted(
-        int((~int(s[4:16], 16)) & probe_warp._MASK48) % 4096 for s in today)
-    assert counters == list(range(1, 16))
+def test_session_pool_15_per_ip_and_regenerate_on_ip_change():
+    probe_warp._SESSION_POOLS.clear()
+    seen = set()
+    for _ in range(15 * probe_warp.SESSION_POOL_SWITCH_EVERY):
+        seen.add(probe_warp._pick_session("ip-a"))
+    assert len(seen) == probe_warp.SESSION_POOL_SIZE == 15
+    assert all(re.fullmatch(r"ses_[0-9a-f]{12}[0-9A-Za-z]{14}", s) for s in seen)
+    # 同一个 IP 循环复用时不再生成新 id
+    again = {probe_warp._pick_session("ip-a") for _ in range(150)}
+    assert again == seen
+    # IP 变化立即换一组全新的、与旧组不相交的 15 个
+    fresh = {probe_warp._pick_session("ip-b") for _ in range(150)}
+    assert len(fresh) == 15
+    assert not (seen & fresh)
 
 
-def test_pick_session_always_from_daily_set():
-    today = set(probe_warp._daily_sessions())
-    picked = {probe_warp._pick_session() for _ in range(200)}
-    assert picked <= today
-    # 200 次抽样覆盖全部 15 个（单个漏掉的概率 15 * (14/15)^200 ≈ 1e-5）
-    assert len(picked) == 15
+def test_session_pool_wraps_to_first_after_15_sessions():
+    probe_warp._SESSION_POOLS.clear()
+    total = probe_warp.SESSION_POOL_SIZE * probe_warp.SESSION_POOL_SWITCH_EVERY
+    seq = [probe_warp._pick_session("ip-wrap") for _ in range(total + 1)]
+    assert len(set(seq)) == probe_warp.SESSION_POOL_SIZE
+    assert seq[total] == seq[0]  # 第 151 次回绕到第 1 个（均分循环）
+
+
+def test_session_switches_at_least_every_10_within_ip():
+    probe_warp._SESSION_POOLS.clear()
+    seq = [probe_warp._pick_session("ip-c") for _ in range(11)]
+    assert len(set(seq[:10])) == 1          # 前 10 次同一个会话
+    assert seq[10] != seq[0]                # 第 11 次切到下一个
+    rotated = probe_warp._pick_session("ip-c", rotate=True)
+    assert rotated != seq[10]               # quota 重试立即切
+
+
+def test_unknown_egress_sentinel_does_not_share_pool():
+    probe_warp._SESSION_POOLS.clear()
+    seen = {probe_warp._pick_session("?") for _ in range(15 * probe_warp.SESSION_POOL_SWITCH_EVERY)}
+    # egress_ip 失败返回 "?"，必须归一到未知池，不能把 "?" 当成真实出口 key。
+    assert "?" not in probe_warp._SESSION_POOLS
+    assert "-" in probe_warp._SESSION_POOLS
+    assert len(seen) == probe_warp.SESSION_POOL_SIZE
 
 
 def test_parse_retry_after_header_numeric():

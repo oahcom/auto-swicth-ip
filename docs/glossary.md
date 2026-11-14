@@ -41,6 +41,7 @@
 | **封禁** | `blocked` | 出口被 opencode 判定 403（abusive traffic）或 429（配额耗尽） | 403 和 429 的处置相同，但成因不同 |
 | **烧穿** | `burned` / `ban` | 整个 colo 的地址段在窗口内 100% 被封，重启换地址无效 | 不等于"这节点坏了" |
 | **新鲜度** | `fresh` | 出口 IP 是否在 24h 复用窗口外、且未被标记 | 「新鲜」不保证「能用」 |
+| **生命周期截止** | `expires_at` | 台账条目**最早可以被删除**的时刻。只由生命周期事件推进：真实成功流量打点 / 新一轮惩罚开启 / 精确封禁延长；**被访问、被选中、探测记账一律不续命** | 不是「解禁时刻」（那是 `ban_until`），也不是「最近被碰过」（那是 `ts`）。`ledger_cleanup_mode="expires_at"` 时它是清理唯一判据；且恒 ≥ 该轮最晚解禁时刻（提前删会把封禁中的地址当新地址放回） |
 
 ## 四、动作
 
@@ -90,6 +91,33 @@
 > 详见：[architecture/ip-pools.md](architecture/ip-pools.md) 第三节、
 > [established-facts.md](established-facts.md) 第八节。
 
+## 六之三、配置六面（对账模型）
+
+配置事实分布在六个「面」上，跨源自检（`_config_consistency_check_impl`）逐面对账：
+
+| 面 | 载体 | 谁来对账 |
+|---|---|---|
+| 声明面 | members（配置声明） | 自检分类一~六（磁盘五面互查） |
+| 产物面 | 渲染出的 singbox.json | 同上 |
+| 单元面 | systemd 单元 | 同上 |
+| 台账面 | line_state | 同上 |
+| 档位面 | tiers.json | 同上 |
+| **生效面** | 进程内真正加载的 selector 成员（Clash API `all`） | 自检分类七 `selector_drift`；判据唯一来源 `asip/config_projection.py`；`asip audit --runtime-drift` 可手动查 |
+
+**最容易误用的地方**：前五面全在磁盘上——**写盘成功 + 自检通过 ≠ 配置已生效**（INC-017：热重载返回 204 时旧进程仍拿着旧成员）。第六面只能问运行时；API 读不到时结论是「无法判定」，绝不算「一致」。
+
+## 六之四、台账生命周期与影子观测
+
+| 名词 | 代码名 | 定义 | 最容易误用的地方 |
+|---|---|---|---|
+| **影子** | `ledger_shadow` / `_LEDGER_SHADOW` | P0 旁路试算：用新清理判据对台账算一遍、对比旧判据，不影响生产行为。只回答「切 P2 是否安全」 | 不是监控告警；也不替代测试，只验判据一致性 |
+| **干跑 / would-delete** | `_ledger_shadow_sweep` | 用真清理谓词（`cleanup_verdict`）只算不删，产出「若此刻切 P2 会删谁」（`would_delete` / `would_delete_samples`） | 与实删共用同一谓词——两边天然同步，别再造第二份 |
+| **起点戳** | `started_at` | 影子观察窗口的起算时刻，落盘 `.ledger_shadow.json`；文件完好时跨重启保留，硬崩溃丢快照则回退重计 | 不落盘的计数每次重启归零，「连续 ≥24h」永远无法证明（INC-019 同款）；门槛必须实查「`started_at` 已是 24h 前」 |
+| **分人群** | `shadow_bucket` | 偏差统计分干净档 / 惩罚期档：干净档不计 deviation，`exact_match` 只统计惩罚期条 | 混在一起统计，干净条目的时间戳会被计成偏差（1.79e9 秒假象） |
+| **missing_expires** | 影子计数字段 | **可补齐**的缺 `expires_at` 条目数 = 写入口收敛是否彻底的证据（P2 门槛一） | 不是坏数据计数——锚点全坏、补不出的计 `unmigrated` |
+| **unmigrated** | 影子计数字段 | 时间锚点全坏、补不出 `expires_at` 的条目数；清理跳过并告警，**永不静默删** | 与 `missing_expires` 混用会污染门槛一的诊断 |
+| **单一事实源** | `asip/ledger_policy.py` | 释放时刻 / 判定 / 续命计算的唯一出处：判定、清理、影子、报表全部委托它 | 「各自本地重算」是历史缺陷根因——判据一改，口径必然分家 |
+
 ## 七、日志常见词
 
 | 日志原文 | 含义 |
@@ -119,6 +147,14 @@
 ### ③ 换线 vs 换节点
 - **换线**：当前出口从 A 线切到 B 线。B 线本来就是健康的
 - **换节点**：把 A 线自己绑的机场节点换掉。换完必须重启 A 线才生效
+
+### ④ 渠道轮换 vs 渠道块内部的轮换 vs 代理池轮换
+
+- **渠道轮换**：渠道之间的切换——WARP 换线/重连、秒切换槽、9router 重试指向新渠道。轮换主体是「渠道」，回答「走哪条渠道」。主动节奏在此层：`_maybe_proactively_rotate_warp`（fixed 时长 / requests 配额格数两种判据）。
+- **渠道块内部的轮换**：渠道内部对 IP 的连通性择优——延迟表、延迟分数、预检、判死/冷却排除。被动选择器，内部只有延迟相关逻辑，**无主动节奏**。
+- **代理池轮换**：第七闸口（slot-7）对机场池节点的轮换，与「第七闸口轮换」是同一事物。发起权全部在闸口：`/rotate` 报错换（800ms 合并窗）、keeper 死节点换、在役（`proxy_gate_serving_window_sec` 300s）主动换（`proactive_rotate_sec`）。执行：PUT slot-7 自己进程的 `proxy` selector + `now` 回读验证。
+- 代理池轮换选节点时调用渠道块内部的延迟择优逻辑（`pick_next_node` → `_filter_candidates`/`_p2c_select`）：借用关系，不是归属。
+- 主进程侧的 `_rotate_pool_proactive`/`_rotate_on_error` 只翻主进程 `proxy` selector（落池态，`_pool_should_rotate` 三态判据），翻不到 slot-7 进程。
 
 ---
 

@@ -124,7 +124,7 @@ v4 依旧 timeout，v6 立刻 `Connected to MASQUE server`。
 ## 三、按性价比的处理顺序
 
 1. **先掐住 verdict=OK 的换线**：只有 `quota` / `403` / `transport` 才允许换，OK 的线留在原地。这一刀能把 3.27 发往上抬一个量级，其他都是次要的。
-2. **探针固定 session**（已改：每天 15 个、随机取 1）—— 不再自己烧 L1 名额。
+2. ~~**探针固定 session**（每天 15 个、随机取 1）—— 不再自己烧 L1 名额。~~ **2026-11-13 实测推翻**：固定 ID 会被 session 侧全局烧穿，换多少 IP 都 0 OK。改为**每出口 IP 15 个随机会话、IP 内每 10 次切一个、IP 变即重建**（见 `opencode-429-limit-model-20261112.md` §五）；9router 的 opencode/opencode-zen 执行器也已同步。
 3. **429 按各自 Retry-After 排期**，别用统一 60s 冷却对滚动窗口。
 4. 冷却要真正落到 sing-box selector，现在 `_mark_egress_cooling` 只写内存 dict，全文件没有一处操作 selector。
 

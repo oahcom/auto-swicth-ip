@@ -16,9 +16,11 @@ FreeTierError 拒掉。实测定位到唯一门控项是请求体里 `read`/`she
 commit bfd5ad66 实测）。因此请求必须走 Bun 的 HTTP 栈，不能用 curl。
 
 per-tunnel 是 SOCKS5（1080-1099），Bun fetch 只认 HTTP 代理，故每次探测先在
-本地起一个 CONNECT→SOCKS5 的桥（probe_fetch.mjs 负责 Bun 侧）。会话按「端口」
-稳定复用（9router 的 stable session 语义，TTL 2h），遇到 quota 才换一代重试一次
-（对应 opencode.js 的 rotateSession + 一次重试）。会话表落 `.probe_sessions.json`。
+本地起一个 CONNECT→SOCKS5 的桥（probe_fetch.mjs 负责 Bun 侧）。会话按「出口 IP」
+维护：一个 IP 固定 15 个随机会话，IP 内每 10 次切一个，IP 一变立刻重新生成 15 个
+（绝不跨 IP 共用；同 IP 重访复用同一组，distinct 会话数恒 ≤15 < 40）。遇到 quota
+重试时在组内立即切下一个（对应 opencode.js 的 rotateSession + 一次重试）。
+会话池在内存里按 IP 维护，不落盘。
 429 响应会解析 `Retry-After`（头或体），输出该出口的确切封禁剩余秒数。
 """
 import argparse
@@ -192,36 +194,65 @@ FINGERPRINT_TOOLS = [
 ]
 
 
-SESSION_DAILY_COUNT = 15
-# 前缀 12 hex 里编码的时钟锚点（当天几点）。上游会把前缀解码成时间戳并与请求时钟比对，
-# 偏差过大直接 429；锚在当天 00:00 时，全天偏差落在 0~24h。
-SESSION_DAY_ANCHOR_HOUR = 0
+SESSION_POOL_SIZE = 15
+SESSION_POOL_SWITCH_EVERY = 10
+SESSION_POOL_MAX_ENTRIES = 8192
+
+_SESSION_POOLS: dict[str, dict] = {}
+_SESSION_POOL_LOCK = threading.Lock()
 
 
-def _daily_sessions(day: str | None = None) -> list[str]:
-    """当天固定的 15 个会话 id —— 确定性派生，不落盘、不轮换、不看过期。
+def _session_id() -> str:
+    """上游解码前 12 位 hex 并拒绝过大的 counter（实测 0..16 通过，>=100 拒），必须是 1。"""
+    prefix = ~(int(time.time() * 1000) * 0x1000 + 1) & _MASK48
+    return "ses_" + format(prefix, "012x") + "".join(secrets.choice(_B62) for _ in range(14))
 
-    - 前 12 hex = ~(当天锚点毫秒 * 0x1000 + 序号) 的低 48 位，counter 取 1..15
-      （上游实测 counter 0..16 通过、>=100 直接 403 FreeTierError）。
-    - 后 14 位 = sha256("opencode-daily-session|YYYYMMDD|序号") 映射到 base62，
-      因此同一天恒定、跨天必然不重样。
+
+def _mint_pool() -> list[str]:
+    pool = [_session_id() for _ in range(SESSION_POOL_SIZE)]
+    secrets.SystemRandom().shuffle(pool)
+    return pool
+
+
+def _session_pool(ip: str) -> dict:
+    """按出口 IP 取（或新建）一组会话。调用方须持有 _SESSION_POOL_LOCK。"""
+    now = time.time()
+    entry = _SESSION_POOLS.get(ip)
+    if entry is None:
+        entry = {"sessions": _mint_pool(), "idx": 0, "used": 0, "ts": now}
+        _SESSION_POOLS[ip] = entry
+        overflow = len(_SESSION_POOLS) - SESSION_POOL_MAX_ENTRIES
+        if overflow > 0:
+            oldest = sorted(_SESSION_POOLS, key=lambda k: _SESSION_POOLS[k]["ts"])
+            for k in oldest[:overflow]:
+                _SESSION_POOLS.pop(k, None)
+    return entry
+
+
+def _pick_session(ip: str | None = None, rotate: bool = False) -> str:
+    """取当前出口 IP 的会话：一 IP 一组 15 个随机 id，IP 内每 10 次切一个。
+
+    - IP 不变复用同一组；同 IP 重访也不重新生成，distinct 会话数恒为 ≤15（<40）。
+    - IP 一变（换线/重连）立刻生成新的 15 个随机会话，绝不跨 IP 共用。
+    - 组内每 SESSION_POOL_SWITCH_EVERY 次切下一个；15×10=150 正好覆盖单出口
+      一轮约 150 格的探测额度，使每个会话只承担约 10 次请求。
+    - 150 次后回绕到组内第 1 个（均分循环），不重新生成；IP 不变时复用同一组。
+    - rotate=True（quota 重试）立即切到组内下一个。
     """
-    if day is None:
-        day = time.strftime("%Y%m%d")
-    anchor = time.mktime(time.strptime(day, "%Y%m%d")) + SESSION_DAY_ANCHOR_HOUR * 3600
-    day_ms = int(anchor * 1000)
-    out = []
-    for i in range(SESSION_DAILY_COUNT):
-        prefix = ~(day_ms * 0x1000 + (i + 1)) & _MASK48
-        digest = hashlib.sha256(f"opencode-daily-session|{day}|{i}".encode()).digest()
-        suffix = "".join(_B62[b % 62] for b in digest[:14])
-        out.append("ses_" + format(prefix, "012x") + suffix)
-    return out
-
-
-def _pick_session() -> str:
-    """从当天 15 个里等概率随机取一个。"""
-    return secrets.choice(_daily_sessions())
+    key = (ip or "").strip()
+    if not key or key == "?":
+        key = "-"
+    now = time.time()
+    with _SESSION_POOL_LOCK:
+        entry = _SESSION_POOLS.get(key)
+        if entry is None:
+            entry = _session_pool(key)
+        entry["ts"] = now
+        if rotate or entry["used"] >= SESSION_POOL_SWITCH_EVERY:
+            entry["idx"] = (entry["idx"] + 1) % len(entry["sessions"])
+            entry["used"] = 0
+        entry["used"] += 1
+        return entry["sessions"][entry["idx"]]
 
 
 def _apply_env_marker(body: dict) -> dict:
@@ -580,8 +611,17 @@ def classify(status: int | None, head: str) -> str:
     return "err"
 
 
-def probe(port: int, timeout: float) -> tuple[str, float, str, int | None]:
+def probe(port: int, timeout: float, ip: str | None = None) -> tuple[str, float, str, int | None]:
     t0 = time.time()
+    if not ip or ip == "?":
+        try:
+            ip = egress_ip(port) or ""
+        except Exception:
+            ip = ""
+        # egress_ip 失败时返回 "?"（不是空串）。它必须当成未知出口，按端口分组；
+        # 否则所有探测失败的端口会共用同一个 "?" 会话池，等于跨出口复用会话。
+        if not ip or ip == "?":
+            ip = f"port:{port}"
     bun = _bun_bin()
     if not bun:
         # 返回独立结论而不是 unreachable：没装 bun 是探测器缺失，不是这条线
@@ -590,7 +630,7 @@ def probe(port: int, timeout: float) -> tuple[str, float, str, int | None]:
         return "noprobe", 0.0, "bun not found (set PROBE_BUN_BIN)", None
     try:
         with _LocalBridge(port) as proxy_url:
-            session = _pick_session()
+            session = _pick_session(ip)
             status, head, retry, err = _bun_probe(bun, proxy_url, session, timeout)
             if err is not None:
                 return "unreachable", round(time.time() - t0, 1), f"bun: {err}"[:100], None
@@ -600,7 +640,7 @@ def probe(port: int, timeout: float) -> tuple[str, float, str, int | None]:
                         parse_retry_after(retry, head))
             # quota 一律按出口判定；换一代会话只为排除上游对单次请求的门控，
             # 重试仍 quota 即确认该出口不可用。对齐 opencode.js 的一次重试。
-            session = _pick_session()
+            session = _pick_session(ip, rotate=True)
             time.sleep(ROTATE_DELAY_SEC)
             status, head, retry, err = _bun_probe(bun, proxy_url, session, timeout)
             if err is not None:

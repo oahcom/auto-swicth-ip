@@ -41,6 +41,7 @@ WHY 需要这个工具：
 """
 
 import argparse
+import ipaddress
 import re
 import subprocess
 import sys
@@ -73,8 +74,29 @@ REQ_ROTATED = re.compile(
 REQ_RESESSION = re.compile(r"\[EGRESS\]\s*429 re-session replay(.*)$")
 
 
+# journalctl 的相对时间窗必须带 - 前缀（3h → -3h）；绝对时间（2026-11-13、
+# "2026-11-13 13:00:00"）必须原样传。之前无条件加 "-"，--since 2026-11-13 被传成
+# -2026-11-13，journalctl 解析失败又被 stderr=DEVNULL 吞掉，用户只看到
+# 「窗口内没有可识别的 req」这种误导文案。
+RELATIVE_SINCE = re.compile(r"\d+[smhdw]?", re.IGNORECASE)
+
+
+def normalize_since(v):
+    if not v:
+        return v
+    if v.startswith("-"):       # 已自带 - 前缀，别加成 --
+        return v
+    if re.fullmatch(RELATIVE_SINCE, v):
+        return "-" + v
+    return v
+
+
 def read_lines(args):
-    """返回日志行迭代器（已去掉 journald 前缀）。"""
+    """返回日志行迭代器（已去掉 journald 前缀）。
+
+    journalctl 路径用 Popen 逐行流式读取（全量 PIPE 会把整个窗口吃进内存），
+    失败时把 stderr 和实际命令打到 stderr 并退出码非零，绝不静默。
+    """
     if args.file:
         with open(args.file, "rb") as f:
             for raw in f:
@@ -82,10 +104,21 @@ def read_lines(args):
         return
     cmd = ["journalctl", "-u", "9router", "--no-pager", "-o", "cat"]
     if args.since:
-        cmd += ["--since", "-" + args.since]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    for raw in p.stdout.split(b"\n"):
-        yield raw.decode("utf-8", "replace")
+        cmd += ["--since", normalize_since(args.since)]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for raw in p.stdout:
+            yield raw.decode("utf-8", "replace").rstrip("\n")
+        err = p.stderr.read().decode("utf-8", "replace").strip()
+        rc = p.wait()
+    finally:
+        p.stdout.close()
+        p.stderr.close()
+    if rc != 0 or err:
+        sys.stderr.write(
+            "journalctl 失败 (exit=%d):\n%s\n实际命令: %s\n"
+            % (rc, err or "(stderr 为空)", " ".join(cmd)))
+        raise SystemExit(1)
 
 
 def strip_prefix(line):
@@ -96,7 +129,14 @@ def strip_prefix(line):
 def seg64(ip):
     if not ip or ":" not in ip:
         return ip
-    return ":".join(ip.split(":")[:4])
+    try:
+        # :: 压缩靠前的地址不能按冒号切：2606:4700::6812:a42 的真实 /64 是
+        # 2606:4700:0:0，取「前 4 个冒号 token」会混进第 5 段。展开后取
+        # 前 4 个 hextet（去掉补零）才是 /64 口径。
+        hextets = ipaddress.IPv6Address(ip).exploded.split(":")[:4]
+        return ":".join(h.lstrip("0") or "0" for h in hextets)
+    except ValueError:
+        return ":".join(ip.split(":")[:4])
 
 
 def ok(v):
@@ -105,9 +145,16 @@ def ok(v):
 
 
 def is_ip6(x):
-    """纯 IPv6 字面量。必须用字符集判，不能用「含冒号」——
-    代理池节点长这样：ttll20-ooi.dankenet.help:64657-any，也含冒号。"""
-    return bool(x) and re.fullmatch(r"[0-9a-fA-F:]{4,}", x) is not None
+    """纯 IPv6 字面量。必须用解析判定——「含冒号」会把代理池节点
+    （ttll20-ooi.dankenet.help:64657-any）误判成 IPv6；字符集判
+    会把全 hex 无点主机名误判、漏判 ::1。"""
+    if not x:
+        return False
+    try:
+        ipaddress.IPv6Address(x)
+        return True
+    except ValueError:
+        return False
 
 
 def egress_id(h):
@@ -177,15 +224,21 @@ class ReqTrace:
                     "        判定的问题线: %s (%s)  verdict=%s"
                     % (who_line or "-", who_ip or "-", h.get("verdict", "n/a"))
                 )
-            if h.get("acct_port"):
+            for a in h.get("acct", []):
                 lines.append(
                     "        这次 %s 记在 :%s (%s, retry %s)"
-                    % (h.get("acct_code", "?"), short_port(h["acct_port"]),
-                       h.get("acct_status", "?"), h.get("acct_try", "?"))
-                )
+                    % (a["code"], short_port(a["port"]), a["status"], a["try"]))
             nxt = egress_id(h)
             if nxt:
                 lines.append("        → 下一跳: %s" % nxt)
+        # 孤立记账：没找到可挂载的 hop，绝不静默丢弃。
+        for ev in self.events:
+            if ev.get("_kind") == "orphan_retry":
+                lines.append(
+                    "  ⚠️ 孤立记账 %s  retry %s/%s %s 记在 :%s (%s)：没找到对应的 rotate hop"
+                    % (ev.get("_ts", "?"), ev.get("n"), ev.get("m"),
+                       ev.get("code"), short_port(ev.get("port")),
+                       ev.get("status")))
         if self.done:
             lines.append("  DONE  %s" % self.done)
         if show_events and self.events:
@@ -202,6 +255,10 @@ class ReqTrace:
                     lines.append("  %s  resession %s" % (ts, ev.get("detail", "")))
                 elif k == "retry":
                     lines.append("  %s  retry %s/%s %s  记在 :%s (%s)"
+                                 % (ts, ev.get("n"), ev.get("m"), ev.get("code"),
+                                    short_port(ev.get("port")), ev.get("status")))
+                elif k == "orphan_retry":
+                    lines.append("  %s  retry %s/%s %s  记在 :%s (%s)  [孤立记账]"
                                  % (ts, ev.get("n"), ev.get("m"), ev.get("code"),
                                     short_port(ev.get("port")), ev.get("status")))
         chain = self.chain()
@@ -271,14 +328,22 @@ def build(traces, line, state):
         ev = {"_kind": "retry", "_ts": ts, "n": n, "m": m, "code": code,
               "port": port, "status": status}
         tr.events.append(ev)
-        # 挂到最近一个还没记账的 hop 上：日志顺序是 rotate → rotated → retry。
+        # 按 retry 行里的 attempt 序号 N 挂载：挂到最近一个**尚未收到相同 N**
+        # 的 hop。之前挂到「最近一个还没记账的 hop」，rotate(B)→retry 1/2→
+        # retry 2/2 时第二发会反向错挂到更早的 hop；全部挂满后还会静默丢弃
+        # ——现在丢弃的进孤立记账，在 render 里单独显示。
         for h in reversed(tr.hops):
-            if "acct_port" not in h:
-                h["acct_port"] = port
-                h["acct_status"] = status
-                h["acct_code"] = code
-                h["acct_try"] = "%s/%s" % (n, m)
+            seen = h.setdefault("_acct_ns", [])
+            if n not in seen:
+                seen.append(n)
+                h.setdefault("acct", []).append(
+                    {"try": "%s/%s" % (n, m), "port": port,
+                     "status": status, "code": code})
                 break
+        else:
+            tr.events.append({"_kind": "orphan_retry", "_ts": ts, "n": n,
+                              "m": m, "code": code, "port": port,
+                              "status": status})
         return
     mrot = REQ_ROTATED.search(t)
     if mrot:
@@ -306,7 +371,6 @@ def print_stats(traces, top_n):
     dist = Counter(len(t.hops) for t in traces.values())
     succ = [t for t in traces.values() if t.is_success()]
     fail = [t for t in traces.values() if not t.is_success() and t.fails]
-    inport = [t for t in traces.values() if t.is_success() and not t.hops]
     print("窗口内请求数：%d（成功 %d / 失败 %d / 未判 %d）"
           % (total, len(succ), len(fail), total - len(succ) - len(fail)))
     print("\n换线次数分布：")
@@ -337,10 +401,11 @@ def main():
     ap = argparse.ArgumentParser(description="按 req= 重建请求出口序列")
     ap.add_argument("--req", help="只看这个 req id")
     ap.add_argument("--top", type=int, default=10, help="列出换线最多的 N 个请求")
-    ap.add_argument("--since", default="6h", help="journalctl 时间窗，如 3h / 2026-11-13")
+    ap.add_argument("--since", default="6h",
+                    help="journalctl 时间窗；相对时间如 3h/25m（自动加 - 前缀），"
+                         "绝对时间如 2026-11-13 或 \"2026-11-13 13:00:00\" 原样传")
     ap.add_argument("--file", help="从日志文件读，而不是 journalctl")
     ap.add_argument("--stats", action="store_true", help="输出全局分布而不是单条时间线")
-    ap.add_argument("--verbose", action="store_true", help="单请求模式下同时打印未归类行")
     ap.add_argument("--events", action="store_true",
                     help="额外打印原始事件序列（rotate / rotated / retry 按日志顺序）")
     args = ap.parse_args()

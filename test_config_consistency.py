@@ -204,6 +204,21 @@ def test_html_and_cli_agree_on_no_sample_cause(mod, tmp_path):
 
 # ---------------------------------------------------------------- daemon 自检
 
+@pytest.fixture(autouse=True)
+def _isolate_selector_drift(monkeypatch):
+    """隔离分类七（产物面 ⊄ 生效面）的真实输入面。
+
+    分类七会去读真实槽位的 Clash API 与磁盘渲染配置，而本文件的用例只测
+    分类一~六、且对 `problems` 做**精确计数断言** —— 线上真实漂移数据混
+    进来会把断言打成 flaky（本机 daemon 常驻，槽位 API 是活的）。这里把
+    输入面统一置为「无法判定」（unknown 不计 problems），分类七自身的
+    覆盖在 test_config_drift_inspect.py。
+    """
+    import daemon as d
+    monkeypatch.setattr(d, "consumer_slots", lambda: [])
+    monkeypatch.setattr(d, "singbox_api", lambda *a, **k: (0, None))
+
+
 def _daemon():
     import daemon
     return daemon

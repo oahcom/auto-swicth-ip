@@ -121,6 +121,39 @@
 
 ---
 
+### 3b. session 也有状态上限：固定会话集会被**全局烧穿**（2026-11-13 实测）
+
+**看起来像**：为了让探针少占 L1 名额，把探针固定成每天 15 个确定性 session，全天所有线路复用。
+按"每 IP 40 个 session"的模型，15 < 40，应该很安全。
+
+**实际是**：opencode 对 **session ID 本身**也有状态/上限（与"单 IP 40 个 session"对称，很可能是
+"单 session 只能服务有限个出口 IP"或单会话总用量）。15 个固定 ID 被用在几千个 IP 上，
+**15 个 ID 全部被拉黑**，之后换多少新 IP 都返回 `FreeUsageLimitError`——143 因此一天重启 2 万多
+次仍几乎 0 OK。
+
+**决定性证据**（同 IP、同 body/marker、同时刻，只换 session；IP 均不在 143 的 `.warp_ip_used.json`）：
+- `2a09:bac5:2a92:246e::3a1:33`（FRA-27）：常规 session → OK，`_daily_sessions()[6]` → **quota**，
+  午夜锚+随机后缀 → OK，当前时刻+同一 sha 后缀 → OK，当前时刻+随机 → OK。
+- `2a09:bac1:76c0:7d0::8f:5e`（SLC-11）：常规 → OK，daily[6] → **quota**，fresh → OK。
+- 只换前缀（午夜→当前）或只换后缀都能过，**只有那 15 个精确 ID 整串被拒** → 不是时间戳过期，
+  是 session 被标记。
+
+**该现象只在部分被标记的 session 上触发**：正常 IP 上单会话仍能打满额度；所以"在 IP 内多会话分散"
+在正常 IP 上无害，在标记 session 上能规避"单会话打不完额度"。
+
+**现行方案**：每出口 IP 15 个随机会话（当前时刻+随机后缀），IP 内每 10 次切一个，
+IP 一变立即重建 15 个；同 IP 重访复用，distinct/IP 恒 ≤15 < 40；绝不跨 IP 共用。
+代码：`probe_warp.py` 的 `SESSION_POOL_*` / `_pick_session(ip, rotate)`。
+**9router 侧同步**：`open-sse/executors/opencode.js` / `opencode-zen.js` 已改为按出口 IP 的
+15 会话池（IP 变重建、IP 内每 10 次轮换、429 重试强制换下一个）。主 429 换线循环按目标
+出口重新取会话；第七闸口用池节点 tag 作身份；池 8192/LRU；探针 `"?"` 按端口分组。
+池内 15 会话按 10 次/会话均分，150 次后回绕到第 1 个。
+完整设计记录见 `docs/design-20261113-per-egress-session-pool.md`。
+
+**不要动**：不要改回"全局固定 session 池"（无论每天 15 个还是别的常数）。
+
+---
+
 ## 二、地址池的物理约束
 
 ### 4. v6 每次重连必换地址，v4 只在 colo 的地址池内翻牌
@@ -1608,3 +1641,440 @@ test_warp_wg.py` 里两条「只应有 3 条 WG 线」的用例看到 22 条而�
 | `test_cached_ok_verdict_does_not_skip_probe` | TTL 内 OK 仍须实测 | **直接复用**（主人 2026-10-28 拍板「省配额优先，复用被烧地址可接受」；T-225 把 TTL 抬到 1800） |
 | `test_restart_cap_survives_state_reload` | 重启后恢复 20 条 `restart_hist` | **启动即清空**（重启是人工动作，不该继承重启前的小时预算） |
 | `test_probe_cache_never_bleeds_across_ips_in_same_segment` | 结论按线隔离 | `quota`/`flagged` **跨线复用**（判的是地址，不是隧道）；`unreachable`/`err` 仍不跨线 |
+
+### 30. 轮换的三层归属与第七闸口的实际出口链（2026-11-13 实测）
+
+**实测依据**：slot-7 进程配置 `singbox-config.json-slot7.json` + Clash API（127.0.0.1:9097，配置内 secret）实时查询。
+
+- slot-7 路由规则：`domain_suffix ["opencode.ai"] → opencode-out`；其余流量 `route.final = proxy`。
+- `proxy` selector 成员 = 机场订阅节点（实测 203 个；成员数随订阅动态变化，见第 29 条）。
+- `opencode-out` selector 成员 = 本机 WARP socks 出口（实测 146 个）+ `proxy`（链式成员）；实时 `now = proxy`。
+- opencode 流量进 7897 后的出口链：`opencode-out →（链式）→ proxy → 机场节点`。
+- 常规槽（slot-1..6）的 `opencode-out` 指向各自的 WARP 线；slot-7 是唯一 `opencode-out` 链式指向机场池的槽。
+- 闸口轮换目标 `pool_selector = CFG["singbox"]["selector"] = "proxy"`。
+
+**轮换的三层归属**：
+
+| 层 | 轮换主体 | 主动轮换 | 代码锚点 |
+|---|---|---|---|
+| 渠道轮换 | 渠道（WARP 线、槽位） | 有：fixed 时长 / requests 配额格数 | `_maybe_proactively_rotate_warp` |
+| 渠道块内部 IP 轮换 | 渠道手里的 IP | 无：纯延迟相关，被动选择器 | 延迟表 / `_p2c_select` / `_filter_candidates` / 预检 |
+| 代理池轮换（= 第七闸口轮换） | 机场池节点 | 有：keeper 在役节奏 + /rotate 报错换 | `_proxy_gate_maintain` / `_rotate_proxy_gate_once` |
+
+**为什么**：轮换发起权与延迟择优分属不同层。渠道块内部的延迟择优是被动的打分器，不含任何时钟判据；主动节奏只存在于渠道轮换层（fixed/requests 换线）与第七闸口（keeper 在役换、报错换）。主进程落池态另有一处主动池轮换 `_rotate_pool_proactive`（`_pool_should_rotate`：不在 WARP 或池节点死才换），只翻主进程 selector。
+
+**改了会怎样**：把主动轮换判据放进渠道块内部的延迟择优函数，会同时改变渠道轮换与代理池轮换的选点行为；把第七闸口轮换当主路径池轮换来改，会改错进程的 selector（见 CLAUDE.md「池内轮换的归属」）。
+
+### 31. node_info.ip 字段被污染 + 池节点 v4/v6 出口实测（2026-11-13）
+
+**实测依据**：经 slot-7 的 7897 端口，抽样 10 个池节点（等距抽样），逐节点切换后访问 api.ipify.org（v4）/ api6.ipify.org（v6），测毕恢复原节点。
+
+- node_info 表的 ip 字段**不是该节点的出口 IP**：写入函数 fetch_node_ip_region 的 node 参数在函数体内未被使用，实际经主进程 7890 端口查 ipify，记录的是「写入时刻主进程的出口 IP」（通常为 WARP 隧道地址）。基于该字段的任何「节点→出口 IP」统计不可信。
+- 抽样 10 节点实测：v4 可用 6/10，6 个全不同 v4 IP；v6 可用 4/10，4 个全不同 v6 IP；双栈 4/10；4 个连 ipify 都不通（死节点）。
+- 出口 IP 按协议族独立：同一节点可只有 v4、只有 v6 或双栈；不同入口端口可对应不同出口 IP。
+- 上游配额按协议族独立支持（v4、v6 各自计额）。
+
+**为什么**：node_info.ip 的写入路径与节点出口无绑定；机场节点的真实出口只能经该节点实际出网测得。
+
+**改了会怎样**：把 node_info.ip 当节点出口 IP 用于 IP 级冷却/去重/脏 IP 避让，会把主路径 WARP 的历史地址误记到池节点名下，IP 维度的判断整体失真。
+
+### 32. `blocked` 标志永不复位；`expires_at` 是条目的唯一生命周期时钟（2026-11-13）
+
+**依据**：`asip/ledger_policy.py`（释放时刻/判定/续命的单一事实源）+ `docs/design-20261113-ledger-lifecycle.md`。
+
+- `blocked=True` **单向置真**，全项目没有复位为 False 的代码。惩罚期满只是 `_warp_ip_is_blocked` 返回 False（地址降级为次级优质、可复用），标志要等条目被清理整条删除才消失。所以直接数 `blocked` 字段会把「当前被封」高估一个数量级——判定口径永远用 `_warp_ip_is_blocked`（或 `tools/channel_report.py --blocked-ips`）。
+- 条目什么时候可以删，生命周期字段 `expires_at` 说了算（`ledger_cleanup_mode="expires_at"` 时唯一判据）。它只由三类事件推进：真实成功流量打点 / 新一轮惩罚开启 / 精确封禁延长；**被访问、被选中、探测记账一律不续命**。旧实现拿 `ts` 当清理锚点，而 `ts` 被每次访问刷新——活跃条目永远满足不了 24h cutoff。
+- 安全不变量：`expires_at` 恒 ≥ 该轮最晚解禁时刻。提前删除会让仍处惩罚期的地址以「从未出现过」（档 0 最优）身份回池，直接引发 403/429 爆发。
+
+**为什么**：台账条目同时承担「选线状态」与「生命周期管理」，生命周期判据复用业务字段（`ts`、`ban_until`）并被多处逻辑各自解释，是历史缺陷的共同根因。收敛到单一字段后，判定、清理、报表各管一件事。
+
+**改了会怎样**：把 `blocked` 当「当前是否被封」直接统计或展示，规模会错一个数量级；让访问刷新 `expires_at`，等于恢复「活跃条目永不删除」的旧行为。
+
+### 33. 写盘成功 + 自检通过 ≠ 配置已生效：配置有六个面，第六面在进程里（2026-11-13）
+
+**依据**：INC-017（2026-11-09，热重载回 204 后 selector 成员仍旧，手工 kill 才恢复）+ bc89daa 漂移自愈 + `docs/design-20261113-config-drift.md`。
+
+- 配置事实有六个面：声明面 members / 产物面 singbox.json / 单元面 systemd / 台账面 line_state / 档位面 tiers.json / **生效面（进程内真正加载的 selector 成员）**。前五面全在磁盘，跨源自检逐面对账；第六面只能经 Clash API 问运行时（自检分类七 `selector_drift`，判据唯一来源 `asip/config_projection.py`）。
+- `reload_singbox_config` 的 HTTP 204 只证明热载**不断流**，不证明配置内容已生效。热载后由 `_slot_drift_after_reload` 逐槽校验成员，未收敛走 `_slot_drift_maybe_heal` 单槽重启进程——只有整进程重启才重建成员。
+- 「无法判定」（API 读不到）绝不算「一致」：假阴性会把漂移当正常放行。
+
+**为什么**：写盘（render/patch）与生效（reload）是两条路，靠「changed 列表」传参衔接，传漏即漂；旧进程存活时热重载是假成功。磁盘五面自检全绿恰恰掩盖了这一类漂移。
+
+**改了会怎样**：拿磁盘配置或 204 响应当「已生效」的证据，会重复 FR-12 / R-9 / INC-017 一整类复发；把「读不到」当「一致」，巡检永远报平安。
+
+### 34. 写入口缺口是**动态再生**的；缺 `expires_at` = 未迁移，不是已过期（2026-11-13）
+
+**依据**：2026-11-13 19:2x 重验 + 同日修复（写入口收敛 `_ledger_new_entry` / `_ledger_apply_event_locked`、载入补齐 `_normalize_ledger_entry`、`asip/ledger_policy.py` 的 `backfill_expires_at`；验证报告 `report-20261113-ledger-lifecycle-verify.md`）。
+
+- 历史缺陷链：探针验证建账路径直写 `_WARP_IP_USED[ip]`，绕过 `expires_at` 双写；旧 float 格式载入同样漏。缺口**动态再生**（18:53 有 20 条缺字段 → 18:56 涨到 27 → 19:22 剩 9，全部带 `probe_ok_ts` 且全干净）——修掉一处不够，口径是「凡写台账必经收敛入口」。
+- 清理侧语义已反转：`ledger_cleanup_mode="expires_at"` 下「无 `expires_at`」＝未迁移 → **先补齐再判**；仍补不出的（时间锚点全坏）**跳过删除并计 `unmigrated`**，绝不静默删。旧语义「有 exp 且未到期才保留」会把缺字段当过期，P2 一切换就秒删探针建账的干净条目、丢档位 1/2 选线证据（`probe_ok_ts` / `last_ok_ts`），且影子对无 `expires_at` 条目不计数，连误删都看不见。
+- 两个计数口径分开：`missing_expires` 只计**可补齐**的缺字段条目（写入口收敛是否彻底的直接证据，P2 门槛一）；`unmigrated` 计**补不出**的坏数据（门槛二）。坏数据混进前者会把门槛诊断带偏。
+- 补齐锚点只取条目**已发生的真实事件时刻**（`ts` / `last_ok_ts` / 解禁时刻），宁短勿长、绝不用 now——用 now 等于每次重启凭空续整窗。
+
+**为什么**：生命周期字段的完整性必须是结构保证（所有写路径共用收敛入口），不能靠调用方自觉；清理语义反转是纵深防御——即使再有旁路漏进来，也只会跳过＋告警，不会误删。
+
+**改了会怎样**：绕过收敛入口直写台账，`missing_expires` 随探测动态上涨，P2 门槛一永远过不了；把缺字段当过期删，等于把最好的探针证据（干净、新鲜、带 `probe_ok_ts`）最先扔掉。
+
+### 35. 影子计数必须落盘带起点戳；偏差分人群；P2 门槛靠 would-delete 干跑排演（2026-11-13）
+
+**依据**：INC-019（熔断计数重启清零）同款教训 + 19:39 实测（干净条目把时间戳计成偏差，`deviation_max≈1.79e9` 秒假象淹没真偏差）+ 同日修复（`.ledger_shadow.json` 落盘带 `started_at`、`shadow_bucket` 分人群、`_ledger_shadow_sweep` 干跑）+ 同日实测：21:2x WSL 硬崩溃，21:29:28 重启后未 fsync 的快照丢失，`started_at` 按设计回退重计（非 bug，但门槛钟须从 21:29:28 重新起算）。
+
+- 影子（P0）= 新清理判据旁路试算、不影响生产行为，只回答「切 P2 是否安全」。三个历史缺陷：① 计数纯内存、重启清零、无起点戳 →「violations==0 连续 ≥24h」无法证明起点（一次重启就归零）；② 偏差不分人群——干净条目两边都判「不删」，却被把条目时间戳计成偏差，假象淹没真偏差；③ 只验 INV-1（`expires_at` 单调不减），不排演 INV-2（不该删的绝不删）——误删风险只有设计推演，没有运行证据。
+- 现行口径：影子落盘（启动合并续计；**文件完好时** `started_at` 跨重启保留，文件丢失/损坏则「静默从零」重计——快照未 fsync，硬崩溃可丢，runbook 门槛专查「`started_at` 已是 24h 前」即防此；照 M10 `_api_stats` 模板；pytest 隔离防污染生产文件）；偏差分干净/惩罚期两档（干净档不计 deviation；`exact_match` 只统计惩罚期条、**不作门槛**）；**would-delete 干跑**与实删共用 `ledger_policy.cleanup_verdict`，产出 `would_delete` / `would_delete_samples`——「若此刻切 P2 会删谁」进观测口径。
+- P2 门槛四条（`runbook/ledger-cleanup-switch.md`）：`missing_expires==0`、`would_delete` 干净且可解释、`violations==0` 且 `started_at` 起连续 ≥24h、全量测试绿。
+
+**为什么**：观测口径的缺陷会直接变成决策盲区——假象口径下「violations==0」几乎恒真，拿它当门槛等于没有门槛。起点戳让「连续 24h」跨重启可证；干跑把 INV-2 从假设变排演。
+
+**改了会怎样**：计数不落盘，门槛钟每次重启归零、永远攒不满 24h；不分人群，真偏差被假象淹没；没有干跑，P2 误删只能靠设计推演兜底，出事前没有任何运行信号。
+
+### 36. 引入 import 的提交必须把被引文件带进同一笔（2026-11-13）
+
+**依据**：F-7 断头（起点 c819e4a：daemon.py 开始 `from asip import ledger_policy`，但 `asip/ledger_policy.py` 一直 untracked，到 4e1e2f9 才补入，期间 stash / 新检出即 ImportError）。
+
+- 「工作区能跑」≠「HEAD 自洽」：daemon 常驻从工作区加载，断头在 stash / 新检出 / CI 视角才暴露，且崩点（import 行）离真因（漏 add）很远。
+- 提交前自检：新 import 的目标文件必须在 HEAD 里存在（`git cat-file -e HEAD:<file>` 验证）；untracked 文件（`git status` 的 `??`）在多人并行时最容易被淹没。
+
+**为什么**：多路并行开发里「写了但没 add」和「改了但没 commit」同样危险，前者在工作区里不可见——代码在磁盘上，仓库里却没有，两边都看着正常。
+
+**改了会怎样**：断头期间任何 stash 应用、分支检出、CI 构建都在 import 处直接崩；且因为工作区正常，问题容易被误判成环境故障而不是仓库自洽问题。
+
+### 37. opencode 按出口 IP 独立分配额度（L2 0–358 发），差异是机制而非故障（2026-11-14）
+
+**依据**：2026-11-13 全天四线交叉取证（trackA/B/C/D）+ 纯代理池容量复测 + 生产日志 22h 实测。生产数据 `journalctl -u 9router`，测试数据独立 sing-box 实例（不混入生产）。
+
+**核心事实**：
+- L2 额度按单出口 IP 独立计额，各 IP 额度**天然不同**（实测 0–358 发），同一时刻不同 IP 可用额度无关联。上游不提供「统一额度池」，也无法从错误体区分 L1（40 session 全封）和 L2（发数额度）。
+- **「单 IP 攒不到 300 发」不是 bug**：300 是理想独占容量上限，生产可达值远低于此。不同 IP 的额度差异是上游机制，代码层无法改变。
+- IP 寿命分布极不均匀（9router 日志 22h 实测，1,115 个有流量的 IP）：**中位使用跨度 24 秒**，52.6% 活不过 30 秒，但存在极少数长寿 IP（10+ 小时 / 400+ 发）——说明 L2 容量本身没问题，是绝大多数 IP 活不到用上容量就被切走。
+
+**优质节点典型例**（生产日志 22h，按使用次数排序）：
+
+| 类型 | 节点 | 使用次数 | 跨度 | 特征 |
+|---|---|---|---|---|
+| **CF 节点** | cn.bing.com:443~7-any | **432** | 19.4h | CF 系最稳定，全天高频 |
+| CF 节点 | us.bing.com:443~3-any | 305 | 14.4h | 美区 CF，稳定 |
+| CF 节点 | cn.bing.com:443~9-any | 301 | 14.4h | |
+| CF 节点 | cn.bing.com:443~23-any | 279 | 14.4h | |
+| CF 节点 | cn.bing.com:443~6-any | 271 | 14.4h | |
+| 代理节点 | pq.aws66.yydjc.top:443-vl | 265 | 14.4h | AWS 系 vless，稳定 |
+| 代理节点 | downloadcfpro.xn--ghq880n3na965a.com:443~4-vl | 256 | 14.4h | CF 代理，稳定 |
+| 代理节点 | pq.aws67.yydjc.top:443-vl | 240 | 14.4h | |
+
+**CF 节点 vs 代理节点**：
+- **CF 节点**（cn.bing.com / us.bing.com 系，30 个）：平均使用 4.6h，最多 432 次，跨度长但单节点承载量差异大（约 7 至 432 次不等）。作为兜底闸口主力。
+- **代理节点**（dankenet / greatgameupload / yydjc / downloadcfpro 系，139 个）：平均 8.4h，单供应商内节点质量均匀（如 downloadcfpro 平均 14.8h、unamecf3 平均 14.6h），但 bilibili-image-cdn 系极差（平均 0.5h）。
+- **高性价比供应商**：downloadcfpro、unamecf3（跨度 14+ 小时）、ttll20-ooi.dankenet（12.7h）。
+- **WARP IP**（2a09:bac5/bac1 系）：中位 24 秒、平均 6 分钟，远短于池节点。长寿 WARP IP 稀缺（12 个超 1 小时）但存在（最长 11.1h / 465 发）。
+
+**推论与策略**：
+- 优化方向 = **提高好 IP 的利用率**（少浪费、少误切、优先选好 IP），而非追求每 IP 到 300。
+- KPI 建议：每绑定 ≥5 发、每 IP ≥50 发（比单 IP 300 更现实）。
+- 池节点优先选 CF 系 + downloadcfpro/unamecf3 系，避免 bilibili-image-cdn 系。
+
+**为什么**：把「单 IP 到不了 300」当故障追，会在代码层无限归因——实为上游额度天然离散。认清机制后，资源应投向供给端（多搞好 IP）和利用率（减少浪费）。
+
+**改了会怎样**：继续把 300 当硬指标，会误判代码缺陷、浪费工程资源；放弃对 IP 质量的选择，则好 IP 被坏 IP 拖累，整体利用率更低。
+
+---
+
+### 38. 探针不烧额度：429 节点探 0 格，OK 节点 30min TTL 内只算一格（2026-11-13 主人拍板口径）
+
+**看起来像**：探针活动量是生产流量的 2.4–5.1 倍，探针在大量烧额度。
+
+**实际是**：
+- 对 **429（被限）节点**的探测 **0 额度** —— 上游直接拒，不产生计费性消耗。
+- 对 **OK 节点**：结论缓存 TTL 1800s（30 分钟），命中即复用，**每线每 30min 至多 1 格**。
+- "探针活动量 2.4-5.1x" 是**日志条数**，不是额度消耗——两者差一个数量级。
+
+**为什么**：探针是小请求；被限节点在闸口层就被拒（0 格），健康节点 30min 内结论复用（T-225 把 TTL 从 30s 抬到 1800s：旧 30s 等于每发必探）。
+
+**改了会怎样**：按"探针烧额度"去砍探针频率，会失去坏线发现速度，省下的额度远小于换线误判的损失。
+
+### 39. 429 绑定的是出口 IP，不是会话；回收 IP 继承封禁（2026-11-14 trackE 实测）
+
+**看起来像**：429 是会话级/账号级限流，换会话或重连就能解。
+
+**实际是**（同会话跨出口、换会话不解封、回收 IP 三组对照实验）：
+- 同一请求会话跨不同出口：Retry-After 窗口**各自独立跟随出口 IP**。
+- 换新会话打同一 IP：**照样 429**（封禁窗 ~13.8h 不随会话/重连重置）。
+- 换线后拿到的"新" IP 有 **95.4% 是回收 IP**，带着上游封禁到场。
+
+**为什么**：上游限流按出口 IP 计（L1=40 会话全封 / L2=24h 额度 0–358 / L3=Retry-After 窗，三闸同一错误体 FreeUsageLimitError）。IP 本身有独立配额（见 37）。
+
+**改了会怎样**：把 429 当会话问题去重建会话/重连，只会把请求继续发在死 IP 上；正确动作是**记脏 IP + 换出口**——这就是 /rotate 记账链存在的理由（漏了记账=漏拦，见 40）。
+
+### 40. 429 漏拦的三个口子：A1 零记账、A2 条件门、borrowed 恒误标（2026-11-14 实测+修复）
+
+**实测依据**：9router 日志 22h 审计，812 个**完全无记账/换线证据**的 429：
+- **A1（501 个）**：DefaultExecutor / openai-compatible-chat-* 路径零 EGRESS —— 429 直接落 chatCore 错误出口，不喂 /rotate。
+- **A2（311 个）**：opencode.js 的 `rotateEgress` 被 `if (retryBody || typeof args.body === "string")` 条件门挡住，非字符串 body 的记账整个消失。
+- **borrowed 恒误标（修复 A1/A2 后 36/57 ERROR 429 仍是 borrowed_skip）**：三发循环跨端口重试用 `requestProxyUrl`（executeInner 开头的原始端口，循环内从不更新）判借道，跨端口恒判 borrowed=1 → daemon 走 borrowed_skip **不标脏不换线**（defer_verdict 只短冷却）→ 被限 IP 不进 24h 台账，后续请求反复撞墙。而三发循环的重试已 sessionRotate 重建凭据，不是 D14 定义的借道。
+
+**修法**（均已部署）：chatCore 429 出口补 `rotateEgress`（A1）+ `isAsipLocalGateProxy` 判据（环回+可换端口才记账，防把非本机闸口的账号级 429 喂给 /rotate 误标脏主出口）；A2 移出条件门；borrowed 按 credsRebuilt/本闸失败记账（三发循环恒 false，重放路径按凭据是否重建）。
+
+**改了会怎样**：漏一个口子 = 被限 IP 继续接流量、429 反复出现；borrowed 误标 = 应判死的 IP 不判死。测试：chatcore-429-gate-accounting 7 例、asip/429 簇 101+ 全绿。
+
+### 41. `already_retired` 判「已换走」会说谎：报障地址仍是当前出口时必须真换线（2026-11-14 实测+修复）
+
+**看起来像**：迟到 429 追的是已下线隧道，回 `already_retired` 让调用方原地重连即可，省一条新线（D3/D6 白跳实测 74.5% 落地仍 429，所以不给备槽）。
+
+**实际是**：两条判据都会说谎——
+1. **exit ledger 只看「这个地址曾经被换走」**：IP 回收/原地重连后同一个 /128 又回来，旧记录还在，恒判「已换走」；
+2. **`switched_at > request_started_at` 是时刻推断**：重试发出晚于换线，但传进来的还是原请求的开始时间，恒真。
+
+实锤：req=wfgkef17a（2026-11-14 04:58）daemon 日志自相矛盾——`请求地址 2a09:…:3a3:55 在请求发出后被换走（当前 WARP-H2-FRA-77 / 2a09:…:3a3:55）`，**请求地址就是当前出口**。同死 IP 三连撞（首发 429→不换线→20.7s header-timeout→不换线→重放 429）白烧 34s 后 ERROR，combo 备胎 1 秒就救回。同类链条实测占 >20s 慢请求的 301+ 条（100s+ 的 stall 链 8 连撞都有）。
+
+**修法**（已部署）：**事实 veto**——`egress_ip == cur_ip`（当前出口）时否定「已换走」，走真换线（标脏+备槽），`_rotate_once`/`_rotate_slot_once` 两处；9router 侧 `lineMoved` 同款客户端 veto（already_retired 但回包 active_egress==本发失败地址→拒绝原地白打，早失败早走 combo）+ 三发循环 holder 逐发更新发出时刻。veto **只用于否定，不用于肯定**（迟到报障地址≠当前出口时行为不变）。
+
+**为什么**：429 绑定出口 IP（39），同 IP 重连必然还是死的。
+
+**改了会怎样**：不加 veto，换线不触发、请求在死 IP 上反复 20s 超时直到预算耗尽；加了误伤面为零。
+
+### 42. 槽位健康结论是内存态，重启即丢 = transport 风暴；必须持久化（2026-11-14 实测+修复）
+
+**实测依据**：04:45 daemon 重启，WARP 线路状态从磁盘恢复（166 条）但 `_SLOT_HEALTH` 纯内存丢失 → 全槽位 unknown→bad→no_healthy_slot → transport 报障 43 倍（1→43/min）持续 7 分钟，触发 9router 自重启反馈环。
+
+**修法**：`.slot_health.json` 落盘（`_slot_mark` 状态变更即写、启动恢复 status/verdict/ts/switched_at/tag/egress）。**repairing 不持久化**（无后台线程在修，恢复了会永远卡住——load 时降级 unknown）。
+
+**改了会怎样**：重启 3 秒内槽位回到 ok（实测对比：7 分钟风暴 vs 无感）。
+
+### 43. 上游前缀缓存被逐请求随机 env 打断——大上下文 TTFT 的主因（2026-11-14 实测+修复）
+
+**看起来像**：上游 TTFT 高是模型推理慢，没办法。
+
+**实际是**：CACHE ↻（上游 usage.cached_tokens）命中率随输入规模暴跌——IN 0-50K 命中 **65%**，100-250K 仅 **5-8%**；命中值 p50=**8960 常数**=系统提示词头。决定性旁证：自带 `<env>` 透传的真实 opencode 客户端（提示词稳定）同一上游吃到 max **179840** 缓存——上游前缀缓存完全正常。根因：`applyEnvFingerprint` 逐请求用 CSPRNG 生成随机 workdir（INC-018 防拉黑引入），`<env>` 块在系统提示词**尾部**，每发一变前缀就断，100K+ 会话历史每条请求全量重算 prefill（上游侧 TTFT p50≈9.5s 的主体）。
+
+**修法**（已部署）：`envWorkdirFor(会话锚点)` FNV-1a 确定性推导（锚点=首条用户侧消息前 512 字符）——同会话字节恒定（缓存吃到整段历史），跨会话多样（INC-018 防拉黑保留：几百条各活一个会话的假项目路径收不进静态黑名单；真实 CLI 会话 cwd 本来就跨轮次不变，逐请求变反而是破绽），无锚点回退随机，`OPENCODE_ENV_WORKING_DIR` 钉死保留。
+
+**2026-11-14 延迟基线**（5185 请求，00:00–05:26）：p50=13.9s / p90=41s；>20s 占 31%（A 死 IP stall 链 301 / B 429 换线链 109 / C 上游 TTFT 慢 577 / D 生成长 605 / E 其他 33）。修复后预期：大请求命中 5-8%→90%+，上游 TTFT ~9.5s→2-3s。验证口径：长窗观测里 CACHE ↻ 应出现随会话增长的 30K–150K 命中。
+
+**改了会怎样**：不修，大上下文每条请求白算 10 万+ token prefill；修了 TTFT 直接砍到零头。C/D 两类（新 token prefill + 生成 + THINK:high 思考）是模型本体耗时，不可无损压缩。
+
+### 44. fail-open 的「等待超时」是延迟税：外置服务挂掉时每请求白等满超时（2026-11-14 实测）
+
+**实测依据**：headroom 压缩服务（127.0.0.1:8787）崩溃循环 583 次（二进制丢失 203/EXEC）期间，`compressWithHeadroom` 的 fail-open 是**等满 3s AbortSignal 超时**才放弃——POST→PROXY 发送前管线 p50=3.0s（无超时事件的请求 p50=0.0s），1109 次 × 3s ≈ 55 分钟纯等待。TTFT 从 POST 起算（`ttftAt - requestStartTime`），管线耗时直接进 TTFT。
+
+**为什么**：fail-open 的语义是"压缩失败不阻塞请求"，但实现里 fetch 的超时预算**串在关键路径上**；服务挂掉时每个请求都付满预算。
+
+**改了会怎样**：fail-open 必须配**连续失败熔断**（N 次失败后 M 秒内直接跳过、不发起调用），否则任何外置辅助服务的静默宕机都会变成全局延迟税。服务恢复后税消失；熔断是防复发的保险。
+
+---
+
+### 45. 前缀缓存的真凶排序：工具表逐轮变化 > env 随机；缓存本身完全工作（2026-11-14 受控实验）
+
+**实验设计**（经 9router 真实链路，9router_hermes → opencode free 档，读 usage.cached_tokens）：
+
+| 实验 | 结果 |
+|---|---|
+| 字节相同请求背靠背 | 命中但只有 system+工具 前缀（3456/5549），消息段不涨 |
+| 同会话 +1 消息（工具表稳定） | **命中 5760/7793（74%）**——前缀缓存跨轮次工作 |
+| 同会话 +1 消息（工具表 +1 个） | **0**——连上一轮刚暖的前缀都全灭 |
+| 生产高命中对（openai→openai、工具表恒定 24） | **217344/217896（99%）**，跨闸口（7895→7896）照样命中 |
+| 生产低命中对（claude→openai、工具表 9→18 逐轮增长） | **0** |
+
+**结论**：
+1. **上游前缀缓存完全工作**（99% 命中实测），内容前缀式、跨会话跨闸口——#43 里"缓存被 env 打断"只对了一半：env 是真凶之一（已修），但更大的凶手是**工具表逐轮变化**。工具定义在提示词序列里排在消息之前，工具表变一个字节 = 整个会话历史的缓存全灭。claude 客户端（hermes agent）的工具表逐轮增长（9 TOOL→18 TOOL）就是低命中那批的形态。
+2. 命中分布是**双峰**：前缀稳定的会话 94-99%，工具表/前缀在变的会话 0-8%。p50 会被双峰平均成"5-8%"，别用 p50 判断缓存能力。
+3. 大请求 TTFT 的无损优化排序：**① 客户端每轮发送稳定完整的工具表**（固定注册表/首轮给全——收益最大，hermes 大请求 95% 的 prefill 可省）；② env 会话稳定（已修）；③ 其余见 43/44。
+
+**改了会怎样**：不控工具表稳定性，光修 env 只能吃到 system+工具 层的缓存；工具表钉住后同会话历史全部命中，TTFT 从重算 10-25 万 token 降到只算新尾。
+
+**实验脚本**：docs/reports-20261114/cache_experiment*.py（可复跑复核）。
+
+### 46. fn 工具名中性化层不抖动 —— 前缀缓存杀手排除（2026-11-14 实测）
+
+**结论**：9router 的 `neutralizeCallerToolNames`（`fn_<hash>` 工具名替换）**不是**前缀缓存杀手；缓存抖动源是客户端工具集合逐轮增长。
+
+**机制背景**（详见 9router 仓库 `docs/incident-20261111-fn-toolname-restore-miss.md` 与
+`open-sse/utils/opencodeFingerprint.js` 头注释）：上游 free 档有第四道「工具名门」——
+单个 `subagent_fork` 就触发 429 FreeUsageLimitError（大小写不敏感、与定义无关），且真名
+数量有阈值（48 个里真名 46 个即 429，45 个通过）。9router 请求侧把 caller 工具真名改写成
+中性别名 `fn_<FNV-1a哈希>`，响应侧 `restoreToolNames` 还原；`OPENCODE_NEUTRALIZE_TOOL_NAMES=off`
+可关（代价是可能重撞上游 429 名单）。
+
+**实测（fn_alias_stability_test.mjs，对真实模块跑）**：
+1. 同工具集两次调用 → 别名逐字节一致；
+2. 工具集 9→18 增长 → 前 9 个名字的别名全部不变（别名按名字哈希生成，与集合无关）；
+3. 工具顺序打乱 → 每个名字的别名不变；
+4. structuredClone 克隆体重跑 → 不套第二层别名（2026-11-11 事故的防线仍在）。
+
+**为什么缓存还是死**：上游 prompt 布局是 [系统提示][tools 块][会话历史]。tools 块排在历史
+**之前**，客户端工具集合一增长（实测 claude→openai 会话 TOOL 9→18 逐轮涨），tools 块字节
+变化，排在其后的历史整体 shift → 全部 miss。与名字稳不稳定无关——fn 层只改名、不增减
+（`appendMissingFingerprintTools` 最多补 read/shell 2 个，且在日志计数点之后）。
+
+**TOOL 计数口径**：`chatCore.js` 请求行的 `TOOL N` 是**翻译后、打指纹前**的计数 = 客户端
+自己声明的工具数。9→18 是 hermes 客户端会话中途又注册工具（延迟加载/工具发现），
+不是 9router 改的。
+
+**无损优化归位**：客户端首轮发全量稳定工具表（顺序、描述也恒定）仍是最大收益；9router 侧
+无可修项。缓存自愈：工具表稳定后下一轮即恢复全命中。
+
+### 47. 提示词改写层审计 —— Headroom 全历史改写是缓存头号嫌疑（2026-11-14）
+
+**9router 提示词改写管线**（chatCore 顺序）：RTK → Headroom → Caveman → Ponytail → Custom。
+
+| 层 | 改写对象 | 确定性 | 缓存影响 |
+|---|---|---|---|
+| RTK (`rtk/index.js`) | 仅 tool 输出（git/grep/ls/tree/log 规则式截断，Rust rtk 移植） | ✅ 纯文本过滤器，无 LLM | 安全 |
+| **Headroom** (`rtk/headroom.js`) | **整个 messages 数组发 /v1/compress 后整体替换**（OpenAI 形状兜底分支 `body[key] = data.messages`） | ❓ LLM 压缩，实测有波动 | **头号嫌疑** |
+| Caveman / Ponytail / Custom | 系统提示追加固定文本 | ✅ 恒定 | 安全 |
+
+**Headroom 证据**：
+- 实验窗口 06:05-06:20 实测 **272 次压缩改写**（vs 41 次跳过）；每轮请求把**全部历史**重写一遍。
+- 压缩收益极小：effective 多为 0.2-1.6%，9router 自己标 `⚠️ phantom savings`（shrank <5%）。
+- 一次压缩后消息反而 **+9 字节**（`req=wfiz889ai 16509B→16518B`）——即此前观察到的"消息体 -10B 微变"来源。
+- 时间线吻合：00:00-05:40 headroom 宕机（fail-open 不改写）→ 生产 217344/217896（99%）大命中；05:42 服务恢复压缩后 → 06:07-06:18 受控实验基本全 0 命中。
+- 保留项：headroom 活跃窗口内生产仍出现 45312/69504 大命中 → 压缩输出可能温度 0 近确定（同输入同输出），但任何漂移即全灭，且重试/克隆路径会重新压缩。
+
+**建议**：① 按内容哈希记忆化压缩（per-message LRU：hash(原文)→压缩文，同消息恒同压缩）——服务端确定不确定都稳；② 或 openai 通道暂关 headroom（收益 0-4% vs 失去 200K 前缀缓存 = 全量 prefill ~7-9s TTFT，倒挂）；③ 服务恢复后同 payload 二连发 /v1/compress diff 定案。
+
+**fn 工具名定案（回应"每次随机"）**：不是随机。`fn_<FNV-1a哈希7位>`，同名恒同别名（4 项实测见 #46）。日志里"看着随机"是哈希长相；randomInt 仅用于 env 路径（已改会话稳定，#43）。
+
+**read/shell 前置**：`appendMissingFingerprintTools` 改为插到 tools 数组**头部**（06:24 部署 MATCH BkHL0f-KFaZ6wD5RWocEi）——工具表生长轮保住 [read][shell][旧工具] 前缀。局限：工具块总长一变历史仍位移；"整体挪到历史后"上游模板定死、做不到。
+
+### 47b. 上游缓存机制定案（DeepSeek 上下文硬盘缓存官方文档，2026-11-14）
+
+上游是 opencode free 档（deepseek 系），缓存规则以 DeepSeek 文档为准（api-docs.deepseek.com/guides/kv_cache）：
+
+- **严格前缀**："只有当两个请求的前缀内容相同时（从第 0 个 token 开始相同），才算重复。中间开始的重复不能被缓存命中。"
+- **缓存前缀单元**（Sliding Window Attention 后的新机制）："每条缓存前缀是一个独立的完整单元。后续请求只有在完整匹配缓存前缀单元时，才能命中。"落盘时机：①请求边界（用户输入结束位置/模型输出结束位置各产生一个单元）②**公共前缀检测**（多请求共同前缀自动落盘为独立单元）③固定 token 间隔切分。
+- 例二：A+B vs A+C 不命中（单元不匹配），但系统识别公共前缀 A 落盘 → A+D 命中 A。**这正是实测常数命中 2816/3328/5376/5504 的来源（system+工具块头单元）**，也解释了"同实验两轮反转"（单元落盘秒级延迟 + best-effort）与生产双峰（全单元命中 vs 仅头单元命中）。
+- **收益量化**（官方）：128K 重复输入 TTFT 13s → 500ms；命中 token 计费 0.1 元/M（未命中 1 元/M）。
+- 目标口径：让每轮请求完整匹配上一轮"用户输入结束位置"的单元 = **历史前缀字节恒定**（工具块/系统提示/改写层都不得逐轮抖动）。
+
+**请求形状定案**（OpenAI function-calling 文档确认）：`tools: [{type:"function", function:{name, description, parameters}}]`，工具名在 `function.name`；历史里 `tool_calls[].function.name` 与 `role:"tool"` 结果消息。工具定义序列化进 prompt 前缀、位于会话历史之前（DeepSeek 例一"多轮对话命中上一轮上下文"+ 工具变→历史 miss 双向证实）。
+
+### 48. 9router 社区（decolua/9router）相关问题索引（2026-11-14 检索）
+
+**缓存类**：
+- **#5596**（11-12）"0% cache hit rate" —— 是**记账 bug 不是真没命中**：上游 DeepSeek 实际 97-99% 命中，但 OpenAI→Claude 流转换器丢弃 choices:[] 的 usage 尾块 + cached_tokens 被 Claude 白名单过滤 → 客户端显示 0%。顺带证实：稳定前缀下 DeepSeek-V4.1-Flash 上游缓存工作正常。
+- **#5036 + PR #5037**（10-19）Claude 缓存 TTL：system/tools 锚 1h 但**尾部 5m**，停顿 >5min 尾巴过期 → 整段历史重写。34h 实测 **68.6% miss token 来自停顿后首个请求**；尾部改 1h 后命中 89.2%→96.4%。仅影响 claude/anthropic 直连道（free 档是 deepseek 硬盘缓存，TTL 小时-天级）。
+- **#5030** 流式响应丢 prompt_tokens_details.cached_tokens（记账）；**#5114** Kiro cache usage 不上报 + session affinity；**#5353** 请求每请求命中率显示（feature）。
+- 社区实践共识（9router 使用文章）："要让缓存命中必须保持上下文前缀稳定：固定内容放 prompt 前部，动态内容放后部"。
+
+**429/工具名类**：
+- **#5218** "OpenCode Fix 429"（19 评论，作者 zeusire，fix 分支 zeusire/fix-429-old）：429 四根因——①`<env>` 两行块 ②TLS 指纹（必须 Bun 传输，node/curl 429）③session id 内嵌时钟校验（ses_ 前 12 hex 是时钟编码，摘要派生会被拒）④Retry-After 处理。经验："The IPs you're using must not have previously received a 429 error"——**污染 IP 继承封禁**（与 trackE 95.4% 结论互证）。⚠️ 该 issue 未覆盖 fn_ 工具名改名（名字门是另一层）。
+- **anomalyco/opencode#56193**：`shell→shell_client` 改名事故（指纹层对 Windows 客户端描述不符就改名）→ 修复 decolua/9router#4971/#4972（in-place 归一化 = 我们代码里的 canNormalizeInPlace），fork 已带。
+- 其它：#5368/#5275/#5033（429/abusive traffic/IP 污染讨论）、#5559（free 档可靠性）。
+
+**Headroom/RTK**：GitCode 有 Headroom sidecar 部署指南（HEADROOM_URL、docker compose）；RTK 官方口径 "cuts tool-result input tokens by 20-40%"。
+
+**对我们的启示**：①长窗观测 CACHE 数字留心 usage 记账 bug（#5056 估算值 max-merge 吞真实值）；②free 档免受 5m TTL 影响；③我们 fork（oahcom/9router，master-oa）继承了 #5218 修复线（zeusire）。
+
+### 49. 社区 opencode 429 深挖（#5368/#5275/#5630/#5559，2026-11-14）+ fork 雷点自查
+
+**根因图谱（社区 40h×5 节点实测与我们结论互证）**：
+1. **429 消息多闸共用**（#5275）：缺 `<env>`/指纹工具、TLS 指纹不对、名字门、真配额——全部返回同一句 FreeUsageLimitError。"当配额处理会走错方向"（#5218）。
+2. **配额单位是 /64 前缀**（#5368）：508 个 IPv6 仅 123 个 /64（12 个 /48）；复用 /64 中位 21s 即 429、中位只服务 1 发；全新 /64 中位 29min/42 发（≈我们 L1=40）；75% 轮换落在已烧 /64（≈trackE 95.4% 预封禁）。"200+/天的旧额度已不存在"（200 基准已死的社区版）。
+3. **晚到 429 烧新前缀**：102/1027 个 429 描述已不存在的地址，照做会烧掉干净前缀 = 我们 already_retired/D3/D6 veto。
+4. 多账号无用（实测）= fact #39；CLI 能用而 9router 不能 = 出口地址不同（两个桶）。
+5. 低用户密度地区配额干净 = colo 分化（PHX/SIN）。
+6. **会话刷太快判可疑**："别每次换 session id，复用到 force-compact 再换"（评论 #20）。
+7. 指纹是第二维度（有人数日一换指纹）；5×WARP 隧道 40h 打 11,852 发可行，"停摆要换"。
+
+**9router 自身"假 429"雷点**：
+- **#5630（zeusire 报告）**：`resetAccountState`/`buildClearModelLocksUpdate` **导出但零调用点** → modelLock + backoffLevel 只增不减，一次真 429 后无限回放陈旧 429（上游其实 200），需重启+手工清库。**fork 自查：调用点为零，雷还在** → 待修（成功后重置 + 过期锁懒清理 + backoffLevel 衰减）。
+- **#5559**：①stable session 缓存 429 不失效→死会话永久卡（fork 有 rotateSession+epoch，asip 换线路径已覆盖 ✅）②getExecutor 兜底绕过指纹加固（fork 已修：unknown-provider 拒绝策略 + WHY 注释 ✅）。
+
+**待办**：①修 #5630 雷（可能与我们 [AUTH] 5min 锁风暴相关）②daemon 出口段台账确认 /64 为预算单位（已有 32/48/64/128 台账）③会话复用策略评估（少换 + force-compact 时机）。
+### 50. 前缀缓存定案收尾：env 修复生效，headroom/工具表全部排除（2026-11-14 06:24–07:00 生产 400 样本）
+
+**实测依据**
+- env 会话稳定修复 + read/shell 前置部署（05:42 / 06:24）后的命中率（CACHE/IN 比值）：IN 100-250K 桶 **p50=99.4%**（≥50% 命中占 95%），IN 50-100K p50=97.5%，IN≥250K p50=96.3%。对比修复前同桶 5-8%——**修复完全生效**。
+- headroom 无罪定案（受控实验，`docs/reports-20261114/headroom_diff_test.py`、`headroom_growth_test.py`）：① 同一 payload 二连发 `/v1/compress`，输出逐字节全同（确定性）；② 压缩 [m1..m4] 后再压 [m1..m4,m5]，旧消息压缩结果一字不变（**不随上下文增长改写历史**）。且生产大命中 185 条中 184 条经过 headroom 压缩——压缩与缓存共存。
+- 中命中簇（CACHE 5-20K，170 条）解剖：**166 条是 MSG=2 的新会话首拍**——没有历史可缓存，命中系统+工具块静态前缀（5376/5504）是物理必然，不是缺陷。小命中簇同理（33/45 是 MSG≤2）。
+- 残留 4 条长会话偶发低命中（MSG=103/115/226 → 16640/6144）：相邻请求同 pool 却命中 11 万+，判定为上游缓存单元落盘时序（#47b：单元 best-effort、秒级延迟）撞上未落盘窗口，无损不可控，自愈。
+- 工具表：大命中会话 TOOL=25/26 全程恒定；hermes claude 客户端的 9→18 逐轮增长只影响其自己的会话，且增长结束后下一轮即恢复命中（缓存自愈）。
+
+**改了会怎样**：缓存优化项到此收口——服务端可修项（env/fn/read-shell/顺序）全部落地；剩余优化在客户端（工具表首轮发全）。观测口径：长窗观测里的 CACHE ↻ 应以「同会话逐轮递增」为健康形态，新会话首拍低命中不必报异常。
+
+### 51. #5630「假 429 雷」fork 状态定案：主链路已免疫，残留是单账号锁窗（2026-11-14 代码核实）
+
+**雷的机制（社区 #5630，zeusire 报告）**
+9router 的账号熔断：上游 429 → `modelLock_<model>`（锁到时间戳）+ `backoffLevel`+1（指数退避 2s→…→max 5min）→ 选号跳过被锁账号 → 全锁时回放 `lastError` 里的陈旧 429 文本给客户端（**假 429**：上游其实已恢复，客户端仍收 429）。社区版的致病因：`accountFallback.js` 的 `resetAccountState`/`buildClearModelLocksUpdate` **导出了但零调用**——锁永不重置 → 无限回放假 429 → 只能重启+手工清库。
+
+**我们的 fork 核实结果（修正此前"这颗雷还在"的判断）**
+- `accountFallback.js` 的 `resetAccountState`/`buildClearModelLocksUpdate` 确实零调用（死代码）——社区雷的根源在我们这**也是死的**；
+- 但实际消费的锁状态走的是**另一套实现**（`src/sse/services/auth.js`）：`markAccountUnavailable`（加锁）+ `clearAccountError`（**成功即清锁 + backoffLevel 归零**），后者挂在 `onRequestSuccess` 回调（chat.js:358 → chatCore 的流式/非流式 handler 都触发）——**重置有接线**；
+- 且锁是**时间戳过期制**（`isModelLockActive` 比较 expiry>now），即使清锁失败也自然过期（日志 "reset after 4m 1s" 的倒计时即此），`BACKOFF_CONFIG.max=5min` 封顶；
+- **结论：社区版"永不重置、无限假 429"的最坏情况在我们 fork 不成立**。
+
+**残留的真实影响（与用户有感的部分）**
+- 单账号连接（"all 1 accounts locked"，实测 32 次/4h，均为 openai-compatible-chat-* 不走 asip 闸口的连接）：一次真 429 → 整个 provider 锁最长 5 分钟 → 期间所有请求收合成错误（503+lastError 文本）。单账号没有轮换空间，锁账号是合理防御，但 5min 顶格退避对单账号偏长；
+- `backoffLevel` 仅在 `clearAccountError` 且"无剩余活跃锁"时归零——多模型并发锁时可能保持高位（锁窗顶格 5min）；
+- 两套并存（accountFallback 死代码 vs auth.js 活实现）是后人误读源，社区 #5368 就有人踩过 reset 相关的坑。
+
+**改了会怎样**：死代码删除/标注可消除误导（零行为变更）；单账号锁窗 honor Retry-After 或缩短退避可减少服务空窗（有行为变更风险，待拍板）。
+### 52. env 修复归因对照：同会话前缀缓存命中率 19% → 96%（2026-11-14）
+
+**实验设计**（cache_attribution_ab.py，可复跑）：取同会话相邻两轮（时间差 ≤180s、IN 递增且增量 <60K = 一轮消息），看第二轮 CACHE 是否覆盖第一轮 IN（历史是否被缓存），按 05:42 env 修复部署时刻切开。
+
+| 组 | 样本 | CACHE/IN p50 | 只吃静态前缀(<20K) | 命中上一轮前缀 |
+|---|---|---|---|---|
+| 05:42 之前 | 497 对 | **19%** | 70% | 31% |
+| 05:42 之后 | 1370 对 | **96%** | 41% | 70% |
+
+**修复前的病理形态**（明细实证）：会话长到 MSG=237 / IN=192K 时 CACHE 仍恒定在 11008–15232（= 系统+工具块静态前缀），历史零命中——前缀在系统提示词尾部（随机 `<env>` 路径处）断裂，后面 18 万 token 每轮全量重算。
+**修复后的健康形态**：CACHE 逐轮跟会话增长（9143→30344→46352→57350...），第二轮起命中上一轮完整前缀。
+
+**结论**：缓存改善不是"自己好的"，env 会话稳定修复（05:42 部署 MATCH `_j5zscm8J`）是主因，跳变卡在部署时刻且病理形态与机制完全吻合。
+
+**残留 30% 未命中的构成**：① 工具表逐轮增长（hermes 客户端中途注册工具，客户端侧待修）② 上游缓存前缀单元落盘秒级延迟（best-effort，不可控，自愈）③ 新会话首拍（物理必然）。
+
+**方法论教训（自我纠错）**：此前 cache_experiment*.py 系列每次发全新会话，测的是**静态前缀命中**而非**会话历史缓存**，据此得出的"工具+1→0 铁证""实验两轮反转"等结论参考价值有限，不应拿来降级 env 修复的归因。归因对照必须用生产同会话续轮样本。
+
+### 53. 429 重试代价量化与 stall-replay 零收益（2026-11-14）
+
+**统计**（retry_cost.py，9router journal 07:00–14:50，2219 请求）：4.5%（100 条）经历换线重试。
+
+| 重试次数 | n | 错误 | 总耗时 p50 | TTFT p50 |
+|---|---|---|---|---|
+| 0 | 2170 | 37 | 9.6s | 5.6s |
+| 1 | 36 | 0 | **16.1s（+6.5s）** | 14.6s |
+| 2 | 2 | 2 | 45.1s | — |
+| ≥3 | 11 | 7 | 16.0s | 26.1s |
+
+大请求（IN>50K）：1 重试 +8.3s（9.7→18.0s），3 重试链 p50 35.6s 且 7/11 死亡。
+
+**单跳成本解剖**（wfxlm33cz / wfzh20csi 全时间线）：rotate 调用 + 目标端口重连 ≈ 2–5s；请求体重传按 1.7s/100K 斜率（570KB 体一跳约 5s）；上游快 429（1–2s 返回）本身不贵——贵在每跳全量重传 + 冷连接。多重试链封顶 3 次合理。
+
+**stall-replay（transport 停滞 → 同线重放）本窗 10/10 全部失败**：含 wfwlyid7b 典型（20.7s header-timeout → 33s 重放 → 429 死亡，总 53.9s 零收益）。样本不大但 0/10 支持重估「停滞 → 先换线而非同线重放」（属语义变更，待拍板）。
+
+### 54. 渠道延迟保底测量：asip 侧原生探测（2026-11-14）
+
+**动机**：生产 TTFT 残差受上游排队/缓存/生成长度干扰，且 asip 未来可能脱离 9router——延迟测量必须有独立于生产流量与 9router 的原生通道。
+
+**工具**：`tools/native_channel_probe.py`（auto-switch-ip 仓库），三层测量，结果写 `.warp/channel_latency.json`：
+1. **warp-endpoint**——本机→CF WARP 端点 162.159.198.3–9:443 TCP RTT：基底 166–177ms，7 端点全稳；
+2. **node**——代理池节点 TCP/TLS（清单=h2_probe_state.json）：直连可达 17/173，NRT 族 345–565ms、HKG 族 406–585ms、SIN 族 560–578ms；TLS 握手受中间盒干扰（552ms–10s 乱跳），**TCP connect 才是干净指标**；
+3. **channel**——经各渠道 socks_port 端到端 TLS/TTFB 打 1.1.1.1 IPv6（清单=channels.json）：88/117 成功。
+
+**渠道排行（14:49 快照）**：
+- 最快：TPE-67（TLS 221ms）/ SJC-176（363）/ NRT-123（381）/ NRT-115（387）/ PHX-170（393）——TPE/NRT/SJC 族普遍 400–620ms；
+- 最慢：PHX-171（9322）/ FRA-77（6035）/ LAX-97（5043）/ SIN-139（4837）/ SIN-184（4416）——欧洲（FRA/IST/LHR）与部分 SIN/LAX 落在 4–9s；
+- **同城个体差异巨大**：SIN-147（530ms）vs SIN-139（4837ms）——不能按城市选，要按线测。
+
+**与生产 TTFT 残差互证**（port_line_ttft.py，07:00–14:40，2141 req / 44 线）：
+- 慢线双通道一致：IST-80 原生 3953ms / 生产残差 +5667ms；SIN-139 4837/+4727；SIN-184 4416/+4698；
+- 生产残差排行：最快 HKG-102（−6ms）/ CF4-D（+225）/ PHX-172（+615）；最慢 HKG-162（+10703）/ LAX-96 & SIN-148（+6560）/ HKG-70 & HKG-155 & IST-80（+5650）；
+- 个别线两口径背离（FRA-77 原生慢/生产中游、NRT-117 原生快/生产慢）→ 单口径都会骗人，保底用原生、体感看生产，互为校验。
+
+**用法（脱离 9router 仍成立）**：daemon 换线目标选择把 channel_latency.json 作软偏好（同优先级候选内取低延迟渠道）；探测、状态、选择全在 asip 侧。
+
+### 55. 零漏出防线：429 逃逸两路径修复 + 渠道延迟软偏好（2026-11-14）
+
+**目标**（用户指令）：有闸口可用时生产 0 个 429 打出。
+
+**哨兵基线**（07:00–15:30，24 个生产 429）：leak 19 / budget 3 / unknown 2 / legit 0。
+leak 两条主路径：① stall-replay 牺牲（重放 429 后"no second replay"交回，本窗 10/10 全败，单条 8–54s 纯损耗）② 换线环封顶 3 打死（仍有健康闸口却终结，wflupuofa/wfzj8cftg 型）。
+
+**修复**（部署 MATCH `YYPWkQ1eij5LkZryAlyP6`，opencode.js）：
+1. 重放 429 且记账给新闸口 → 回 executeInner 首发+换线环续试（"绝不再重放"保持：重放全程一次、无递归；"只重放一次"风暴防护只管 transport 停滞——429 是额度证据不适用）。
+2. `MAX_ROTATE_ATTEMPTS` 3→6（常规闸口全覆盖）。防死循环靠 triedEgress 拒同址 + ROTATE_ATTEMPT_BUDGET_MS 25s（保留"不拖几十秒"原设计，零漏出与延迟的权衡可调 `OPENCODE_ROTATE_BUDGET_MS`）。
+
+**渠道延迟软偏好**（daemon.py `_slot_pick_key`）：`.warp/channel_latency.json` 原生延迟作同档速度位第一信号、探针延迟兜底。分层不加权语义不变；数据缺失/过期（>2h）退化旧键（软偏好非硬过滤，测试钉死）。测量→状态→选择全在 asip 侧（脱离 9router 可用）。
+
+**观察**：zero_429_sentinel.py 分类 leak/budget/legit/unknown（按标记链：no further line/refused=no new egress→legit，gate hop/budget spent→budget，其余终局 429→leak），定时任务每 2h 跑（至 11-16 23:00），记录 零429哨兵-记录.md。
+
+**遗留**：openai-compatible-chat-* 兼容面 2 例无 EGRESS 标记的 429（wfzk6fmu0/wfzmsejva）待补记账接线；budget 类折衷是否放宽看哨兵数据。

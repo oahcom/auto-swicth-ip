@@ -5,9 +5,13 @@
 以及没有 daemon 时的优雅降级（不能甩 traceback 或假装成功）。
 """
 
+import http.server
+import json
 import os
+import socketserver
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -173,3 +177,88 @@ def test_status_degrades_without_daemon(fake_env):
     assert "读不到 /slots" in r.stderr
     assert "日志仍可查" in r.stderr
     assert "Traceback" not in (r.stdout + r.stderr)
+
+
+# ── gate st 兜底文案：池闸健康决定「唯一兜底」是否成立 ─────────────────────
+# /slots 取数路径与生产一致：run/rotate.sock（UDS HTTP）+ api-token。
+
+def _make_slots_json(*, gate, warp_statuses=("bad",) * 6):
+    """常规闸口默认全部不可选（0/6），由 gate 单独控制池闸健康。"""
+    slots = [{"name": "WARP-%d" % i, "kind": "warp", "status": s}
+             for i, s in enumerate(warp_statuses)]
+    slots.append(gate)
+    return json.dumps({"slots": slots, "active_tag": "pool"})
+
+
+@pytest.fixture
+def fake_slots_server(tmp_path):
+    """假 daemon /slots 接口：rotate.sock + api-token，供 gate st 真实走一遍取数。"""
+    run = tmp_path / "run"
+    run.mkdir(exist_ok=True)
+    token = "gate-test-token"
+    (run / "api-token").write_text(token, encoding="utf-8")
+    sock_path = run / "rotate.sock"
+    if sock_path.exists():
+        sock_path.unlink()
+    state = {"body": "{}"}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.headers.get("X-Asip-Token") != token:
+                self.send_response(403)
+                self.end_headers()
+                return
+            body = state["body"].encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    class UDSServer(socketserver.UnixStreamServer):
+        def get_request(self):
+            c, _ = super().get_request()
+            return c, ("localhost", 0)      # http.server 要求 (host, port) 形状
+
+    server = UDSServer(str(sock_path), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_gate_st_pool_ok_when_no_warp_available(fake_env, fake_slots_server):
+    """常规 0/6 + 池闸 ok → 兜底在位，池闸是唯一兜底。"""
+    fake_slots_server["body"] = _make_slots_json(
+        gate={"name": "pool", "kind": "proxy", "port": 17897,
+              "status": "ok", "serving": True})
+    r = run_cli(fake_env, "gate", "st", "2")
+    assert r.returncode == 0, r.stderr
+    assert "常规闸口可选: 0/6" in r.stdout
+    assert "全部不可选，池闸是唯一兜底" in r.stdout
+
+
+def test_gate_st_pool_dead_when_no_warp_available(fake_env, fake_slots_server):
+    """常规 0/6 + 池闸也不健康 → 不能谎称兜底在位。"""
+    fake_slots_server["body"] = _make_slots_json(
+        gate={"name": "pool", "kind": "proxy", "port": 17897,
+              "status": "bad", "verdict": "pool_dead", "serving": False})
+    r = run_cli(fake_env, "gate", "st", "2")
+    assert "无任何可用兜底" in r.stdout
+    assert "pool_dead" in r.stdout
+    assert "唯一兜底" not in r.stdout
+
+
+def test_gate_st_pool_status_missing(fake_env, fake_slots_server):
+    """/slots 没带池闸 status → 显示状态未知，不妄称兜底在位。"""
+    fake_slots_server["body"] = _make_slots_json(
+        gate={"name": "pool", "kind": "proxy", "port": 17897,
+              "serving": False})
+    r = run_cli(fake_env, "gate", "st", "2")
+    assert "池闸状态未知" in r.stdout
+    assert "唯一兜底" not in r.stdout
