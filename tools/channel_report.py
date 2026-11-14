@@ -541,12 +541,16 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
     `segments` 是 `channel_segments()` 的结果；不传就留空（单测与离线调用
     不必依赖 daemon.log）。"""
     now = time.time() if now is None else now
-    # 数据窗口：至少覆盖整个配额日（昨天08:00->今天08:00）。
-    # hours 太小时（如4h）会把凌晨数据裁掉导致"数据少"。
-    cutoff = max(now - hours * 3600, _day_start(now), now - 24 * 3600)
+    # 数据窗口：**至少覆盖整个配额日**（昨天08:00->今天08:00）。
+    # hours 太小时（默认 6h）会把凌晨数据裁掉导致"数据少"（2026-11-15
+    # 主人实测：02:45 时配额日已跑 18.75h，报表只显示 6h）。方向：窗口取
+    # max(hours跨度, 配额日至今) = cutoff 取 min；外沿 24h 兜底（样本由
+    # _channel_ban_trim 只留配额日当天，24h 外本来就没有）。
+    cutoff = min(now - hours * 3600, _day_start(now))
+    cutoff = max(cutoff, now - 24 * 3600)
     urls = sub_url_map()
     idx = source_index(sources)
-    colos = colo_ban_rates(hours * 3600, now)
+    colos = colo_ban_rates(now - cutoff, now)
     segs = segments or {}
     declared_of = {m.get("tag"): m.get("service")
                    for m in CFG["warp"]["members"] if m.get("tag")}
@@ -1267,7 +1271,11 @@ def print_table(rows: list[dict], hours: float) -> None:
         print("（没有渠道数据）")
         return
     window_from = rows[0]["window_from"]
-    if window_from > time.time() - hours * 3600 + 60:
+    _span_h = (time.time() - window_from) / 3600
+    if window_from < time.time() - hours * 3600 - 60:
+        print(f"注：窗口按配额日展开（08:00→08:00），实际从 "
+              f"{_fmt_ts(window_from)} 起（{_span_h:.1f}h > {hours:g}h）\n")
+    elif window_from > time.time() - hours * 3600 + 60:
         print(f"注：渠道样本只保留当天，实际窗口从 {_fmt_ts(window_from)} 起"
               f"（< {hours:g}h）\n")
     # 入口延迟：测机场节点 TCP（所有线都测）
