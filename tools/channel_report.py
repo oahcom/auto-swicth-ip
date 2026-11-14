@@ -1023,7 +1023,12 @@ def _parse_node(node: str) -> tuple[str, int]:
 
 
 def _measure_latency(node: str) -> str:
-    """TCP 连接测速入口节点延迟。返回 "XXms" 或 "不可达"。"""
+    """TCP 连接测速入口节点延迟。返回 "XXms" 或 "不可达"。
+
+    DNS 轮询节点会解析出多个 IP、其中部分是死的（实测 pq.aws65.yydjc.top
+    4 个 IP 中 2 个超时）——必须遍历全部解析地址，任一连通即返回，
+    只测第一个会把活节点报成「不可达」（2026-11-15）。
+    """
     import socket, time as _t
     host, port = _parse_node(node)
     if not host:
@@ -1033,7 +1038,7 @@ def _measure_latency(node: str) -> str:
         try:
             import ipaddress
             ipaddress.ip_address(host)
-            addr = host  # 已是 IP，跳过 DNS
+            addrs = [host]  # 已是 IP，跳过 DNS
         except ValueError:
             from concurrent.futures import ThreadPoolExecutor as _TPE
             with _TPE(max_workers=1) as _dns_pool:
@@ -1041,24 +1046,50 @@ def _measure_latency(node: str) -> str:
                     socket.getaddrinfo, host, port,
                     socket.AF_UNSPEC, socket.SOCK_STREAM)
                 try:
-                    addr = _dns_fut.result(timeout=2.0)[0][4][0]
+                    infos = _dns_fut.result(timeout=2.0)
                 except Exception:
                     return "不可达"
-        # TCP 连接测速
-        s = socket.socket(socket.AF_INET6 if ':' in addr else socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(2.0)
-        t0 = _t.monotonic()
-        try:
-            s.connect((addr, port))
-            dt = (_t.monotonic() - t0) * 1000
-            s.close()
-            return f"{dt:.0f}ms"
-        except (socket.timeout, OSError, ConnectionRefusedError):
+            seen: set[str] = set()
+            addrs = []
+            for ai in infos:
+                a = ai[4][0]
+                if a not in seen:
+                    seen.add(a)
+                    addrs.append(a)
+        # 并行竞速全部地址（happy-eyeballs）：任一连通即返回。
+        # 逐个串行不行——DNS 轮询的死 IP 会吃满超时拖慢/拖垮判定，
+        # 活 IP 偶尔抖动 >1.2s 时前 3 个全失败就误报「不可达」（2026-11-15）。
+        from concurrent.futures import ThreadPoolExecutor as _TPE2
+        from concurrent.futures import as_completed as _ac
+
+        def _try_one(a: str):
+            s = socket.socket(socket.AF_INET6 if ':' in a else socket.AF_INET,
+                              socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            t0 = _t.monotonic()
             try:
-                s.close()
-            except Exception:
-                pass
-            return "不可达"
+                s.connect((a, port))
+                return (_t.monotonic() - t0) * 1000
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+        pool = _TPE2(max_workers=max(1, len(addrs)))
+        try:
+            futs = {pool.submit(_try_one, a) for a in addrs}
+            for f in _ac(futs, timeout=3.0):
+                try:
+                    dt = f.result()
+                except Exception:
+                    continue  # 这个地址失败，等下一个
+                return f"{dt:.0f}ms"
+        except Exception:
+            pass
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return "不可达"
     except Exception:
         return "不可达"
 
