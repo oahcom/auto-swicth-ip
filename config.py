@@ -318,6 +318,9 @@ CFG = {
         "cooldown_sec": 300,   # 报障节点的独立冷却（不写公共冷却表）
         # 专属账本（JSONL）。只记本闸口自己的轮换归因，绝不写公共 node_info。
         "ledger_path": os.path.join(PROJECT_DIR, ".opencode_gate_ledger.jsonl"),
+        # slot-8 专属流量日志（sing-box log.output）：连接日志不再混写公共
+        # singbox.log，`asip oc log` 按这个文件看原生请求（出站连接粒度）。
+        "log_path": os.path.join(PROJECT_DIR, "opencode-gate.log"),
     },
 
     "warp": {

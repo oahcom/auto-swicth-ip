@@ -977,7 +977,8 @@ def make_config(nodes: list[dict], listen_port: int = 0,
                 clash_port: int = 0, clash_secret: str = "",
                 include_h2: bool = False, stats_out=None,
                 slot_index: int = 0, include_lan: bool = True,
-                default_to_pool: bool = False) -> dict:
+                default_to_pool: bool = False,
+                log_output: str | None = None) -> dict:
     """生成 sing-box 配置：mixed port + selector + clash API
 
     include_h2: 是否包含 hysteria2 节点（WSL2 下 utls 不兼容，默认排除）
@@ -985,6 +986,9 @@ def make_config(nodes: list[dict], listen_port: int = 0,
       kind=opencode）用 —— warp selector 的
       default 指到池 selector 而不是某条 WARP 线。重启后 selector 复位到
       default，正好复位回「池闸」而不是某条线，这是兜底闸自愈的关键。
+    log_output: 非 None 时写进 log.output（槽位专属流量日志，如第八闸口的
+      opencode-gate.log）；None 时不加 output 键，log 段与旧渲染逐字等价。
+      这是通用接线：路径归属由调用方（opencode_gate.make_slot）决定。
     """
     if not listen_port:
         listen_port = CFG["singbox"]["mixed_port"]
@@ -1059,8 +1063,14 @@ def make_config(nodes: list[dict], listen_port: int = 0,
     pool_selector = CFG["singbox"]["selector"]
     warp_selector = CFG["warp"]["selector"]
 
+    # log 段：不传 log_output 时必须与旧渲染逐字等价（不许多 output 键），
+    # 其它槽位/无槽位渲染零回归。
+    log_cfg = {"level": "info", "timestamp": True}
+    if log_output is not None:
+        log_cfg["output"] = log_output
+
     return {
-        "log": {"level": "info", "timestamp": True},
+        "log": log_cfg,
         "inbounds": inbounds,
         "outbounds": outbounds + [
             {
@@ -1302,7 +1312,8 @@ if __name__ == "__main__":
                               stats_out=(args.out if i == 0 else None),
                               slot_index=i, include_lan=(i == 0),
                               default_to_pool=bool(slot.get("kind")
-                                                   in ("proxy", "opencode")))
+                                                   in ("proxy", "opencode")),
+                              log_output=slot.get("log_output"))
             write_json(out_path, cfg, mode=0o600, indent=2)
     else:
         out_path = args.out + ".tmp" if drafting else args.out

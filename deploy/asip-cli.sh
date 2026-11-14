@@ -104,6 +104,9 @@ asip — auto-switch-ip 日志与出口诊断
   asip gate 9r [N]     9router 侧切线与重放日志（默认 30 行，-f 跟随）
   asip gate -h         本子命令帮助
 
+第八闸口（opencode 专属闸口 slot-8）
+  asip oc              状态/专属流量日志/轮换账本（asip oc -h 看子命令）
+
 诊断
   asip st              状态快照：出口模式 / 当前节点 / 近 1h 切换次数
   asip warp status     各隧道状态 + 各自出口 IP + 当前出口
@@ -410,6 +413,171 @@ cmd_gate() {
       rm -f "$tmp"
       _gate_router_log "$n" "$follow" "$port" ;;
     *) echo "✗ 未知子命令: asip gate $sub" >&2; _gate_usage >&2; return 1 ;;
+  esac
+}
+
+# ── 第八闸口（opencode 专属闸口）：只读诊断 ─────────────────────────────
+# 证据两处，全部只读、不 PUT、不触发轮换：
+#   opencode-gate.log            slot-8 专属流量日志（sing-box 连接行）
+#   .opencode_gate_ledger.jsonl  轮换账本（from→to / 原因 / 结果）
+# 路径解析、账本格式化都借 asip/opencode_gate.py 的只读辅助函数（log_path /
+# recent_rotations / rotation_summary），本脚本只接线不写业务逻辑。
+_oc_usage() {
+  cat <<'EOF'
+asip oc — 第八闸口（opencode 专属闸口）日志与状态
+
+  asip oc              状态快照（等同 asip oc st）
+  asip oc st [N]       端口/监听态、当前池节点、最近一次轮换、近 1h 轮换次数、
+                       流量日志最近 N 行（默认 12）
+  asip oc log [N] [-f] 回看专属流量日志 opencode-gate.log（默认 200 行；-f 跟随）
+  asip oc rot [N]      轮换账本 .opencode_gate_ledger.jsonl（默认 30 行）
+  asip oc -h           本帮助
+
+  流量日志 = slot-8 专属 sing-box 连接日志：每个出站连接一行（含目标域名）。
+  HTTP 路径级日志 sing-box 给不了，不要按那个粒度找。日志/账本路径由
+  config.CFG["opencode_gate"] 决定（asip/opencode_gate.py 解析），不写死在
+  本脚本。全部命令只读。
+EOF
+}
+
+_oc_log_path() {  # 流量日志路径由模块解析，不在脚本里写死
+  "$ASIP_PY" - "$ASIP_DIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from asip import opencode_gate
+print(opencode_gate.log_path() or "")
+PY
+}
+
+_oc_rot() {  # $1=行数；轮换账本 JSONL → 本地时间行
+  "$ASIP_PY" - "$ASIP_DIR" "$1" <<'PY'
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from asip import opencode_gate
+n = int(sys.argv[2])
+rows = opencode_gate.recent_rotations(n)
+if not rows:
+    print("（轮换账本为空或不存在：%s）"
+          % (opencode_gate.snapshot().get("ledger_path") or "-"))
+    raise SystemExit(0)
+print("── 轮换账本最近 %d 条（ts 本地时间  reason  from → to  session  outcome）──"
+      % len(rows))
+for e in rows:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S",
+                       time.localtime(float(e.get("ts") or 0)))
+    print("  %s  %-10s  %s → %s  %s  %s"
+          % (ts, e.get("reason") or "-", e.get("from_node") or "-",
+             e.get("to_node") or "-", e.get("session_id") or "-",
+             e.get("outcome") or "-"))
+PY
+}
+
+_oc_status() {  # $1=/slots JSON  $2=流量日志行数
+  OC_LINES="$2" OC_HOST="${ASIP_SOCKS_HOST:-localhost}" "$ASIP_PY" - "$ASIP_DIR" "$1" <<'PY'
+import json, os, socket, sys, time
+repo, path = sys.argv[1], sys.argv[2]
+sys.path.insert(0, repo)
+from asip import opencode_gate
+try:
+    d = json.load(open(path, encoding="utf-8"))
+except (OSError, ValueError) as e:
+    raise SystemExit("✗ /slots 不是合法 JSON: %s" % e)
+slots = d.get("slots") or []
+gate = next((s for s in slots if s.get("kind") == "opencode"), None)
+if gate is None:
+    raise SystemExit("✗ /slots 里没有 kind=opencode 的槽位"
+                     "（第八闸口未启用？看 config 的 opencode_gate.slots）")
+name, port = gate.get("name", "?"), gate.get("port")
+listen = "✗ 未监听"
+try:
+    with socket.create_connection((os.environ.get("OC_HOST", "localhost"),
+                                  int(port)), 0.4):
+        listen = "✓ 监听中"
+except (OSError, ValueError, TypeError):
+    pass
+print("第八闸口（opencode 专属闸口）  %s  port=%s  %s" % (name, port, listen))
+print("  健康:  %s  verdict=%s  持续 %ss"
+      % (gate.get("status", "?"), gate.get("verdict") or "-",
+         gate.get("status_age_s", "?")))
+print("  当前池节点: %s" % (gate.get("tag") or "-"))
+summ = opencode_gate.rotation_summary()
+last = summ.get("last")
+if last:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S",
+                       time.localtime(float(last.get("ts") or 0)))
+    print("  最近轮换: %s → %s  %s  [%s/%s]"
+          % (last.get("from_node") or "-", last.get("to_node") or "-", ts,
+             last.get("reason") or "-", last.get("outcome") or "-"))
+else:
+    print("  最近轮换: 无记录")
+print("  近1h: 轮换 %d 次 / 报障 %d 次"
+      % (summ["rotations_in_window"], summ["calls_in_window"]))
+logp = opencode_gate.log_path()
+n = int(os.environ.get("OC_LINES", "12") or 12)
+rows = []
+try:
+    with open(logp, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            rows.append(line.rstrip())
+except OSError:
+    pass
+recent = rows[-n:] if n else []
+if n and recent:
+    print("")
+    print("── 流量日志最近 %d 行（%s；asip oc log 看全量/跟随）──"
+          % (len(recent), os.path.basename(logp or "")))
+    for line in recent:
+        print("  " + line)
+elif n:
+    print("")
+    print("── 流量日志 %s 为空/不存在（asip oc log）──" % logp)
+PY
+}
+
+cmd_oc() {
+  local sub=${1:-st} n follow=0 logp tmp rc a
+  shift || true
+  case "$sub" in
+    -h|--help|help) _oc_usage ;;
+    log|follow|f)
+      # [N] 与 -f 可乱序
+      n=""
+      for a in "$@"; do
+        case "$a" in
+          -f|follow) follow=1 ;;
+          *) n=$a ;;
+        esac
+      done
+      [ -n "$n" ] || n=200
+      _gate_num "$n" || return 1
+      logp=$(_oc_log_path) || return 1
+      if [ -z "$logp" ]; then
+        echo "✗ 解析不到流量日志路径（asip/opencode_gate.log_path()）" >&2
+        return 1
+      fi
+      if [ "$follow" = 1 ]; then
+        _follow "" "$n" "$logp"
+      elif ! tail -n "$n" "$logp" 2>/dev/null; then
+        echo "✗ 读不到流量日志: $logp" >&2
+        return 1
+      fi ;;
+    rot|rotate|ledger)
+      n=${1:-30}; _gate_num "$n" || return 1
+      _oc_rot "$n" ;;
+    st|status|'')
+      n=${1:-12}; _gate_num "$n" || return 1
+      tmp=$(mktemp) || return 1
+      if ! _gate_slots "$tmp"; then
+        rm -f "$tmp"
+        echo "✗ 读不到 /slots（daemon 未起 / rotate.sock 或 api-token 缺失）" >&2
+        echo "  日志仍可查：asip oc log / asip oc rot" >&2
+        return 1
+      fi
+      _oc_status "$tmp" "$n"
+      rc=$?
+      rm -f "$tmp"
+      return $rc ;;
+    *) echo "✗ 未知子命令: asip oc $sub" >&2; _oc_usage >&2; return 1 ;;
   esac
 }
 
@@ -938,6 +1106,7 @@ case "${1:-}" in
   -h|--help|help) _usage ;;
   warp) shift; cmd_warp "$@" ;;
   gate|slot7|g7) shift; cmd_gate "$@" ;;
+  oc|slot8|g8) shift; cmd_oc "$@" ;;
   sub) shift; cmd_sub "$@" ;;
   inbox|inb) shift; cmd_inbox "$@" ;;
   # Vercel 中继：子命令全在 python 里（argparse 管，别在 bash 里再抄一份参数表）。

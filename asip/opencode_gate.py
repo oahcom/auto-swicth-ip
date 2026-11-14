@@ -23,7 +23,11 @@
   coalesce_ms    合并窗（毫秒），一批并发报障只换一次
   cooldown_sec   报障节点的独立冷却（秒）
   ledger_path    专属账本路径（JSONL）；缺失时只记内存，不静默改写别处
+  log_path       专属流量日志路径（slot-8 sing-box 的 log.output）；
+                 缺键时回退常量 PROJECT_DIR/opencode-gate.log
 """
+import json
+import os
 import random
 import threading
 import time
@@ -77,6 +81,21 @@ def _ledger_path():
     return str(p) if p else None
 
 
+def log_path() -> str | None:
+    """slot-8 专属流量日志路径（渲染进 sing-box log.output，asip oc log 读它）。
+
+    读 CFG["opencode_gate"]["log_path"]；缺键时回退常量
+    PROJECT_DIR/opencode-gate.log —— 与 ledger_path 同风格的常量回退：
+    闸口永远有专属流量日志，不退回混写公共 singbox.log（连接行不带槽位
+    归属，8 槽混流无法可靠过滤）。
+    """
+    p = _cfg().get("log_path")
+    if p:
+        return str(p)
+    from config import PROJECT_DIR
+    return os.path.join(PROJECT_DIR, "opencode-gate.log")
+
+
 def _client(slot) -> ClashClient:
     """该槽位 sing-box 的 Clash API 客户端（按端口缓存）。"""
     port = slot["clash_api_port"]
@@ -120,6 +139,9 @@ def make_slot(base_port: int, base_clash: int, slot_index: int) -> dict:
         "clash_api_port": clash_p,
         "config_file": consumer_slot_config_path(
             str(sb.get("config_file") or ""), slot_index),
+        # slot-8 专属流量日志：渲染时进 sing-box log.output，连接日志不再
+        # 混写公共 singbox.log。归属逻辑在本模块（log_path()），渲染器只接线。
+        "log_output": log_path(),
     }
 
 
@@ -332,3 +354,45 @@ def snapshot() -> dict:
             "coalesce_win_sec": _coalesce_win(),
             "cooldown_sec": _cooldown_sec(),
         }
+
+
+# ── 只读辅助（asip oc CLI 诊断；不产生任何写入）──────────────────────
+
+def recent_rotations(n: int | None = None) -> list[dict]:
+    """轮换账本最近 n 条（时间序，旧→新）；n=None 取全部。
+
+    文件缺失/单行损坏都显式降级（空表/跳行）：诊断命令不能因账本半截崩掉。
+    """
+    path = _ledger_path()
+    if not path:
+        return []
+    out: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict):
+                    out.append(e)
+    except OSError:
+        return []
+    if n is None:
+        return out
+    return out[-n:] if n > 0 else []
+
+
+def rotation_summary(window_sec: float = 3600.0) -> dict:
+    """只读摘要：最近一次轮换 + 窗口内真换节点/报障次数（供 asip oc st）。"""
+    now = time.time()
+    entries = recent_rotations(None)
+    in_win = [e for e in entries if float(e.get("ts") or 0) >= now - window_sec]
+    return {
+        "last": entries[-1] if entries else None,
+        "rotations_in_window": sum(1 for e in in_win if e.get("switched")),
+        "calls_in_window": len(in_win),
+    }

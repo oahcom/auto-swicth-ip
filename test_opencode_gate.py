@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import json
+import os
 
 import pytest
 
@@ -327,3 +328,77 @@ def test_snapshot_is_readonly(gate_env):
     assert snap["coalesce_win_sec"] == pytest.approx(0.8)
     # 只读：快照不产生账本写入
     assert not gate_env.ledger.exists()
+
+
+# ── 专属流量日志：log_output 接线（make_slot → make_config → log.output）──
+
+def _render_cfg(monkeypatch, **kw):
+    """make_config 的确定性渲染：外挂文件全打桩，只看 log 段接线。"""
+    monkeypatch.setattr(parse_subscription, "_load_warp_outbounds", lambda: [])
+    monkeypatch.setattr(parse_subscription, "_load_dormant_outbounds", lambda: [])
+    monkeypatch.setattr(parse_subscription, "_load_dormant_state", lambda _n: set())
+    nodes = [{"tag": "n1", "server": "1.2.3.4", "server_port": 443,
+              "type": "socks"}]
+    return parse_subscription.make_config(
+        nodes, listen_port=7899, clash_port=9099,
+        include_lan=False, **kw)
+
+
+def test_make_slot_log_output_points_to_dedicated_log(gate_env, monkeypatch):
+    log_file = str(gate_env.ledger.parent / "opencode-gate.log")
+    monkeypatch.setitem(config.CFG["opencode_gate"], "log_path", log_file)
+    slot = opencode_gate.make_slot(7890, 9090, 7)
+    assert slot["log_output"] == log_file
+    # 缺键时回退常量路径：仍专属（指向 opencode-gate.log），不退回 None
+    # 去混写公共 singbox.log
+    monkeypatch.delitem(config.CFG["opencode_gate"], "log_path")
+    slot2 = opencode_gate.make_slot(7890, 9090, 7)
+    assert slot2["log_output"] is not None
+    assert os.path.basename(slot2["log_output"]) == "opencode-gate.log"
+    assert opencode_gate.log_path() == slot2["log_output"]
+
+
+def test_make_config_log_output_sets_output_key(monkeypatch):
+    cfg = _render_cfg(monkeypatch, log_output="/tmp/oc-test.log")
+    assert cfg["log"]["output"] == "/tmp/oc-test.log"
+    assert cfg["log"]["level"] == "info"
+    assert cfg["log"]["timestamp"] is True
+
+
+def test_make_config_default_log_matches_legacy(monkeypatch):
+    """不传 log_output：log 段与改动前逐字等价（无 output 键），
+    其它槽位/无槽位渲染零回归。"""
+    cfg = _render_cfg(monkeypatch)
+    assert cfg["log"] == {"level": "info", "timestamp": True}
+    assert "output" not in cfg["log"]
+    # 显式 None 与不传同义
+    cfg2 = _render_cfg(monkeypatch, log_output=None)
+    assert cfg2["log"] == {"level": "info", "timestamp": True}
+
+
+def test_recent_rotations_reads_tail_of_ledger(gate_env):
+    now = time.time()
+    entries = [
+        {"ts": now - 10, "reason": "rate429", "from_node": "n0",
+         "to_node": "n1", "session_id": "s0", "outcome": "ok",
+         "switched": True},
+        {"ts": now - 5, "reason": "rate429", "from_node": "n1",
+         "to_node": None, "session_id": "s1", "outcome": "coalesced",
+         "switched": False},
+        {"ts": now - 1, "reason": "transport", "from_node": "n1",
+         "to_node": "n2", "session_id": "s2", "outcome": "ok",
+         "switched": True},
+    ]
+    with open(gate_env.ledger, "a", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+    # 喂 3 条取最近 2 条（时间序，旧→新）
+    rows = opencode_gate.recent_rotations(2)
+    assert [r["from_node"] for r in rows] == ["n1", "n1"]
+    assert [r["to_node"] for r in rows] == [None, "n2"]
+    assert len(opencode_gate.recent_rotations(None)) == 3
+    assert opencode_gate.recent_rotations(0) == []
+    summ = opencode_gate.rotation_summary()
+    assert summ["last"]["to_node"] == "n2"
+    assert summ["calls_in_window"] == 3
+    assert summ["rotations_in_window"] == 2   # coalesced 不算真换节点
