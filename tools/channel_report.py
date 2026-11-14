@@ -57,6 +57,7 @@ BAN_VERDICTS = {"quota", "flagged"}
 
 # 块表没收录的 colo 兜底（BOM 是 2026-11-04 新订阅实测出来的）。
 COLO_FALLBACK = {
+    'IAD': '华盛顿·达拉斯', 'DUB': '都柏林', 'JNB': '约翰内斯堡', 'GIG': '里约热内卢', 'IST': '伊斯坦布尔', 'SYD': '悉尼',
     "NRT": "东京", "PHX": "凤凰城", "LAX": "洛杉矶", "SJC": "圣何塞",
     "SIN": "新加坡", "TPE": "台北", "HKG": "香港", "ORD": "芝加哥",
     "ICN": "首尔", "SLC": "盐湖城", "PIT": "匹兹堡", "BOM": "孟买",
@@ -1083,6 +1084,80 @@ def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
     return result
 
 
+def _measure_tunnel_latency(socks_port: int) -> str:
+    """通过 SOCKS5 代理测隧道出口延迟。隧道不通 -> 不可达。"""
+    import socket, time as _t
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        t0 = _t.monotonic()
+        s.connect(("127.0.0.1", int(socks_port)))
+        s.sendall(b"\x05\x01\x00")
+        resp = s.recv(2)
+        if len(resp) < 2 or resp[0] != 5 or resp[1] != 0:
+            s.close(); return "不可达"
+        s.sendall(b"\x05\x01\x00\x01\x01\x01\x01\x01\x01\xbb")
+        resp = s.recv(10)
+        if len(resp) < 2 or resp[1] != 0:
+            s.close(); return "不可达"
+        dt = (_t.monotonic() - t0) * 1000
+        s.close()
+        return f"{dt:.0f}ms"
+    except (socket.timeout, OSError, ConnectionRefusedError):
+        return "不可达"
+    except Exception:
+        return "不可达"
+
+
+def _measure_tunnel_latency_batch(ports: list[int]) -> dict[int, str]:
+    """批量测隧道出口延迟。{socks_port: latency_str}"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FTError
+    result = {}
+    valid = list(set(p for p in ports if p and p > 0))
+    if not valid:
+        return {}
+    with ThreadPoolExecutor(max_workers=50) as pool:
+        futs = {pool.submit(_measure_tunnel_latency, p): p for p in valid}
+        try:
+            for f in as_completed(futs, timeout=6.0):
+                p = futs[f]
+                try:
+                    result[p] = f.result(timeout=0.1)
+                except Exception:
+                    result[p] = "不可达"
+        except (FTError, TimeoutError):
+            pass
+        finally:
+            for f, p in futs.items():
+                if p not in result:
+                    result[p] = "不可达" if not f.done() else "—"
+                    f.cancel()
+    return result
+
+
+def _load_sock_ports() -> dict[str, int]:
+    """从 channels.json 和 warp_wg_state.json 加载 tag -> socks_port。"""
+    import json
+    out = {}
+    try:
+        for row in _read_json(PROJECT / ".warp/h2/channels.json") or []:
+            tag = row.get("member_tag") or row.get("channel")
+            sp = row.get("socks_port")
+            if tag and sp:
+                out[tag] = int(sp)
+    except Exception:
+        pass
+    try:
+        for tag, line in ((_read_json(PROJECT / ".warp/warp_wg_state.json") or {})
+                          .get("lines") or {}).items():
+            sp = line.get("socks_port")
+            if sp:
+                out[tag] = int(sp)
+    except Exception:
+        pass
+    return out
+
+
 def _load_slot_health() -> dict:
     """加载闸道槽位健康状态（与 daemon _pick_healthy_slot 同源）。"""
     import json, os
@@ -1106,7 +1181,7 @@ def _load_slot_health() -> dict:
         return {}
 
 
-def _display_state(r: dict, slot_health: dict, latency_map: dict) -> tuple:
+def _display_state(r: dict, slot_health: dict, latency_map: dict, tunnel_latency_map: dict = None) -> tuple:
     """计算显示状态 + 排序优先级。返回 (state_str, sort_pri)。
     sort_pri: OK=0, quota=1, 中间态=2, 隧道中断=3, 单元停用=4
 
@@ -1115,9 +1190,9 @@ def _display_state(r: dict, slot_health: dict, latency_map: dict) -> tuple:
     """
     if not r.get("unit_ok", True):
         return ("单元停用", 4)
-    # 实时隧道健康覆盖：入口不可达 = 隧道中断，不管探针历史结论是什么
-    _lat = latency_map.get(r.get("node", "-"), "")
-    if _lat == "不可达":
+    # 实时隧道健康覆盖：隧道出口不可达 = 隧道中断（不管探针历史结论）
+    _tlat = (tunnel_latency_map or {}).get(r.get("node", "-"), "")
+    if _tlat == "不可达":
         return ("隧道中断", 3)
     if r["held"]:
         return ("封禁", 1)
@@ -1155,14 +1230,18 @@ def print_table(rows: list[dict], hours: float) -> None:
     if window_from > time.time() - hours * 3600 + 60:
         print(f"注：渠道样本只保留当天，实际窗口从 {_fmt_ts(window_from)} 起"
               f"（< {hours:g}h）\n")
-    # 批量测入口延迟（并发 TCP connect）
+    # 入口延迟：测机场节点 TCP（所有线都测）
     latency_map = _measure_latency_batch([r.get("node", "-") for r in rows])
+    # 隧道出口延迟：通过 SOCKS 代理测（隧道不通 -> 不可达）
+    _sock_ports = _load_sock_ports()
+    tunnel_map = _measure_tunnel_latency_batch(list(_sock_ports.values()))
     slot_health = _load_slot_health()
     # 排序：状态优先级最高 -> 成功率 -> colo -> 订阅 -> 节点名
     # 延迟不可达排最后（同组内保持原有顺序）
     def _sort_key(r):
-        _s, _pri = _display_state(r, slot_health, latency_map)
-        _lat_bad = 1 if latency_map.get(r.get("node", "-")) == "不可达" else 0
+        _s, _pri = _display_state(r, slot_health, latency_map, tunnel_map)
+        _sp = _sock_ports.get(r["tag"])
+        _lat_bad = 1 if tunnel_map.get(_sp, "不可达") == "不可达" else 0
         return (_pri, _lat_bad, -(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or "")
     rows.sort(key=_sort_key)
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
@@ -1171,7 +1250,7 @@ def print_table(rows: list[dict], hours: float) -> None:
             f"{_pad('/32,/48,/64,/128', _SEG_W, False)} "
             f"{_pad('单ip服务', 12, False)} "
             f"{_pad('重启', 6, False)}  "
-            f"{_pad('订阅', 8)} {_pad('节点名', 30)} {_pad('延迟', 7, False)} 状态")
+            f"{_pad('订阅', 8)} {_pad('节点名', 30)} {_pad('入口延迟', 7, False)} {_pad('隧道延迟', 7, False)} 状态")
     print(head)
     print("-" * (_w(head) + 40))
     tier_off = _tier_disabled()
@@ -1179,7 +1258,9 @@ def print_table(rows: list[dict], hours: float) -> None:
         # 状态列只放线的当前状态（统一层级），不混流程解释
         state = "-"
         notes = []
-        _lat = latency_map.get(r.get("node", "-"), "")
+        _sp = _sock_ports.get(r["tag"])
+        _lat_entry = latency_map.get(r.get("node", "-"), "—")
+        _lat_tunnel = tunnel_map.get(_sp, "—") if _sp else "—"
         if r["tag"] in tier_off:
             notes.append("档位停用")
         if not r.get("unit_ok", True):
@@ -1192,7 +1273,7 @@ def print_table(rows: list[dict], hours: float) -> None:
             # 报表只印「档位停用 单元停用（线没跑）」—— 把「没人探它」
             # 显示成「它坏了」，正是主人说的「原因标错」。
             state = f"单元停用{_frozen_verdict_label(r)}"
-        elif _lat == "不可达":
+        elif _lat_tunnel == "不可达":
             state = "隧道中断"
         elif r["held"]:
             state = f"封禁至{_fmt_ts(r['hold_until'])}"
@@ -1269,8 +1350,8 @@ def print_table(rows: list[dict], hours: float) -> None:
             else:
                 state = "不在探测名单"
         okfail = f"{r['ok']}/{r['ban'] + r['err']}"
-        _lat = latency_map.get(r.get("node", "-"), "—")
-        _lat_style = "不可达" if _lat == "不可达" else _lat
+        _lat_entry_style = "不可达" if _lat_entry == "不可达" else _lat_entry
+        _lat_tunnel_style = "不可达" if _lat_tunnel == "不可达" else _lat_tunnel
         _note = (' ' + ' '.join(notes)) if notes else ''
         print(f"{_pad(r['tag'], 18)} {_pad(r['carrier'], 5)} "
               f"{_pad(r['colo'], 4)} {_pad(r['loc'], 8)} "
@@ -1281,7 +1362,7 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(_ip_svc_label(r), 12, False)} "
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
-              f"{_pad(_lat_style, 7, False)} "
+              f"{_pad(_lat_entry_style, 7, False)} {_pad(_lat_tunnel_style, 7, False)} "
               f"{state}{_note}")
     print("-" * (_w(head) + 40))
     tot = sum(r["samples"] for r in rows)
