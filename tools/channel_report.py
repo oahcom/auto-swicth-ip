@@ -981,59 +981,22 @@ def _measure_latency(node: str) -> str:
         return "不可达"
 
 
-async def _latency_one(node: str, timeout: float = 0.5) -> tuple[str, str]:
-    """异步 TCP 连接测延迟。"""
-    import asyncio, re, time as _t
-    m = re.match(r"^(.+):(\d+)(?:~(\d+))?(?:-[a-zA-Z0-9]+)?$", node)
-    if not m:
-        return node, "—"
-    host, port = m.group(1), int(m.group(2))
-    try:
-        t0 = _t.monotonic()
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout)
-        elapsed = (_t.monotonic() - t0) * 1000
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        return node, f"{elapsed:.0f}ms"
-    except Exception:
-        return node, "不可达"
-
-
 def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
-    """批量测速（asyncio 真并发，0.5s 超时）→ {node: latency_str}。"""
-    import asyncio
-    unique = list({n for n in nodes if n and n != "-"})
-    if not unique:
-        return {n: "—" for n in nodes}
-    async def _all():
-        return await asyncio.gather(
-            *[_latency_one(n) for n in unique], return_exceptions=True)
-    try:
-        results = asyncio.run(_all())
-    except RuntimeError:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        result = {}
-        with ThreadPoolExecutor(max_workers=200) as pool:
-            futs = {pool.submit(_measure_latency, n): n for n in unique}
-            for f in as_completed(futs):
-                n = futs[f]
-                try:
-                    result[n] = f.result()
-                except Exception:
-                    result[n] = "不可达"
-        for n in nodes:
-            if n not in result:
-                result[n] = "—"
-        return result
-    out = {r[0]: r[1] for r in results if isinstance(r, tuple)}
+    """批量测速（ThreadPool 并发，1s 超时）→ {node: latency_str}。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    result = {}
+    with ThreadPoolExecutor(max_workers=200) as pool:
+        futs = {pool.submit(_measure_latency, n): n for n in set(nodes) if n and n != "-"}
+        for f in as_completed(futs):
+            n = futs[f]
+            try:
+                result[n] = f.result()
+            except Exception:
+                result[n] = "不可达"
     for n in nodes:
-        if n not in out:
-            out[n] = "—"
-    return out
+        if n not in result:
+            result[n] = "—"
+    return result
 
 
 def _load_slot_health() -> dict:
@@ -1114,9 +1077,10 @@ def print_table(rows: list[dict], hours: float) -> None:
             _probe_age_min = (time.time() - float(r.get("last_probe_ts") or 0)) / 60
             _stale = r["verdict_stale"] or _probe_age_min > 30
             state = f"{_v}（旧地址·{_ts}判）" if _stale else f"{_v}（{_ts}判）"
-        elif r["no_addr_since"]:
+        elif r["no_addr_since"] and not r["samples"]:
+            # 无样本 + no_addr = 隧道拿不到地址
             state = "隧道中断"
-        elif r.get("egress_error"):
+        elif r.get("egress_error") and not r["samples"]:
             state = f"隧道中断:{r['egress_error']}"
         else:
             # 窗口内一条样本都没有 → `last_verdict` 是**旧的**，不能当成
@@ -1148,8 +1112,6 @@ def print_table(rows: list[dict], hours: float) -> None:
                     # 红线：不从槽位 verdict 取 OK——只显示槽位状态
                     _sv = _sh.get("verdict") or ""
                     state = f"槽位{_sh['status']}" + (f"({ _sv})" if _sv and _sv != "OK" else "")
-                elif r.get("no_addr_since") or _lat_now == "不可达":
-                    state = "隧道中断"
                 else:
                     # 备胎线（不在活跃槽位）：以探测 verdict 为准
                     _v = r['last_verdict']
