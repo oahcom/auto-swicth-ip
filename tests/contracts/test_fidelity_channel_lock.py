@@ -70,13 +70,51 @@ def test_rle_dual_format_verdict_positions():
                            for e in trimmed)
 
 
-def test_trim_drops_yesterday_samples():
-    """只留当天样本：昨日样本到期即弃，防止锁定互相续期（附件 A8）。
+def test_trim_keeps_prev_quota_day_drops_older():
+    """保留当前+上一个配额日，更早的丢弃（2026-11-15 主人实测变更）。
+
+    旧契约「只留当天」让报表永远看不到完整配额日（08:00 一过昨天的账
+    就被裁掉）。锁定互相续期的风险改由 _channel_ban_hold_hit 的当日
+    过滤兜住 —— 见 test_lock_ignores_prev_day_samples。
     """
     now = time.time()
-    old = [[now - 90000, now - 90000, 10, "quota"]]  # 跨天
+    day = d._quota_day(now)
+    prev_day = day - 86400
+    older = prev_day - 86400
+    old = [[older + 3600, older + 3600, 10, "quota"]]  # 上上个配额日 → 丢
     d._channel_ban_trim(old, now)
     assert old == []
+    prev = [[prev_day + 3600, prev_day + 3600, 10, "quota"]]  # 上一个配额日 → 留
+    d._channel_ban_trim(prev, now)
+    assert len(prev) == 1
+    cur = [[day + 3600, day + 3600, 10, "quota"]]  # 当前配额日 → 留
+    d._channel_ban_trim(cur, now)
+    assert len(cur) == 1
+
+
+def test_lock_ignores_prev_day_samples():
+    """锁判据只认当前配额日：昨天的样本不计数也不否决（2026-11-15）。
+
+    trim 留两个配额日后，判据若不夹窗口：昨天的 OK 会否决今天的锁、
+    昨天的 quota 会凑今天的条数 —— 旧契约防的「锁定互相续期」必须
+    在这里继续成立。
+    """
+    now = time.time()
+    d._WARP_LINE_STATE.clear()
+    n = int(d._warp().get("channel_ban_min_samples"))
+    day = d._quota_day(now)
+    prev_day = day - 86400
+    # 昨天 n 条全 quota —— 不能因此锁今天的线
+    st = d._warp_line_state("WARP-WG-9")
+    st["ban_probes"] = [[prev_day + 3600, prev_day + 3600, n, "quota"]]
+    assert not d._channel_ban_hold_hit(st["ban_probes"], now)
+    # 今天 n 条全 quota —— 锁
+    st["ban_probes"] = [[day + 3600, day + 3600, n, "quota"]]
+    assert d._channel_ban_hold_hit(st["ban_probes"], now)
+    # 今天出现一条 OK —— 否决
+    st["ban_probes"] = [[day + 3600, day + 3600, n - 1, "quota"],
+                        [day + 7200, day + 7200, 1, "OK"]]
+    assert not d._channel_ban_hold_hit(st["ban_probes"], now)
 
 
 def test_cf_lines_never_locked_but_sampled():

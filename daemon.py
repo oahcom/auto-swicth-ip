@@ -4477,7 +4477,13 @@ def _channel_ban_trim(samples: list, now: float) -> list:
             start = end = float(e[0])
             count = 1
             verdict = str(e[1])
-        if _quota_day(start) != day or _quota_day(end) != day:
+        # 保留**当前 + 上一个**配额日：报表要能显示一个完整的配额日
+        # （昨天 08:00→今天 08:00）。只留当天的话 08:00 一过、昨天的账
+        # 就没了（2026-11-15 主人实测「chan 数据太少」）。更早的照丢。
+        seg_day = _quota_day(start)
+        if seg_day != day and seg_day != day - 86400:
+            continue
+        if _quota_day(end) not in (day, day - 86400):
             continue
         if runs and runs[-1][3] == verdict:
             runs[-1][1] = end
@@ -4545,10 +4551,15 @@ def _channel_ban_hold_hit(samples: list, now: float) -> bool:
     真烧穿的渠道因为探测抖动而永远锁不上。
     """
     _channel_ban_trim(samples, now)
-    n = sum(int(e[2]) for e in samples if len(e) >= 4)
+    # 只认**当前配额日**的样本：trim 现在保留两个配额日（报表要看完整
+    # 配额日），锁判据必须自己夹窗口，否则昨天的 OK 会否决今天的锁、
+    # 昨天的 quota 会凑今天的条数（2026-11-15）。
+    day = _quota_day(now)
+    today = [e for e in samples if len(e) >= 4 and _quota_day(float(e[0])) == day]
+    n = sum(int(e[2]) for e in today)
     if n < int(_warp().get("channel_ban_min_samples", 1000)):
         return False
-    return all(e[3] == "quota" for e in samples)
+    return all(e[3] == "quota" for e in today)
 
 
 def _channel_ban_note(tag: str, verdict: str, now: float) -> None:
