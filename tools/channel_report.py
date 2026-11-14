@@ -896,16 +896,16 @@ def _no_sample_reason(r: dict) -> str:
     now = r.get("now")
     if not last_probe:
         if not r.get("in_members", True):
-            return "无样本·不在探测名单"
-        return "无样本·从未探测"
+            return "不在探测名单"
+        return "单元停用"
     n = int(r.get("blocked_notes") or 0)
     if n > 0:
-        return f"无样本·惩罚期短路（{_probe_age(last_probe, now)}探过）"
+        return "quota（惩罚期短路）"
     if r.get("no_addr_since"):
-        return f"无样本·取不到地址（{_probe_age(last_probe, now)}探过）"
+        return "隧道中断"
     if not r.get("in_members", True):
-        return f"无样本·不在探测名单（{_probe_age(last_probe, now)}探过）"
-    return f"无样本·探测未入账（{_probe_age(last_probe, now)}探过）"
+        return "不在探测名单"
+    return "探测未入账"
 
 
 def _frozen_verdict_label(r: dict) -> str:
@@ -1012,13 +1012,13 @@ def print_table(rows: list[dict], hours: float) -> None:
             # 显示成「它坏了」，正是主人说的「原因标错」。
             state = f"单元停用{_frozen_verdict_label(r)}"
         elif r["held"]:
-            state = f"锁定至{_fmt_ts(r['hold_until'])}"
+            state = f"封禁至{_fmt_ts(r['hold_until'])}"
         elif r["quota_until"] > time.time():
-            state = f"限流惩罚中(至{_fmt_ts(r['quota_until'])})"
+            state = f"封禁至{_fmt_ts(r['quota_until'])}"
         elif r["no_addr_since"]:
-            state = "无地址"
+            state = "隧道中断"
         elif r.get("egress_error"):
-            state = f"取址失败:{r['egress_error']}"
+            state = f"隧道中断:{r['egress_error']}"
         else:
             # 窗口内一条样本都没有 → `last_verdict` 是**旧的**，不能当成
             # 现在的结论印出来。WARP-CF-C/G/H/I 的单元 2026-10-28 缩容时
@@ -1031,15 +1031,27 @@ def print_table(rows: list[dict], hours: float) -> None:
             #   探过但没入账  → 入账漏记的 bug（判了 blocked 却没进 ban_probes）
             #   探过但无地址  → 隧道取不到出口
             if r["samples"]:
-                _v = r['last_verdict']
-                if _v == "blocked":
-                    _v = "已解禁·旗标残留"
-                elif _v == "quota":
-                    _v = "限流惩罚中"
-                _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
-                state = f"{_v}（旧地址·{_ts}判）" if r["verdict_stale"] else f"{_v}（{_ts}判）"
+                # 实时隧道健康信号优先于历史 verdict：
+                # 入口不可达 / no_addr_since -> 隧道当前拿不到 IP -> 隧道中断
+                _lat_now = latency_map.get(r.get("node", "-"), "—")
+                _tunnel_down = r.get("no_addr_since") or _lat_now == "不可达"
+                if _tunnel_down:
+                    state = "隧道中断"
+                else:
+                    _v = r['last_verdict']
+                    if _v == "blocked":
+                        _ban_until = float(r.get('quota_until', 0) or 0)
+                        _v = "OK" if _ban_until <= time.time() else "quota"
+                    _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
+                    state = f"{_v}（旧地址·{_ts}判）" if r["verdict_stale"] else f"{_v}（{_ts}判）"
             elif r.get("in_members", True):
-                state = "从未探测"
+                # 从未探测 -> 拆到具体原因
+                if not r.get("unit_ok", True):
+                    state = "单元停用"
+                elif r.get("no_addr_since"):
+                    state = "隧道中断"
+                else:
+                    state = "不在探测名单"
             else:
                 state = "不在探测名单"
         okfail = f"{r['ok']}/{r['ban'] + r['err']}"
@@ -1212,7 +1224,7 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
                 pills.append('<span class="pill">'
                              f'{html.escape(_no_sample_reason(r))}</span>')
         elif r["held"]:
-            pills.append(f'<span class="pill hold">锁定至 {_fmt_ts(r["hold_until"])}</span>')
+            pills.append(f'<span class="pill hold">封禁至 {_fmt_ts(r["hold_until"])}</span>')
         elif r["quota_until"] > time.time():
             pills.append(f'<span class="pill quot">配额至 {_fmt_ts(r["quota_until"])}</span>')
         elif r["no_addr_since"]:
