@@ -498,6 +498,22 @@ def _singbox_outbound_tags() -> set[str]:
             if isinstance(o, dict) and o.get("tag")}
 
 
+def _ip_service_stats(ban_probes: list) -> dict:
+    """从 ban_probes 游程提取 per-IP 服务数分布: {max, min, avg, median}。
+    每游程 [起, 止, 条数, 结论] 的条数 = 该 IP 在该时段服务的探测次数。"""
+    counts = [int(e[2]) for e in ban_probes if isinstance(e, (list, tuple)) and len(e) >= 3 and e[2]]
+    if not counts:
+        return {"max": 0, "min": 0, "avg": 0, "med": 0}
+    counts.sort()
+    n = len(counts)
+    return {
+        "max": counts[-1],
+        "min": counts[0],
+        "avg": round(sum(counts) / n, 1),
+        "med": counts[n // 2] if n % 2 == 1 else round((counts[n//2 - 1] + counts[n//2]) / 2, 1),
+    }
+
+
 def summarize(state: dict, chans: dict, sources: dict, hours: float,
               now: float | None = None, dormant: set[str] | None = None,
               segments: dict[str, dict] | None = None) -> list[dict]:
@@ -586,6 +602,7 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             # 约束** —— 段列表是「这条线去过哪些地方」，不是随时间衰减的指标
             # （见 `channel_segments()`）。不是「池子里有多少段」：池子是机房
             # 共享的，同一时刻所有线在同一个池里抽签；这里说的是这条线自己的覆盖面。
+            "ip_svc": _ip_service_stats(st.get("ban_probes") or []),
             "seg_v6": (segs.get(tag) or {}).get("v6") or [],
             # 这条线落过的 /128 个数。和 /64 个数并列才有意义：同样 60 个 /64，
             # 摊着 60 个地址 vs 挤在 1 个 /64 里的 60 个地址，撞车概率差 60 倍。
@@ -816,6 +833,14 @@ def print_segments(rows: list[dict], segments: dict[str, dict]) -> None:
 _SEG_W = 20
 
 
+def _ip_svc_label(r: dict) -> str:
+    """单ip服务数: 最大/最小/平均/中位"""
+    s = r.get("ip_svc") or {}
+    if not s.get("max"):
+        return "-"
+    return f"{s['max']}/{s['min']}/{s['avg']}/{s['med']}"
+
+
 def _seg_label(r: dict) -> str:
     """表格里的「出口段」列：`/32//48//64//128` 四级个数，v4 追加 `+Nv`。
 
@@ -1037,6 +1062,7 @@ def print_table(rows: list[dict], hours: float) -> None:
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
             f"{_pad('/32,/48,/64,/128', _SEG_W, False)} "
+            f"{_pad('单ip服务', 12, False)} "
             f"{_pad('重启', 6, False)}  "
             f"{_pad('订阅', 8)} {_pad('节点名', 30)} {_pad('延迟', 7, False)} 状态")
     print(head)
@@ -1142,6 +1168,7 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(_pct(r['ban_rate']), 5, False)} "
               f"{_pad(okfail, 7, False)} "
               f"{_pad(_seg_label(r), _SEG_W, False)} "
+              f"{_pad(_ip_svc_label(r), 12, False)} "
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
               f"{_pad(_lat_style, 7, False)} "
