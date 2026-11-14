@@ -14322,10 +14322,13 @@ def _slot_pick_key(slot, tag, ip, now, serving):
     rank = _warp_ip_rank(ip, now, _warp_guard_for_reason("rate429"))
     delay = _slot_probe_sec(slot["name"])
     chan = _channel_latency_ms(tag, now)
+    # 渠道延迟 >5s 的排最后（正常 TLS 建连 <2s，>5s 可能已退化到不可用边缘）
+    _chan_slow = 1 if (chan is not None and chan > 5000) else 0
     return (
         0 if slot["name"] != serving else 1,
         rank[0],                                    # 新鲜度档位
         rank[1],                                    # 同档内避开刚烧过的 /64
+        _chan_slow,                                 # 延迟过高的排最后
         0 if chan is not None else 1,               # 有渠道原生延迟的优先
         chan if chan is not None else 0.0,          # 渠道延迟低者优先
         0 if delay is not None else 1,              # 有探针延迟数据的优先
@@ -14509,6 +14512,16 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
         if _slot_ip_is_quarantined(ip, t0):
             log("· 秒切候选 %s 出口=%s 已隔离（生产标脏/quota），跳过"
                 % (s["name"], ip or "未知"))
+            continue
+        # 渠道延迟不可达剔除（2026-11-15）：channel_latency.json 里 tls_ms
+        # 为 None = 入口 TLS 握手失败 = 隧道必然不通。即使 slot_health 说
+        # ok（探针结论可能过期），入口不可达的线不许进候选 —— 延迟小的
+        # 优先选，不可达的 ok 也不能用（主人 2026-11-15）。
+        _chan_ms = _channel_latency_ms(tag, t0)
+        if _chan_ms is not None and _chan_ms > 10000:
+            # >10s 的渠道延迟视为不可用（正常渠道 TLS 建连 <2s）
+            log("· 秒切候选 %s 渠道延迟 %.0fms 过高（>10s），跳过"
+                % (s["name"], _chan_ms))
             continue
         candidates.append((s, tag, ip))
     if not candidates:

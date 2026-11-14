@@ -991,23 +991,49 @@ def _frozen_verdict_label(r: dict) -> str:
     return f"（{v}·{age}冻结）"
 
 
-def _measure_latency(node: str) -> str:
-    """TCP 连接测速入口节点延迟。node 格式如 host:port-suffix 或 host:port~N-suffix。
-    返回 "XXms" 或 "不可达"。
+def _parse_node(node: str) -> tuple[str, int]:
+    """解析 node 字符串为 (host, port)。
+    格式: host:port / host:port~N / host:port~N-suffix / host:port-suffix。
+    用字符串处理而非 regex——regex 非贪婪+可选端口对带数字后缀（-hkg2）会误匹配。
     """
+    s = (node or "").strip()
+    if not s or s == "-":
+        return ("", 0)
+    # 去掉尾部后缀（-hkg / -vl / -hkg2 等）：最后一个 - 后跟字母数字
+    import re as _re
+    s = _re.sub(r'-[a-z0-9]+$', '', s)
+    # 去掉 ~N 段
+    s = _re.sub(r'~\d+$', '', s)
+    # 分离 host:port（从右侧拆，host 可能含冒号如 IPv6）
+    if ':' in s:
+        _h, _p = s.rsplit(':', 1)
+        if _p.isdigit():
+            return (_h, int(_p))
+    return (s, 443)
+
+
+def _measure_latency(node: str) -> str:
+    """TCP 连接测速入口节点延迟。返回 "XXms" 或 "不可达"。"""
     import socket, time as _t
-    # 解析 host:port —— 去掉协议后缀（-any/-vl 等）和 ~N 段
-    m = re.match(r'^(.+?)(?::(\d+))?(?:~\d+)?(?:-[a-z]+)?$', node or '')
-    if not m or not m.group(1):
+    host, port = _parse_node(node)
+    if not host:
         return "—"
-    host = m.group(1)
-    port = int(m.group(2) or 443)
     try:
-        # 先解析域名（IP 直连跳过解析）
+        # DNS 解析（IP 直连跳过）—— 包一层线程超时防 getaddrinfo 卡死
         try:
-            addr = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)[0][4][0]
-        except (socket.gaierror, OSError):
-            return "不可达"
+            import ipaddress
+            ipaddress.ip_address(host)
+            addr = host  # 已是 IP，跳过 DNS
+        except ValueError:
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            with _TPE(max_workers=1) as _dns_pool:
+                _dns_fut = _dns_pool.submit(
+                    socket.getaddrinfo, host, port,
+                    socket.AF_UNSPEC, socket.SOCK_STREAM)
+                try:
+                    addr = _dns_fut.result(timeout=2.0)[0][4][0]
+                except Exception:
+                    return "不可达"
         # TCP 连接测速
         s = socket.socket(socket.AF_INET6 if ':' in addr else socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(2.0)
@@ -1018,7 +1044,10 @@ def _measure_latency(node: str) -> str:
             s.close()
             return f"{dt:.0f}ms"
         except (socket.timeout, OSError, ConnectionRefusedError):
-            s.close()
+            try:
+                s.close()
+            except Exception:
+                pass
             return "不可达"
     except Exception:
         return "不可达"
@@ -1029,11 +1058,11 @@ def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
     from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FTError
     import time as _t
     result = {}
-    deadline = _t.monotonic() + 4.0  # 全局 3s 上限
-    with ThreadPoolExecutor(max_workers=200) as pool:
+    deadline = _t.monotonic() + 6.0  # 全局 6s 上限（DNS 需要余量）
+    with ThreadPoolExecutor(max_workers=50) as pool:  # 50 并发：DNS 友好，不压垮 resolver
         futs = {pool.submit(_measure_latency, n): n for n in set(nodes) if n and n != "-"}
         try:
-            for f in as_completed(futs, timeout=4.0):
+            for f in as_completed(futs, timeout=6.0):
                 n = futs[f]
                 try:
                     result[n] = f.result(timeout=0.1)
@@ -1077,9 +1106,17 @@ def _load_slot_health() -> dict:
 
 def _display_state(r: dict, slot_health: dict, latency_map: dict) -> tuple:
     """计算显示状态 + 排序优先级。返回 (state_str, sort_pri)。
-    sort_pri: OK=0, quota=1, 中间态=2, 隧道中断=3, 单元停用=4"""
+    sort_pri: OK=0, quota=1, 中间态=2, 隧道中断=3, 单元停用=4
+
+    红线：延迟不可达的线**不允许显示 OK**——入口 TCP 都连不上，隧道
+    必然不通，探针历史 OK 是旧结论（线当时还活着），不能冒充现状。
+    """
     if not r.get("unit_ok", True):
         return ("单元停用", 4)
+    # 实时隧道健康覆盖：入口不可达 = 隧道中断，不管探针历史结论是什么
+    _lat = latency_map.get(r.get("node", "-"), "")
+    if _lat == "不可达":
+        return ("隧道中断", 3)
     if r["held"]:
         return ("封禁", 1)
     if r["quota_until"] > time.time():
@@ -1140,6 +1177,7 @@ def print_table(rows: list[dict], hours: float) -> None:
         # 状态列只放线的当前状态（统一层级），不混流程解释
         state = "-"
         notes = []
+        _lat = latency_map.get(r.get("node", "-"), "")
         if r["tag"] in tier_off:
             notes.append("档位停用")
         if not r.get("unit_ok", True):
@@ -1152,6 +1190,8 @@ def print_table(rows: list[dict], hours: float) -> None:
             # 报表只印「档位停用 单元停用（线没跑）」—— 把「没人探它」
             # 显示成「它坏了」，正是主人说的「原因标错」。
             state = f"单元停用{_frozen_verdict_label(r)}"
+        elif _lat == "不可达":
+            state = "隧道中断"
         elif r["held"]:
             state = f"封禁至{_fmt_ts(r['hold_until'])}"
         elif r["quota_until"] > time.time():
