@@ -5083,10 +5083,51 @@ def _h2_select(member: dict | None, node: str) -> str:
     return "err"
 
 
-# 每条 H2 线**本轮已试过**的候选节点；拿到出口地址时清空（见 `_probe_one_line`）。
-# 没有它，整池失效的线（实测 ORD 池只有 1 个、SLC/LAX 池全是 bilibili）会每
-# 60s 在死节点之间空转：PUT 本身无害，但每次都会清掉 `ip` 并触发一整轮探测。
+# **每个隧道池**本轮已试过的候选节点；池内任一线拿到出口地址时清空
+# （见 `_probe_one_line`）。没有它，整池失效的线（实测 ORD 池只有 1 个、
+# SLC/LAX 池全是 bilibili）会每 60s 在死节点之间空转：PUT 本身无害，但
+# 每次都会清掉 `ip` 并触发一整轮探测。
+# 2026-11-15 主人指令「同一个隧道池的只需要探一次」：键从 tag 改为池 key ——
+# 同池线各自轮转同一批节点是纯冗余（实测 NRT-103/123 锁步换同一个节点、
+# 全天 573 次换节点），节点承载能力是节点属性，同池试一次即可。
 _H2_TRIED: dict[str, set[str]] = {}
+# tag → 池 key 的缓存（channels.json 的 pool 字段），随台账 mtime 失效。
+_H2_POOL_KEY_BY_TAG: dict[str, str] = {}
+_H2_POOL_KEY_MTIME: float = 0.0
+
+
+def _h2_pool_key(member: dict | None) -> str:
+    """线的隧道池标识：channels.json 里 pool 字段相同的线同池。
+
+    读不到台账（或线不在台账里）退化为 tag —— 单例池，行为与旧按线一致。
+    """
+    global _H2_POOL_KEY_MTIME, _H2_POOL_KEY_BY_TAG
+    if not member:
+        return ""
+    tag = member.get("tag") or ""
+    try:
+        mtime = _h2_channels_mtime()
+    except Exception:
+        mtime = -1.0
+    if mtime != _H2_POOL_KEY_MTIME:
+        try:
+            with open(os.path.join(_PROJECT, ".warp", "h2", "channels.json"),
+                      encoding="utf-8") as f:
+                rows = json.load(f)
+        except (OSError, ValueError):
+            rows = []
+        fresh: dict[str, str] = {}
+        if isinstance(rows, list):
+            for r in rows:
+                try:
+                    t = r["member_tag"]
+                    key = "\x1f".join(sorted(r.get("pool") or [])) or t
+                except (KeyError, TypeError):
+                    continue
+                fresh[t] = key
+        _H2_POOL_KEY_BY_TAG = fresh
+        _H2_POOL_KEY_MTIME = mtime
+    return _H2_POOL_KEY_BY_TAG.get(tag, tag)
 # 整池试遍仍拿不到出口的 H2 线 → 判死时刻。重启 usque 换的是同一个死节点上的
 # 新会话，重启没有意义（见 `_line_node_cannot_carry`）。拿到出口或换节点成功
 # 即清空；`_H2_POOL_DEAD_RETRY_SEC` 后再重走一遍池子，免得节点恢复后永久停产。
@@ -5110,7 +5151,7 @@ def _h2_next_node(member: dict | None) -> str | None:
     cands = [o[len("h2-"):] for o in (names or []) if o.startswith("h2-")]
     if not cands:
         return None
-    tried = _H2_TRIED.setdefault(member["tag"], set())
+    tried = _H2_TRIED.setdefault(_h2_pool_key(member), set())
     k = cands.index(now_ob[len("h2-"):]) if (now_ob or "").startswith("h2-") \
         and now_ob[len("h2-"):] in cands else -1
     for step in range(1, len(cands) + 1):
@@ -5131,23 +5172,26 @@ def _h2_repair(member: dict | None) -> bool:
     # 判死是暂时的：整池不通可能只是机场抖动。过了重试窗口把整池重新走一遍
     # （否则节点恢复后这条线永远停产 —— `_h2_next_node` 只认 `_H2_TRIED`）。
     dead = _H2_POOL_DEAD.get(tag)
+    pk = _h2_pool_key(member)
     if dead and now - dead >= _H2_POOL_DEAD_RETRY_SEC:
         _H2_POOL_DEAD.pop(tag, None)
-        _H2_TRIED.pop(tag, None)
+        # 重走池子清**池共享集**：同池其他线也该重新有机会试（2026-11-15）。
+        _H2_TRIED.pop(pk, None)
     nxt = _h2_next_node(member)
     _NODE_NEXT_CHECK[tag] = now + float(
         _warp().get("node_rotation_interval_sec", 60))
     if not nxt:
         # 只有**试过候选**才判死：`_h2_next_node` 在 Clash API 读不到池子时
         # 同样返回 None（共享 sing-box 重启中），那不是节点的结论。
-        if _H2_TRIED.get(tag):
+        if _H2_TRIED.get(pk):
             # `setdefault`：这里每 60s 被调一次，重写时间戳会让重试窗口永远不到点。
+            # 判死按线记（不共享）：设备坏不该连坐同池健康线，30min 后各自重试。
             _H2_POOL_DEAD.setdefault(tag, now)   # 整池试遍，等重渲染/重试窗口
         return False
     if _rehome_one(tag, nxt) != "ok":
         return False
     _H2_POOL_DEAD.pop(tag, None)
-    _H2_TRIED.setdefault(tag, set()).add(nxt)
+    _H2_TRIED.setdefault(pk, set()).add(nxt)
     # 新落地节点的出口地址必然不同：清掉旧地址，让探测器按新链路重新判。
     _invalidate_warp_line_ip(tag)
     log(f"  ⇄ {tag} 连续取不到出口 → 换节点 {nxt}（selector，未重启）")
@@ -6846,8 +6890,9 @@ def _probe_one_line(member: dict) -> None:
     # 算起，5 小时那条判据会被一次历史故障带偏。
     _channel_noaddr_note(tag, True, now)
     # 这条链路能出地址了：H2 的候选池从头开始记（见 `_h2_next_node`）。
+    # 清的是**池共享集**：池里有节点能出地址 = 池是活的，同池线的轮换重置。
     if member.get("kind") == "h2":
-        _H2_TRIED.pop(tag, None)
+        _H2_TRIED.pop(_h2_pool_key(member), None)
         _H2_POOL_DEAD.pop(tag, None)
     cur = _warp_line_state(tag)
     if tag != active and _warp_line_ok_fresh(tag, now) and cur.get("ip") == ip:
