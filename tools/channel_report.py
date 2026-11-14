@@ -652,7 +652,20 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "now": now,
             "window_from": cutoff,
         })
-    rows.sort(key=lambda r: (-(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or ""))
+    def _status_pri(r):
+        if not r.get("unit_ok", True):
+            return 4  # 单元停用
+        if r.get("no_addr_since") and not r["samples"]:
+            return 3  # 隧道中断
+        if r["samples"]:
+            v = (r.get("last_verdict") or "").lower()
+            if v == "ok":
+                return 0  # OK
+            if v in ("quota", "flagged"):
+                return 1  # quota
+            return 2  # 中间态
+        return 3  # 无样本 -> 视同隧道问题
+    rows.sort(key=lambda r: (_status_pri(r), -(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or ""))
     return rows
 
 
@@ -1058,6 +1071,8 @@ def print_table(rows: list[dict], hours: float) -> None:
     # 批量测入口延迟（并发 TCP connect）
     latency_map = _measure_latency_batch([r.get("node", "-") for r in rows])
     slot_health = _load_slot_health()
+    # 稳定排序：延迟不可达排最后（同组内保持原有顺序）
+    rows.sort(key=lambda r: 1 if latency_map.get(r.get("node", "-")) == "不可达" else 0)
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
