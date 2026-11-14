@@ -943,7 +943,7 @@ def _measure_latency(node: str) -> str:
             return "不可达"
         # TCP 连接测速
         s = socket.socket(socket.AF_INET6 if ':' in addr else socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3.0)
+        s.settimeout(1.5)
         t0 = _t.monotonic()
         try:
             s.connect((addr, port))
@@ -961,7 +961,7 @@ def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
     """批量测速（并发，3s 超时）→ {node: latency_str}。"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     result = {}
-    with ThreadPoolExecutor(max_workers=20) as pool:
+    with ThreadPoolExecutor(max_workers=50) as pool:
         futs = {pool.submit(_measure_latency, n): n for n in set(nodes) if n and n != "-"}
         for f in as_completed(futs):
             n = futs[f]
