@@ -74,3 +74,11 @@ deploy/daemon.py.*
 
 .dormant_probe_attempt
 .api_stats.json
+
+# 运行态文件（daemon 持续写入，不入库）
+.slot_health.json
+.opencode_gate_ledger.jsonl
+.subject_map.json
+.subject_state.json
+.egress_map.json
+.ledger_shadow.json
