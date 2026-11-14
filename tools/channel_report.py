@@ -233,6 +233,10 @@ def _seg_name(net) -> str:
                     for p in net.network_address.exploded.split(":")[:4])
 
 
+_SEGS_CACHE_FILE = Path(CFG.get("log_file", "/tmp/asip.log")).parent / ".chan_segs_cache.json"
+_SEGS_CACHE_TTL = 300  # 5 分钟
+
+
 def channel_segments(log_file: Path | None = None) -> dict[str, dict]:
     """每条渠道落过的出口：`{tag: {"v6": [/64 段名...], "addr": [/128...],
     "v4": [地址...]}}`。
@@ -252,6 +256,14 @@ def channel_segments(log_file: Path | None = None) -> dict[str, dict]:
     渠道归属**（唯一写入点 `daemon.py:_mark_warp_ip_used` 拿到的就是地址）。
     带渠道归属的只有 daemon 打的两类出口行：`出口 <ip> 模型层` / `重启后出口=<ip>`。
     """
+    import time as _tc, json as _jc
+    try:
+        if _SEGS_CACHE_FILE.exists():
+            _cached = _jc.loads(_SEGS_CACHE_FILE.read_text())
+            if _tc.time() - _cached.get("ts", 0) < _SEGS_CACHE_TTL:
+                return _cached["data"]
+    except Exception:
+        pass
     path = log_file or Path(CFG["log_file"])
     seen: dict[str, dict[str, set]] = defaultdict(
         lambda: {"v6": set(), "addr": set(), "v4": set()})
@@ -303,10 +315,15 @@ def channel_segments(log_file: Path | None = None) -> dict[str, dict]:
                 seen[tag]["addr"].update(d["addr"])
                 seen[tag]["v4"].update(d["v4"])
 
-    return {tag: {"v6": sorted(v["v6"], key=_seg_sort),
-                  "addr": sorted(v["addr"], key=_addr_sort),
-                  "v4": sorted(v["v4"])}
-            for tag, v in seen.items()}
+    result = {tag: {"v6": sorted(v["v6"], key=_seg_sort),
+                    "addr": sorted(v["addr"], key=_addr_sort),
+                    "v4": sorted(v["v4"])}
+              for tag, v in seen.items()}
+    try:
+        _SEGS_CACHE_FILE.write_text(_jc.dumps({"ts": _tc.time(), "data": result}))
+    except Exception:
+        pass
+    return result
 
 
 def _addr_sort(ip: str):
