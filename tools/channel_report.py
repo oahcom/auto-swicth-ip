@@ -611,7 +611,7 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "now": now,
             "window_from": cutoff,
         })
-    rows.sort(key=lambda r: (r["carrier"] or "", r["colo"], r["tag"]))
+    rows.sort(key=lambda r: (-(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or ""))
     return rows
 
 
@@ -976,6 +976,29 @@ def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
     return result
 
 
+def _load_slot_health() -> dict:
+    """加载闸道槽位健康状态（与 daemon _pick_healthy_slot 同源）。"""
+    import json, os
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "..", ".slot_health.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        # tag -> {status, verdict, slot_name} 反向映射
+        out = {}
+        for slot_name, h in d.items():
+            tag = h.get("tag")
+            if tag:
+                out[tag] = {
+                    "slot": slot_name,
+                    "status": h.get("status", "unknown"),
+                    "verdict": h.get("verdict"),
+                }
+        return out
+    except Exception:
+        return {}
+
+
 def print_table(rows: list[dict], hours: float) -> None:
     if not rows:
         print("（没有渠道数据）")
@@ -986,6 +1009,7 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"（< {hours:g}h）\n")
     # 批量测入口延迟（并发 TCP connect）
     latency_map = _measure_latency_batch([r.get("node", "-") for r in rows])
+    slot_health = _load_slot_health()
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
@@ -1015,6 +1039,17 @@ def print_table(rows: list[dict], hours: float) -> None:
             state = f"封禁至{_fmt_ts(r['hold_until'])}"
         elif r["quota_until"] > time.time():
             state = f"封禁至{_fmt_ts(r['quota_until'])}"
+        elif slot_health.get(r["tag"], {}).get("status") == "ok":
+            # 活跃槽位且闸道认可（_pick_healthy_slot 同源）：以槽位健康为准，
+            # 不管 no_addr_since / 延迟不可达 —— 闸道正在用这条线服务真实流量。
+            _v = r['last_verdict']
+            if _v == "blocked":
+                _ban_until = float(r.get('quota_until', 0) or 0)
+                _v = "OK" if _ban_until <= time.time() else "quota"
+            _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
+            _probe_age_min = (time.time() - float(r.get("last_probe_ts") or 0)) / 60
+            _stale = r["verdict_stale"] or _probe_age_min > 30
+            state = f"{_v}（旧地址·{_ts}判）" if _stale else f"{_v}（{_ts}判）"
         elif r["no_addr_since"]:
             state = "隧道中断"
         elif r.get("egress_error"):
@@ -1034,16 +1069,31 @@ def print_table(rows: list[dict], hours: float) -> None:
                 # 实时隧道健康信号优先于历史 verdict：
                 # 入口不可达 / no_addr_since -> 隧道当前拿不到 IP -> 隧道中断
                 _lat_now = latency_map.get(r.get("node", "-"), "—")
-                _tunnel_down = r.get("no_addr_since") or _lat_now == "不可达"
-                if _tunnel_down:
-                    state = "隧道中断"
-                else:
+                _sh = slot_health.get(r["tag"])
+                # 活跃槽位上的线：槽位健康是闸道判据，优先于 no_addr_since
+                if _sh and _sh["status"] == "ok":
                     _v = r['last_verdict']
                     if _v == "blocked":
                         _ban_until = float(r.get('quota_until', 0) or 0)
                         _v = "OK" if _ban_until <= time.time() else "quota"
                     _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
-                    state = f"{_v}（旧地址·{_ts}判）" if r["verdict_stale"] else f"{_v}（{_ts}判）"
+                    _probe_age_min = (time.time() - float(r.get("last_probe_ts") or 0)) / 60
+                    _stale = r["verdict_stale"] or _probe_age_min > 30
+                    state = f"{_v}（旧地址·{_ts}判）" if _stale else f"{_v}（{_ts}判）"
+                elif _sh and _sh["status"] != "ok":
+                    state = _sh.get("verdict") or _sh["status"]
+                elif r.get("no_addr_since") or _lat_now == "不可达":
+                    state = "隧道中断"
+                else:
+                    # 备胎线（不在活跃槽位）：以探测 verdict 为准
+                    _v = r['last_verdict']
+                    if _v == "blocked":
+                        _ban_until = float(r.get('quota_until', 0) or 0)
+                        _v = "OK" if _ban_until <= time.time() else "quota"
+                    _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
+                    _probe_age_min = (time.time() - float(r.get("last_probe_ts") or 0)) / 60
+                    _stale = r["verdict_stale"] or _probe_age_min > 30
+                    state = f"{_v}（旧地址·{_ts}判）" if _stale else f"{_v}（{_ts}判）"
             elif r.get("in_members", True):
                 # 从未探测 -> 拆到具体原因
                 if not r.get("unit_ok", True):
