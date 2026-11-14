@@ -25,7 +25,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-ROOT = "/home/administrator/dkk-projects/auto-switch-ip"
+import os as _os; ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 CHANNELS = f"{ROOT}/.warp/h2/channels.json"
 PROBE_STATE = f"{ROOT}/.warp/h2_probe_state.json"
 OUT = f"{ROOT}/.warp/channel_latency.json"
