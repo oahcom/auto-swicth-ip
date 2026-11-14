@@ -924,6 +924,58 @@ def _frozen_verdict_label(r: dict) -> str:
     return f"（{v}·{age}冻结）"
 
 
+def _measure_latency(node: str) -> str:
+    """TCP 连接测速入口节点延迟。node 格式如 host:port-suffix 或 host:port~N-suffix。
+    返回 "XXms" 或 "不可达"。
+    """
+    import socket, time as _t
+    # 解析 host:port —— 去掉协议后缀（-any/-vl 等）和 ~N 段
+    m = re.match(r'^(.+?)(?::(\d+))?(?:~\d+)?(?:-[a-z]+)?$', node or '')
+    if not m or not m.group(1):
+        return "—"
+    host = m.group(1)
+    port = int(m.group(2) or 443)
+    try:
+        # 先解析域名（IP 直连跳过解析）
+        try:
+            addr = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)[0][4][0]
+        except (socket.gaierror, OSError):
+            return "不可达"
+        # TCP 连接测速
+        s = socket.socket(socket.AF_INET6 if ':' in addr else socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3.0)
+        t0 = _t.monotonic()
+        try:
+            s.connect((addr, port))
+            dt = (_t.monotonic() - t0) * 1000
+            s.close()
+            return f"{dt:.0f}ms"
+        except (socket.timeout, OSError, ConnectionRefusedError):
+            s.close()
+            return "不可达"
+    except Exception:
+        return "不可达"
+
+
+def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
+    """批量测速（并发，3s 超时）→ {node: latency_str}。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    result = {}
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        futs = {pool.submit(_measure_latency, n): n for n in set(nodes) if n and n != "-"}
+        for f in as_completed(futs):
+            n = futs[f]
+            try:
+                result[n] = f.result()
+            except Exception:
+                result[n] = "不可达"
+    # "-" 或空的不测
+    for n in nodes:
+        if n not in result:
+            result[n] = "—"
+    return result
+
+
 def print_table(rows: list[dict], hours: float) -> None:
     if not rows:
         print("（没有渠道数据）")
@@ -932,12 +984,14 @@ def print_table(rows: list[dict], hours: float) -> None:
     if window_from > time.time() - hours * 3600 + 60:
         print(f"注：渠道样本只保留当天，实际窗口从 {_fmt_ts(window_from)} 起"
               f"（< {hours:g}h）\n")
+    # 批量测入口延迟（并发 TCP connect）
+    latency_map = _measure_latency_batch([r.get("node", "-") for r in rows])
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
-            f"{_pad('colo ban', 9, False)} {_pad('/32,/48,/64,/128', _SEG_W, False)} "
-            f"{_pad('落点', 8)} {_pad('重启', 6, False)}  "
-            f"{_pad('订阅', 8)} {_pad('节点名', 30)} 节点 / 状态")
+            f"{_pad('/32,/48,/64,/128', _SEG_W, False)} "
+            f"{_pad('重启', 6, False)}  "
+            f"{_pad('订阅', 8)} {_pad('节点名', 30)} {_pad('延迟', 7, False)} 状态")
     print(head)
     print("-" * (_w(head) + 40))
     tier_off = _tier_disabled()
@@ -995,17 +1049,18 @@ def print_table(rows: list[dict], hours: float) -> None:
                 flags.append(f"{_v}（旧地址·{_ts}判）" if r["verdict_stale"]
                              else f"{_v}（{_ts}判）")
         okfail = f"{r['ok']}/{r['ban'] + r['err']}"
+        _lat = latency_map.get(r.get("node", "-"), "—")
+        _lat_style = "不可达" if _lat == "不可达" else _lat
         print(f"{_pad(r['tag'], 18)} {_pad(r['carrier'], 5)} "
               f"{_pad(r['colo'], 4)} {_pad(r['loc'], 8)} "
               f"{_pad(_pct(r['success_rate']), 6, False)} "
               f"{_pad(_pct(r['ban_rate']), 5, False)} "
               f"{_pad(okfail, 7, False)} "
-              f"{_pad(_pct(r['colo_ban_rate']), 9, False)} "
               f"{_pad(_seg_label(r), _SEG_W, False)} "
-              f"{_pad(_fp_label(r), 8)} "
               f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
-              f"{r['node']}  {' '.join(flags)}")
+              f"{_pad(_lat_style, 7, False)} "
+              f"{' '.join(flags)}")
     print("-" * (_w(head) + 40))
     tot = sum(r["samples"] for r in rows)
     ok = sum(r["ok"] for r in rows)
