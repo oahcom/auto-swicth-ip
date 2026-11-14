@@ -993,7 +993,7 @@ def _measure_latency(node: str) -> str:
             return "不可达"
         # TCP 连接测速
         s = socket.socket(socket.AF_INET6 if ':' in addr else socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1.0)
+        s.settimeout(2.0)
         t0 = _t.monotonic()
         try:
             s.connect((addr, port))
@@ -1012,11 +1012,11 @@ def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
     from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FTError
     import time as _t
     result = {}
-    deadline = _t.monotonic() + 3.0  # 全局 3s 上限
+    deadline = _t.monotonic() + 4.0  # 全局 3s 上限
     with ThreadPoolExecutor(max_workers=200) as pool:
         futs = {pool.submit(_measure_latency, n): n for n in set(nodes) if n and n != "-"}
         try:
-            for f in as_completed(futs, timeout=3.0):
+            for f in as_completed(futs, timeout=4.0):
                 n = futs[f]
                 try:
                     result[n] = f.result(timeout=0.1)
