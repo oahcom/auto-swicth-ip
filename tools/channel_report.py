@@ -3,7 +3,7 @@
 
 **只读**本机台账，不测量、不写任何运行状态：
 
-    .warp_line_state.json     每条线的模型层实测样本 [(ts, verdict)]、锁定、重启数
+    .warp_line_state.json     每条线的模型层实测样本 [(ts, verdict)]、锁定
     .warp_ip_history.jsonl    出口 IP 换线历史 → 按 colo 现算窗口内 ban 率
     .warp/block-map.json      节点 → colo / 类别 / 出口 IP
     .warp/warp_wg_state.json  WG 线当前绑定的节点
@@ -1297,7 +1297,6 @@ def print_table(rows: list[dict], hours: float) -> None:
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
             f"{_pad('/32,/48,/64,/128', _SEG_W, False)} "
             f"{_pad('单ip服务', 12, False)} "
-            f"{_pad('重启', 6, False)}  "
             f"{_pad('订阅', 8)} {_pad('节点名', 30)} {_pad('入口延迟', 7, False)} {_pad('隧道延迟', 7, False)} 状态")
     print(head)
     print("-" * (_w(head) + 40))
@@ -1408,7 +1407,6 @@ def print_table(rows: list[dict], hours: float) -> None:
               f"{_pad(okfail, 7, False)} "
               f"{_pad(_seg_label(r), _SEG_W, False)} "
               f"{_pad(_ip_svc_label(r), 12, False)} "
-              f"{_pad(str(r['restarts']), 6, False)}  "
               f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
               f"{_pad(_lat_entry_style, 7, False)} {_pad(_lat_tunnel_style, 7, False)} "
               f"{state}{_note}")
@@ -1517,7 +1515,7 @@ footer{{color:var(--muted);font-size:11px;margin-top:14px;line-height:1.7}}
 <th>ban 率</th><th>成功/失败</th><th>colo ban</th>
 <th title="v6 出口段四级个数：/32 / /48 / /64 / /128（悬停看 /32 批次）。/128 与 /64 并肩看才分得清「地址挤在同一段」和「摊在各个段」。v4 另计">出口段 /32·/48·/64·/128</th>
 <th title="段指纹反推的落地机房。≠ 表示与声明的 colo 不同（WG 线经机场节点中转时是常态）">落点</th>
-<th>重启</th><th>状态</th>
+<th>状态</th>
 </tr></thead><tbody>{rows}</tbody></table></div>
 <div class="legend">
 <span><i class="dot" style="background:{good}"></i>成功率 ≥90% / ban ≤10%</span>
@@ -1608,7 +1606,6 @@ def render_html(rows: list[dict], hours: float, out: Path) -> None:
             f'{html.escape(" ".join(p for p, *_ in _seg32_groups(r)))}">'
             f'{html.escape(_seg_label(r))}</td>'
             f'<td class="mono dim">{html.escape(_fp_label(r))}</td>'
-            f'<td class="mono dim">{r["restarts"]}</td>'
             f'<td>{" ".join(pills)}</td></tr>')
 
     out.write_text(_TMPL.format(
