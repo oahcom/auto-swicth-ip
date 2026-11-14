@@ -6217,7 +6217,12 @@ def _warp_line_record_observation(tag: str, ip: str | None, verdict: str,
             # 地址、每次都判 quota），日志写「连续 2457 次取不到出口地址」，
             # 与事实相反 —— 真故障反而被这堆噪声埋掉。
             if verdict == "unknown":
-                st["fail_streak"] = int(st.get("fail_streak") or 0) + 1
+                _prev_fail = int(st.get("fail_streak") or 0)
+                st["fail_streak"] = _prev_fail + 1
+                # unknown 卡住超过 30min（约 10 次连续 unknown），加压推进重启
+                # 判据。中间态不允许持久存在（2026-11-15 用户）。
+                if _prev_fail >= 10:
+                    st["fail_streak"] = _prev_fail + 3  # 加速触发 _probe_one_line 重启
             else:
                 # `port_closed` 也不进 fail_streak：那是进程没了（systemd 的活），
                 # 不是「线不健康」。单元被删后仍留在 members 的线（实测

@@ -540,7 +540,9 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
     `segments` 是 `channel_segments()` 的结果；不传就留空（单测与离线调用
     不必依赖 daemon.log）。"""
     now = time.time() if now is None else now
-    cutoff = max(now - hours * 3600, _day_start(now))
+    # 数据窗口：至少覆盖整个配额日（昨天08:00->今天08:00）。
+    # hours 太小时（如4h）会把凌晨数据裁掉导致"数据少"。
+    cutoff = max(now - hours * 3600, _day_start(now), now - 24 * 3600)
     urls = sub_url_map()
     idx = source_index(sources)
     colos = colo_ban_rates(hours * 3600, now)
