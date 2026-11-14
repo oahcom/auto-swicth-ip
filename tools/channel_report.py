@@ -652,20 +652,8 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "now": now,
             "window_from": cutoff,
         })
-    def _status_pri(r):
-        if not r.get("unit_ok", True):
-            return 4  # 单元停用
-        if r.get("no_addr_since") and not r["samples"]:
-            return 3  # 隧道中断
-        if r["samples"]:
-            v = (r.get("last_verdict") or "").lower()
-            if v == "ok":
-                return 0  # OK
-            if v in ("quota", "flagged"):
-                return 1  # quota
-            return 2  # 中间态
-        return 3  # 无样本 -> 视同隧道问题
-    rows.sort(key=lambda r: (_status_pri(r), -(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or ""))
+    # 排序移到 print_table（状态算完后再排）—— 判据与显示一致
+    rows.sort(key=lambda r: (-(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or ""))
     return rows
 
 
@@ -1021,16 +1009,26 @@ def _measure_latency(node: str) -> str:
 
 def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
     """批量测速（ThreadPool 并发，1s 超时）→ {node: latency_str}。"""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FTError
+    import time as _t
     result = {}
+    deadline = _t.monotonic() + 3.0  # 全局 3s 上限
     with ThreadPoolExecutor(max_workers=200) as pool:
         futs = {pool.submit(_measure_latency, n): n for n in set(nodes) if n and n != "-"}
-        for f in as_completed(futs):
-            n = futs[f]
-            try:
-                result[n] = f.result()
-            except Exception:
-                result[n] = "不可达"
+        try:
+            for f in as_completed(futs, timeout=3.0):
+                n = futs[f]
+                try:
+                    result[n] = f.result(timeout=0.1)
+                except Exception:
+                    result[n] = "不可达"
+        except (FTError, TimeoutError):
+            pass  # 超时的 future 留空
+        finally:
+            for f, n in futs.items():
+                if n not in result:
+                    result[n] = "不可达" if not f.done() else "—"
+                    f.cancel()
     for n in nodes:
         if n not in result:
             result[n] = "—"
@@ -1060,6 +1058,39 @@ def _load_slot_health() -> dict:
         return {}
 
 
+def _display_state(r: dict, slot_health: dict, latency_map: dict) -> tuple:
+    """计算显示状态 + 排序优先级。返回 (state_str, sort_pri)。
+    sort_pri: OK=0, quota=1, 中间态=2, 隧道中断=3, 单元停用=4"""
+    if not r.get("unit_ok", True):
+        return ("单元停用", 4)
+    if r["held"]:
+        return ("封禁", 1)
+    if r["quota_until"] > time.time():
+        return ("quota", 1)
+    _sh = slot_health.get(r["tag"])
+    if _sh and _sh["status"] == "ok":
+        _v = r['last_verdict']
+        if _v == "blocked":
+            _ban = float(r.get('quota_until', 0) or 0)
+            _v = "OK" if _ban <= time.time() else "quota"
+        if _v not in ("OK", "quota", "flagged"):
+            _v = "待验" if _v in ("unknown", "") else _v
+        pri = 0 if _v == "OK" else (1 if _v in ("quota", "flagged") else 2)
+        return (_v, pri)
+    if r["no_addr_since"] and not r["samples"]:
+        return ("隧道中断", 3)
+    if r.get("egress_error") and not r["samples"]:
+        return ("隧道中断", 3)
+    if r["samples"]:
+        _v = r['last_verdict']
+        if _v == "blocked":
+            _ban = float(r.get('quota_until', 0) or 0)
+            _v = "OK" if _ban <= time.time() else "quota"
+        pri = 0 if _v == "OK" else (1 if _v in ("quota", "flagged") else 2)
+        return (_v, pri)
+    return ("不在探测名单", 3)
+
+
 def print_table(rows: list[dict], hours: float) -> None:
     if not rows:
         print("（没有渠道数据）")
@@ -1071,8 +1102,13 @@ def print_table(rows: list[dict], hours: float) -> None:
     # 批量测入口延迟（并发 TCP connect）
     latency_map = _measure_latency_batch([r.get("node", "-") for r in rows])
     slot_health = _load_slot_health()
-    # 稳定排序：延迟不可达排最后（同组内保持原有顺序）
-    rows.sort(key=lambda r: 1 if latency_map.get(r.get("node", "-")) == "不可达" else 0)
+    # 排序：状态优先级最高 -> 成功率 -> colo -> 订阅 -> 节点名
+    # 延迟不可达排最后（同组内保持原有顺序）
+    def _sort_key(r):
+        _s, _pri = _display_state(r, slot_health, latency_map)
+        _lat_bad = 1 if latency_map.get(r.get("node", "-")) == "不可达" else 0
+        return (_pri, _lat_bad, -(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or "")
+    rows.sort(key=_sort_key)
     head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
             f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
