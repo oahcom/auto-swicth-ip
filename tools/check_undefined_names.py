@@ -25,6 +25,18 @@ from pathlib import Path
 BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__", 
                            "__package__", "__spec__", "__loader__"}
 
+# PEP 649（Python 3.14）延迟注解产生的编译器内部名字。symtable 把它们当
+# 全局/自由引用报出来，但它们不是用户代码里的名字——报出来就是误杀。
+# 实测 97/zeus 的 Python 3.14.4 会报 __classdict__ x5 + __conditional_annotations__
+# x1，导致 h2-install.sh 拒绝安装全部 usque-h2 单元（2026-11-14 诊断）。
+PEP649_INTERNALS = {
+    "__annotate__",
+    "__classdict__",
+    "__conditional_annotations__",
+    "__annotations_cache__",
+    "__extra_annotations__",
+}
+
 
 def _collect(table: symtable.SymbolTable, path: str,
              out: list[tuple[str, str]]) -> None:
@@ -41,7 +53,7 @@ def _collect(table: symtable.SymbolTable, path: str,
     for sym in table.get_symbols():
         if not (sym.is_global() or sym.is_free()):
             continue
-        if sym.get_name() in BUILTINS:
+        if sym.get_name() in BUILTINS or sym.get_name() in PEP649_INTERNALS:
             continue
         out.append((path, sym.get_name()))
 
@@ -72,7 +84,7 @@ def check_file(path: Path) -> list[tuple[str, str]]:
                  or s.is_namespace()}
         for sym in table.get_symbols():
             name = sym.get_name()
-            if name in BUILTINS or name in module_defined or name in local:
+            if name in BUILTINS or name in PEP649_INTERNALS or name in module_defined or name in local:
                 continue
             if name in outer_defined:
                 continue

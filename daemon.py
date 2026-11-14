@@ -52,13 +52,29 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from config import CFG, NODE_INFO_DB, OPENCODE_FREE_PROVIDER, RECENT_WINDOW, REJECT_WINDOW, TRANSPORT_LOOKBACK_SEC, BAD_NODES_TTL, BAD_NODES_MAX_TTL, MIXED_PORT, LOG_FORMAT, get_singbox_secret, consumer_slots, consumer_slot_config_path
 from asip.atomic_io import append_line as _atomic_append_line
 from asip.atomic_io import write_json as _atomic_write_json
-from asip.atomic_io import update_json as _atomic_update_json
 from asip.atomic_io import write_text as _atomic_write_text
 from asip.clash_client import ClashClient
 from asip.egress import TRACE_URL, probe_egress
 from asip import ledger_policy
 from asip import config_projection
 from asip.redact import redact_secrets as _redact_secrets
+# 4a 告警窄接口：事件流水 + 可插拔 sink。模块自身不 import daemon/config，
+# 这里只做接线（写盘失败钩子、启动期 configure）。
+from asip import alerting as _alerting
+from asip import health as _health
+# `.bad_nodes.json` 的唯一写口（daemon 与 cron 两侧语义是参数，不是两份代码）
+from asip.state_store import writers as _state_writers
+# 状态库双写/对账/管理面（影子阶段只搬运，不含判据）
+from asip.state_store import bridge as _state_bridge
+from asip.state_store import schema as _state_schema
+from asip.state_store import mgmt as _state_mgmt
+
+# 状态库句柄的**早绑定占位**：库真要打开是在 alerting 配置之后（见下方
+# `_STATE_STORE = _state_bridge.open_store(CFG)`），但写路径函数在更早的行里，
+# 模块导入期若有人调用它们会拿到 None 而不是 NameError —— 语义上「还没有库」
+# 本来就是 None 的意思。
+_STATE_STORE = None
+_STATE_SHADOW = None
 # opencode 专属闸口（kind="opencode"）：rotate 与槽位产出全部委托该模块，
 # daemon 只做 /rotate-opencode-gate 的接线与「非 WARP 线槽位」分类跳过。
 from asip import opencode_gate
@@ -174,6 +190,10 @@ def _save_node_ip_used() -> None:
         snapshot = {ip: ts for ip, ts in _NODE_IP_USED.items()
                     if now - ts < max(keep, 86400)}
         _write_json_atomic(_node_ip_used_path(), snapshot)
+        # 影子双写：在锁内做，镜像与 JSON 是同一份快照；库写失败只告警。
+        _state_bridge.mirror_rows(
+            _STATE_STORE, _state_schema.KIND_NODE_IP_USED, snapshot,
+            alert=_alerting)
 
 
 def _record_node_ip_used(ip: str | None, ts: float | None = None) -> None:
@@ -609,6 +629,12 @@ def _write_json_atomic(path: str, payload: dict) -> None:
         _atomic_write_json(path, payload, mode=0o600)
     except Exception as e:
         log(f"✗ 写 {os.path.basename(path)} 失败: {e}")
+        # 4a：写盘失败从「只进滚动日志」升级为告警 + 事件流水。原作用不变
+        # （仍吞异常：台账写失败不该掀翻调用链），只是把「已停更」这件事
+        # 送到独立出口 —— 磁盘满时 daemon.log 自己也写不进去，日志先滚失
+        # 就再也查不到「哪本台账从什么时候开始停在旧值」。
+        _alerting.notify_write_failure(path, e,
+                                       source="daemon._write_json_atomic")
 
 
 def _record_udp_bad_node(node: str, now: float) -> None:
@@ -636,6 +662,7 @@ def _save_warp_ip_used() -> None:
     `_LEDGER_ALLOW_EMPTY_WRITE` 供清理逻辑显式放行一次写空（R-6/D-3）。
     """
     global _LEDGER_ALLOW_EMPTY_WRITE
+    allow_empty = bool(_LEDGER_ALLOW_EMPTY_WRITE)
     path = _warp_ip_used_path()
     if not _WARP_IP_USED and not _LEDGER_ALLOW_EMPTY_WRITE:
         try:
@@ -652,6 +679,12 @@ def _save_warp_ip_used() -> None:
             pass
     _LEDGER_ALLOW_EMPTY_WRITE = False
     _write_json_atomic(path, {"used": _WARP_IP_USED})
+    # 影子双写（T2b）：JSON 成功后尽力镜像；库拒写只上报不改变上面的落盘。
+    # allow_empty 必须跟着原标志走 —— 清理路径显式放行的「写空」，库侧也要
+    # 放行，否则清理永远只清 JSON、库越积越多，差异恒非零。
+    _state_bridge.mirror_rows(
+        _STATE_STORE, _state_schema.KIND_IP_USED, _WARP_IP_USED,
+        allow_empty=allow_empty, alert=_alerting)
 
 
 _SEGMENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -667,6 +700,9 @@ def _save_segment_start(ts: float) -> None:
     try:
         _write_json_atomic(_segment_path(),
                            {"ts": float(ts), "ip": _ACTIVE_WARP_IP})
+        _state_bridge.mirror_doc(_STATE_STORE, _state_schema.KIND_SEGMENT,
+                                 {"ts": float(ts),
+                                  "ip": _ACTIVE_WARP_IP}, alert=_alerting)
     except Exception as e:
         log(f"✗ 段起点落盘失败: {e}")
 
@@ -1260,8 +1296,8 @@ def _probe_ok_recent(ip: str | None, now: float, window_sec: float) -> bool:
     """该地址是否在 window_sec 内被探针判过 OK（D1 的 line_ok 早退判据）。
 
     只认地址级 OK 且只要「新近」：transport 报障后若探针刚说 OK，换下去的
-    多半是好线（实测 88.7% 会回来服务）。窗口默认 30s —— 再长就会把「探针
-    OK 后线才坏」的真故障也放行。查两张表（_WARP_PROBE_SEEN 与换线前实测的
+    多半是好线（实测 88.7% 会回来服务）。窗口默认 1800s（对齐
+    probe_ok_ttl_sec，旧默认 30s 已废止；真故障由二击出局兜底）。查两张表（_WARP_PROBE_SEEN 与换线前实测的
     _PROBE_BEFORE_ROTATE），与 _probe_verdict_for_ip 同源。
     """
     if not ip:
@@ -1591,10 +1627,11 @@ class _BoundedPool:
     随订阅增长（实测 2026-11-03 已到 122 个）。队列深度按 worker 数推导时，
     122 个任务打 120 个名额，启动那一秒固定丢 2 个，节点延迟表就缺两条。
     """
-    __slots__ = ('_executor', '_sem', '_name')
+    __slots__ = ('_executor', '_sem', '_name', '_capacity')
     def __init__(self, max_workers: int, name_prefix: str, queue: int | None = None):
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=name_prefix)
-        self._sem = threading.Semaphore(queue if queue is not None else max_workers * 2)
+        self._capacity = queue if queue is not None else max_workers * 2
+        self._sem = threading.Semaphore(self._capacity)
         self._name = name_prefix
     def submit(self, fn, /, *args, **kwargs):
         # 非阻塞获取：队列满时返回 None 而非阻塞事件循环
@@ -1604,6 +1641,17 @@ class _BoundedPool:
         f = self._executor.submit(fn, *args, **kwargs)
         f.add_done_callback(lambda _: self._sem.release())
         return f
+    def stats(self) -> dict:
+        """健康端点用的队列快照。depth = 已占用名额（排队 + 在跑）。
+
+        直接读 Semaphore 的 `_value`（当前可用数）而不另设计数器：多一个
+        计数器就多一处会与真实许可分叉的状态，而「队列满已在丢任务」正是
+        健康面要报的那件事。
+        """
+        available = int(getattr(self._sem, "_value", 0))
+        return {"capacity": self._capacity,
+                "depth": self._capacity - available,
+                "available": available}
     def shutdown(self, wait=True):
         self._executor.shutdown(wait=wait)
 
@@ -1886,6 +1934,41 @@ def log_health(msg: str):
         return
     _LAST_HEALTH_LOG = now
     log(msg)
+
+# 4a 告警接线：只有 systemd 拉起的进程才建流水（沿用 `_side_effects_off`
+# 的既有口径：pytest / 手工 import 一律不落生产文件）。log_sink 复用现成
+# `log()`，告警仍进 daemon.log/journald；事件流水承担「日志滚失后仍可查」。
+# 通道选型未定时这就是可用形态：健康端点 + 日志告警 + 可后插的 webhook。
+if not _side_effects_off() and CFG.get("alert_event_file"):
+    _alerting.configure(
+        journal_path=CFG["alert_event_file"],
+        log_sink=log,
+        webhook_url=CFG.get("alert_webhook_url") or None,
+    )
+
+# 状态库接线（P3/T2b 影子阶段）。顺序在 alerting 之后：库这块的失败要能
+# 走告警通道报出去。`open_store` 在 shadow 关 / 库不存在时返回 None ——
+# 上线默认零行为变化；库由迁移器建，daemon 自己从不建库（否则 schema 版本
+# 变成「谁先启动谁定」）。
+_STATE_STORE = _state_bridge.open_store(CFG)
+_STATE_SHADOW = None
+if _STATE_STORE is not None:
+    _STATE_SHADOW = _state_bridge.make_runner(
+        _STATE_STORE, lambda: _state_snapshot_for_shadow(),
+        alert=_alerting,
+        interval_sec=float((CFG.get("state_store") or {}).get(
+            "shadow_interval_sec") or 300))
+    # 事件流水入表：与 JSONL 并存不冲突（p6a 的 EventJournal 语义保留为
+    # 失败回退）。先落流水再扇出的顺序由 alerting.Dispatcher 保证。
+    if (CFG.get("state_store") or {}).get("journal_enabled"):
+        try:
+            _alerting.configure(
+                journal=_STATE_STORE,
+                log_sink=log,
+                webhook_url=CFG.get("alert_webhook_url") or None,
+            )
+        except Exception as _e:      # 流水接不上不影响告警本身
+            log(f"· 事件流水接库失败（仍走 JSONL）: {_e}")
 
 # ============= 9router 监控 =============
 
@@ -4190,12 +4273,28 @@ def _save_warp_line_state(force: bool = False) -> None:
                 if isinstance(old_lines, dict) and len(old_lines) > len(payload["lines"]):
                     log(f"  ⚠ 拒绝覆盖状态表 {path}：盘上 {len(old_lines)} 条 > "
                         f"内存 {len(payload['lines'])} 条（疑似状态表未加载就落盘）")
+                    # 4a：拒绝覆盖是「脏值/未加载就落盘」的实证。以前只有一行
+                    # 日志，滚掉后没人知道这台机器的台账当时差点被抹平。
+                    _alerting.emit(
+                        _alerting.CATEGORY_LEDGER_ANOMALY,
+                        f"拒绝覆盖状态表 {os.path.basename(path)}："
+                        f"盘上 {len(old_lines)} 条 > 内存 {len(payload['lines'])} 条",
+                        severity=_alerting.SEVERITY_ERROR,
+                        key=f"ledger_shrink:{path}",
+                        source="daemon._save_warp_line_state",
+                        path=path, on_disk=len(old_lines),
+                        in_memory=len(payload["lines"]))
                     return
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
             pass
     _write_json_atomic(path, payload)
+    # 影子双写：payload["lines"] 与 JSON 同一份快照。库侧同样过缩水护栏
+    # （INV-SHRINK），所以这里不会出现「JSON 拒写、库却写进去」的劈叉。
+    _state_bridge.mirror_rows(
+        _STATE_STORE, _state_schema.KIND_LINE_STATE, payload["lines"],
+        alert=_alerting)
 
 
 def _load_warp_line_state() -> None:
@@ -4300,6 +4399,20 @@ def _channel_ban_hold_secs(now: float) -> float:
     return reset - now
 
 
+def _quota_day(ts: float) -> float:
+    """配额日起点（08:00→次日 08:00）。返回该 ts 所属配额日的起始时刻。
+
+    WHY 08:00 不是 00:00：上游配额按 08:00 重置（channel_ban_reset_hour=8），
+    判据窗口必须跟配额日对齐。用自然日零点会把凌晨 0-8 点的数据错误地
+    归到前一天（2026-11-14 用户："chan 判断的数据应该是当天八点到次日八点"）。
+    """
+    lt = time.localtime(ts)
+    start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 8, 0, 0, 0, 0, -1))
+    if ts < start:
+        start -= 86400
+    return start
+
+
 def _channel_ban_trim(samples: list, now: float) -> list:
     """只留当天样本；同结论相邻样本合并成段（保留最新）。纯函数。
 
@@ -4320,7 +4433,7 @@ def _channel_ban_trim(samples: list, now: float) -> list:
     `for t, v in samples` 抛 TypeError，进程退出、systemd 10s 后拉起、同一个
     文件再崩一次，死循环。执行顺序：先判元素形状，再解包。
     """
-    day = time.localtime(now)[:3]
+    day = _quota_day(now)  # 配额日 08:00→次日 08:00（2026-11-14 #41）
     runs: list[list] = []
     for e in samples:
         if not isinstance(e, (list, tuple)) or len(e) < 2:
@@ -4337,7 +4450,7 @@ def _channel_ban_trim(samples: list, now: float) -> list:
             start = end = float(e[0])
             count = 1
             verdict = str(e[1])
-        if time.localtime(start)[:3] != day or time.localtime(end)[:3] != day:
+        if _quota_day(start) != day or _quota_day(end) != day:
             continue
         if runs and runs[-1][3] == verdict:
             runs[-1][1] = end
@@ -5074,8 +5187,8 @@ def _rehome_one(tag: str, node: str | None) -> str:
 # 是独立进程（`refresh_main_outbounds` 起子进程），只改 daemon 的
 # `CFG["warp"]["members"]` 它看不见，出口根本发不出去；而且 daemon 重启
 # 一次补位渠道就凭空消失，08:00 也就无从撤销。
-_BACKFILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              ".warp", "backfill.json")
+_BACKFILL_FILE = os.environ.get("ASIP_BACKFILL_FILE_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".warp", "backfill.json")
 
 
 def _backfill_rows() -> list[dict]:
@@ -6386,22 +6499,13 @@ def _warp_line_restart(member: dict, reason: str,
             return False
     if not rebound and _night_block_restart(tag, reason, now):
         return False
-    # 排空闸（2026-11-11）：刚被换下的线必须按字节流事实判空才允许回收。
-    # 放在额度/夜间/渠道锁之后（策略层拒绝优先于排空），warming=True 之前
-    # （拒绝时绝不置 warming，否则这条线会被所有探测路径永久跳过）。不放
-    # 进 CV 锁：闸内 _lines_in_use / _warp_line_stats 在启动窗口含 HTTP。
-    allow, note = _drain_gate(member, now, reason)
-    if not allow:
-        try:
-            with _WARP_LINE_CV:
-                _warp_line_state_locked(tag)["next_probe_ts"] = (
-                    now + float(_warp().get("drain_poll_sec", 5)))
-        except Exception:
-            pass
-        if now - _NIGHT_LOG_TS.get("drain:" + tag, 0.0) > 300.0:
-            _NIGHT_LOG_TS["drain:" + tag] = now
-            log("  · %s 暂不回收：%s（%s）" % (tag, note, reason))
-        return False
+    # 策略闸先行（附件 B4：策略拒绝优先于排空）：渠道锁/重启额度/档位三道
+    # 策略判据必须在排空闸**之前**求值。旧落位把排空闸插在夜间锁之后、渠道锁
+    # 之前，于是「渠道锁定中」的线先被排空闸判空 —— 放行即清 `_RETIRED_AT` /
+    # `_DRAIN_PENDING`，紧接着渠道锁拒绝，下一轮再走「台账洞」分支重起表，
+    # 连接非零时刷假「无退役记录」警告（2026-11-14 18:03 WARP-H2-LAX-175
+    # 实测，与「日志假事件污染账本」同族）。判据只读状态表，可在锁内一次求值；
+    # warming 置位仍留在排空闸之后的锁内 —— 拒绝路径绝不置位（附件 A9）。
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
         if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
@@ -6429,6 +6533,29 @@ def _warp_line_restart(member: dict, reason: str,
             if now - _NIGHT_LOG_TS.get("tier:" + tag, 0.0) > 300.0:
                 _NIGHT_LOG_TS["tier:" + tag] = now
                 log(f"  · {tag} 档位停用中，跳过重启（{reason}）")
+            return False
+    # 排空闸（2026-11-11）：刚被换下的线必须按字节流事实判空才允许回收。
+    # 放在策略层（夜间/渠道锁/额度/档位）之后 —— 策略拒绝优先于排空，被策略
+    # 拒掉的线不该先走一遍排空：那会清掉 `_RETIRED_AT`/`_DRAIN_PENDING`，留下
+    # 「已排空却没重启」的假象。也不放进 CV 锁：闸内 _lines_in_use /
+    # _warp_line_stats 在启动窗口含 HTTP。
+    allow, note = _drain_gate(member, now, reason)
+    if not allow:
+        try:
+            with _WARP_LINE_CV:
+                _warp_line_state_locked(tag)["next_probe_ts"] = (
+                    now + float(_warp().get("drain_poll_sec", 5)))
+        except Exception:
+            pass
+        if now - _NIGHT_LOG_TS.get("drain:" + tag, 0.0) > 300.0:
+            _NIGHT_LOG_TS["drain:" + tag] = now
+            log("  · %s 暂不回收：%s（%s）" % (tag, note, reason))
+        return False
+    # warming 置位必须在全部闸门放行之后（附件 A9/B3）：排空闸要按字节流事实
+    # 判空，可能跨秒；期间另一线程可能已认领这条线。锁内复核一次再置位。
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
             return False
         st["warming"] = True
     got_slot = False
@@ -7661,11 +7788,18 @@ def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, int, 
 
     四档（对应「按使用来区分」）：
       0. 从未出现过 —— 最优，必然没被 opencode 见过；
-      1. **探针刚验过 OK** —— 空跑实测此刻确实能服务。排在「撑过生产流量」
-         之前：探测器每条线都在跑，这个结论是**此刻**的；而 `last_ok_ts` 只由
-         当前出口挣得、且每次重启清零，它奖励的是「一直没被换下」而不是
-         「现在还能用」。档内按「距上次探针 OK 的时长」排，**越新越优先** ——
-         刚刷出来的 OK 说明这个地址这一刻还没被烧，压着它是等它过期；
+      1. **最近一次探针判过 OK** —— 且此后没被生产流量标脏（标脏即进惩罚期，
+         由调用方先筛掉）。本函数**不校验探针结论的年龄**：TTL 判据在
+         `_probe_ok_recent`（窗口 `probe_ok_ttl_sec`，默认 1800s），那是「要不要
+         为这条线早退/复用」的判断，不是选线分档。实测 2026-11-14 18:00 台账
+         36372 条里 3045 条带 `probe_ok_ts`，其中 96% 已超 30min TTL（中位
+         463min），所以这一档的真实语义是「有过探针成功证据、且此刻不在惩罚
+         期」，**不是**「此刻实测能服务」。陈不陈旧只影响档内次序（`now -
+         probe_ok`，越新越优先），不影响跨档胜负。档内只认 probe 时刻、不取
+         `last_ok_ts` 的更晚时刻：双证据条目仅 150 条（141 条生产证据更晚），
+         占可竞争池 0.5%，不动它以保持右栏「档 1 压档 2」的档内次序可预期。
+         排在档 2 之前：`last_ok_ts` 只由当前出口挣得、每次重启清零，它奖励的
+         是「一直没被换下」而不是「现在还能用」；
       2. 次级优质 —— **真的撑过生产流量**，且已过对应的惩罚期（403 六小时 /
          429 默认六十秒；解析到精确 Retry-After/body/message 时以 ban_until
          为准，上限 24h）。过了惩罚期的 IP 可以复用，不是废址；档内同样越新
@@ -7686,7 +7820,19 @@ def _warp_ip_rank(ip: str | None, now: float, window: float) -> tuple[int, int, 
     probe_ok = entry.get("probe_ok_ts") if isinstance(entry, dict) else None
     if probe_ok:
         # 越新越优先：取正，调用方用 min()，刚验出来的 OK 排序值最小。
-        return (1, hot, now - float(probe_ok))
+        #
+        # 档内「最新成功证据」取 max(probe_ok, last_ok)：探针结论会陈旧，生产
+        # 成功不会（前者只在探测轮次写、后者由真实流量打点）。实测 2026-11-14
+        # 18:00 的 150 条双证据条目里 141 条 `last_ok_ts` 比 `probe_ok_ts` 更新
+        # （probe 年龄中位 1099min，last_ok 中位 1093min 但分布更靠后），只拿
+        # probe 排序会把「6 分钟前还在承载流量」的地址按 18 小时前的探针结论
+        # 排到「从没服务过、只是刚被探针验过」的地址后面 —— 越新越优先的语义
+        # 反了。跨档胜负不变（档 1 仍压档 2，右栏保真）。
+        best = float(probe_ok)
+        ok_now = entry.get("last_ok_ts") if isinstance(entry, dict) else None
+        if ok_now:
+            best = max(best, float(ok_now))
+        return (1, hot, now - best)
     ok = entry.get("last_ok_ts") if isinstance(entry, dict) else None
     if ok:
         # 同样越新越优先。
@@ -8337,9 +8483,8 @@ def _dormant_probe_attempt_ts() -> float:
 
 def _mark_dormant_probe_attempt() -> None:
     try:
-        with open(os.path.join(_PROJECT, _DORMANT_PROBE_ATTEMPT_FILE),
-                  "w", encoding="utf-8") as f:
-            f.write(str(time.time()))
+        _atomic_write_text(os.path.join(_PROJECT, _DORMANT_PROBE_ATTEMPT_FILE),
+                           str(time.time()))
     except OSError:
         pass
 
@@ -8425,13 +8570,13 @@ def _maybe_run_dormant_probe() -> None:
             # 但日志只留了最后 4 行，首条故障原因、实例什么时候垮的
             # 全都查不到 —— 只报告摘要等于把证据丢掉。
             try:
-                with open(os.path.join(_PROJECT, _DORMANT_PROBE_LOG_FILE),
-                          "w", encoding="utf-8") as f:
-                    f.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                            f"exit={r.returncode}\n")
-                    f.write(r.stdout or "")
-                    if r.stderr:
-                        f.write("\n--- stderr ---\n" + r.stderr)
+                body = (f"# {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                        f"exit={r.returncode}\n")
+                body += r.stdout or ""
+                if r.stderr:
+                    body += "\n--- stderr ---\n" + r.stderr
+                _atomic_write_text(
+                    os.path.join(_PROJECT, _DORMANT_PROBE_LOG_FILE), body)
             except OSError:
                 pass
             tail = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()][-4:]
@@ -10482,25 +10627,23 @@ def _export_dead_nodes_locked(total_count: int = 0):
             log("  ⚠ Clash API 不通或节点数为 0，跳过 bad_nodes 导出（保留已标记状态）")
             return
 
-        # 防全误判：死节点超过总节点 60% 时跳过导出
+        # 防全误判：死节点超过总节点 70%（1-_POOL_MIN_RATIO）时跳过导出
         if len(_DEAD_NODES) > total_count * (1 - _POOL_MIN_RATIO):
-            log(f"  ⚠ 跳过 bad_nodes 导出: {len(_DEAD_NODES)}/{total_count} 死节点 >60%")
+            log(f"  ⚠ 跳过 bad_nodes 导出: {len(_DEAD_NODES)}/{total_count} 死节点 >70%")
             return
-
-        def _merge(shared):
-            if not isinstance(shared, dict):
-                shared = {}
-            # 只追加 daemon 发现的死节点，不覆盖 proxy-global/cron 已有的条目
-            for n in _DEAD_NODES:
-                if n not in shared:
-                    shared[n] = {"expire": _DEAD_NODES_RELEASE_TS.get(n, _now_ts() + BAD_NODES_TTL),
-                                 "reason": "daemon_dead"}
-            return shared
 
         # 与 self_evolve_checkpoint 共用同一把 flock：两边都做 read-modify-write，
         # 无锁并发会互相覆盖（cron 刚写进的坏节点被 daemon 的旧快照抹掉）。
-        _atomic_update_json(_BAD_NODES_FILE, _merge, default={},
-                            lock_path=_BAD_NODES_FILE + ".lock")
+        # 收编到 writers：锁路径与 merge 语义各有唯一实现 —— 以前两侧靠
+        # 「`.with_suffix()` 恰好拼出同一路径」保持一致，那是约定不是机制。
+        _state_writers.update_bad_nodes(
+            _BAD_NODES_FILE,
+            _DEAD_NODES,
+            expire_of=lambda n: _DEAD_NODES_RELEASE_TS.get(
+                n, _now_ts() + BAD_NODES_TTL),
+            reason="daemon_dead",
+            overwrite=False,
+        )
     except Exception:
         pass  # 写失败不影响主逻辑
 
@@ -11290,19 +11433,13 @@ def _record_pool_sample(pool: int) -> None:
     if _side_effects_off():
         return                      # 测试/审查/手工跑不往线上基线里塞样本
     try:
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_pool_history_path()),
-                                   prefix=".pool_history.", suffix=".tmp")
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump({"samples": samples[-2000:]}, f)
-            os.replace(tmp, _pool_history_path())
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        # 手写 mkstemp 收编到 atomic_io：临时名唯一、fsync、0600、失败清理
+        # 全在一处实现。原实现只差 fsync —— 掉电后 rename 可能引用未落盘的
+        # inode，池基线会回退到更旧的窗口，护栏按旧基线放行。
+        _atomic_write_json(_pool_history_path(), {"samples": samples[-2000:]})
+        _state_bridge.mirror_doc(_STATE_STORE,
+                                 _state_schema.KIND_POOL_HISTORY,
+                                 {"samples": samples[-2000:]}, alert=_alerting)
     except OSError as e:
         log(f"⚠ 护栏样本写不进去（{e}），基线会一直用旧窗口")
 
@@ -12670,10 +12807,12 @@ def _persist_api_stats() -> None:
     try:
         snap = dict(_api_stats)
         snap["persisted_at"] = time.time()
-        tmp = _API_STATS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snap, f)
-        os.replace(tmp, _API_STATS_FILE)
+        # 收编到 atomic_io：唯一临时名 + fsync。原实现用固定 `.tmp`，两个
+        # 线程（周期快照 / atexit 补写）同时落盘会写进同一个临时文件，
+        # 交错出的 JSON 被 replace 后就是一份坏台账。
+        _atomic_write_json(_API_STATS_FILE, snap)
+        _state_bridge.mirror_doc(_STATE_STORE, _state_schema.KIND_API_STATS,
+                                 snap, alert=_alerting)
     except Exception as e:
         log(f"· _api_stats 落盘失败（忽略）: {e}")
 
@@ -12756,10 +12895,11 @@ def _persist_ledger_shadow() -> None:
     try:
         snap = dict(_LEDGER_SHADOW)
         snap["persisted_at"] = time.time()
-        tmp = _LEDGER_SHADOW_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snap, f)
-        os.replace(tmp, _LEDGER_SHADOW_FILE)
+        # 收编理由同 `_persist_api_stats`：固定 `.tmp` 名在并发落盘时会交错。
+        _atomic_write_json(_LEDGER_SHADOW_FILE, snap)
+        _state_bridge.mirror_doc(_STATE_STORE,
+                                 _state_schema.KIND_LEDGER_SHADOW,
+                                 snap, alert=_alerting)
     except Exception as e:
         log(f"· 影子统计落盘失败（忽略）: {e}")
 
@@ -14815,6 +14955,169 @@ def _api_debug_state() -> dict:
         ],
     }
 
+def _state_snapshot_for_shadow() -> dict:
+    """影子对账的内存快照：**只读**，形状与 `Store.snapshot()` 一致。
+
+    每个 kind 都取「下一次落盘会写成什么」，而不是「库现在有什么」—— 差异
+    才等于「投影有没有忠实反映内存」。取不到的 kind 直接不出现：`ShadowRunner`
+    跳过缺失 kind，避免把「这条线本来就没启用」报成差异。
+    """
+    snap: dict = {}
+    try:
+        with _WARP_IP_LOCK:
+            snap[_state_schema.KIND_IP_USED] = {
+                str(k): dict(v) if isinstance(v, dict) else v
+                for k, v in _WARP_IP_USED.items()}
+    except Exception:
+        pass
+    try:
+        with _WARP_LINE_CV:
+            snap[_state_schema.KIND_LINE_STATE] = {
+                t: dict(s) for t, s in _WARP_LINE_STATE.items()}
+    except Exception:
+        pass
+    try:
+        with _NODE_IP_LOCK:
+            snap[_state_schema.KIND_NODE_IP_USED] = dict(_NODE_IP_USED)
+    except Exception:
+        pass
+    try:
+        snap[_state_schema.KIND_API_STATS] = dict(_api_stats)
+    except Exception:
+        pass
+    try:
+        snap[_state_schema.KIND_LEDGER_SHADOW] = dict(_LEDGER_SHADOW)
+    except Exception:
+        pass
+    try:
+        snap[_state_schema.KIND_POOL_HISTORY] = {
+            "samples": _read_pool_history()}
+    except Exception:
+        pass
+    return snap
+
+
+def _api_health_snapshot() -> dict:
+    """管理面健康快照（4a 契约；字段口径在 asip/health）。
+
+    为什么和 /debug/state 分开：debug 是「全量现场」（给排障的人看），health
+    是「四项判据」（给监控与状态权威管理面轮询）。后者是稳定契约，字段只增
+    不改语义，P3 的「状态快照三件套」直接复用它，不再造第二份汇总。
+
+    判据只收「确定坏」：无活线（或上次换线因错误失败）、队列满（已在丢
+    任务）、台账体积失控。保留期/增长率这类细阈值属 P3 台账生命周期，
+    不在这里发明第二份口径；判不出来就报 None（unknown），不当成好。
+    """
+    now = time.time()
+    err = get_last_egress_error()
+    active_ip = _ACTIVE_WARP_IP
+    if err:
+        health_ok, health_detail = False, "last_egress_error=%s" % err
+    elif active_ip:
+        health_ok, health_detail = True, ""
+    else:
+        # 启动早期还没取到出口地址：不是坏，是「尚未取证」。
+        health_ok, health_detail = None, "active ip not resolved yet"
+
+    try:
+        with _WARP_IP_LOCK:
+            rows = len(_WARP_IP_USED)
+    except Exception:
+        rows = -1
+    try:
+        size = os.path.getsize(_warp_ip_used_path())
+    except OSError:
+        size = -1
+    ledger_cap = 32 * 1024 * 1024
+    ledger_ok = None if size < 0 else size < ledger_cap
+
+    pools = {"health": _health_pool.stats(), "io": _io_pool.stats()}
+    queue_depth = sum(p["depth"] for p in pools.values())
+    queue_ok = all(p["depth"] < p["capacity"] for p in pools.values())
+
+    with _BG_LOCK:
+        inflight = sorted(_BG_BUSY)
+
+    checks = {
+        _health.CHECK_HEALTH: _health.Check(
+            name=_health.CHECK_HEALTH,
+            value={"active_ip": active_ip, "last_egress_error": err},
+            ok=health_ok, ts=now, detail=health_detail),
+        _health.CHECK_LEDGER_HEADROOM: _health.Check(
+            name=_health.CHECK_LEDGER_HEADROOM,
+            value={"file": os.path.basename(_warp_ip_used_path()),
+                   "rows": rows, "bytes": size, "cap_bytes": ledger_cap},
+            ok=ledger_ok, ts=now,
+            detail="" if ledger_ok is not None else "ledger unreadable"),
+        _health.CHECK_QUEUE_DEPTH: _health.Check(
+            name=_health.CHECK_QUEUE_DEPTH,
+            value={"depth": queue_depth, "pools": pools},
+            ok=queue_ok, ts=now),
+        _health.CHECK_INFLIGHT_COMMANDS: _health.Check(
+            name=_health.CHECK_INFLIGHT_COMMANDS,
+            value={"count": len(inflight), "tasks": inflight[:10]},
+            ok=True, ts=now),
+    }
+    return _health.build_health_snapshot(checks, now=now)
+
+
+def _api_state_unban(req: dict) -> dict:
+    """手动解封（走 daemon 写口）。判定在 `asip.state_store.mgmt`，这里只落地。
+
+    WHY 必须回到这个进程里做：`_WARP_IP_USED` 是 daemon 的内存态，运维手改
+    磁盘上的 JSON 之后，下一次 `_save_warp_ip_used()` 会拿内存旧值整表覆盖，
+    白改 —— 而且没留痕，事后查不到谁在什么时候解了哪个地址。所以解封只有
+    一条合法路径：改内存（持 `_WARP_IP_LOCK`）→ 走既有落盘（含空表/缩水护栏）
+    → 写事件流水（谁/何时/为什么）。
+    """
+    ip = str(req.get("ip") or "").strip()
+    if not ip:
+        return {"ok": False, "reason": "缺少 ip"}
+    dry_run = bool(req.get("dry_run"))
+    now = time.time()
+    warp = _warp()
+    ttl = {"abuse403": float(warp.get("blocked_guard_sec") or 21600.0),
+           "rate429": float(warp.get("rate429_guard_sec") or 60.0),
+           "legacy": float(warp.get("blocked_ttl_sec") or 86400.0)}
+    with _WARP_IP_LOCK:
+        entry = _WARP_IP_USED.get(ip)
+        if not isinstance(entry, dict):
+            return {"ok": False, "found": False, "ip": ip,
+                    "reason": "台账里没有这个地址（不在池里，无需解封）"}
+        if not ledger_policy.is_effectively_blocked(
+                entry, now, ttl):
+            return {"ok": False, "found": True, "ip": ip,
+                    "reason": "该地址当前不在惩罚期（未被标记或已过期）"}
+        tf = _state_mgmt.unban_transform(
+            entry, now=now, ttl=ttl,
+            retention_sec=float(warp.get("ledger_retention_sec") or 86400.0))
+        if dry_run:
+            return {"ok": True, "dry_run": True, "ip": ip,
+                    "was_blocked": tf["was_blocked"],
+                    "cleared_fields": tf["cleared_fields"],
+                    "before": {k: tf["before"].get(k) for k in
+                               ("blocked", "blocked_kind", "ban_until",
+                                "expires_at")},
+                    "after": {k: tf["after"].get(k) for k in
+                              ("blocked", "blocked_kind", "ban_until",
+                               "expires_at")}}
+        _WARP_IP_USED[ip] = tf["after"]
+    # 落盘在锁外：与其它写路径同序（先改内存、再整表落），避免锁序交叉。
+    _save_warp_ip_used()
+    audit = {"ip": ip, "actor": str(req.get("actor") or "unknown")[:64],
+             "ts": round(now, 3),
+             "reason": str(req.get("reason") or "(未填写)")[:200],
+             "cleared_fields": tf["cleared_fields"],
+             "expires_at": tf["after"].get("expires_at")}
+    _alerting.emit(_alerting.CATEGORY_LEDGER_ANOMALY,
+                   "手动解封 %s（清理字段：%s）"
+                   % (ip, ",".join(tf["cleared_fields"]) or "无"),
+                   severity=_alerting.SEVERITY_WARNING,
+                   key="manual_unban:" + ip,
+                   source="daemon._api_state_unban", **audit)
+    return {"ok": True, "ip": ip, "cleared_fields": tf["cleared_fields"],
+            "audit": audit}
+
 
 _CLIENT_GONE = {"count": 0, "last_log": 0.0, "last_switched": 0}
 
@@ -15332,6 +15635,14 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         return self.headers.get("X-Asip-Token") == _API_TOKEN
 
     def do_GET(self):
+        if self.path == "/health":
+            # 4a：管理面健康快照（状态权威三件套之一）。与 /slots、/debug/state
+            # 同一 UDS 同一 token —— 监控与 P3 管理面复用同一套鉴权，不新开面。
+            if not self._authed():
+                self._send(401, {"ok": False, "reason": "unauthorized"})
+                return
+            self._send(200, _api_health_snapshot())
+            return
         if self.path == "/slots":
             if not self._authed():
                 self._send(401, {"ok": False, "reason": "unauthorized"})
@@ -15348,6 +15659,25 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         self._send(200, _api_debug_state())
 
     def do_POST(self):
+        if self.path == "/state/unban":
+            # P3 管理面：手动解封（状态权威三件套之一）。判定在
+            # `asip.state_store.mgmt`，落地在本进程（持锁改内存 + 既有落盘 +
+            # 事件流水留痕）。与 /slots、/health 同一 UDS 同一 token。
+            if not self._authed():
+                self._send(401, {"ok": False, "reason": "unauthorized"})
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n > 0 else b"{}"
+                req = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                req = {}
+            try:
+                out = _api_state_unban(req if isinstance(req, dict) else {})
+            except Exception as e:
+                out = {"ok": False, "reason": "%s: %s" % (type(e).__name__, e)}
+            self._send(200 if out.get("ok") else 409, out)
+            return
         if self.path == "/refresh-sub":
             # 订阅源刚被改过（`asip sub add`）时用它立刻生效。后台线程跑：
             # 刷新要拉 4~5 个源 + 重启 sing-box，十几秒起步，阻塞在 HTTP
@@ -16498,6 +16828,13 @@ def main():
             if now - last_ledger_shadow_tick > 60:
                 last_ledger_shadow_tick = now
                 _submit_once("ledger-shadow-tick", _ledger_shadow_tick)
+
+            # ---- 3b5. 状态库影子对账（T2b，内部按 shadow_interval_sec 自限）----
+            # 只读内存态 + 读库 + 落 shadow 表，不动任何落盘路径。库没开时
+            # `_STATE_SHADOW is None`，这一块整体跳过（上线零行为变化）。
+            if _STATE_SHADOW is not None and _STATE_SHADOW.due():
+                _submit_once("state-shadow-tick",
+                             lambda: _STATE_SHADOW.tick())
 
             # ---- 3c0. 双向兜底的反向：停在 proxy 上时池挂了才切回 ----
             # 内部要探测整池健康（最慢 15s），丢后台。

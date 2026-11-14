@@ -82,3 +82,6 @@ deploy/daemon.py.*
 .subject_state.json
 .egress_map.json
 .ledger_shadow.json
+# 4a 告警事件流水（含路径/错误文本，运行态）
+.asip_events.jsonl
+.asip_events.jsonl.*

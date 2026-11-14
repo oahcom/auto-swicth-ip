@@ -17,18 +17,21 @@ import daemon as d
 
 
 @pytest.fixture(autouse=True)
-def _isolate_stats(monkeypatch):
-    """统计全局与落盘路径按用例隔离，避免污染真实文件与后续用例。"""
+def _isolate_stats(monkeypatch, tmp_path):
+    """统计全局与落盘路径按用例隔离，避免污染真实文件与后续用例。
+
+    落点必须是 `tmp_path`（仓外）：写进 `tests/` 会在 `ASIP_TEST_WRITE_GUARD=block`
+    下被判为「测试写穿仓库」。这条用例原本就在往 `tests/.api_stats_test.tmp.json`
+    写 —— 审计钩子上线前没人发现，因为它只污染自己、不影响生产。
+    """
     monkeypatch.setattr(d, "_api_stats",
                         {k: 0 for k in ("calls", "switched", "coalesced",
                                         "retired", "too_frequent",
                                         "no_standby")})
     monkeypatch.setattr(d, "_API_STATS_BASELINE", {})
-    tmp_file = Path(__file__).parent / ".api_stats_test.tmp.json"
+    tmp_file = tmp_path / ".api_stats_test.json"
     monkeypatch.setattr(d, "_API_STATS_FILE", str(tmp_file))
     yield
-    if tmp_file.exists():
-        tmp_file.unlink()
 
 
 def test_merge_accumulates_missing_and_new_keys():

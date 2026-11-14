@@ -281,7 +281,14 @@ def device_holders(unit_dir: str | Path = "/etc/systemd/system") -> dict[str, li
             continue
         for line in svc.read_text(errors="ignore").splitlines():
             if line.startswith("WorkingDirectory="):
-                dev = Path(line.split("=", 1)[1].strip()).name
+                wd = Path(line.split("=", 1)[1].strip())
+                # 只把 .warp/ 下的设备目录算作「持有设备」。项目根目录
+                # （如 /home/administrator/auto-swicth-ip）不是设备目录——
+                # daemon 和 sing-box 入站的 WorkingDirectory 都是项目根，
+                # 旧逻辑把项目根名当设备名，误报「设备争用」（2026-11-14）。
+                if ".warp" not in wd.parts:
+                    continue
+                dev = wd.name
                 holders.setdefault(dev, []).append(svc.name)
     return holders
 

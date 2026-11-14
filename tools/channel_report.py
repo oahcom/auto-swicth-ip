@@ -400,8 +400,16 @@ def load_channels() -> dict[str, dict]:
 
 
 def _day_start(now: float) -> float:
+    """配额日起点（08:00→次日 08:00），与 daemon._quota_day 同口径。
+
+    WHY 08:00：上游配额按 08:00 重置，报表窗口必须跟配额日对齐。
+    自然日零点会把凌晨 0-8 点的数据错误归到前一天（2026-11-14 #41）。
+    """
     lt = time.localtime(now)
-    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 8, 0, 0, 0, 0, -1))
+    if now < start:
+        start -= 86400
+    return start
 
 
 def sources_path() -> Path:
@@ -975,8 +983,17 @@ def print_table(rows: list[dict], hours: float) -> None:
             if not r["samples"]:
                 flags.append(_no_sample_reason(r))
             else:
-                flags.append(f"{r['last_verdict']}（旧地址）" if r["verdict_stale"]
-                             else r["last_verdict"])
+                # blocked ≠ 节点不可用（2026-11-14）：拆「限流惩罚中」/
+                # 「已解禁·旗标残留」，并加判定时间戳。
+                _v = r['last_verdict']
+                if _v == "blocked":
+                    if r["quota_until"] > time.time() or r.get("held"):
+                        _v = f"限流惩罚中(至{_fmt_ts(max(r.get('quota_until',0), r.get('hold_until',0)))})"
+                    else:
+                        _v = "已解禁·旗标残留"
+                _ts = _fmt_ts(float(r.get("last_probe_ts") or 0)) if r.get("last_probe_ts") else "?"
+                flags.append(f"{_v}（旧地址·{_ts}判）" if r["verdict_stale"]
+                             else f"{_v}（{_ts}判）")
         okfail = f"{r['ok']}/{r['ban'] + r['err']}"
         print(f"{_pad(r['tag'], 18)} {_pad(r['carrier'], 5)} "
               f"{_pad(r['colo'], 4)} {_pad(r['loc'], 8)} "

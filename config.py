@@ -990,6 +990,14 @@ CFG = {
     "gate_log_file": _env_path("ASIP_GATE_LOG_FILE",
                                os.path.join(PROJECT_DIR, "gate.log")),
     "gate_log_mirror": _env_bool("ASIP_GATE_LOG_MIRROR", False),
+    # 4a 告警事件流水：独立 JSONL（P3 状态权威落 SQLite 事件表前的过渡落点）。
+    # 为什么不复用 daemon.log：5MB×5 轮转，磁盘满/告警风暴时最先滚掉的恰恰
+    # 是因果；滚动日志可以丢，事件流水不能。
+    "alert_event_file": _env_path("ASIP_ALERT_EVENT_FILE",
+                                  os.path.join(PROJECT_DIR, ".asip_events.jsonl")),
+    # 外发通道（可选）。留空=只落流水 + daemon.log；webhook 是参考实现，
+    # 邮件/IM 走 asip.alerting.AlertSink 后插拔，不改配置结构。
+    "alert_webhook_url": os.environ.get("ASIP_ALERT_WEBHOOK_URL") or "",
     "log_format": "%Y-%m-%d %H:%M:%S",
 }
 
@@ -1101,6 +1109,27 @@ def _append_backfill_members(cfg: dict) -> None:
             continue
 
 _append_backfill_members(CFG)
+
+# ============= 状态权威（P3） =============
+# 库必须落 Linux 本地盘：WAL 的共享内存与文件锁在 9p（/mnt/c）/网络挂载上
+# 不可靠，写进去等于把回滚点建在流沙上。state_store 打开时会自查 /proc/mounts
+# 并在远端文件系统上直接拒开（见 asip/state_store/store.py 的 StoreError）。
+# 路径按 PROJECT_DIR 推导、不写死家目录：换用户/换机器直接失效（与
+# api.socket_path 踩过的同一个坑同名同因）。
+CFG["state_store"] = {
+    "db_path": _env_path("ASIP_STATE_DB",
+                         os.path.join(PROJECT_DIR, "run", "state.sqlite3")),
+    # 影子对账（双写 + 周期 diff + 差异告警）。默认关闭：上线即零行为变化，
+    # 要开必须显式打开并观察一个窗口 —— 差异=0 是切读门槛（T2c），不是默认态。
+    "shadow": _env_bool("ASIP_STATE_SHADOW", False),
+    "shadow_interval_sec": 300,
+    # 事件流水进库（alerting.configure(journal=<Store>)）。关闭时仍走 JSONL，
+    # 即 p6a 已交付的 EventJournal —— 关这个键不会丢告警。
+    "journal_enabled": _env_bool("ASIP_STATE_JOURNAL", True),
+    # 台账保留上限（健康面 ledger_headroom 判据）。超限报 degraded 而不自动删：
+    # 清理走后台低优先车道，且不得与 /rotate 抢 IO（阶段 2 硬约束）。
+    "ledger_headroom_cap_bytes": 32 * 1024 * 1024,
+}
 
 # ============= 便捷常量 =============
 # ponytail: SINGBOX_SECRET 不在此导出为模块级常量——CFG["singbox"]["secret"] 是 import 时冻结的

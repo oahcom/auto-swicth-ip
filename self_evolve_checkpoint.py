@@ -18,7 +18,7 @@ from pathlib import Path
 from collections import Counter
 
 from asip import proc
-from asip.atomic_io import update_json, write_json
+from asip.atomic_io import write_json
 from asip.clash_client import ClashClient
 
 STATE_FILE = Path(__file__).parent / ".monitor_state.json"
@@ -43,22 +43,23 @@ def _write_bad_nodes(bad: dict) -> None:
 
     格式与 daemon 完全一致：{node: {"expire": now+TTL, "reason": "egress_error_rate"}}。
     daemon 的 cleanup_dead_ttl 已读取此文件并受 _POOL_MIN_RATIO 阀门保护，故写入即接入拉黑闭环。
+
+    写口收编到 `asip.state_store.writers`：本侧语义是「覆盖自己归因的条目」
+    （每次归因都是对同一节点的新观测，expire 必须往后推），daemon 侧是
+    「只追加」。以前两侧各写一份 merge + 各自拼锁路径，靠 `.with_suffix()`
+    恰好拼成同一路径保持一致 —— 那是约定不是机制，任一侧改写法锁就分家，
+    事故形态是「cron 刚写进的坏节点被 daemon 旧快照抹掉」。
     """
     now = int(time.time())
-    # read-modify-write 必须串行：两个 cron 轮次同时归因时，后写者会拿旧
-    # 快照覆盖前者刚写入的节点，等于漏拉黑。daemon 只读此文件，所以仅需
-    # 在写入方加锁。
-    lock_path = str(_BAD_NODES_FILE.with_suffix(".json.lock"))
+    from asip.state_store import writers
 
-    def _merge(data):
-        if not isinstance(data, dict):
-            data = {}
-        for node in bad:
-            data[node] = {"expire": now + _BAD_NODES_TTL,
-                          "reason": "egress_error_rate"}
-        return data
-
-    update_json(str(_BAD_NODES_FILE), _merge, default={}, lock_path=lock_path)
+    writers.update_bad_nodes(
+        str(_BAD_NODES_FILE),
+        bad,
+        expire_of=lambda _node: now + _BAD_NODES_TTL,
+        reason="egress_error_rate",
+        overwrite=True,
+    )
 
 # 与 daemon.py 阀门一致：允许 70% 节点拉黑（_POOL_MIN_RATIO=0.3）。
 # 天花板从 Clash API 实时节点数 derivation，防止订阅变更后 65 这类魔表失效。

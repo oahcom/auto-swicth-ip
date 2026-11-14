@@ -245,39 +245,16 @@ case "$UNIT_DIR" in
         ;;
     *) echo "⚠ 单元写入 $UNIT_DIR（非系统级）：跳过 asip-unit/sudoers 安装" >&2 ;;
 esac
-cat > "$UNIT_DIR/auto-switch-ip.service" <<EOF
-[Unit]
-Description=auto-switch-ip daemon — monitor 9router errors + rotate sing-box proxy nodes
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-# 以 administrator 而非 root 运行：config.py 用 pwd.getpwuid(os.getuid()).pw_dir
-# 取家目录，root 会得到 /root，9router 的库、.env、.warp 全部找不到。
-# 代价是重启系统级单元要提权，走 /usr/local/bin/asip-unit（sudoers 白名单）。
-User=$RUN_USER
-Group=$RUN_USER
-ExecStart=$PYBIN $DIR/daemon.py
-WorkingDirectory=$DIR
-Restart=always
-RestartSec=10
-# sing-box 由 daemon 用 Popen(start_new_session=True) 拉起，仍留在本 unit 的 cgroup 里。
-# 默认 KillMode=control-group 会让每次 restart 连带杀掉 sing-box → daemon 置 bypass 直连
-# → opencode 看到本地 IP 直接 403。实测三次重启各触发 ~50-100 条 403。
-KillMode=process
-# 夜间刷新锁按**本地小时**判窗口（daemon._night_active 用 localtime）。
-# 主机时区若被改成 UTC（WSL 重建/容器常见），20:00→08:00 会整体偏移 8h，
-# 变成白天锁、夜里不锁 —— 那正是这套锁要修的事故形态，且只在特定时段可见。
-# 钉死在 Asia/Shanghai 与上游免费层 08:00 配额重置同源。
-Environment=TZ=Asia/Shanghai
-EnvironmentFile=-$DIR/.env
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# ---- 单元文件：渲染收口到 deploy/gen-units.py（单一真相源）----
+# WHY 收口：单元内容曾以 heredoc 写死在本脚本，线上单元被手改后与模板各自
+# 演化（手改 --interval、SINGBOX_SECRET/NINE_ROUTER_PASSWORD 直写、KillMode/TZ
+# 靠 drop-in 补）——「配置双主人」在 unit 层重演。渲染统一走 gen-units.py，
+# 本脚本保留全部护栏（防误覆盖闸、precheck 下发、sudoers、enable/restart）。
+# 单元文本与旧 heredoc 逐字节等价（演练对照见 docs/unit-drift-report-20261114.md）。
+# 成员表经 stdin 传入：与注册用的是同一份 members 输出，不在渲染期二次采样。
+printf '%s\n' "$MEMBERS" | "$PYBIN" "$DIR/deploy/gen-units.py" --write \
+    --unit-dir "$UNIT_DIR" --project-dir "$DIR" --run-user "$RUN_USER" \
+    --pybin "$PYBIN" --members-stdin
 
 # 部署前关卡随单元一起下发。旧版只在本机手工放过 drop-in，远端装完新代码
 # 却没有 ExecStartPre —— 而「直接改工作区文件 + systemctl restart」恰恰是
@@ -297,37 +274,7 @@ else
     exit 1
 fi
 
-cat > "$UNIT_DIR/asi-selfcheck.service" <<EOF
-[Unit]
-Description=auto-switch-ip 自检引擎 — 巡检并写入 .monitor_state.json
-After=multi-user.target
-
-[Service]
-Type=oneshot
-User=$RUN_USER
-Group=$RUN_USER
-ExecStart=$PYBIN $DIR/self_evolve_checkpoint.py
-WorkingDirectory=$DIR
-EnvironmentFile=-$DIR/.env
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > "$UNIT_DIR/asi-selfcheck.timer" <<'EOF'
-[Unit]
-Description=auto-switch-ip 自检定时器 — 每 10 分钟触发 asi-selfcheck.service
-
-[Timer]
-OnCalendar=*:0/10
-Persistent=true
-RandomizedDelaySec=60
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# asi-selfcheck.service / asi-selfcheck.timer 已随上一步由 gen-units.py 一并渲染。
 
 # 单元名必须与 config.py 的 warp.members[].service 一致，否则 daemon 的
 # systemctl restart 会打空。
@@ -336,23 +283,7 @@ while read -r tag port svc dir fam; do
     SERVICES="$SERVICES $svc"
     # fam 原样传给 usque-launch.sh（"-" = 只要 v4），由它在启动时按本机路由决定
     # 实际地址族。不在渲染期定死：同一份单元要在有/没有 IPv6 的网络上都能用。
-    cat > "$UNIT_DIR/$svc" <<EOF
-[Unit]
-Description=Cloudflare WARP (MASQUE) SOCKS5 proxy $tag for auto-switch-ip
-After=network-online.target
-
-[Service]
-Type=simple
-User=$RUN_USER
-Group=$RUN_USER
-WorkingDirectory=$DIR/.warp/$dir
-ExecStart=$DIR/deploy/usque-launch.sh $port $fam
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    # （单元文本由 gen-units.py 渲染，此处只收集单元名供 enable 用。）
 done <<< "$MEMBERS"
 
 # 单元写到哪就 reload 哪：本机生产单元在 /etc（系统级），对空着的用户级目录

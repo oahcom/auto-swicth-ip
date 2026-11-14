@@ -219,8 +219,16 @@ def test_line_worker_dry_run_keeps_legacy_scheduling(monkeypatch):
 
 
 def test_dead_nodes_export_shares_lock_and_keeps_foreign_entries(monkeypatch, tmp_path):
-    """daemon 与 cron 都读改写 .bad_nodes.json，必须共用同一把锁且不覆盖。"""
+    """daemon 与 cron 都读改写 .bad_nodes.json，必须共用同一把锁且不覆盖。
+
+    写口已收编到 `asip.state_store.writers.update_bad_nodes`：锁路径由该模块
+    唯一计算（不再由 daemon 自己拼），语义差异（append-only vs overwrite）是
+    参数。这里钉两件事：daemon 走的是 append-only 语义（不覆盖他方条目），
+    并且锁路径与 cron 侧一致。
+    """
     import json as _json
+
+    from asip.state_store import writers
 
     target = tmp_path / ".bad_nodes.json"
     target.write_text(_json.dumps({"from-cron": {"expire": 999, "reason": "x"}}))
@@ -228,19 +236,26 @@ def test_dead_nodes_export_shares_lock_and_keeps_foreign_entries(monkeypatch, tm
     monkeypatch.setattr(daemon, "_DEAD_NODES", {"from-daemon"})
     monkeypatch.setattr(daemon, "_DEAD_NODES_RELEASE_TS", {})
     monkeypatch.setattr(daemon, "_now_ts", lambda: 1000)
+    monkeypatch.setattr(daemon, "BAD_NODES_TTL", 300)
 
     seen = {}
+    real_update = writers.update_bad_nodes
 
-    def fake_update(path, merge, **kwargs):
+    def spy(path, entries, **kwargs):
         seen["path"] = path
-        seen["lock"] = kwargs.get("lock_path")
-        seen["data"] = merge(_json.loads(target.read_text()))
+        seen["entries"] = set(entries)
+        seen["overwrite"] = kwargs.get("overwrite")
+        return real_update(path, entries, **kwargs)
 
-    monkeypatch.setattr(daemon, "_atomic_update_json", fake_update)
+    monkeypatch.setattr(writers, "update_bad_nodes", spy)
     daemon._export_dead_nodes_locked(10)
+
     assert seen["path"] == str(target)
-    assert seen["lock"] == str(target) + ".lock"
-    assert set(seen["data"]) == {"from-cron", "from-daemon"}
+    assert seen["entries"] == {"from-daemon"}
+    assert seen["overwrite"] is False            # append-only：不抹他方条目
+    assert writers.lock_path_for(str(target)) == str(target) + ".lock"
+    # 真的落了盘，且他方条目保留
+    assert set(_json.loads(target.read_text())) == {"from-cron", "from-daemon"}
 
 
 # ─────────────────────────────────────────────────────────────
