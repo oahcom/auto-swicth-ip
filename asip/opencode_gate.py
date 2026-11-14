@@ -238,6 +238,37 @@ def _normalize_reason(raw) -> str:
 
 # ── 轮换（契约 C1）────────────────────────────────────────────────────
 
+# 选点超时上限：ccs 侧 rotate 客户端 5s 预算，留 ~1s 给 PUT+回读。常态
+# （有新鲜延迟样本）P2C 毫秒级作答；病理场景（daemon 忙锁/连环重探）宁可
+# 退均匀随机也不挂调用方 —— 2026-11-15 03:36 实测：选点无超时把 rotate
+# 挂死 40s+，所有换节点请求全卡在死节点上。
+_PICKER_TIMEOUT_SEC = 4.0
+
+
+def _pick_with_timeout(picker, cur, pool, cooled):
+    """带超时的选点调用 → (值, 是否按时答)。
+
+    超时/异常 → (None, False)，调用方回退均匀随机。被弃线程只做只读
+    探测、daemon=True 随进程退场，无害。超时 ≠ 「不换」：报障轮换场景
+    里留在原节点是最差结果；但 picker 正常答 None（判无可用）仍尊重
+    其判断、不换。
+    """
+    box: dict = {}
+
+    def _run():
+        try:
+            box["v"] = picker(cur, pool, cooled)
+        except Exception:  # noqa: BLE001 — 选点异常不掀翻整个 rotate
+            box["errored"] = True
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(_PICKER_TIMEOUT_SEC)
+    if t.is_alive() or box.get("errored"):
+        return None, False
+    return box.get("v"), True
+
+
 def _rotate_node(slot, cur, picker=None):
     """池内换节点：独立冷却过滤 + 选一个非当前节点；失败返回 None。
 
@@ -247,8 +278,10 @@ def _rotate_node(slot, cur, picker=None):
       - 选点：picker 优先（依赖注入点，daemon 委托传 pick_next_node 的
         P2C + 自适应分数，签名 (current, all_nodes, fail_set) -> str|None，
         冷却中的节点经 fail_set 交出去）；缺省 None 回退均匀随机（单测
-        独立可跑，不依赖 daemon 私有状态）。两条路的返回都必须落在池内
-        候选（非当前、不在冷却中），不然宁可不换；
+        独立可跑，不依赖 daemon 私有状态）。picker 正常回答必须落在池内
+        候选（非当前、不在冷却中），不然宁可不换；picker 超时/异常（4s
+        上限）回退均匀随机 —— 挂死调用方比换到普通候选更糟，留在故障
+        节点是最差结果；
       - 不预检/不延迟择优（那是 daemon 私有状态，模块红线禁止 import）；
       - 换节点 = PUT 自己的 pool selector + 回读验证（不中断在途）；
       - 记账进本模块账本，绝不调 daemon.update_node_info_async。
@@ -259,8 +292,13 @@ def _rotate_node(slot, cur, picker=None):
     elig = [n for n in pool if n != cur and n not in cooled]
     if not elig:
         return None
-    nxt = picker(cur or "", pool, cooled) if picker is not None \
-        else random.choice(elig)
+    if picker is not None:
+        nxt, answered = _pick_with_timeout(picker, cur or "", pool, cooled)
+        if not answered:
+            # 超时/异常兜底：均匀随机（缺省策略）快换，不挂调用方。
+            nxt = random.choice(elig)
+    else:
+        nxt = random.choice(elig)
     if nxt not in elig:
         return None
     c = _client(slot)

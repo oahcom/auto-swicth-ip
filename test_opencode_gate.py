@@ -483,3 +483,52 @@ def test_fault_cools_old_node_but_proactive_does_not(gate_env, monkeypatch):
     assert resp2["switched"] is True
     assert cur not in opencode_gate.snapshot()["cooldown"]   # proactive 不冷
     assert daemon._COOLDOWN_NODES == {}                      # 公共表始终没人写
+
+
+# ── 选点超时兜底（2026-11-15 rotate 挂死 40s 事故）──────────────────
+
+def test_picker_timeout_falls_back_to_uniform_random(gate_env, monkeypatch):
+    """picker 挂死也必须在预算内换节点：超时兜底=均匀随机，不挂调用方。"""
+    _reset_coalesce(monkeypatch, 0)
+    monkeypatch.setattr(opencode_gate, "_PICKER_TIMEOUT_SEC", 0.2)
+
+    def hung_picker(cur, all_nodes, fail_set):
+        time.sleep(30)   # 模拟 daemon 忙锁挂死
+        return "n3"
+
+    t0 = time.time()
+    resp = opencode_gate.handle_rotate(_req(), picker=hung_picker)
+    elapsed = time.time() - t0
+    assert elapsed < 2.0, "超时后必须立即兜底，不许挂死调用方"
+    assert resp["switched"] is True
+    assert resp["switch_to_node"] in ("n2", "n3")
+    assert len(gate_env.world.puts) == 1
+
+
+def test_picker_exception_falls_back_to_uniform_random(gate_env, monkeypatch):
+    """picker 抛异常同超时处理：兜底换节点，不掀翻整个 rotate。"""
+    _reset_coalesce(monkeypatch, 0)
+
+    def boom(cur, all_nodes, fail_set):
+        raise RuntimeError("picker boom")
+
+    resp = opencode_gate.handle_rotate(_req(), picker=boom)
+    assert resp["switched"] is True
+    assert resp["switch_to_node"] in ("n2", "n3")
+
+
+def test_picker_answered_none_respected_no_switch(gate_env, monkeypatch):
+    """picker 正常答 None（判无可用）→ 尊重判断不换（原语义保留）。"""
+    _reset_coalesce(monkeypatch, 0)
+    resp = opencode_gate.handle_rotate(_req(), picker=lambda *a: None)
+    assert resp["switched"] is False
+    assert resp["reason"] == "no_healthy_node"
+    assert gate_env.world.puts == []
+
+
+def test_picker_out_of_elig_refused(gate_env, monkeypatch):
+    """picker 答越界值（当前/冷却中节点）→ 宁可不换（原语义保留）。"""
+    _reset_coalesce(monkeypatch, 0)
+    resp = opencode_gate.handle_rotate(_req(), picker=lambda *a: "n1")
+    assert resp["switched"] is False
+    assert gate_env.world.puts == []
