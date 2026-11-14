@@ -11841,6 +11841,124 @@ _H2SYNC_LAST = 0.0
 _H2SYNC_MIN_GAP = 1800
 
 
+def _reregister_noaddr_devices() -> None:
+    """自动恢复「无地址」线：CF 设备注册过期/被封 → 重注册 + 重启单元。
+
+    WHY：入口可达但 WARP 会话注册失败（usque 日志持续 "SOCKS closed during
+    negotiation"）是设备凭据问题，不是网络问题。重注册 = 重新拿一套
+    WireGuard 密钥注册到 CF。根因明确（>30min 无地址）就该自动恢复，
+    不该等人工介入（2026-11-14 用户指令）。
+    """
+    now = time.time()
+    threshold = 30 * 60  # 30 分钟
+    state_path = os.path.join(_PROJECT, ".warp_line_state.json")
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    lines = state.get("lines", {})
+    if not lines:
+        return
+
+    # 找出无地址超 30 分钟的线
+    victims = []
+    for tag, st in lines.items():
+        if not isinstance(st, dict):
+            continue
+        since = float(st.get("ban_noaddr_since") or 0)
+        if since and (now - since) > threshold:
+            victims.append((tag, st, now - since))
+
+    if not victims:
+        return
+
+    log(f"🔧 自动恢复 {len(victims)} 条无地址线（>30min）")
+
+    # 找 tag → unit name 的映射（与 channel_report._service_of_tag 同逻辑）
+    # 简化：从 /etc/systemd/system 扫 usque-h2-* 单元的 WorkingDirectory
+    # 匹配设备目录，再通过 device config.json 判断是哪条线。
+    # 实际用 tag → unit 的映射更精确，但 daemon 里已有 svc_of 逻辑。
+    # 这里直接按 tag 找 usque-h2-* 单元（tag 里的数字 → unit 序号）。
+    import re as _re
+    proj = _PROJECT
+    usque_bin = os.path.join(proj, ".warp", "usque", "usque")
+
+    for tag, st, age_min in victims:
+        # 从 tag 提取序号（如 WARP-H2-SLC-14 → usque-h2-14）
+        m = _re.search(r'(\d+)$', tag)
+        if not m:
+            continue
+        idx = m.group(1)
+        unit_name = f"usque-h2-{idx}.service"
+
+        # 找设备目录（从单元 WorkingDirectory 或已知设备映射）
+        # 用 systemctl show 拿 WorkingDirectory
+        try:
+            r = subprocess.run(
+                ["systemctl", "show", unit_name, "-p", "WorkingDirectory"],
+                capture_output=True, text=True, timeout=5)
+            wd = r.stdout.strip().split("=", 1)[-1]
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if not wd or not os.path.isdir(wd):
+            continue
+
+        config = os.path.join(wd, "config.json")
+        if not os.path.exists(config):
+            continue
+
+        log(f"  ↻ 重注册 {tag}（无地址 {age_min:.0f}min）→ {wd}")
+
+        # 1. 备份旧配置
+        try:
+            os.rename(config, config + ".bak-" + str(int(now)))
+        except OSError:
+            pass
+
+        # 2. 重新注册
+        try:
+            env = {k: v for k, v in os.environ.items()
+                   if k.lower() not in ("http_proxy", "https_proxy")}
+            r = subprocess.run(
+                ["env", "-u", "http_proxy", "-u", "https_proxy",
+                 "-u", "HTTP_PROXY", "-u", "HTTPS_PROXY",
+                 "./usque", "register", "--accept-tos", f"-n", f"asip-{tag.lower()}"],
+                cwd=wd, capture_output=True, text=True, timeout=60, env=env)
+            if r.returncode != 0:
+                log(f"    ✗ 注册失败: {(r.stderr or '')[:80]}")
+                # 还原旧配置
+                try:
+                    os.rename(config + ".bak-" + str(int(now)), config)
+                except OSError:
+                    pass
+                continue
+            os.chmod(config, 0o600)
+            log(f"    ✓ 注册成功")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"    ✗ 注册异常: {e}")
+            continue
+
+        # 3. 重启 usque 单元
+        try:
+            subprocess.run(["sudo", "-n", "systemctl", "restart", unit_name],
+                           capture_output=True, text=True, timeout=30)
+            log(f"    ✓ {unit_name} 已重启")
+        except (OSError, subprocess.TimeoutExpired):
+            log(f"    ✗ 重启失败")
+
+        # 4. 清除 noaddr 状态
+        st["ban_noaddr_since"] = 0.0
+        st["stop_probe"] = False
+
+    # 写回状态
+    try:
+        with open(state_path, "w") as f:
+            json.dump(state, f, indent=2)
+    except OSError:
+        pass
+
+
 def _run_h2_sync() -> None:
     """块模型里出现新渠道（新 colo / 同 colo 多一条）就自动补线并安装。
 
@@ -11860,6 +11978,11 @@ def _run_h2_sync() -> None:
         if time.time() - _H2SYNC_LAST < _H2SYNC_MIN_GAP:
             return
         _H2SYNC_LAST = time.time()
+    # 先自动恢复「无地址」线（CF 设备注册过期/被封），再补新线
+    try:
+        _reregister_noaddr_devices()
+    except Exception as _e:
+        log(f"  ⚠ 无地址自动恢复异常: {_e}")
     proj = _PROJECT
     render = os.path.join(proj, "deploy", "render_h2_lines.py")
     try:
