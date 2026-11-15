@@ -467,6 +467,20 @@ def test_picker_none_falls_back_to_uniform_random(gate_env, monkeypatch):
     assert len(gate_env.world.puts) == 1
 
 
+def test_other_tenant_node_excluded(gate_env, monkeypatch):
+    """房子模型：9router（slot-7 池闸）正在住的节点，L7 换房时跳过。"""
+    _reset_coalesce(monkeypatch, 0)
+    # 把 9router 池闸当前节点设成 n2（L7 的池里也有它 = 同一间房）
+    for s in gate_env.slots:
+        if s.get("kind") == "proxy":
+            gate_env.world.put_state(s["clash_api_port"], s["pool_selector"],
+                                     "n2", ["n2", "n1", "n3"])
+    resp = opencode_gate.handle_rotate(_req())
+    assert resp["switched"] is True
+    assert resp["switch_to_node"] == "n3"   # n1 是当前、n2 别人在住，只剩 n3
+    assert gate_env.world.puts[0][2] == "n3"
+
+
 def test_fault_cools_old_node_but_proactive_does_not(gate_env, monkeypatch):
     """冷却语义照第七闸口：报障冷却旧节点、proactive 不冷；独立冷却表。"""
     _reset_coalesce(monkeypatch, 0)

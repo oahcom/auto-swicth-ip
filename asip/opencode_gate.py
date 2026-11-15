@@ -269,6 +269,25 @@ def _pick_with_timeout(picker, cur, pool, cooled):
     return box.get("v"), True
 
 
+def _other_tenant_nodes() -> set[str]:
+    """其他租户正在住的池节点（9router 的池闸 slot-7 当前选中节点）。
+
+    房子模型（用户裁决 2026-11-15）：一间房同一时刻只住一户。两个槽位的
+    池选择器共用同一份订阅、各自独立选点，会撞同一间房（同出口 IP 互相
+    打爆额度）——换节点时排除别人正在住的。读失败返回空集：只少一层
+    避让，不阻断轮换。
+    """
+    try:
+        from config import consumer_slots
+        for s in consumer_slots():
+            if s.get("kind") == "proxy":
+                now = _client(s).current(s.get("pool_selector") or "proxy")
+                return {now} if now else set()
+    except Exception:  # noqa: BLE001 — 台账读不到只少一层避让
+        pass
+    return set()
+
+
 def _rotate_node(slot, cur, picker=None):
     """池内换节点：独立冷却过滤 + 选一个非当前节点；失败返回 None。
 
@@ -289,7 +308,10 @@ def _rotate_node(slot, cur, picker=None):
     now = time.time()
     cooled = {n for n, until in _STATE["cooldown"].items() if until > now}
     pool = _pool_candidates(slot)
-    elig = [n for n in pool if n != cur and n not in cooled]
+    # 房源租约（房子模型）：跳过其他租户（9router 池闸）正在住的节点
+    other = _other_tenant_nodes()
+    elig = [n for n in pool
+            if n != cur and n not in cooled and n not in other]
     if not elig:
         return None
     if picker is not None:

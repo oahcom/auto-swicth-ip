@@ -22,23 +22,21 @@
      虚拟主机按它路由）、Connection: close（隧道一请求一连接，重试要新隧道）。
      响应头/体流式原样回传，SSE/chunked 逐块转发（按上游块帧节奏），不整包
      缓冲；Content-Length/块帧都精确消费，支持客户端 keep-alive 复用。
-  2. 统合出口（用户架构 2026-11-15）：第八闸口是其他闸口的统合出口 —— 本进程
-     是 opencode 流量的统一门口，上游出口走 consumer_slots() 里第一台非
-     opencode 闸口（发现失败才回退 DEFAULT_EGRESS_URL），跨请求记住上次成功/
-     换到的闸口（9router 的「当前闸口」语义）。
+  2. 自家房子（用户裁决 2026-11-15 租户模型）：L7 是独立入口，只住自己的
+     槽位（kind=opencode，默认 127.0.0.1:7898），跨请求记住上次出口；9router
+     的房子一概不碰——不同入口的闸口互不冲突。
   3. 判据（只在「尚未向客户端回传任何响应字节」时才换 ok 重试）：
      - 上游响应 429 → reason=rate429；
      - 上游连接失败 / TLS 失败 / 响应头没收全（socket 中途断）→ reason=transport；
      - 其它一切响应（含其它 4xx/5xx）一律透传不干预。
-  4. 换 ok 动作 = 9router 同款 rotate 接口（用户裁决：直接在闸口里调用 rotate
-     的逻辑，按回包把请求指向对应闸口）：POST /rotate（UDS run/rotate.sock +
-     头 X-Asip-Token，token 在 run/api-token），带 egress_proxy_url=本发实际
-     出口。回包 switch_to_url 非空 → 请求改指该闸口（在闸口之间跳）；
-     already_retired / line_ok / too_frequent 等 switched=false → 原地重试
-     （新线已在同一端口就位）。每次请求最多 MAX_ROTATE_RETRIES 次换 ok 重试；
-     再失败把最后一个上游错误透传给客户端（429 原样 / transport 包装 502），
-     日志记 final=no_ok_channel（判「无可用通道」）。换 ok 的「ok」判定 =
-     重试请求成功（请求级验证）。
+  4. 换 ok 动作：统一 rotate 接口 POST /rotate（9router 同款，UDS
+     run/rotate.sock + 头 X-Asip-Token）+ `consumer=l7` 分车道。daemon 按
+     consumer 隔离租户：L7 只能动自己的槽位（越界回 not_my_gate，无任何
+     轮换副作用）。回包 switched=true → 自家池节点已换（switch_to_node），
+     重试仍走同一端口（新节点就位）；already_retired / line_ok / too_frequent
+     / coalesced 等 switched=false → 原地重试。每次请求最多
+     MAX_ROTATE_RETRIES 次重试；再失败把最后一个上游错误透传给客户端
+     （429 原样 / transport 包装 502），日志记 final=no_ok_channel。
   5. 日志：run/opencode-l7.log JSONL 每请求一行——请求流量日志（正常流量
      也记全，换 ok 记录只是其中一个字段，不是主体）：
      {ts, method, path, status, ms, req_bytes, resp_bytes, upstream_via,
@@ -363,20 +361,19 @@ def _read_token() -> str:
 
 
 def _discover_gate_egress() -> str | None:
-    """统合出口首跳：consumer_slots() 里第一台非 opencode 闸口的 URL。
+    """自家房子：consumer_slots() 里 kind=opencode 的第八闸口 URL（默认 7898）。
 
-    第八闸口是其他闸口的统合出口（用户架构）：opencode 流量经其他闸口出，
-    /rotate 按 egress_proxy_url 定位被报闸口、回包 switch_to_url 给出下一台。
-    slot-8 自己的 sing-box 不参与：/rotate 的槽位路径会把它当 WARP 线修整，
-    且 _pick_healthy_slot 只认 status=ok 的常规闸口（池闸健康由各自 keeper
-    维护）。发现失败返回 None，调用方回退 DEFAULT_EGRESS_URL。
+    租户模型（用户裁决 2026-11-15）：L7 是独立入口，只住自己的槽位——上游
+    出口固定是自己的 sing-box，429 时由 /rotate（consumer=l7）在自家池里
+    换节点；9router 的六个 WARP 槽位与池闸一律不碰。发现失败返回 None，
+    调用方回退 DEFAULT_EGRESS_URL。
     """
     try:
         if PROJECT_DIR not in sys.path:
             sys.path.insert(0, PROJECT_DIR)
         from config import consumer_slots
         for s in consumer_slots():
-            if s.get("kind") != "opencode" and s.get("port"):
+            if s.get("kind") == "opencode" and s.get("port"):
                 return "http://127.0.0.1:%d" % int(s["port"])
     except Exception as e:  # noqa: BLE001 — 发现失败只回退常量，不阻断监听
         print("opencode-l7: gate discovery failed: %s" % e, file=sys.stderr)
@@ -766,6 +763,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "reason": fault,
                 "egress_proxy_url": egress,
                 "request_started_at": started,
+                # 租户身份：daemon 按 consumer 分车道，L7 只能动自己的槽位
+                "consumer": "l7",
             }
             if retry_after_ms is not None:
                 rot_req["retry_after_ms"] = retry_after_ms
@@ -776,6 +775,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             rotate_actions.append({
                 "reason": fault, "outcome": outcome,
                 "switched": switched, "switch_to_url": sw_url,
+                # 自家池节点轮换时给出换到了哪个节点（人工排查用）
+                "switch_to_node": (str(resp.get("switch_to_node") or "").strip()
+                                   or None),
             })
             if switched and sw_url:
                 # 在闸口里跳：请求改指回包给出的闸口，并记住它

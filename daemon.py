@@ -13320,6 +13320,26 @@ def _proxy_gate_slot():
     return None
 
 
+# ── 房源租约（用户裁决 2026-11-15 房子模型）──────────────────────────
+# gate 群是开发商建的房子，9router 与 L7 是两个租户，都有资格租任意一间；
+# 同一间同一时刻只归一个租户——别人在住的房子不归你管（/rotate 拒绝）。
+# 缺省归属按槽位类型给：常规槽位与池闸归 9router（它本来就在轮询这些端口），
+# opencode 槽位归 l7。台账在内存里，重启按缺省重建。
+_TENANCY: dict = {}
+_TENANCY_LOCK = threading.Lock()
+
+
+def _tenancy_owner(slot) -> str:
+    """该槽位当前的租户名；首次问询时按类型落缺省租约。"""
+    name = slot["name"]
+    with _TENANCY_LOCK:
+        owner = _TENANCY.get(name)
+        if owner is None:
+            owner = "l7" if slot.get("kind") == "opencode" else "9router"
+            _TENANCY[name] = owner
+        return owner
+
+
 def _pool_selector_name() -> str:
     return CFG["singbox"]["selector"]
 
@@ -15467,6 +15487,21 @@ def _proxy_gate_rotate_node(slot, cur_node, reason):
     if not nodes:
         _slot_mark(name, "bad", "unreachable")
         return None
+    # 房源租约（房子模型）：一间房同一时刻只住一户。跳过 opencode 租户
+    # （slot-8 自己的池选择器）正在住的节点——两个池共用同一份订阅，各自
+    # 独立选点会撞同一间房（同出口 IP 互相打爆额度）。读失败只少一层避让。
+    try:
+        oc = opencode_gate._find_slot()
+        if oc is not None:
+            held = opencode_gate._client(oc).current(
+                oc.get("pool_selector") or "proxy")
+            if held:
+                nodes = [n for n in nodes if n != held]
+    except Exception:
+        pass
+    if not nodes:
+        _slot_mark(name, "bad", "unreachable")
+        return None
     if cur_node and reason not in ("proactive", "dead"):
         # 报障换节点才冷却旧节点；dead 已在 _DEAD_NODES 里，再冷却无意义。
         _cool_down_node(cur_node)
@@ -15965,6 +16000,36 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         # 让 9router 重连到别的端口。不走下面的单主出口逻辑。
         slot = _slot_by_proxy_url(req.get("egress_proxy_url"))
         if slot is not None:
+            # 多入口（租户）隔离（用户裁决 2026-11-15 房子模型）：gate 群是
+            # 开发商建的房子，9router 与 L7 是两个租户，都有资格租任意一间；
+            # 同一间同一时刻只归一个租户，别人在住的房子不归你管（拒绝轮换）。
+            # consumer 缺省 "9router" —— 9router 不带该字段，零改动。缺省
+            # 归属按槽位类型给（常规槽位/池闸→9router，opencode 槽位→l7），
+            # 首次报障时落台账；未来扩容的空槽先到先得（租给首个报它的租户）。
+            consumer = str(req.get("consumer") or "9router").strip().lower()
+            owner = _tenancy_owner(slot)
+            if owner != consumer:
+                log("· /rotate 拒绝：%s 是 %s 在住的房子（%s 报 %s）"
+                    % (slot["name"], owner, consumer, req.get("reason")))
+                self._send(200, {"ok": False, "switched": False, "ms": 0,
+                                 "reason": "occupied_by_other",
+                                 "consumer": consumer, "owner": owner})
+                return
+            if slot.get("kind") == "opencode":
+                # 第八闸口：自家池节点轮换。业务逻辑在 asip/opencode_gate.py
+                # （模块红线），这里只接线——与 /rotate-opencode-gate 同一实现。
+                try:
+                    payload = opencode_gate.handle_rotate(
+                        req,
+                        picker=lambda cur, nodes, fail: pick_next_node(
+                            cur, nodes, fail, count_call=False))
+                except Exception as e:
+                    log(f"✗ /rotate 第八闸口异常: {e}")
+                    self._send(500, {"ok": False, "reason": "internal_error"})
+                    return
+                payload["consumer"] = consumer
+                self._send(200, payload)
+                return
             try:
                 payload = _rotate_slot_once(
                     slot,
@@ -15979,6 +16044,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                 log(f"✗ 槽位 /rotate 异常: {e}")
                 self._send(500, {"ok": False, "reason": "internal_error"})
                 return
+            payload["consumer"] = consumer
             # 信号由 _slot_redirect_payload 给：无健康备槽 -> restart_required，
             # 9router 收到后自行重启重建连接池，等后台把被报槽修好。主链路
             # 不做同步兜底，也不把空出口身份写回调用方。

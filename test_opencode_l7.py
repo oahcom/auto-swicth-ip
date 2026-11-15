@@ -224,7 +224,7 @@ class _RotateHandler(socketserver.BaseRequestHandler):
 
 
 class FakeRotate:
-    """假换 ok 端点：应答脚本化（缺省=真换了但没给 switch_to_url）。"""
+    """假换 ok 端点：应答脚本化（缺省=换到池节点 nX，同端口重试）。"""
 
     DEFAULT = {"ok": True, "switched": True, "reason": "ok",
                "switch_to_node": "nX", "switch_to_url": None}
@@ -265,7 +265,7 @@ class FakeRotate:
 def l7(monkeypatch, tmp_path):
     up = FakeUpstream()
     proxy1 = FakeEgress(up.addr)   # 默认出口（生产=127.0.0.1:7898）
-    proxy2 = FakeEgress(up.addr)   # 换 ok 后的 switch_to_url 出口
+    proxy2 = FakeEgress(up.addr)   # 交叉验证：租户模型下不该被打到
     rot = FakeRotate(tmp_path)
     token_file = tmp_path / "api-token"
     token_file.write_text("tok-abc", encoding="utf-8")
@@ -411,7 +411,7 @@ def test_2xx_sse_chunked_stream_passthrough(l7):
     assert rows[0]["status"] == 200
 
 
-# ── ② 429 → rotate → 换 ok 重试成功（换 ok 语义核心）──────────────────
+# ── ② 429 → rotate（consumer=l7 分车道）→ 自家池换节点重试成功 ──────────
 
 def test_429_rotate_switch_ok_retry_succeeds(l7):
     l7.upstream.set_script(
@@ -423,27 +423,28 @@ def test_429_rotate_switch_ok_retry_succeeds(l7):
          "headers": [("Content-Type", "application/json")],
          "body": b'{"ok":true}'},
     )
+    # 租户模型：第八闸口回包只换自家池节点（switch_to_node），不给 switch_to_url
     l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
-                       "switch_to_node": "n2",
-                       "switch_to_url": l7.proxy2.url})
+                       "switch_to_node": "n2"})
     raw = _raw_request(l7.port, _req())
     status, _, body = _parse(raw)
     assert (status, body) == (200, b'{"ok":true}')
 
-    # rotate 被调且请求体契约字段齐全（reason/egress_proxy_url/…）
+    # rotate 被调且请求体契约字段齐全（consumer/egress_proxy_url/…）
     assert len(l7.rotate.calls) == 1
     call = l7.rotate.calls[0]
     assert call["path"] == "/rotate"
     assert call["token"] == l7.token          # X-Asip-Token 接线
     rb = call["body"]
+    assert rb["consumer"] == "l7"             # 租户身份（分车道）
     assert rb["reason"] == "rate429"
     assert rb["egress_proxy_url"] == l7.proxy1.url
     assert rb["req_id"] and rb["request_started_at"] > 0
     assert rb["retry_after_ms"] == 5000       # Retry-After: 5（秒）→ 毫秒
 
-    # 换 ok 落点：重试走 switch_to_url（proxy2），原出口只被打过一次
-    assert l7.proxy1.targets == ["opencode.ai:443"]
-    assert l7.proxy2.targets == ["opencode.ai:443"]
+    # 换节点后重试仍走自家房子（同一端口）；proxy2 不该被打到
+    assert l7.proxy1.targets == ["opencode.ai:443", "opencode.ai:443"]
+    assert l7.proxy2.targets == []
     # 请求头原样：Authorization 透传到上游，Host 重写为上游域名
     assert l7.upstream.requests[1]["headers"]["authorization"] \
         == "Bearer sk-test"
@@ -453,19 +454,19 @@ def test_429_rotate_switch_ok_retry_succeeds(l7):
     assert len(rows) == 1
     r = rows[0]
     assert r["final"] == "ok" and r["retried"] == 1 and r["status"] == 200
-    assert r["upstream_via"] == l7.proxy2.url
+    assert r["upstream_via"] == l7.proxy1.url
     assert r["rotate_actions"] == [{"reason": "rate429", "outcome": "ok",
-                                    "switched": True,
-                                    "switch_to_url": l7.proxy2.url}]
+                                    "switched": True, "switch_to_url": None,
+                                    "switch_to_node": "n2"}]
 
 
-# ── ②b 换闸后仍 429：第二跳必须报新闸口（在闸口里跳）────────────────────
+# ── ②b 连续 429：两次都报自家房子，节点逐个换（房客换房不碰别人）────────
 
 def test_hop_chain_reports_new_gate_egress(l7):
-    """首次 429 报 proxy1；换到 proxy2 后仍 429，第二跳要报 proxy2。
+    """两次 429 都按本发实际出口（自家房子）报账，节点换了两回。
 
-    统合出口语义（用户架构）：每次 /rotate 都按「本发实际出口」报账，
-    daemon 才能定位被报闸口；报错闸口会把迟到证据记到已换走的线上。
+    租户模型：换节点只在自己槽位里做，egress_proxy_url 恒为自家端口；
+    回包 switch_to_node 给出换到的节点，重试原地进行。
     """
     l7.upstream.set_script(
         {"status": 429, "reason": "Too Many Requests", "headers": [],
@@ -475,27 +476,28 @@ def test_hop_chain_reports_new_gate_egress(l7):
         {"status": 200, "reason": "OK", "headers": [], "body": b"ok3"},
     )
     l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
-                       "switch_to_url": l7.proxy2.url})
+                       "switch_to_node": "n2"})
     l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
-                       "switch_to_url": l7.proxy1.url})
+                       "switch_to_node": "n3"})
     raw = _raw_request(l7.port, _req())
     status, _, body = _parse(raw)
     assert (status, body) == (200, b"ok3")
 
-    # 跳闸链：proxy1(429) → proxy2(429) → proxy1(200)
+    # 三发都在自家房子上；两次 rotate 都报自家端口
     assert len(l7.rotate.calls) == 2
-    assert l7.rotate.calls[0]["path"] == "/rotate"
-    assert l7.rotate.calls[0]["body"]["egress_proxy_url"] == l7.proxy1.url
-    assert l7.rotate.calls[1]["body"]["egress_proxy_url"] == l7.proxy2.url
-    assert l7.proxy1.targets == ["opencode.ai:443", "opencode.ai:443"]
-    assert l7.proxy2.targets == ["opencode.ai:443"]
+    for call in l7.rotate.calls:
+        assert call["path"] == "/rotate"
+        assert call["body"]["consumer"] == "l7"
+        assert call["body"]["egress_proxy_url"] == l7.proxy1.url
+    assert l7.proxy1.targets == ["opencode.ai:443"] * 3
+    assert l7.proxy2.targets == []
 
     rows = _read_log(l7.log_path)
     assert len(rows) == 1
     r = rows[0]
     assert r["final"] == "ok" and r["retried"] == 2
-    assert [a["switch_to_url"] for a in r["rotate_actions"]] == \
-        [l7.proxy2.url, l7.proxy1.url]
+    assert [a["switch_to_node"] for a in r["rotate_actions"]] == ["n2", "n3"]
+    assert [a["switch_to_url"] for a in r["rotate_actions"]] == [None, None]
 
 
 # ── ③ transport 断连 → rotate → 重试成功 ──────────────────────────────
@@ -533,11 +535,9 @@ def test_two_switch_ok_attempts_still_429_no_ok_channel(l7):
          "body": b"err3"},
     )
     l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
-                       "switch_to_node": "n2",
-                       "switch_to_url": l7.proxy2.url})
+                       "switch_to_node": "n2"})
     l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
-                       "switch_to_node": "n3",
-                       "switch_to_url": l7.proxy2.url})
+                       "switch_to_node": "n3"})
     raw = _raw_request(l7.port, _req())
     status, _, body = _parse(raw)
     assert status == 429
