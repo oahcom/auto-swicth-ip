@@ -169,7 +169,7 @@ class FakeEgress:
 
     def __init__(self, upstream_addr):
         self.upstream_addr = upstream_addr
-        self.targets = []          # ["api.opencode.ai:443", ...]
+        self.targets = []          # ["opencode.ai:443", ...]
         self._srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0),
                                                     _ProxyHandler)
         self._srv.daemon_threads = True
@@ -439,12 +439,12 @@ def test_429_rotate_switch_ok_retry_succeeds(l7):
     assert rb["retry_after_ms"] == 5000       # Retry-After: 5（秒）→ 毫秒
 
     # 换 ok 落点：重试走 switch_to_url（proxy2），原出口只被打过一次
-    assert l7.proxy1.targets == ["api.opencode.ai:443"]
-    assert l7.proxy2.targets == ["api.opencode.ai:443"]
+    assert l7.proxy1.targets == ["opencode.ai:443"]
+    assert l7.proxy2.targets == ["opencode.ai:443"]
     # 请求头原样：Authorization 透传到上游，Host 重写为上游域名
     assert l7.upstream.requests[1]["headers"]["authorization"] \
         == "Bearer sk-test"
-    assert l7.upstream.requests[1]["headers"]["host"] == "api.opencode.ai"
+    assert l7.upstream.requests[1]["headers"]["host"] == "opencode.ai"
 
     rows = _read_log(l7.log_path)
     assert len(rows) == 1

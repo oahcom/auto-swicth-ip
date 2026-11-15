@@ -13,17 +13,17 @@
   opencode ──HTTP──▶ 127.0.0.1:7899（本模块）
                      │  HTTP CONNECT 127.0.0.1:7898（slot-8 出口）
                      ▼
-  sing-box(anytls) ──TLS──▶ api.opencode.ai
+  sing-box(anytls) ──TLS──▶ opencode.ai
 
 行为契约：
-  1. 任意方法/路径透明转发 https://api.opencode.ai + 原路径（baseURL 语义：
-     http://127.0.0.1:7899/v1/x → https://api.opencode.ai/v1/x）。请求头/体
+  1. 任意方法/路径透明转发 https://opencode.ai + 原路径（baseURL 语义：
+     http://127.0.0.1:7899/inference/v1/x → https://opencode.ai/inference/v1/x）。请求头/体
      原样（含 Authorization），仅两处重写：Host → 上游域名（反代必需，上游
      虚拟主机按它路由）、Connection: close（隧道一请求一连接，重试要新隧道）。
      响应头/体流式原样回传，SSE/chunked 逐块转发（按上游块帧节奏），不整包
      缓冲；Content-Length/块帧都精确消费，支持客户端 keep-alive 复用。
   2. 上游出口走 slot-8：CONNECT 到 DEFAULT_EGRESS_URL（http://127.0.0.1:7898）
-     再 TLS 到 api.opencode.ai；换 ok 后按 rotate 回包的 switch_to_url 改出口。
+     再 TLS 到 opencode.ai；换 ok 后按 rotate 回包的 switch_to_url 改出口。
   3. 判据（只在「尚未向客户端回传任何响应字节」时才换 ok 重试）：
      - 上游响应 429 → reason=rate429；
      - 上游连接失败 / TLS 失败 / 响应头没收全（socket 中途断）→ reason=transport；
@@ -89,7 +89,10 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LISTEN_HOST = "127.0.0.1"          # 仅本地
 LISTEN_PORT = 7899                 # opencode baseURL 指到 http://127.0.0.1:7899/v1
 
-UPSTREAM_HOST = "api.opencode.ai"  # 透明转发目标（HTTPS）
+UPSTREAM_HOST = "opencode.ai"  # 透明转发目标（HTTPS）——真实免费端点
+#   https://opencode.ai/inference/v1/chat/completions（2026-11-15 实测取证；
+#   历史误填 opencode.ai，根路径只是 Hello world，/v1/* 与 /inference/*
+#   全 404）
 UPSTREAM_PORT = 443
 
 DEFAULT_EGRESS_URL = "http://127.0.0.1:7898"   # slot-8 出口（供 rotate 报告同值）
