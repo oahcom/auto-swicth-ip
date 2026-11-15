@@ -104,8 +104,11 @@ asip — auto-switch-ip 日志与出口诊断
   asip gate 9r [N]     9router 侧切线与重放日志（默认 30 行，-f 跟随）
   asip gate -h         本子命令帮助
 
-第八闸口（opencode 专属闸口 slot-8）
-  asip oc              状态/专属流量日志/轮换账本（asip oc -h 看子命令）
+第八闸口（opencode 专属闸口 slot-8；L7 请求拦截：429 换 ok 渠道透明重试）
+  asip oc              状态/请求流量日志/换线账本（asip oc -h 看子命令）
+  asip oc l7 [N] [-f]  请求流量日志：每请求一行（方法/路径/状态/耗时/流量字节/换 ok）
+                       --fail 只看失败；--rot 只看换过渠道；--raw 原始 JSONL
+  asip oc rot [N]      换线账本：每次 rotate 时间/原因/节点从哪换到哪/结果
   asip oc app [N]      opencode 应用日志（429/错误；能读就读）
 
 诊断
@@ -448,13 +451,15 @@ asip oc — 第八闸口（opencode 专属闸口）日志与状态
   asip oc rot [N]      轮换账本 .opencode_gate_ledger.jsonl（默认 30 行）
   asip oc app [N] [-f] 回看 opencode 应用日志 opencode.log（429/错误/语义事件，
                        连接日志的互补面；默认 50 行；-f 跟随）
-  asip oc l7 [N] [-f]  回看 L7 拦截日志 run/opencode-l7.log（请求级 JSONL：
-                       ts/method/path/status/ms/upstream_via/rotate_actions/
-                       retried/final；默认 200 行；-f 跟随）
+  asip oc l7 [N] [-f]  请求流量日志（L7 拦截层每请求一行：时间/方法/路径/状态/
+                       耗时/流量字节/换 ok 记录/err 摘要；默认 200 行；-f 跟随）
+                       --raw 原始 JSONL；--fail 只看失败（状态≥400 或 final≠ok）；
+                       --rot 只看换过渠道的请求
   asip oc -h           本帮助
 
-  流量日志 = slot-8 专属 sing-box 连接日志：每个出站连接一行（含目标域名）。
-  HTTP 路径级日志 sing-box 给不了，不要按那个粒度找。日志/账本路径由
+  流量日志分两层：asip oc l7 = 请求级流量日志（HTTP 方法/路径/状态/耗时/字节，
+  每请求一行含换 ok 记录）——查请求面看它；asip oc log = slot-8 专属 sing-box
+  连接日志（每个出站连接一行，含目标域名）——查连接/出口看它。日志/账本路径由
   config.CFG["opencode_gate"] 决定（asip/opencode_gate.py 解析），不写死在
   本脚本。应用日志路径 env OPENCODE_LOG 可覆盖；能读就读——缺位/无权限时
   提示「opencode.log 不可读」后以 rc=1 退出，不 traceback、不静默空转。
@@ -642,11 +647,14 @@ cmd_oc() {
         return 1
       fi ;;
     l7|intercept)
-      # [N] 与 -f 可乱序（与 asip oc log 同交互）
-      n=""
+      # [N] 与 -f/--raw/--fail/--rot 可乱序（与 asip oc log 同交互）
+      n=""; follow=0; mode=pretty; filt=all
       for a in "$@"; do
         case "$a" in
           -f|follow) follow=1 ;;
+          --raw) mode=raw ;;
+          --fail) filt=fail ;;
+          --rot|--rotated) filt=rot ;;
           *) n=$a ;;
         esac
       done
@@ -657,11 +665,16 @@ cmd_oc() {
         echo "✗ 解析不到 L7 拦截日志路径（asip/opencode_l7.py LOG_PATH）" >&2
         return 1
       fi
+      # 呈现/过滤在 opencode_l7.py --view（日志契约单一解释点）
       if [ "$follow" = 1 ]; then
-        _follow "" "$n" "$logp"
-      elif ! tail -n "$n" "$logp" 2>/dev/null; then
+        _follow "" "$n" "$logp" \
+          | "$ASIP_PY" "$ASIP_DIR/asip/opencode_l7.py" --view "$mode" "$filt"
+      elif [ ! -r "$logp" ]; then
         echo "✗ 读不到 L7 拦截日志: $logp" >&2
         return 1
+      else
+        tail -n "$n" "$logp" \
+          | "$ASIP_PY" "$ASIP_DIR/asip/opencode_l7.py" --view "$mode" "$filt"
       fi ;;
     st|status|'')
       n=${1:-12}; _gate_num "$n" || return 1

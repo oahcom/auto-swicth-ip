@@ -570,3 +570,96 @@ def test_standalone_import_not_shadowed_by_asip_http():
                        capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
     assert "IMPORT_OK" in r.stdout
+
+
+# ── ⑧ 请求流量字段（req_bytes/resp_bytes/err）────────────────────────
+
+def test_log_includes_traffic_bytes_and_err(l7):
+    l7.upstream.set_script(
+        {"status": 200, "reason": "OK",
+         "headers": [("Content-Type", "text/plain")],
+         "body": b"0123456789"},                    # 响应体 10 字节
+    )
+    raw = _raw_request(l7.port, _req(body=b"hello-world"))   # 请求体 11 字节
+    status, _, body = _parse(raw)
+    assert (status, body) == (200, b"0123456789")
+    rows = _read_log(l7.log_path)
+    r = rows[0]
+    assert r["req_bytes"] == 11
+    assert r["resp_bytes"] == 10
+    assert "err" not in r                          # 正常行无 err
+
+    # 换 ok 耗尽的故障行：err 摘要含上游错误内容
+    l7.upstream.set_script(
+        {"status": 429, "reason": "Too Many Requests", "headers": [],
+         "body": b'{"error":"Free usage limit reached"}'},
+        {"status": 429, "reason": "Too Many Requests", "headers": [],
+         "body": b'{"error":"Free usage limit reached"}'},
+        {"status": 429, "reason": "Too Many Requests", "headers": [],
+         "body": b'{"error":"Free usage limit reached"}'},
+    )
+    l7.rotate.respond({"ok": True, "switched": False,
+                       "reason": "no_healthy_node"})
+    raw = _raw_request(l7.port, _req())
+    status, _, _ = _parse(raw)
+    rows = _read_log(l7.log_path)
+    r = rows[-1]
+    assert r["final"] == "no_ok_channel" and r["status"] == 429
+    assert "Free usage limit" in r["err"]
+
+
+# ── ⑨ 流量视图（asip oc l7 呈现层）─────────────────────────────────────
+
+def _run_view(argv, rows):
+    import io
+    buf_in = io.StringIO(
+        "\n".join(json.dumps(x, ensure_ascii=False) for x in rows))
+    out = io.StringIO()
+    old = sys.stdin, sys.stdout
+    sys.stdin, sys.stdout = buf_in, out
+    try:
+        opencode_l7.view_main(argv)
+    finally:
+        sys.stdin, sys.stdout = old
+    return [l for l in out.getvalue().splitlines() if l]
+
+
+def test_view_main_formats_and_filters():
+    rows = [
+        {"ts": 1794733431.055, "method": "GET", "path": "/v1/models",
+         "status": 404, "ms": 790, "req_bytes": 0, "resp_bytes": 12,
+         "upstream_via": "http://127.0.0.1:7898",
+         "rotate_actions": [], "retried": 0, "final": "ok"},
+        {"ts": 1794733455.442, "method": "POST", "path": "/v1/chat/completions",
+         "status": 200, "ms": 3120, "req_bytes": 536, "resp_bytes": 45056,
+         "upstream_via": "http://127.0.0.1:7898",
+         "rotate_actions": [{"reason": "rate429", "outcome": "ok",
+                             "switched": True}],
+         "retried": 1, "final": "ok"},
+        {"ts": 1794733460.0, "method": "POST", "path": "/v1/chat/completions",
+         "status": 200, "ms": 900, "req_bytes": 6, "resp_bytes": 2,
+         "upstream_via": "http://127.0.0.1:7898",
+         "rotate_actions": [], "retried": 0, "final": "ok"},
+    ]
+    pretty = _run_view([], rows)
+    assert len(pretty) == 3
+    assert "GET" in pretty[0] and "/v1/models" in pretty[0]
+    assert "404" in pretty[0] and "↑0B" in pretty[0] and "↓12B" in pretty[0]
+    assert "×1换ok" in pretty[1] and "[rate429→ok]" in pretty[1]
+    assert "44.0K" in pretty[1]                  # 45056B → 44.0K
+    # 过滤：--rot 只留换过渠道的；--fail 只留失败（404）
+    assert _run_view(["pretty", "rot"], rows) == [pretty[1]]
+    fails = _run_view(["pretty", "fail"], rows)
+    assert len(fails) == 1 and "404" in fails[0]
+    raw = _run_view(["raw"], rows)
+    assert raw[0].lstrip().startswith("{") and '"final"' in raw[0]
+
+
+def test_view_reads_old_rows_without_new_fields():
+    # 旧日志行（req_bytes/resp_bytes/err 之前的 schema）照常可读
+    old_row = {"ts": 1794733431.055, "method": "GET", "path": "/v1/models",
+               "status": 404, "ms": 790,
+               "upstream_via": "http://127.0.0.1:7898",
+               "rotate_actions": [], "retried": 0, "final": "ok"}
+    out = _run_view([], [old_row])
+    assert len(out) == 1 and "404" in out[0] and "GET" in out[0]

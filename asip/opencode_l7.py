@@ -36,8 +36,14 @@
      MAX_ROTATE_RETRIES 次换 ok 重试；再失败把最后一个上游错误透传给客户端
      （429 原样 / transport 包装 502），日志记 final=no_ok_channel（判「无可用
      通道」）。换 ok 的「ok」判定 = 重试请求成功（请求级验证）。
-  5. 日志：run/opencode-l7.log JSONL 每请求一行：
-     {ts, method, path, status, ms, upstream_via, rotate_actions[], retried, final}
+  5. 日志：run/opencode-l7.log JSONL 每请求一行——请求流量日志（正常流量
+     也记全，换 ok 记录只是其中一个字段，不是主体）：
+     {ts, method, path, status, ms, req_bytes, resp_bytes, upstream_via,
+      rotate_actions[], retried, final, err?}
+     req_bytes/resp_bytes = 请求/响应体字节数；err 仅故障行有（≤160 字符：
+     上游错误摘要或收尾说明）。人类可读流量视图 asip oc l7（--raw 原始
+     JSONL，--fail/--rot 过滤），格式化与过滤在本模块 view_main（契约单一
+     解释点）。
      final: ok = 响应完整送达（透传或重试成功）
             no_ok_channel = 换 ok 重试耗尽，透传错误
             stream_broken = 已开始回传后上游断流（不可重试，连接收尾）
@@ -421,6 +427,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
         except OSError:
             pass
+        self._resp_bytes = len(body)
         self.close_connection = True
 
     def _read_req_body(self) -> bytes:
@@ -525,8 +532,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         conn = b"keep-alive" if keep else b"close"
         out = head + b"\r\nConnection: " + conn + b"\r\n\r\n"
 
+        sent = 0
+
         def write(data: bytes) -> None:
+            nonlocal sent
             self.wfile.write(data)
+            sent += len(data)
 
         broken = False
         try:
@@ -544,23 +555,32 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
         except (_TransportFault, OSError):
             broken = True
+        self._resp_bytes = max(0, sent - len(out))   # 只计响应体
+        if broken:
+            self._err_snippet = "stream broken mid-response"
         self.close_connection = not keep or broken
         self._finish_log(t0, status, upstream_via, rotate_actions, retried,
                          "stream_broken" if broken else final)
 
     def _finish_log(self, t0, status, upstream_via, rotate_actions,
                     retried, final) -> None:
-        _log_line({
+        entry = {
             "ts": round(time.time(), 3),
             "method": self.command,
             "path": self.path,
             "status": status,
             "ms": int((time.time() - t0) * 1000),
+            "req_bytes": int(getattr(self, "_req_bytes", 0) or 0),
+            "resp_bytes": int(getattr(self, "_resp_bytes", 0) or 0),
             "upstream_via": upstream_via,
             "rotate_actions": rotate_actions,
             "retried": retried,
             "final": final,
-        })
+        }
+        err = str(getattr(self, "_err_snippet", "") or "")
+        if err:
+            entry["err"] = err
+        _log_line(entry)
 
     # ── 主流程 ───────────────────────────────────────────────────────
 
@@ -571,12 +591,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             req_body = self._read_req_body()
+            self._req_bytes = len(req_body)
         except _BodyTooLarge:
             self._send_simple(413, b"asip-l7: request body too large\n")
             self._finish_log(t0, 413, None, [], 0, "ok")
             return
         except Exception as e:  # noqa: BLE001 — 坏请求不掀翻监听线程
             self._dbg("bad request body: %s" % e)
+            self._err_snippet = "bad request body: %s" % type(e).__name__
             self._send_simple(400, b"asip-l7: bad request\n")
             self._finish_log(t0, 400, None, [], 0, "ok")
             return
@@ -669,6 +691,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if retries >= MAX_ROTATE_RETRIES:
                 if fault == "rate429" and last_429 is not None:
                     sl, hl, hd, body, trunc, via = last_429
+                    self._err_snippet = _err_snippet(body)
                     try:
                         self._relay_head_body(sl, hl, hd, None, body, trunc,
                                               self.command, 429, t0, via,
@@ -678,6 +701,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         self._finish_log(t0, 429, via, rotate_actions,
                                          retries, "stream_broken")
                 else:
+                    self._err_snippet = (
+                        "upstream transport failure (no ok channel after "
+                        "%d retries)" % retries)
                     self._send_simple(
                         502, b"asip-l7: upstream transport failure "
                              b"(no ok channel after %d retries)\n" % retries)
@@ -725,6 +751,87 @@ def _retry_after_ms(headers: dict):
         return None
 
 
+# ── 流量视图（asip oc l7 的呈现层）────────────────────────────────
+
+def _err_snippet(body: bytes, limit: int = 160) -> str:
+    """上游错误体摘要：去不可打印字符、折叠空白，截 limit 字符。"""
+    txt = body.decode("utf-8", "replace")
+    txt = "".join(ch for ch in txt if ch.isprintable() or ch in " \t")
+    return " ".join(txt.split())[:limit]
+
+
+def _fmt_bytes(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "-"
+    if n < 1024:
+        return "%dB" % n
+    if n < 1024 * 1024:
+        return "%.1fK" % (n / 1024.0)
+    return "%.1fM" % (n / 1024.0 / 1024.0)
+
+
+def format_entry(d: dict, mode: str = "pretty") -> str:
+    """JSONL 条目 → 流量视图行。mode: pretty（访问日志风格）| raw（JSONL）。"""
+    if mode == "raw":
+        return json.dumps(d, ensure_ascii=False)
+    st = d.get("status") or 0
+    final = str(d.get("final") or "")
+    ras = d.get("rotate_actions") or []
+    tstr = time.strftime("%H:%M:%S", time.localtime(d.get("ts") or 0))
+    out = "%s  %-6s %-38s %3s %6dms" % (
+        tstr, d.get("method") or "?", str(d.get("path") or "?")[:38],
+        st, int(d.get("ms") or 0))
+    if d.get("req_bytes") is not None or d.get("resp_bytes") is not None:
+        out += "  ↑%s ↓%s" % (_fmt_bytes(d.get("req_bytes") or 0),
+                              _fmt_bytes(d.get("resp_bytes") or 0))
+    if d.get("retried"):
+        out += "  ×%d换ok" % int(d["retried"])
+    if ras:
+        acts = ",".join(
+            "%s→%s" % (a.get("reason") or "?", a.get("outcome") or "?")
+            for a in ras if isinstance(a, dict))
+        out += "  [%s]" % acts
+    if final and final != "ok":
+        out += "  %s" % final
+    err = str(d.get("err") or "")
+    if err:
+        out += "  | %s" % err[:120]
+    return out
+
+
+def view_main(argv: list) -> int:
+    """JSONL stdin → 流量视图 stdout（asip oc l7 的过滤/呈现）。
+
+    argv = [mode, filt]：mode: pretty|raw；filt: all|fail|rot
+    （fail = status≥400 或 final≠ok；rot = 换过渠道的请求）。
+    旧日志行（无 req_bytes/resp_bytes/err）照常可读。"""
+    mode = argv[0] if argv and argv[0] in ("pretty", "raw") else "pretty"
+    filt = argv[1] if len(argv) > 1 and argv[1] in ("all", "fail", "rot") \
+        else "all"
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            if mode == "raw":
+                print(line)
+            continue
+        st = d.get("status") or 0
+        final = str(d.get("final") or "")
+        ras = d.get("rotate_actions") or []
+        if filt == "fail" and not (isinstance(st, int) and st >= 400) \
+                and final == "ok":
+            continue
+        if filt == "rot" and not ras:
+            continue
+        print(format_entry(d, mode))
+    return 0
+
+
 # ── 入口 ──────────────────────────────────────────────────────────────
 
 class _ThreadingServer(http.server.ThreadingHTTPServer):
@@ -753,4 +860,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--view":
+        sys.exit(view_main(sys.argv[2:]))
     main()
