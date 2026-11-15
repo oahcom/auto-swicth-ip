@@ -22,21 +22,20 @@
      虚拟主机按它路由）、Connection: close（隧道一请求一连接，重试要新隧道）。
      响应头/体流式原样回传，SSE/chunked 逐块转发（按上游块帧节奏），不整包
      缓冲；Content-Length/块帧都精确消费，支持客户端 keep-alive 复用。
-  2. 自家房子（用户裁决 2026-11-15 租户模型）：L7 是独立入口，只住自己的
-     槽位（kind=opencode，默认 127.0.0.1:7898），跨请求记住上次出口；9router
-     的房子一概不碰——不同入口的闸口互不冲突。
+  2. 上游出口走 slot-8：CONNECT 到 DEFAULT_EGRESS_URL（http://127.0.0.1:7898）
+     再 TLS 到 opencode.ai；换 ok 后按 rotate 回包的 switch_to_url 改出口。
   3. 判据（只在「尚未向客户端回传任何响应字节」时才换 ok 重试）：
      - 上游响应 429 → reason=rate429；
      - 上游连接失败 / TLS 失败 / 响应头没收全（socket 中途断）→ reason=transport；
      - 其它一切响应（含其它 4xx/5xx）一律透传不干预。
-  4. 换 ok 动作：统一 rotate 接口 POST /rotate（9router 同款，UDS
-     run/rotate.sock + 头 X-Asip-Token）+ `consumer=l7` 分车道。daemon 按
-     consumer 隔离租户：L7 只能动自己的槽位（越界回 not_my_gate，无任何
-     轮换副作用）。回包 switched=true → 自家池节点已换（switch_to_node），
-     重试仍走同一端口（新节点就位）；already_retired / line_ok / too_frequent
-     / coalesced 等 switched=false → 原地重试。每次请求最多
-     MAX_ROTATE_RETRIES 次重试；再失败把最后一个上游错误透传给客户端
-     （429 原样 / transport 包装 502），日志记 final=no_ok_channel。
+  4. 换 ok 动作：POST /rotate-opencode-gate（UDS run/rotate.sock + 头
+     X-Asip-Token，token 在 run/api-token）。响应 switch_to_url 非空 → 用它
+     作重试出口（CONNECT 过它的 host:port）；switch_to_url 空但 switched=true
+     → 重试仍走默认出口（selector 已换到健康节点）；coalesced 等 switched=false
+     → 重试当前通道（探测窗语义，失败照旧计入次数）。每次请求最多
+     MAX_ROTATE_RETRIES 次换 ok 重试；再失败把最后一个上游错误透传给客户端
+     （429 原样 / transport 包装 502），日志记 final=no_ok_channel（判「无可用
+     通道」）。换 ok 的「ok」判定 = 重试请求成功（请求级验证）。
   5. 日志：run/opencode-l7.log JSONL 每请求一行——请求流量日志（正常流量
      也记全，换 ok 记录只是其中一个字段，不是主体）：
      {ts, method, path, status, ms, req_bytes, resp_bytes, upstream_via,
@@ -54,15 +53,13 @@
     cp deploy/asip-opencode-l7.service ~/.config/systemd/user/
     systemctl --user daemon-reload
     systemctl --user enable --now asip-opencode-l7
-  再把 opencode 的 provider baseURL 指到本进程
-  （~/.config/opencode/opencode.jsonc → provider.opencode.options.baseURL =
-  http://127.0.0.1:7899/inference/v1；官方 CLI + 原生模型，指纹由 CLI 自带）。
+  再把 opencode 的 provider baseURL 指到 http://127.0.0.1:7899/v1
+  （~/.config/opencode/opencode.jsonc → provider.oc-native.options.baseURL）。
   run/rotate.sock、run/api-token、run/opencode-l7.log 均按仓库根解析。
 
-纯 stdlib：不 import daemon / asip.*；config 只在发现统合出口首跳时懒 import
-（失败回退常量，不阻断监听）。`python3 asip/opencode_l7.py` 可直跑（systemd
-ExecStart 同款）。模块级常量即配置面，测试 monkeypatch 即可全 loopback 假件
-运行（含 _wrap_tls 这个 TLS 缝）。
+纯 stdlib：不 import daemon / config / asip.*，`python3 asip/opencode_l7.py`
+可直跑（systemd ExecStart 同款）。模块级常量即配置面，测试 monkeypatch 即可
+全 loopback 假件运行（含 _wrap_tls 这个 TLS 缝）。
 """
 import os
 import sys
@@ -98,8 +95,7 @@ UPSTREAM_HOST = "opencode.ai"  # 透明转发目标（HTTPS）——真实免费
 #   全 404）
 UPSTREAM_PORT = 443
 
-DEFAULT_EGRESS_URL = "http://127.0.0.1:7898"   # 首跳兜底（闸口发现失败时）
-PREFERRED_EGRESS = None    # 统合出口当前闸口（跨请求记忆；发现/跳闸后更新）
+DEFAULT_EGRESS_URL = "http://127.0.0.1:7898"   # slot-8 出口（供 rotate 报告同值）
 
 ROTATE_SOCK = os.path.join(PROJECT_DIR, "run", "rotate.sock")
 ROTATE_TOKEN_FILE = os.path.join(PROJECT_DIR, "run", "api-token")
@@ -360,46 +356,8 @@ def _read_token() -> str:
         return ""
 
 
-def _discover_gate_egress() -> str | None:
-    """自家房子：consumer_slots() 里 kind=opencode 的第八闸口 URL（默认 7898）。
-
-    租户模型（用户裁决 2026-11-15）：L7 是独立入口，只住自己的槽位——上游
-    出口固定是自己的 sing-box，429 时由 /rotate（consumer=l7）在自家池里
-    换节点；9router 的六个 WARP 槽位与池闸一律不碰。发现失败返回 None，
-    调用方回退 DEFAULT_EGRESS_URL。
-    """
-    try:
-        if PROJECT_DIR not in sys.path:
-            sys.path.insert(0, PROJECT_DIR)
-        from config import consumer_slots
-        for s in consumer_slots():
-            if s.get("kind") == "opencode" and s.get("port"):
-                return "http://127.0.0.1:%d" % int(s["port"])
-    except Exception as e:  # noqa: BLE001 — 发现失败只回退常量，不阻断监听
-        print("opencode-l7: gate discovery failed: %s" % e, file=sys.stderr)
-    return None
-
-
-def _initial_egress() -> str:
-    """本发请求的首跳出口：跨请求记住的当前闸口，否则发现一次并记住。"""
-    global PREFERRED_EGRESS
-    e = PREFERRED_EGRESS
-    if not e:
-        e = _discover_gate_egress() or DEFAULT_EGRESS_URL
-        PREFERRED_EGRESS = e
-    return e
-
-
-def _remember_egress(url) -> None:
-    """记住当前闸口（换到的/实测成功的出口）：下一条请求直接沿用。"""
-    global PREFERRED_EGRESS
-    u = str(url or "").strip()
-    if u:
-        PREFERRED_EGRESS = u
-
-
 def _call_rotate(payload: dict) -> dict:
-    """POST /rotate（9router 同款换线接口）；失败返回 {"ok": False, ...}（不抛）。
+    """POST /rotate-opencode-gate；失败返回 {"ok": False, "reason": ...}（不抛）。
 
     rotate 侧失败不等于「不换」也不是成功——调用方按 switched=false 处理：
     重试当前通道一次（与 coalesced 同路），失败照旧计入重试次数。
@@ -409,7 +367,7 @@ def _call_rotate(payload: dict) -> dict:
     s.settimeout(ROTATE_TIMEOUT_SEC)
     try:
         s.connect(ROTATE_SOCK)
-        head = ("POST /rotate HTTP/1.1\r\nHost: asip\r\n"
+        head = ("POST /rotate-opencode-gate HTTP/1.1\r\nHost: asip\r\n"
                 "X-Asip-Token: %s\r\nContent-Type: application/json\r\n"
                 "Content-Length: %d\r\nConnection: close\r\n\r\n"
                 % (_read_token(), len(body)))
@@ -651,7 +609,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         up_head = self._build_upstream_head()
         req_id = uuid.uuid4().hex[:16]
         started = time.time()
-        egress = _initial_egress()
+        egress = DEFAULT_EGRESS_URL
         rotate_actions: list = []
         retries = 0
         retry_after_ms = None
@@ -720,8 +678,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
             if live is not None:
                 tun, reader, status_line, status, header_lines, headers = live
-                # 这一发拿到响应头：该闸口可用，记住给下一条请求沿用
-                _remember_egress(egress)
                 try:
                     self._relay_head_body(status_line, header_lines, headers,
                                           reader, None, False,
@@ -763,8 +719,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "reason": fault,
                 "egress_proxy_url": egress,
                 "request_started_at": started,
-                # 租户身份：daemon 按 consumer 分车道，L7 只能动自己的槽位
-                "consumer": "l7",
             }
             if retry_after_ms is not None:
                 rot_req["retry_after_ms"] = retry_after_ms
@@ -775,18 +729,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             rotate_actions.append({
                 "reason": fault, "outcome": outcome,
                 "switched": switched, "switch_to_url": sw_url,
-                # 自家池节点轮换时给出换到了哪个节点（人工排查用）
-                "switch_to_node": (str(resp.get("switch_to_node") or "").strip()
-                                   or None),
             })
             if switched and sw_url:
-                # 在闸口里跳：请求改指回包给出的闸口，并记住它
                 egress = sw_url
-                _remember_egress(egress)
-            # switched=false（already_retired/line_ok/too_frequent/coalesced/
-            # no_healthy_slot/rotate 调用失败）：不换新通道，重试当前通道一次
-            # （探测窗语义）。already_retired 的新线已在同一端口就位，原地
-            # 重试即可命中。
+            elif switched:
+                # 回包没给 url 但 selector 已换：重试仍走默认出口（换 ok 协议）
+                egress = DEFAULT_EGRESS_URL
+            # switched=false（coalesced/no_healthy_node/borrowed_skip/rotate
+            # 调用失败）：不换新通道，重试当前通道一次（探测窗语义）。
             retries += 1
 
     # 方法别名：任意动词都走同一条拦截路径
@@ -903,7 +853,7 @@ def main() -> None:
     print("asip-opencode-l7 listening on http://%s:%d → https://%s:%d "
           "via %s (rotate=%s)"
           % (LISTEN_HOST, srv.server_address[1], UPSTREAM_HOST, UPSTREAM_PORT,
-             _initial_egress(), ROTATE_SOCK), flush=True)
+             DEFAULT_EGRESS_URL, ROTATE_SOCK), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
