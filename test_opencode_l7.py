@@ -18,6 +18,8 @@ import json
 import os
 import socket
 import socketserver
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -549,3 +551,22 @@ def test_non_fault_500_passthrough_no_rotate(l7):
     assert r["final"] == "ok" and r["retried"] == 0
     assert r["rotate_actions"] == []
     assert r["upstream_via"] == l7.proxy1.url
+
+
+# ── 直跑导入回归：asip/http.py 不得遮蔽标准库 http 包 ─────────────────
+
+def test_standalone_import_not_shadowed_by_asip_http():
+    """ExecStart 同款直跑的导入路径回归（2026-11-15 真机 systemd 启动即炸）：
+
+    `python3 asip/opencode_l7.py` 时 sys.path[0]=asip/，仓内 asip/http.py
+    遮蔽标准库 http 包 → `import http.server` 打到在仓模块（连锁 import
+    requests 崩），服务起不来。pytest 从仓库根导入测不出这一层，必须按
+    直跑的 sys.path 语义在子进程里复现。
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(opencode_l7.__file__)))
+    code = ("import sys; sys.path.insert(0, 'asip'); "
+            "import opencode_l7; import http.server; print('IMPORT_OK')")
+    r = subprocess.run([sys.executable, "-c", code], cwd=repo,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "IMPORT_OK" in r.stdout

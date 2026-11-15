@@ -55,16 +55,27 @@
 可直跑（systemd ExecStart 同款）。模块级常量即配置面，测试 monkeypatch 即可
 全 loopback 假件运行（含 _wrap_tls 这个 TLS 缝）。
 """
-import http.server
-import json
 import os
-import socket
-import ssl
 import sys
-import threading
-import time
-import urllib.parse
-import uuid
+
+# 直跑修复（2026-11-15 真机 systemd 启动实测）：`python3 asip/opencode_l7.py`
+# 时 sys.path[0] 是 asip/ 本身，仓内 asip/http.py 会遮蔽标准库 http 包——
+# `import http.server` 打到在仓模块上（再连锁 import requests 崩），服务起不来。
+# 本模块不 import asip.*，把脚本目录摘出搜索路径即可根治；包导入
+# （asip.opencode_l7 / pytest）时 sys.path[0] 不是脚本目录，不受影响。
+if sys.path and os.path.abspath(sys.path[0]) == \
+        os.path.dirname(os.path.abspath(__file__)):
+    sys.path.pop(0)
+
+# 以下 import 必须在路径修正之后：http.server 依赖 stdlib http 包。
+import http.server  # noqa: E402
+import json  # noqa: E402
+import socket  # noqa: E402
+import ssl  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+import urllib.parse  # noqa: E402
+import uuid  # noqa: E402
 
 # ── 配置面（模块级常量；测试 monkeypatch，生产不改）────────────────────
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
