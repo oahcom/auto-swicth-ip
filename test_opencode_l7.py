@@ -183,7 +183,7 @@ class FakeEgress:
         self._srv.server_close()
 
 
-# ── 假 rotate UDS（POST /rotate-opencode-gate，抓请求体/token）──────────
+# ── 假 rotate UDS（POST /rotate，抓请求体/token）────────────────────────
 
 class _ThreadingUnix(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
@@ -272,6 +272,9 @@ def l7(monkeypatch, tmp_path):
     log_path = tmp_path / "opencode-l7.log"
 
     monkeypatch.setattr(opencode_l7, "DEFAULT_EGRESS_URL", proxy1.url)
+    # 统合出口首跳：发现禁用（回退 DEFAULT_EGRESS_URL=proxy1），跨请求记忆复位
+    monkeypatch.setattr(opencode_l7, "_discover_gate_egress", lambda: None)
+    monkeypatch.setattr(opencode_l7, "PREFERRED_EGRESS", None)
     monkeypatch.setattr(opencode_l7, "ROTATE_SOCK", rot.sock_path)
     monkeypatch.setattr(opencode_l7, "ROTATE_TOKEN_FILE", str(token_file))
     monkeypatch.setattr(opencode_l7, "LOG_PATH", str(log_path))
@@ -430,7 +433,7 @@ def test_429_rotate_switch_ok_retry_succeeds(l7):
     # rotate 被调且请求体契约字段齐全（reason/egress_proxy_url/…）
     assert len(l7.rotate.calls) == 1
     call = l7.rotate.calls[0]
-    assert call["path"] == "/rotate-opencode-gate"
+    assert call["path"] == "/rotate"
     assert call["token"] == l7.token          # X-Asip-Token 接线
     rb = call["body"]
     assert rb["reason"] == "rate429"
@@ -454,6 +457,45 @@ def test_429_rotate_switch_ok_retry_succeeds(l7):
     assert r["rotate_actions"] == [{"reason": "rate429", "outcome": "ok",
                                     "switched": True,
                                     "switch_to_url": l7.proxy2.url}]
+
+
+# ── ②b 换闸后仍 429：第二跳必须报新闸口（在闸口里跳）────────────────────
+
+def test_hop_chain_reports_new_gate_egress(l7):
+    """首次 429 报 proxy1；换到 proxy2 后仍 429，第二跳要报 proxy2。
+
+    统合出口语义（用户架构）：每次 /rotate 都按「本发实际出口」报账，
+    daemon 才能定位被报闸口；报错闸口会把迟到证据记到已换走的线上。
+    """
+    l7.upstream.set_script(
+        {"status": 429, "reason": "Too Many Requests", "headers": [],
+         "body": b"err1"},
+        {"status": 429, "reason": "Too Many Requests", "headers": [],
+         "body": b"err2"},
+        {"status": 200, "reason": "OK", "headers": [], "body": b"ok3"},
+    )
+    l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
+                       "switch_to_url": l7.proxy2.url})
+    l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
+                       "switch_to_url": l7.proxy1.url})
+    raw = _raw_request(l7.port, _req())
+    status, _, body = _parse(raw)
+    assert (status, body) == (200, b"ok3")
+
+    # 跳闸链：proxy1(429) → proxy2(429) → proxy1(200)
+    assert len(l7.rotate.calls) == 2
+    assert l7.rotate.calls[0]["path"] == "/rotate"
+    assert l7.rotate.calls[0]["body"]["egress_proxy_url"] == l7.proxy1.url
+    assert l7.rotate.calls[1]["body"]["egress_proxy_url"] == l7.proxy2.url
+    assert l7.proxy1.targets == ["opencode.ai:443", "opencode.ai:443"]
+    assert l7.proxy2.targets == ["opencode.ai:443"]
+
+    rows = _read_log(l7.log_path)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["final"] == "ok" and r["retried"] == 2
+    assert [a["switch_to_url"] for a in r["rotate_actions"]] == \
+        [l7.proxy2.url, l7.proxy1.url]
 
 
 # ── ③ transport 断连 → rotate → 重试成功 ──────────────────────────────
