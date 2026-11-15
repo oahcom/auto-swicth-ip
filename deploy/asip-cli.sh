@@ -448,6 +448,9 @@ asip oc — 第八闸口（opencode 专属闸口）日志与状态
   asip oc rot [N]      轮换账本 .opencode_gate_ledger.jsonl（默认 30 行）
   asip oc app [N] [-f] 回看 opencode 应用日志 opencode.log（429/错误/语义事件，
                        连接日志的互补面；默认 50 行；-f 跟随）
+  asip oc l7 [N] [-f]  回看 L7 拦截日志 run/opencode-l7.log（请求级 JSONL：
+                       ts/method/path/status/ms/upstream_via/rotate_actions/
+                       retried/final；默认 200 行；-f 跟随）
   asip oc -h           本帮助
 
   流量日志 = slot-8 专属 sing-box 连接日志：每个出站连接一行（含目标域名）。
@@ -474,6 +477,15 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from asip import opencode_gate
 print(opencode_gate.opencode_log_path())
+PY
+}
+
+_oc_l7_path() {  # L7 拦截日志路径由模块解析，不在脚本里写死
+  "$ASIP_PY" - "$ASIP_DIR" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from asip import opencode_l7
+print(opencode_l7.LOG_PATH or "")
 PY
 }
 
@@ -627,6 +639,28 @@ cmd_oc() {
         _follow "" "$n" "$logp"
       elif ! tail -n "$n" "$logp" 2>/dev/null; then
         echo "✗ opencode.log 读取失败: $logp" >&2
+        return 1
+      fi ;;
+    l7|intercept)
+      # [N] 与 -f 可乱序（与 asip oc log 同交互）
+      n=""
+      for a in "$@"; do
+        case "$a" in
+          -f|follow) follow=1 ;;
+          *) n=$a ;;
+        esac
+      done
+      [ -n "$n" ] || n=200
+      _gate_num "$n" || return 1
+      logp=$(_oc_l7_path) || return 1
+      if [ -z "$logp" ]; then
+        echo "✗ 解析不到 L7 拦截日志路径（asip/opencode_l7.py LOG_PATH）" >&2
+        return 1
+      fi
+      if [ "$follow" = 1 ]; then
+        _follow "" "$n" "$logp"
+      elif ! tail -n "$n" "$logp" 2>/dev/null; then
+        echo "✗ 读不到 L7 拦截日志: $logp" >&2
         return 1
       fi ;;
     st|status|'')

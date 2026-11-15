@@ -1,0 +1,27 @@
+# asip 第八闸口 L7 请求拦截器（opencode 专属）—— systemd 用户单元。
+#
+# 契约（deploy/asip-opencode-l7.service，任务书指定三项）：
+#   Type=simple / Restart=always / RestartSec=3，ExecStart 直跑模块，
+#   WorkingDirectory=仓库（run/rotate.sock、run/api-token、run/opencode-l7.log
+#   都按仓库根解析，见 asip/opencode_l7.py 模块 docstring）。
+#
+# 安装（用户级，无需 root）：
+#   cp deploy/asip-opencode-l7.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now asip-opencode-l7
+# 查看拦截日志：tail -f run/opencode-l7.log（JSONL 每请求一行）
+# 健康检查：curl -s http://127.0.0.1:7899/healthz
+[Unit]
+Description=asip opencode L7 request interceptor (gate 8)
+Documentation=file://%h/dkk-projects/auto-switch-ip/asip/opencode_l7.py
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/administrator/dkk-projects/auto-switch-ip
+ExecStart=python3 asip/opencode_l7.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
