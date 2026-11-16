@@ -608,7 +608,6 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         up_head = self._build_upstream_head()
         req_id = uuid.uuid4().hex[:16]
-        started = time.time()
         egress = DEFAULT_EGRESS_URL
         rotate_actions: list = []
         retries = 0
@@ -621,6 +620,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             live = None      # (tun, reader, status_line, status, header_lines, headers)
             tun = None
             via_at_attempt = egress
+            attempt_started = time.time()
             try:
                 tun = _open_tunnel(egress, UPSTREAM_HOST, UPSTREAM_PORT)
                 tun.sendall(up_head + req_body)
@@ -718,7 +718,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 "req_id": req_id,
                 "reason": fault,
                 "egress_proxy_url": egress,
-                "request_started_at": started,
+                # 本发尝试的开始时刻（不是首发时刻）：gate 的 already_retired
+                # 判据 = switched_at > request_started_at —— 429 属于换线前的
+                # 旧渠道才不烧新渠道；重试发出晚于换线时必须报新时刻，
+                # 否则恒判迟到、永远不换渠道。
+                "request_started_at": attempt_started,
             }
             if retry_after_ms is not None:
                 rot_req["retry_after_ms"] = retry_after_ms

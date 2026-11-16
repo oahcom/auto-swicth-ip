@@ -277,7 +277,7 @@ def test_contract_response_shape(gate_env, monkeypatch):
     assert resp["ok"] is True
     assert resp["ms"] == 0
     assert resp["reason"] in ("ok", "coalesced", "borrowed_skip",
-                              "no_healthy_node")
+                              "already_retired", "no_healthy_node")
     assert isinstance(resp["switched_at"], float)
     # 未启用隧道候选时落到池节点
     assert resp["switch_to_kind"] == "pool"
@@ -631,3 +631,95 @@ def test_no_warp_candidates_keeps_pool_path(gate_env, monkeypatch):
     assert resp["switch_to_kind"] == "pool"
     assert [(s, n) for _, s, n in gate_env.world.puts[len(before_puts):]] == \
         [(slot["pool_selector"], resp["switch_to_node"])]
+
+
+# ── ⑧ 换渠道纪律：学闸口 _rotate_slot_once（2026-11-16）────────────────
+# 三件套：封禁窗冷却（Retry-After 不回候选）/ 迟到证据不烧新渠道
+# （already_retired）/ 合并窗证据先记账（coalesced 也冷报障渠道）。
+
+def test_ban_window_cooldown_uses_retry_after(gate_env, monkeypatch):
+    """429 的 Retry-After 是封禁窗：冷过的渠道封禁期内不回候选。
+
+    固定 300s 冷却的实测后果：同一条线（LAX-175/SJC-178）8 分钟内被
+    换出去又换回来，「换渠道」空转。
+    """
+    _reset_coalesce(monkeypatch, 0)
+    opencode_gate._STATE["current"] = "n2"
+    req = _req()
+    req["retry_after_ms"] = 3600 * 1000     # 上游说封 1 小时
+    t_before = time.time()
+    resp = opencode_gate.handle_rotate(req)
+    assert resp["switched"] is True
+    until = opencode_gate._STATE["cooldown"]["n2"]
+    # 冷却按封禁窗算（>= 1h），不是固定 300s
+    assert until - t_before >= 3590
+
+
+def test_retry_after_short_still_min_cooldown(gate_env, monkeypatch):
+    """Retry-After 比默认冷却短时不缩窗：地板仍是 cooldown_sec。"""
+    _reset_coalesce(monkeypatch, 0)
+    opencode_gate._STATE["current"] = "n2"
+    req = _req()
+    req["retry_after_ms"] = 5000             # 只说 5s
+    t_before = time.time()
+    opencode_gate.handle_rotate(req)
+    until = opencode_gate._STATE["cooldown"]["n2"]
+    assert until - t_before >= 290           # cooldown_sec=300 地板
+
+
+def test_late_evidence_does_not_burn_new_channel(gate_env, monkeypatch):
+    """迟到证据（already_retired）：请求发出后已换线 → 不为旧证据烧新渠道。
+
+    429 属于换线前的旧渠道，新渠道已在 selector 上；再换一次 = 连环烧线
+    （2026-11-15 23:45 风暴期 8 秒烧 6 条 WARP 同源）。
+    """
+    _reset_coalesce(monkeypatch, 0)
+    slot = gate_env.slot
+    opencode_gate._STATE["current"] = "n2"
+    opencode_gate._STATE["switched_at"] = 1000.0    # 刚换过线
+    before_puts = list(gate_env.world.puts)
+    req = _req()
+    req["request_started_at"] = 900.0               # 请求早于换线 = 迟到证据
+    resp = opencode_gate.handle_rotate(req)
+    assert resp["switched"] is False
+    assert resp["reason"] == "already_retired"
+    # 一次 selector 都没动
+    assert gate_env.world.puts == before_puts
+    assert opencode_gate._STATE["current"] == "n2"
+    rows = [json.loads(l) for l in gate_env.ledger.read_text().splitlines() if l]
+    assert rows[-1]["outcome"] == "already_retired"
+
+
+def test_fresh_evidence_still_rotates(gate_env, monkeypatch):
+    """重试发出晚于换线 = 新渠道自己的证据：照常换，不误判迟到。"""
+    _reset_coalesce(monkeypatch, 0)
+    opencode_gate._STATE["current"] = "n2"
+    opencode_gate._STATE["switched_at"] = 900.0
+    req = _req()
+    req["request_started_at"] = 1000.0              # 本发晚于换线
+    resp = opencode_gate.handle_rotate(req)
+    assert resp["switched"] is True
+    assert resp["reason"] == "ok"
+
+
+def test_coalesced_cools_offending_channel(gate_env, monkeypatch):
+    """合并窗内只记证据不换线（闸口同款）：但报障渠道要按封禁窗记入冷却。
+
+    否则一批并发 429 只冷一条，其余刚吃 429 的渠道还挂在候选里。
+    """
+    _reset_coalesce(monkeypatch, 10000)     # 10s 合并窗
+    opencode_gate._STATE["current"] = "n2"
+    req = _req()
+    req["retry_after_ms"] = 3600 * 1000
+    first = opencode_gate.handle_rotate(req)    # 首个：真换
+    assert first["switched"] is True
+    # 第二发在合并窗内，报的还是换线前的渠道语义 → coalesced
+    req2 = _req()
+    req2["request_started_at"] = time.time() + 100   # 不触发 already_retired
+    # 模拟合并窗：last_attempt_ts 刚更新，current 已是新渠道
+    opencode_gate._STATE["current"] = "n2"      # 报障渠道（保守：仍按当前记）
+    resp2 = opencode_gate.handle_rotate(req2)
+    assert resp2["switched"] is False
+    assert resp2["reason"] == "coalesced"
+    # 报障渠道进了冷却（封禁窗），不会马上回候选
+    assert "n2" in opencode_gate._STATE["cooldown"]

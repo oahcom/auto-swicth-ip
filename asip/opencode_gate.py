@@ -48,7 +48,8 @@ _STATE = {
     "egress_by_node": {},    # node -> 请求上报的最近出口（独立记账）
     "ledger_entries": 0,     # 账本条目计数（摘要）
     "counts": {"calls": 0, "ok": 0, "coalesced": 0,
-               "borrowed_skip": 0, "no_healthy_node": 0},
+               "borrowed_skip": 0, "already_retired": 0,
+               "no_healthy_node": 0},
 }
 
 # reason 白名单与 daemon._REASON_WHITELIST 同口径：未知一律按 rate429 记。
@@ -76,6 +77,27 @@ def _cooldown_sec() -> float:
         return float(_cfg().get("cooldown_sec", 300))
     except (TypeError, ValueError):
         return 300.0
+
+
+_BAN_CAP_SEC = 24 * 3600.0
+
+
+def _ban_until(t0, retry_after_ms=None):
+    """报障渠道的冷却截止：按封禁窗冷（学闸口 _rotate_slot_once 的 ban_after）。
+
+    429 的 Retry-After 是上游给的封禁窗（实测 FreeUsageLimitError ~9-10h）；
+    固定 300s 冷却 = 5 分钟后把刚烧的渠道放回候选 —— 实测同一条线
+    （LAX-175/SJC-178）8 分钟内被换出去又换回来，「换渠道」空转。
+    冷却 = max(cooldown_sec, Retry-After)，钳制 <=24h；无 Retry-After 退回
+    cooldown_sec（transport 等非限流故障不长冷）。
+    """
+    ban = _cooldown_sec()
+    if retry_after_ms:
+        try:
+            ban = max(ban, float(retry_after_ms) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+    return t0 + min(ban, _BAN_CAP_SEC)
 
 
 def _ledger_path():
@@ -382,7 +404,7 @@ def handle_rotate(req: dict, picker=None, warp_candidates=None,
            "egress_ip","request_started_at","retry_after_ms","session_id"}
           （后四者可空；borrowed 为可选附加字段，9router 借道标记，D14 语义）
     响应：{"ok":true,"switched":bool,
-           "reason":"ok|coalesced|borrowed_skip|no_healthy_node",
+           "reason":"ok|coalesced|borrowed_skip|already_retired|no_healthy_node",
            "switch_to_node":str|null,"switch_to_kind":"warp|pool"|null,
            "switched_at":float,"active_egress":str|null,"ms":0}
 
@@ -446,6 +468,18 @@ def handle_rotate(req: dict, picker=None, warp_candidates=None,
 
         switched_node = None
         switched_kind = None
+        # 迟到证据（学闸口 _rotate_slot_once 的 already_retired）：请求发出后
+        # 本闸口已换过渠道（switched_at > request_started_at），这个 429 属于
+        # 换线前的旧渠道 —— 新渠道已就位，为旧证据烧新渠道 = 连环烧线
+        # （2026-11-15 23:45 风暴期 8 秒烧掉 6 条 WARP 同源）。只记证据、
+        # 不换渠道，调用方原地重试（新渠道已在 selector 上）。
+        # 事实否决（闸口同款）：报障渠道就是当前渠道时「已换走」不可能成立
+        # —— started_at 缺失时判不出，保持原行为走换渠道。
+        retired = (started_at is not None and started_at > 0
+                   and _STATE["switched_at"] > started_at
+                   and cur is not None)
+        if retired and reason in ("proactive", "dead"):
+            retired = False   # 主动巡检/终态判定不是迟到事故证据
         if slot is None:
             # 显式降级：闸口没开/找不到槽位，不换渠道。
             outcome = "no_healthy_node"
@@ -453,15 +487,23 @@ def handle_rotate(req: dict, picker=None, warp_candidates=None,
             # D14 借道：body/session 都是原线的，单发报障不足以判本闸口的
             # 渠道烧了 —— 不冷渠道、不换渠道。
             outcome = "borrowed_skip"
+        elif retired:
+            outcome = "already_retired"
         elif (_STATE["last_attempt_ts"]
               and t0 - _STATE["last_attempt_ts"] < _coalesce_win()):
+            # 合并窗内只记证据不重复换线（闸口同款）：把报障渠道按封禁窗记入
+            # 冷却，别把刚吃 429 的地址当干净地址放回候选；换线由先到者做。
+            if cur and reason not in ("proactive", "dead"):
+                _STATE["cooldown"][cur] = _ban_until(t0, retry_after_ms)
             outcome = "coalesced"
         else:
             _STATE["last_attempt_ts"] = t0
             if cur and reason not in ("proactive", "dead"):
                 # 报障换渠道才冷却旧渠道（与第七闸口同口径）：proactive 不冷；
                 # dead 已是终态判定，再冷却无意义。独立冷却表，不写公共表。
-                _STATE["cooldown"][cur] = t0 + _cooldown_sec()
+                # 冷却按封禁窗（Retry-After）而非固定 300s：烧过的渠道封禁期
+                # 内不回候选，「换渠道」才真的换到新渠道而不是换出去又换回。
+                _STATE["cooldown"][cur] = _ban_until(t0, retry_after_ms)
             picked = _rotate_node(slot, cur, picker, warp_candidates, warp_lock)
             if picked:
                 switched_node, switched_kind = picked[0], picked[1]
