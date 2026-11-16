@@ -503,6 +503,10 @@ CFG = {
         # 换线对 403 与 429 都有效，两者都是出口 IP 级拦截。
         "blocked_guard_sec": 21600,   # 6h：403 恢复期
         "rate429_guard_sec": 60,      # 429 默认冷却（精确值经 ban_until 覆盖）
+        # trap 线短禁（transport 双杀上报，2026-11-16 晚复盘）：同 IP 10 分钟内
+        # ≥2 次 transport 上报（9router stall 二击）= trap 线实锤（当晚 LHR-83
+        # 一条线反复处决 10 次仍回池）。300s 短禁让它退场，到点后允许复活。
+        "transport_ban_sec": 300,
         # 台账生命周期（docs/design-20261113-ledger-lifecycle.md）：
         # expires_at 的保留窗口，条目到期后才允许清理。默认与
         # ip_reuse_guard_sec 同值，独立配置便于灰度期单独调。

@@ -114,18 +114,26 @@ def test_expired_ban_cleared_before_new_round():
     assert d._warp_ip_is_blocked("2001:db8::a6", t1 + 5)  # 新轮默认窗生效
 
 
-def test_fallback_12h_from_config_not_60s():
-    """生产缺 Retry-After 时 12h 兜底来自 config 实配（附件 A1）。
+def test_no_retry_after_returns_none_not_fabricated():
+    """契约更新（2026-11-16 风暴复盘，e9f7d8b/8bdcd0f 归位）：无 Retry-After
+    不得伪造精确封禁。旧「12h 兜底来自 config 实配（附件 A1）」作废。
 
-    防什么事故：兜底退回 rate429_guard_sec=60 → 刚封地址 60s 回池再烧，
-    复演全池榨干。取值纪律：断言值从 config 读，同时钉「兜底远大于默认冷却」
-    这条语义关系（防有人把 production_429_ban_sec 改小到默认冷却量级）。
+    作废原因：12h 取自探针 FreeUsageLimitError 的 Retry-After 11~13h，被错配到
+    生产 429 无 Retry-After 场景——风暴实测后者是秒级微配额窗（同 IP 恢复
+    p50=3s / max=26s，65 例无一超 26s），12h 兜底把健康线写成半天死线
+    （「blocked 8 点没清」病根一半），且与 2026-10-26 契约 test_429_cooldown
+    「无解析值时不得伪造精确封禁」正面冲突。
+
+    现行语义：无信号 → None → rate429_guard_sec=60s 默认窗（防「回池再烧」由
+    ban_until max 递增 + 探针复判 quota/flagged 兜底长禁承担）；真配额死线走
+    探针 Retry-After 落账；显式配置 production_429_ban_sec > 0 可 opt-in 旧行为。
     """
-    cfg_val = float(d._api_cfg().get("production_429_ban_sec"))
-    assert d._rotate_ban_after_from_req({}) == pytest.approx(
-        min(max(cfg_val, 1.0), 86400.0))
-    assert cfg_val >= 3600.0  # 兜底以小时计，不是秒级默认窗
-    assert cfg_val > float(d._warp()["rate429_guard_sec"])
+    assert d._rotate_ban_after_from_req({}) is None, \
+        "无 Retry-After 不得伪造精确封禁"
+    cfg_val = float(d._api_cfg().get("production_429_ban_sec", 0) or 0)
+    assert cfg_val == 0.0, "出厂默认必须 0（不伪造）；>0 仅限显式 opt-in"
+    assert d._rotate_ban_after_from_req({"retry_after_ms": 43200000}) == 43200.0, \
+        "上游真实 Retry-After（探针实测 12h 级）照常透传为 ban_after"
 
 
 def test_ttl_three_tiers_legacy_not_60s():

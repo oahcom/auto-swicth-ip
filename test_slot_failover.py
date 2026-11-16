@@ -549,11 +549,13 @@ def test_ban_after_prefers_upstream_retry_after_ms():
     assert daemon._rotate_ban_after_from_req({"retry_after_ms": "3600000"}) == 3600.0
 
 
-def test_ban_after_falls_back_to_config_instead_of_60s():
-    secs = daemon._rotate_ban_after_from_req({})
-    cfg = float(daemon._api_cfg().get("production_429_ban_sec", 43200))
-    assert secs == cfg
-    assert secs >= 3600.0, "兜底不能退回到 rate429_guard_sec=60s"
+def test_ban_after_no_signal_returns_none_not_fabricated():
+    # 契约更新（2026-11-16 风暴复盘，e9f7d8b/8bdcd0f 归位）：无解析值不得伪造
+    # 精确封禁——旧断言「兜底 config 值 ≥1h」违反 2026-10-26 既有契约
+    # （test_429_cooldown：无解析值时不得伪造精确封禁），且风暴实测生产 429
+    # 无 Retry-After 是秒级微配额窗（同 IP 恢复 p50=3s / max=26s）。
+    # 显式配置 api.production_429_ban_sec > 0 仍可 opt-in 旧行为（逃生门）。
+    assert daemon._rotate_ban_after_from_req({}) is None
 
 
 def test_slot_rotate_writes_ban_after_into_ledger(isolated, monkeypatch):

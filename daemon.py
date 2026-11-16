@@ -7312,6 +7312,9 @@ def _warp_block_ttl(kind: str | None) -> float:
         return w["blocked_guard_sec"]
     if kind == "rate429":
         return w["rate429_guard_sec"]
+    if kind == "transport":
+        # trap 线短禁（transport 二击，2026-11-16）：短窗可复活，不落 legacy 24h。
+        return float(w.get("transport_ban_sec", 300))
     # legacy：kind 缺失的旧账只认 blocked_ttl_sec 的 24h 保守值，不吃 429 的
     # 60s 默认 —— 无法判别的旧记录不能因为默认缩短而被提前放回候选池。
     return w.get("blocked_ttl_sec", 86400)
@@ -7441,7 +7444,7 @@ def _warp_block_stamps(entry: dict) -> dict[str, float]:
     # 旧记录不必单独迁移 —— 该 IP 下次被标记时回退链读出的结果会写成新格式。
     # kind 缺失归到 legacy（blocked_ttl_sec 的 24h 保守档），不冒充 rate429：
     # 60s 默认只属于「有 kind 但没解析到精确值」的新账。
-    return {(kind if kind in ("abuse403", "rate429") else "legacy"): float(start)}
+    return {(kind if kind in ("abuse403", "rate429", "transport") else "legacy"): float(start)}
 
 
 def _warp_block_remaining(entry: dict, now: float) -> float:
@@ -8067,8 +8070,9 @@ def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
                        ban_after: float | None = None) -> None:
     """记录出口 IP 的本次使用；blocked=True 表示该 IP 已被 403/429 标记。
 
-    `kind` 为 "abuse403" / "rate429"，决定惩罚期是 6h 还是默认 60s；kind
-    缺失的旧记录按 blocked_ttl_sec 的 24h 保守档处理。`ban_after` 是上游 429
+    `kind` 为 "abuse403" / "rate429" / "transport"，决定惩罚期是 6h、默认 60s
+    还是 trap 线短禁（transport_ban_sec=300s）；kind 缺失的旧记录按
+    blocked_ttl_sec 的 24h 保守档处理。`ban_after` 是上游 429
     响应给出的确切剩余秒数（Retry-After），有它时写进 ban_until、替换该类型的
     默认 60s，见 `_warp_block_remaining`；403 不认 Retry-After，仍走 6h。
 顺手清理已出窗口的条目（表长恒定为窗口内 IP 数）。
@@ -8143,7 +8147,7 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
             if now < until:
                 stamps[k] = t
         new_round = not stamps
-        eff_kind = kind if kind in ("abuse403", "rate429") else "rate429"
+        eff_kind = kind if kind in ("abuse403", "rate429", "transport") else "rate429"
         # 必须在 setdefault 之前判断：否则本轮新写入的 rate429 stamp 会让
         # 「上一轮 ban_kind 已不在 stamps」永远为假，过期 ban_until 留在原地
         # 直接盖掉新 429 的默认窗口（实测：Retry-After 到期后再烧，
@@ -14801,6 +14805,38 @@ def _rotate_ban_after_from_req(req) -> float | None:
     return max(1.0, min(secs, 86400.0)) if secs > 0 else None
 
 
+# transport 双杀上报计数（trap 线短禁，2026-11-16）：ip -> 上报时刻列表。
+# _rotate_once 全程持锁天然单飞，普通 dict 即可；窗口外的旧戳惰性清理。
+_TRANSPORT_STRIKES: dict = {}
+
+
+def _transport_strike_push(ip: str, now: float) -> int:
+    """记录一次 transport 双杀上报，返回 10 分钟窗口内的累计次数。"""
+    hits = _TRANSPORT_STRIKES.setdefault(ip, [])
+    hits.append(now)
+    hits[:] = [t for t in hits if now - t <= 600.0]
+    if len(_TRANSPORT_STRIKES) > 512:
+        for k in [k for k, v in _TRANSPORT_STRIKES.items()
+                  if not v or now - v[-1] > 600.0][:256]:
+            _TRANSPORT_STRIKES.pop(k, None)
+    return len(hits)
+
+
+def _transport_strike_account(old_ip: str, t0: float) -> None:
+    """transport 双杀上报记账（trap 线短禁，2026-11-16）。
+
+    单发上报只是抖动证据不记脏；10 分钟窗口内 ≥2 次 = trap 线实锤（当晚
+    LHR-83 一条线反复处决 10 次仍回池，每个踩中者烧 22s）——写 kind=transport
+    短禁（transport_ban_sec，默认 300s），窗口由 _warp_block_ttl /
+    ledger_policy._block_ttl 执法，到点允许复活。
+    """
+    n = _transport_strike_push(old_ip, t0)
+    if n >= 2:
+        _mark_warp_ip_used(old_ip, t0, blocked=True, kind="transport")
+        log(f"  ⛔ trap 线短禁: {old_ip} transport 双杀 x{n}/10min -> "
+            f"{int(_warp().get('transport_ban_sec', 300))}s")
+
+
 def _normalize_rotate_reason(raw) -> str:
     """白名单收敛：429/quota 归 rate429，403/abuse 归 abuse403。
 
@@ -15020,10 +15056,14 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
             was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
         except Exception:
             was_blocked = False
-        # transport 只证明这条连接/链路悬挂，不是 IP 级封禁证据：换线但不记脏。
+        # transport 双杀上报（9router stall 二击）：单发只是抖动证据，换线但
+        # 不记脏；同 IP 10 分钟内 ≥2 次上报 = trap 线实锤（2026-11-16 晚 LHR-83
+        # 一条线反复处决 10 次仍回池，每个踩中者烧 22s）——写 transport 短禁。
         if reason not in ("proactive", "transport") and old_ip:
             _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason,
                                ban_after=ban_after)
+        elif reason == "transport" and old_ip:
+            _transport_strike_account(old_ip, t0)
         try:
             # 合并窗放在记账**之后**：迟到的 429 常常同一批涌进来（实测客户端一次
             # 并发几十条），若先合并再记账，第一条换线后其余全部命中合并窗，历史里

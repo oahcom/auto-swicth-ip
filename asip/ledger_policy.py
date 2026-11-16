@@ -38,6 +38,7 @@ def make_ttl(cfg_warp: dict) -> dict:
     return {
         "abuse403": float(cfg_warp.get("blocked_guard_sec", 21600)),
         "rate429": float(cfg_warp.get("rate429_guard_sec", 60)),
+        "transport": float(cfg_warp.get("transport_ban_sec", 300)),
         "legacy": float(cfg_warp.get("blocked_ttl_sec", 86400)),
     }
 
@@ -59,6 +60,9 @@ def _block_ttl(kind, ttl: dict) -> float:
         return ttl["abuse403"]
     if kind == "rate429":
         return ttl["rate429"]
+    if kind == "transport":
+        # trap 线短禁（transport 二击）：短窗、可复活，不落 legacy 24h。
+        return ttl.get("transport", 300.0)
     return ttl["legacy"]
 
 
@@ -77,7 +81,7 @@ def block_stamps(entry: dict) -> dict[str, float]:
     if start is None:
         return {}
     kind = entry.get("blocked_kind")
-    return {(kind if kind in ("abuse403", "rate429") else "legacy"): float(start)}
+    return {(kind if kind in ("abuse403", "rate429", "transport") else "legacy"): float(start)}
 
 
 def parse_ban_until(entry: dict) -> tuple[float | None, str]:
