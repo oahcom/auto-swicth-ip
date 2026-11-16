@@ -269,15 +269,18 @@ def test_ledger_isolated_from_node_info(gate_env, monkeypatch):
 # ── 契约形状与降级路径 ──────────────────────────────────────────────
 
 def test_contract_response_shape(gate_env, monkeypatch):
-    """C1 响应七字段一字不差；reason 只取契约四个值。"""
+    """C1 响应八字段一字不差（switch_to_kind 为 2026-11-16 换渠道语义新增）；
+    reason 只取契约四个值。"""
     resp = opencode_gate.handle_rotate(_req())
     assert set(resp) == {"ok", "switched", "reason", "switch_to_node",
-                         "switched_at", "active_egress", "ms"}
+                         "switch_to_kind", "switched_at", "active_egress", "ms"}
     assert resp["ok"] is True
     assert resp["ms"] == 0
     assert resp["reason"] in ("ok", "coalesced", "borrowed_skip",
                               "no_healthy_node")
     assert isinstance(resp["switched_at"], float)
+    # 未启用隧道候选时落到池节点
+    assert resp["switch_to_kind"] == "pool"
     # active_egress = 事发出口（请求报来的 egress_ip）
     assert resp["active_egress"] == "203.0.113.9"
 
@@ -532,3 +535,99 @@ def test_picker_out_of_elig_refused(gate_env, monkeypatch):
     resp = opencode_gate.handle_rotate(_req(), picker=lambda *a: "n1")
     assert resp["switched"] is False
     assert gate_env.world.puts == []
+
+
+# ── ⑦ 错误换渠道：WARP 隧道优先，池节点兜底（2026-11-16）──────────────
+# 渠道「能不能用」的判据来自探测（daemon 经 warp_candidates 注入），gate
+# 只做「取一条 + PUT selector」。这几个用例锁住两级语义与回落方向。
+
+def _enable_warp(gate_env, warps, cur=None):
+    """给沙箱的 opencode-out（warp selector）挂 WARP 候选成员。
+
+    warps 为空 = 探测当前没有可用隧道，用来验证池节点兜底。
+    """
+    slot = gate_env.slot
+    members = list(warps) + [slot["pool_selector"]]
+    gate_env.world.put_state(slot["clash_api_port"], slot["selector"],
+                             cur or slot["pool_selector"], members)
+
+
+def _warp_cands(*tags):
+    return lambda cur: [(t, "2001:db8::%d" % i) for i, t in enumerate(tags)]
+
+
+def test_warp_tunnel_preferred_over_pool(gate_env, monkeypatch):
+    """有可用隧道时优先住隧道：PUT 打在 warp selector，不动 pool selector。"""
+    _reset_coalesce(monkeypatch, 0)
+    slot = gate_env.slot
+    _enable_warp(gate_env, ["WARP-A", "WARP-B"])
+    resp = opencode_gate.handle_rotate(_req(), warp_candidates=_warp_cands(
+        "WARP-A", "WARP-B"))
+    assert resp["switched"] is True
+    assert resp["switch_to_kind"] == "warp"
+    assert resp["switch_to_node"] == "WARP-A"   # 按探测给的顺序取第一条
+    assert [(s, n) for _, s, n in gate_env.world.puts] == \
+        [(slot["selector"], "WARP-A")]
+    # 账本记了换到的类型
+    rows = [json.loads(l) for l in gate_env.ledger.read_text().splitlines() if l]
+    assert rows[-1]["to_kind"] == "warp"
+
+
+def test_warp_skips_current_and_cooled(gate_env, monkeypatch):
+    """当前线与冷却中的线不重选：否则换了等于没换 / 刚烧的又拿回来。"""
+    _reset_coalesce(monkeypatch, 0)
+    opencode_gate._STATE["current"] = "WARP-A"
+    opencode_gate._STATE["cooldown"]["WARP-B"] = time.time() + 300
+    _enable_warp(gate_env, ["WARP-A", "WARP-B", "WARP-C"], cur="WARP-A")
+    resp = opencode_gate.handle_rotate(_req(), warp_candidates=_warp_cands(
+        "WARP-A", "WARP-B", "WARP-C"))
+    assert resp["switch_to_node"] == "WARP-C"
+    assert resp["switch_to_kind"] == "warp"
+
+
+def test_warp_empty_falls_back_to_pool(gate_env, monkeypatch):
+    """探测当前没有可用隧道 → 回落池节点，走原 P2C 路径。"""
+    _reset_coalesce(monkeypatch, 0)
+    _enable_warp(gate_env, [])
+    resp = opencode_gate.handle_rotate(_req(), warp_candidates=_warp_cands())
+    assert resp["switched"] is True
+    assert resp["switch_to_kind"] == "pool"
+    assert resp["switch_to_node"] in ("n2", "n3")
+
+
+def test_fallback_from_warp_points_selector_back(gate_env, monkeypatch):
+    """当前住隧道、隧道又全不可用：先把 warp selector 指回池 selector，
+    流量才进池，再换池节点。"""
+    _reset_coalesce(monkeypatch, 0)
+    slot = gate_env.slot
+    opencode_gate._STATE["current"] = "WARP-OLD"
+    _enable_warp(gate_env, [], cur="WARP-OLD")
+    resp = opencode_gate.handle_rotate(_req(), warp_candidates=_warp_cands())
+    assert resp["switch_to_kind"] == "pool"
+    assert [(s, n) for _, s, n in gate_env.world.puts] == [
+        (slot["selector"], slot["pool_selector"]),
+        (slot["pool_selector"], resp["switch_to_node"]),
+    ]
+
+
+def test_warp_put_rejected_falls_back(gate_env, monkeypatch):
+    """隧道 PUT 被拒（成员不存在等）→ 不能卡住，继续走池节点兜底。"""
+    _reset_coalesce(monkeypatch, 0)
+    slot = gate_env.slot
+    _enable_warp(gate_env, ["WARP-A"])   # 成员表里没有 WARP-X
+    resp = opencode_gate.handle_rotate(_req(), warp_candidates=_warp_cands(
+        "WARP-X"))
+    assert resp["switched"] is True
+    assert resp["switch_to_kind"] == "pool"
+    assert resp["switch_to_node"] in ("n2", "n3")
+
+
+def test_no_warp_candidates_keeps_pool_path(gate_env, monkeypatch):
+    """warp_candidates 不注入（None）= 隧道能力关闭，行为与改造前逐字一致。"""
+    _reset_coalesce(monkeypatch, 0)
+    slot = gate_env.slot
+    before_puts = list(gate_env.world.puts)
+    resp = opencode_gate.handle_rotate(_req())
+    assert resp["switch_to_kind"] == "pool"
+    assert [(s, n) for _, s, n in gate_env.world.puts[len(before_puts):]] == \
+        [(slot["pool_selector"], resp["switch_to_node"])]

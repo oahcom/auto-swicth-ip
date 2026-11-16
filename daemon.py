@@ -13527,6 +13527,25 @@ def _slot_claim(slot, extra_avoid=None):
     return None, None
 
 
+def _warp_candidates_for_gate(exclude_tag: str | None) -> list[tuple[str, str]]:
+    """闸口 8 的 WARP 隧道候选：[(tag, ip)]，顺序沿用探测的 rank。
+
+    「渠道能不能用」的判据 100% 来自探测台账（_warp_line_fresh_candidates：
+    当前地址有新鲜 OK、未被封、IP 不重复），这里只做「别人在住的房不能租」
+    的排除（_slot_peers 主出口 + 各槽当前线，实时读 Clash API）。只读，
+    不改任何状态；gate 拿到后只做「取一条 + PUT selector」。
+    """
+    now = time.time()
+    occupied = _slot_peers()
+    occupied.discard(exclude_tag or "")
+    out: list[tuple[str, str]] = []
+    for m, ip in _warp_line_fresh_candidates(exclude_tag, now):
+        if m["tag"] in occupied:
+            continue
+        out.append((m["tag"], ip))
+    return out
+
+
 def _slot_health(name):
     # 必须返回表里的那一份，不能返回同等内容的临时 dict：调用方会往里写
     # last_rotate_ts 之类的限速事实，写到临时对象上等于静默丢弃。
@@ -15929,12 +15948,16 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 req = {}
             try:
-                # 选点接线：P2C + 自适应分数（count_call=False 照
-                # _proxy_gate_rotate_node 的用法）；模块侧冷却独立。
+                # 选点接线：池节点 P2C + 自适应分数（count_call=False 照
+                # _proxy_gate_rotate_node 的用法）；WARP 隧道候选来自探测
+                # 台账（_warp_candidates_for_gate，只读）；挑线+切线共用
+                # _SLOT_PICK_LOCK，与 slot-1..6 互斥防撞线。模块侧冷却独立。
                 payload = opencode_gate.handle_rotate(
                     req,
                     picker=lambda cur, nodes, fail: pick_next_node(
-                        cur, nodes, fail, count_call=False))
+                        cur, nodes, fail, count_call=False),
+                    warp_candidates=_warp_candidates_for_gate,
+                    warp_lock=_SLOT_PICK_LOCK)
             except Exception as e:
                 log("✗ /rotate-opencode-gate 异常: %s" % e)
                 self._send(500, {"ok": False, "reason": "internal_error"})

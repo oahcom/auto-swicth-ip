@@ -729,6 +729,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             rotate_actions.append({
                 "reason": fault, "outcome": outcome,
                 "switched": switched, "switch_to_url": sw_url,
+                # 换到的是 WARP 隧道还是池节点（人工排查用）
+                "switch_to_kind": (
+                    str(resp.get("switch_to_kind") or "").strip() or None),
+                "switch_to_node": (
+                    str(resp.get("switch_to_node") or "").strip() or None),
             })
             if switched and sw_url:
                 egress = sw_url

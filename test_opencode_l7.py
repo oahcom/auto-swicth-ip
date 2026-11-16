@@ -421,7 +421,7 @@ def test_429_rotate_switch_ok_retry_succeeds(l7):
          "body": b'{"ok":true}'},
     )
     l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
-                       "switch_to_node": "n2",
+                       "switch_to_node": "n2", "switch_to_kind": "warp",
                        "switch_to_url": l7.proxy2.url})
     raw = _raw_request(l7.port, _req())
     status, _, body = _parse(raw)
@@ -453,7 +453,9 @@ def test_429_rotate_switch_ok_retry_succeeds(l7):
     assert r["upstream_via"] == l7.proxy2.url
     assert r["rotate_actions"] == [{"reason": "rate429", "outcome": "ok",
                                     "switched": True,
-                                    "switch_to_url": l7.proxy2.url}]
+                                    "switch_to_url": l7.proxy2.url,
+                                    "switch_to_node": "n2",
+                                    "switch_to_kind": "warp"}]
 
 
 # ── ③ transport 断连 → rotate → 重试成功 ──────────────────────────────
@@ -491,7 +493,7 @@ def test_two_switch_ok_attempts_still_429_no_ok_channel(l7):
          "body": b"err3"},
     )
     l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
-                       "switch_to_node": "n2",
+                       "switch_to_node": "n2", "switch_to_kind": "warp",
                        "switch_to_url": l7.proxy2.url})
     l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
                        "switch_to_node": "n3",

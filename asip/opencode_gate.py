@@ -269,26 +269,61 @@ def _pick_with_timeout(picker, cur, pool, cooled):
     return box.get("v"), True
 
 
-def _rotate_node(slot, cur, picker=None):
-    """池内换节点：独立冷却过滤 + 选一个非当前节点；失败返回 None。
+def _prune_cooldown_locked() -> None:
+    now = time.time()
+    for n in [n for n, until in _STATE["cooldown"].items() if until <= now]:
+        _STATE["cooldown"].pop(n, None)
 
-    裁剪自 daemon._proxy_gate_rotate_node 的骨架，但：
-      - 候选过滤只用**本模块自己的**冷却表（不读 daemon._DEAD_NODES /
-        _COOLDOWN_NODES —— 冷却独立）；
-      - 选点：picker 优先（依赖注入点，daemon 委托传 pick_next_node 的
-        P2C + 自适应分数，签名 (current, all_nodes, fail_set) -> str|None，
-        冷却中的节点经 fail_set 交出去）；缺省 None 回退均匀随机（单测
-        独立可跑，不依赖 daemon 私有状态）。picker 正常回答必须落在池内
-        候选（非当前、不在冷却中），不然宁可不换；picker 超时/异常（4s
-        上限）回退均匀随机 —— 挂死调用方比换到普通候选更糟，留在故障
-        节点是最差结果；
-      - 不预检/不延迟择优（那是 daemon 私有状态，模块红线禁止 import）；
-      - 换节点 = PUT 自己的 pool selector + 回读验证（不中断在途）；
-      - 记账进本模块账本，绝不调 daemon.update_node_info_async。
+
+class _NoLock:
+    """warp_lock 未注入时的空锁（单测/降级路径照常跑，不做互斥）。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+_NOLOCK = _NoLock()
+
+
+def _select(slot, selector, name) -> bool:
+    """换出口的唯一动作：PUT selector + 回读验证（不中断在途）。
+
+    PUT 200 但 selector 仍指旧值时不能算换成功 —— 假成功会让调用方以为
+    渠道已换、实际流量还走老路。
+    """
+    c = _client(slot)
+    if not c.select(selector, name):
+        return False
+    return c.current(selector) == name
+
+
+def _rotate_node(slot, cur, picker=None, warp_candidates=None, warp_lock=None):
+    """错误换渠道：WARP 隧道优先，池节点兜底；返回 (tag, kind, ip) 或 None。
+
+    渠道「能不能用」的判据 100% 来自探测 —— daemon 经 warp_candidates 注入
+    _warp_line_fresh_candidates 的结论（OK 且未被他人占用），本模块不探活、
+    不判死活、不重排顺序：**只做「取一条 + PUT selector」**。挑与切放在
+    warp_lock 临界区里，避免与 slot-1..6 的挑线互撞（实测曾有两槽落到同一条
+    WARP 线、同一个出口 IP）。池节点兜底仍是原 P2C 路径，判据不变。
     """
     now = time.time()
     cooled = {n for n, until in _STATE["cooldown"].items() if until > now}
+
+    # ① WARP 隧道优先：按探测给的顺序取第一条可用的
+    if warp_candidates is not None:
+        with (warp_lock if warp_lock is not None else _NOLOCK):
+            for tag, ip in warp_candidates(cur or ""):
+                if not tag or tag == cur or tag in cooled:
+                    continue
+                if _select(slot, slot["selector"], tag):
+                    return tag, "warp", ip
+
+    # ② 池节点兜底：P2C + 自适应分数（picker 由 daemon 注入）
     pool = _pool_candidates(slot)
+    on_pool = bool(cur) and cur in pool
     elig = [n for n in pool if n != cur and n not in cooled]
     if not elig:
         return None
@@ -301,28 +336,25 @@ def _rotate_node(slot, cur, picker=None):
         nxt = random.choice(elig)
     if nxt not in elig:
         return None
-    c = _client(slot)
-    if not c.select(slot["pool_selector"], nxt):
+    # 从隧道回落到池：先把 warp selector 指回池 selector，流量才进池。
+    if not on_pool and not _select(slot, slot["selector"],
+                                   slot["pool_selector"]):
         return None
-    # 回读验证：PUT 200 但 selector 仍指旧节点时不能算换成功。
-    if c.current(slot["pool_selector"]) != nxt:
+    if not _select(slot, slot["pool_selector"], nxt):
         return None
-    return nxt
+    return nxt, "pool", None
 
 
-def _prune_cooldown_locked() -> None:
-    now = time.time()
-    for n in [n for n, until in _STATE["cooldown"].items() if until <= now]:
-        _STATE["cooldown"].pop(n, None)
-
-
-def _payload(outcome, switched_node, cur_at_report, egress_at_report):
-    """C1 响应体：七个字段，一字不差。ms 恒 0（与 /rotate 现回包一致）。"""
+def _payload(outcome, switched_node, cur_at_report, egress_at_report,
+             switched_kind=None):
+    """C1 响应体。除 switch_to_kind（2026-11-16 加，标换到的是隧道还是池
+    节点）外七个字段一字不差。ms 恒 0（与 /rotate 现回包一致）。"""
     return {
         "ok": True,
         "switched": outcome == "ok",
         "reason": outcome,
         "switch_to_node": switched_node,
+        "switch_to_kind": switched_kind,
         "switched_at": _STATE["switched_at"],
         # active_egress = 事发时本闸口的出口（与 /rotate 的 active_egress 同义：
         # 请求刚在上面吃到报错的那个出口）。请求报来的 egress_ip 优先，
@@ -342,7 +374,8 @@ def _note_ledger(entry: dict) -> None:
     _STATE["ledger_entries"] += 1
 
 
-def handle_rotate(req: dict, picker=None) -> dict:
+def handle_rotate(req: dict, picker=None, warp_candidates=None,
+                  warp_lock=None) -> dict:
     """POST /rotate-opencode-gate 的处理（契约 C1）。
 
     请求：{"req_id","reason"(rate429|abuse403|transport|proactive),
@@ -350,22 +383,28 @@ def handle_rotate(req: dict, picker=None) -> dict:
           （后四者可空；borrowed 为可选附加字段，9router 借道标记，D14 语义）
     响应：{"ok":true,"switched":bool,
            "reason":"ok|coalesced|borrowed_skip|no_healthy_node",
-           "switch_to_node":str|null,"switched_at":float,
-           "active_egress":str|null,"ms":0}
+           "switch_to_node":str|null,"switch_to_kind":"warp|pool"|null,
+           "switched_at":float,"active_egress":str|null,"ms":0}
 
-    picker：选点策略的依赖注入点（守模块红线的接线缝）。签名
+    picker：池节点选点策略的依赖注入点（守模块红线的接线缝）。签名
           (current, all_nodes, fail_set) -> str | None。daemon 的委托点传
           pick_next_node（P2C + 自适应分数，count_call=False，与
           _proxy_gate_rotate_node 同用法）；None 回退均匀随机（单测独立
           可跑，不依赖 daemon 私有状态）。
+    warp_candidates：WARP 隧道候选的依赖注入点，签名 (exclude_tag) ->
+          [(tag, ip)]。daemon 传 _warp_candidates_for_gate —— 判据全部来自
+          探测台账（_warp_line_fresh_candidates：OK 且新鲜），本模块不探活、
+          不判死活。None = 不启用隧道候选，只走池节点。
+    warp_lock：挑线+切线的互斥锁（daemon 传 _SLOT_PICK_LOCK，与 slot-1..6
+          的挑线同锁，避免两槽撞同一条 WARP 线）。
 
     语义硬约束：
-      1. 只动本闸口自己的 pool selector —— 不 _pick_healthy_slot、不指回
-         其它闸口、不触发任何别的闸口轮换（模块不 import daemon）；
-      2. 换节点走「不中断在途」路径：只 PUT selector（等价 reconnect_warp
-         的换线语义），绝不调 _warp_line_restart 或等价重启；
+      1. 只动本闸口自己的 selector（warp selector / pool selector）——
+         不 _pick_healthy_slot、不指回其它闸口、不触发任何别的闸口轮换
+         （模块不 import daemon）；
+      2. 换渠道走「不中断在途」路径：只 PUT selector，绝不调重启；
       3. 合并窗 coalesce_ms：一批并发报障只换一次，重复调用回 coalesced；
-      4. 节点池与 slot-7 共享，选中态/冷却/记账独立；
+      4. 渠道池：WARP 隧道优先（探测认定可用的），池节点兜底（P2C）；
       5. 记账落 opencode 专属账本，不写公共 node_info。
     """
     t0 = time.time()
@@ -390,22 +429,29 @@ def handle_rotate(req: dict, picker=None) -> dict:
         slot = _find_slot()
         cur = _STATE["current"]
         if slot is not None and cur is None:
-            # 进程重启后选中态归零：从自己 selector 回读（独立选中态的恢复）。
-            now_node = _client(slot).current(slot["pool_selector"])
-            if _is_pool_node(now_node):
+            # 进程重启后选中态归零：先看 warp selector（WARP 线挂在它上面），
+            # 回落时它指向 pool selector 名；再看 pool selector 的当前节点。
+            now_node = _client(slot).current(slot["selector"])
+            if now_node and now_node != slot["pool_selector"]:
                 cur = now_node
+            else:
+                now_node = _client(slot).current(slot["pool_selector"])
+                if _is_pool_node(now_node):
+                    cur = now_node
+            if cur:
                 _STATE["current"] = cur
         cur_at_report = cur
         if egress and cur_at_report:
             _STATE["egress_by_node"][cur_at_report] = egress
 
         switched_node = None
+        switched_kind = None
         if slot is None:
-            # 显式降级：闸口没开/找不到槽位，不换节点。
+            # 显式降级：闸口没开/找不到槽位，不换渠道。
             outcome = "no_healthy_node"
         elif borrowed:
             # D14 借道：body/session 都是原线的，单发报障不足以判本闸口的
-            # 池节点烧了 —— 不冷节点、不换节点。
+            # 渠道烧了 —— 不冷渠道、不换渠道。
             outcome = "borrowed_skip"
         elif (_STATE["last_attempt_ts"]
               and t0 - _STATE["last_attempt_ts"] < _coalesce_win()):
@@ -413,11 +459,12 @@ def handle_rotate(req: dict, picker=None) -> dict:
         else:
             _STATE["last_attempt_ts"] = t0
             if cur and reason not in ("proactive", "dead"):
-                # 报障换节点才冷却旧节点（与第七闸口同口径）：proactive 不冷；
+                # 报障换渠道才冷却旧渠道（与第七闸口同口径）：proactive 不冷；
                 # dead 已是终态判定，再冷却无意义。独立冷却表，不写公共表。
                 _STATE["cooldown"][cur] = t0 + _cooldown_sec()
-            switched_node = _rotate_node(slot, cur, picker)
-            if switched_node:
+            picked = _rotate_node(slot, cur, picker, warp_candidates, warp_lock)
+            if picked:
+                switched_node, switched_kind = picked[0], picked[1]
                 outcome = "ok"
                 _STATE["current"] = switched_node
                 _STATE["switched_at"] = t0
@@ -431,9 +478,11 @@ def handle_rotate(req: dict, picker=None) -> dict:
             "egress_ip": egress, "request_started_at": started_at,
             "retry_after_ms": retry_after_ms,
             "from_node": cur_at_report, "to_node": switched_node,
+            "to_kind": switched_kind,
             "outcome": outcome, "switched": outcome == "ok",
         })
-        return _payload(outcome, switched_node, cur_at_report, egress)
+        return _payload(outcome, switched_node, cur_at_report, egress,
+                        switched_kind)
 
 
 def snapshot() -> dict:
