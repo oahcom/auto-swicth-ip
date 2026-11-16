@@ -7500,7 +7500,8 @@ def _warp_ip_is_blocked(ip: str | None, now: float | None = None) -> bool:
     两类拦截的恢复期不同，各自计时后取**最晚解除**的那一类：
       - abuse403：出口 IP 信誉标记，6 小时后刷新（blocked_guard_sec）；
       - rate429：出口 IP 级限流，默认 60s 冷却（rate429_guard_sec）；上游给出
-        Retry-After 时由 ban_until 覆盖（钳制 1s~24h，生产缺失时兜底 12h）；
+        Retry-After 时由 ban_until 覆盖（钳制 1s~24h；生产缺失时不伪造精确
+        封禁，落 60s 默认窗——2026-11-16 风暴实测微配额窗同 IP 恢复 max=26s）；
       - kind 缺失（旧记录）：按 24 小时保守处理（blocked_ttl_sec）。
     同一 IP 先 403 后 429 时两条惩罚线并行，解除时间取晚的（用户规则「按多的来」）。
     满期即视为已恢复，降级为**次级优质**地址、可以复用 —— 惩罚期结束不是永久报废。
@@ -15988,7 +15989,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         _rid = req.get("req_id")
         rid = str(_rid).strip()[:64] if _rid else None
         # 生产 429 的封禁时长：9router 透传的真实 Retry-After 优先，
-        # 缺失时用 api.production_429_ban_sec 兜底（见函数注释）。
+        # 缺失时不伪造精确封禁（返回 None → 60s 默认窗，见函数注释）。
         ban_after = _rotate_ban_after_from_req(req)
         # 多端口：带 egress_proxy_url 的请求按端口定位槽位，走独立 sing-box 路径。
         # 每台 sing-box 独立连接池，9router 轮询，429 时后台修那台，立即返回

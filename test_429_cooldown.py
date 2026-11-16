@@ -153,3 +153,15 @@ def test_rotate_ban_after_no_signal_returns_none_not_fabricated(monkeypatch):
 def test_rotate_ban_after_optin_escape_hatch(monkeypatch):
     monkeypatch.setattr(daemon, "_api_cfg", lambda: {"production_429_ban_sec": 43200})
     assert daemon._rotate_ban_after_from_req({}) == 43200.0,         "显式配置 production_429_ban_sec 可恢复旧行为（逃生门）"
+
+
+def test_rotate_ban_after_shipped_default_does_not_fabricate():
+    # 2026-11-16 全面审查抓到的架空缺陷回归锁：e9f7d8b 把无信号改成 return
+    # None，但 config.py 默认 production_429_ban_sec=43200 让逃生门常开、修复
+    # 被静默架空（上面测试全 mock _api_cfg，没一条走真实 CFG 装载值）。
+    # 本例故意不 mock：走真实 CFG，出厂默认下必须 return None。
+    assert daemon._rotate_ban_after_from_req({}) is None, \
+        "出厂默认（真实 CFG）下无 Retry-After 必须返回 None，不得伪造精确封禁"
+    # 默认值本身也锁死：>0 = 逃生门默认开启 = 伪禁回归
+    assert float(daemon._api_cfg().get("production_429_ban_sec", 0)) == 0.0, \
+        "出厂默认 production_429_ban_sec 必须为 0（不伪造）；>0 仅限显式 opt-in"

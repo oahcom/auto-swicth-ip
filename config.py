@@ -290,10 +290,14 @@ CFG = {
         # 这是硬上限：超时后即便还有 unknown 也不再抑制，避免某条线
         # 长期探不出结果时永远不发信号。
         "slot_boot_grace_sec": 60,
-        # 生产 429 未带 Retry-After 时的兜底封禁时长（秒）。探针实测上游
-        # FreeUsageLimitError 的 Retry-After 为 11~13h；默认 rate429_guard_sec=60
-        # 会让刚封的 /128 立刻回池并被反复复用。9router 透传真实值时以它为准。
-        "production_429_ban_sec": 43200,
+        # 生产 429 未带 Retry-After 时的封禁时长（秒）。0=不伪造精确封禁。
+        # 2026-11-16 风暴实测：无 Retry-After 的生产 429 是秒级微配额窗（同 IP
+        # 恢复 p50=3s / max=26s），旧默认 43200（12h）把健康线锁成半天死线，
+        # 且让 e9f7d8b 的「无信号→None」修复被默认值架空（逃生门常开）。
+        # 真配额死线（探针实测 FreeUsageLimitError Retry-After 11~13h）由探针
+        # 路径带真实值落账（ban_after=retry_after），不受此处影响。
+        # 显式设 >0 可恢复旧行为（逃生门）。
+        "production_429_ban_sec": 0,
         # 限速按「上一次切到的线是否已验证」分档：
         #   - 已验证（缓存命中，可确信是优质出口）：8s。好线撑 8 秒绰绰有余，
         #     窗口内的 429 多半是瞬时限流而非配额耗尽，换线只会白扔一个好 IP。
