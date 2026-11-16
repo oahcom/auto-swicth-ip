@@ -463,8 +463,6 @@ def handle_rotate(req: dict, picker=None, warp_candidates=None,
             if cur:
                 _STATE["current"] = cur
         cur_at_report = cur
-        if egress and cur_at_report:
-            _STATE["egress_by_node"][cur_at_report] = egress
 
         switched_node = None
         switched_kind = None
@@ -473,13 +471,25 @@ def handle_rotate(req: dict, picker=None, warp_candidates=None,
         # 换线前的旧渠道 —— 新渠道已就位，为旧证据烧新渠道 = 连环烧线
         # （2026-11-15 23:45 风暴期 8 秒烧掉 6 条 WARP 同源）。只记证据、
         # 不换渠道，调用方原地重试（新渠道已在 selector 上）。
-        # 事实否决（闸口同款）：报障渠道就是当前渠道时「已换走」不可能成立
-        # —— started_at 缺失时判不出，保持原行为走换渠道。
+        # 事实否决（闸口 _rotate_slot_once 同款「否定已换走」）：报障出口就是
+        # 当前渠道已知出口时「已换走」不可能成立 —— 该证据是当前渠道自己的，
+        # 走真换线。已知出口取 egress_by_node 的前值（写入前先留）；渠道从未
+        # 报过出口时无从否决，判不出保持 retired（宁可不烧新渠道）。
+        # started_at 缺失时判不出迟到，保持原行为走换渠道。
+        prev_egress = (_STATE["egress_by_node"].get(cur_at_report)
+                       if cur_at_report else None)
         retired = (started_at is not None and started_at > 0
                    and _STATE["switched_at"] > started_at
                    and cur is not None)
         if retired and reason in ("proactive", "dead"):
             retired = False   # 主动巡检/终态判定不是迟到事故证据
+        if retired and egress and prev_egress and egress == prev_egress:
+            retired = False   # 报障出口=当前出口：否定「已换走」，走真换线
+        # 出口记账只记当前渠道自己的出口：迟到报告的 egress 属于换线前的
+        # 旧渠道，写进来会把新渠道的出口记成旧 IP（active_egress 失真、
+        # 后续事实否决被污染）。retired 时跳过写入。
+        if egress and cur_at_report and not retired:
+            _STATE["egress_by_node"][cur_at_report] = egress
         if slot is None:
             # 显式降级：闸口没开/找不到槽位，不换渠道。
             outcome = "no_healthy_node"

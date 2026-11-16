@@ -744,8 +744,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             elif switched:
                 # 回包没给 url 但 selector 已换：重试仍走默认出口（换 ok 协议）
                 egress = DEFAULT_EGRESS_URL
-            # switched=false（coalesced/no_healthy_node/borrowed_skip/rotate
-            # 调用失败）：不换新通道，重试当前通道一次（探测窗语义）。
+            # switched=false（already_retired/coalesced/no_healthy_node/
+            # borrowed_skip/rotate 调用失败）：不换新通道，原地重试一次 ——
+            # already_retired 时新渠道已在 selector 上（探测窗语义）。
             retries += 1
 
     # 方法别名：任意动词都走同一条拦截路径

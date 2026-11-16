@@ -665,3 +665,32 @@ def test_view_reads_old_rows_without_new_fields():
                "rotate_actions": [], "retried": 0, "final": "ok"}
     out = _run_view([], [old_row])
     assert len(out) == 1 and "404" in out[0] and "GET" in out[0]
+
+
+# ── ⑧ request_started_at 语义锁：每次尝试报本发时刻 ─────────────────────
+# gate 的 already_retired 判据 = switched_at > request_started_at。重试若报
+# 首发时刻，第二跳恒判迟到、永远不换渠道。这个锁保证换回旧语义必红。
+
+def test_retry_reports_per_attempt_start_time(l7):
+    l7.upstream.set_script(
+        {"status": 429, "reason": "Too Many Requests", "headers": [],
+         "body": b"e1"},
+        {"status": 429, "reason": "Too Many Requests", "headers": [],
+         "body": b"e2"},
+        {"status": 200, "reason": "OK", "headers": [], "body": b"ok"},
+    )
+    l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
+                       "switch_to_node": "n2"})
+    l7.rotate.respond({"ok": True, "switched": True, "reason": "ok",
+                       "switch_to_node": "n3"})
+    raw = _raw_request(l7.port, _req())
+    status, _, body = _parse(raw)
+    assert (status, body) == (200, b"ok")
+    assert len(l7.rotate.calls) == 2
+    t1 = l7.rotate.calls[0]["body"]["request_started_at"]
+    t2 = l7.rotate.calls[1]["body"]["request_started_at"]
+    # 第二跳必须报自己的时刻（≥ 第一跳的；严格递增由时间保证，
+    # 相等说明两跳共用了同一个时间戳 = 回到首发时刻语义）
+    assert t2 >= t1
+    # 两跳之间有真实间隔（各自 _open_tunnel 往返）→ 时刻必须不同
+    assert t2 != t1

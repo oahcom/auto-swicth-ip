@@ -723,3 +723,37 @@ def test_coalesced_cools_offending_channel(gate_env, monkeypatch):
     assert resp2["reason"] == "coalesced"
     # 报障渠道进了冷却（封禁窗），不会马上回候选
     assert "n2" in opencode_gate._STATE["cooldown"]
+
+
+def test_fact_veto_offending_is_current_channel(gate_env, monkeypatch):
+    """事实否决（闸口同款）：报障出口 = 当前渠道已知出口 → 「已换走」不成立。
+
+    时间判据会说谎（IP 回收/同刻换线重放）：此刻证据就是当前渠道自己的，
+    必须走真换线，不能吞成 already_retired 留在死渠道上。
+    """
+    _reset_coalesce(monkeypatch, 0)
+    opencode_gate._STATE["current"] = "n2"
+    opencode_gate._STATE["switched_at"] = 1000.0
+    opencode_gate._STATE["egress_by_node"]["n2"] = "203.0.113.9"
+    req = _req()
+    req["request_started_at"] = 900.0          # 时间上判「迟到」
+    req["egress_ip"] = "203.0.113.9"           # 但报障出口 = 当前出口
+    resp = opencode_gate.handle_rotate(req)
+    assert resp["reason"] == "ok"              # 否决成立 → 真换线
+    assert resp["switched"] is True
+
+
+def test_retired_report_does_not_poison_egress_map(gate_env, monkeypatch):
+    """迟到报告的 egress 属于旧渠道，不能写到新渠道名下。
+
+    否则 active_egress 失真、后续事实否决被污染（把旧 IP 当成新渠道的出口）。
+    """
+    _reset_coalesce(monkeypatch, 0)
+    opencode_gate._STATE["current"] = "n2"
+    opencode_gate._STATE["switched_at"] = 1000.0
+    req = _req()
+    req["request_started_at"] = 900.0          # 迟到证据
+    req["egress_ip"] = "203.0.113.77"          # 旧渠道的出口
+    resp = opencode_gate.handle_rotate(req)
+    assert resp["reason"] == "already_retired"
+    assert opencode_gate._STATE["egress_by_node"].get("n2") != "203.0.113.77"
