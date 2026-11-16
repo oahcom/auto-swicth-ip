@@ -14775,9 +14775,16 @@ def _rotate_ban_after_from_req(req) -> float | None:
     """把 9router 透传的 Retry-After 毫秒转成 ban_after 秒。
 
     9router 从上游 429 的响应头/正文解析（parseRetryAfterMs），有值以它为准；
-    上游不给时用 api.production_429_ban_sec 兜底（默认 12h，来自探针实测
-    11~13h），避免 rate429_guard_sec=60s 让刚封的地址立刻回池。
-    transport / proactive 不标脏，传了也不会产生任何写入。
+    上游不给时**返回 None** —— 不伪造精确封禁（契约 test_429_cooldown：
+    「无解析值时不得伪造精确封禁」），由 rate429_guard_sec=60s 默认窗口接管。
+
+    2026-11-16 风暴实测定性：无 Retry-After 的生产 429 是秒级微配额窗（同 IP
+    恢复 p50=3s / max=26s，65 例无一超过 26s），旧 12h 兜底
+    （production_429_ban_sec=43200）会把健康线写成半天死线——「blocked 8 点
+    没清」病根的一半。真配额死线（探针实测 11~13h）由探针路径带 Retry-After
+    落账（_probe 路径 ban_after=retry_after）；60s 后回池再撞墙会再记一轮
+    （_mark_warp_ip_used 取 ban_until max 递增），探针复判（quota/flagged）
+    兜底长禁。需要旧行为可显式配置 api.production_429_ban_sec > 0（逃生门）。
     """
     raw = req.get("retry_after_ms") if isinstance(req, dict) else None
     try:
@@ -14787,10 +14794,10 @@ def _rotate_ban_after_from_req(req) -> float | None:
     except (TypeError, ValueError):
         pass
     try:
-        secs = float(_api_cfg().get("production_429_ban_sec", 43200))
+        secs = float(_api_cfg().get("production_429_ban_sec", 0))
     except (TypeError, ValueError):
-        secs = 43200.0
-    return max(1.0, min(secs, 86400.0))
+        secs = 0.0
+    return max(1.0, min(secs, 86400.0)) if secs > 0 else None
 
 
 def _normalize_rotate_reason(raw) -> str:

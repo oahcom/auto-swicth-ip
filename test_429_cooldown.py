@@ -135,3 +135,21 @@ def test_mark_rate429_without_ban_after_keeps_default_window(monkeypatch):
     assert not entry.get("ban_until"), "无解析值时不得伪造精确封禁"
     assert entry["blocked_ts_by_kind"].get("rate429") == 1000.0, \
         "默认冷却仍按 rate429 惩罚起点记账"
+
+
+# ---- /rotate 透传路径（_rotate_ban_after_from_req，2026-11-16 风暴复盘）----
+def test_rotate_ban_after_honors_retry_after_ms(monkeypatch):
+    monkeypatch.setattr(daemon, "_api_cfg", lambda: {})
+    assert daemon._rotate_ban_after_from_req({"retry_after_ms": 150000}) == 150.0,         "Retry-After 应按毫秒透传为秒"
+    assert daemon._rotate_ban_after_from_req({"retry_after_ms": "30000"}) == 30.0
+
+def test_rotate_ban_after_no_signal_returns_none_not_fabricated(monkeypatch):
+    monkeypatch.setattr(daemon, "_api_cfg", lambda: {})
+    assert daemon._rotate_ban_after_from_req({}) is None,         "无 Retry-After 不得伪造 12h 精确封禁（契约：无解析值不得伪造精确封禁）"
+    assert daemon._rotate_ban_after_from_req({"retry_after_ms": 0}) is None
+    assert daemon._rotate_ban_after_from_req({"retry_after_ms": "bad"}) is None
+    assert daemon._rotate_ban_after_from_req(None) is None
+
+def test_rotate_ban_after_optin_escape_hatch(monkeypatch):
+    monkeypatch.setattr(daemon, "_api_cfg", lambda: {"production_429_ban_sec": 43200})
+    assert daemon._rotate_ban_after_from_req({}) == 43200.0,         "显式配置 production_429_ban_sec 可恢复旧行为（逃生门）"
