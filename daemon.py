@@ -14829,12 +14829,23 @@ def _transport_strike_account(old_ip: str, t0: float) -> None:
     LHR-83 一条线反复处决 10 次仍回池，每个踩中者烧 22s）——写 kind=transport
     短禁（transport_ban_sec，默认 300s），窗口由 _warp_block_ttl /
     ledger_policy._block_ttl 执法，到点允许复活。
+
+    2026-11-18 事故修正：报障没有出口身份（线无地址/egress 未传）时 None 键
+    会把全局 strike 混计并 _mark(None) 空转（实测 94 连发全是 None）——直接
+    跳过，这类由槽位 bad→repairing 线级机制接管。
     """
+    if not old_ip:
+        return
     n = _transport_strike_push(old_ip, t0)
     if n >= 2:
         _mark_warp_ip_used(old_ip, t0, blocked=True, kind="transport")
         log(f"  ⛔ trap 线短禁: {old_ip} transport 双杀 x{n}/10min -> "
             f"{int(_warp().get('transport_ban_sec', 300))}s")
+
+
+# 2026-11-18 事故修正：报障没有出口身份（线无地址/egress 未传）时 None 键会
+# 把全局 strike 混计并 _mark(None) 空转（实测 94 连发全是 None）——直接跳过，
+# 这类由槽位 bad→repairing 线级机制接管。
 
 
 def _normalize_rotate_reason(raw) -> str:
