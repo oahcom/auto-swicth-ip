@@ -15679,6 +15679,14 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         verdict_before = (_probe_verdict_for_ip(cur_ip, t0)
                           if cur_ip else None)
         verdict_after = verdict_before
+        # trap 线短禁（transport 双杀，与 _rotate_once 同口径）：每笔 transport
+        # 报障都记一击，10min 窗 ≥2 击 = trap 线实锤 → 300s 短禁。挂在所有
+        # 早退（already_retired / line_ok）之前——2026-11-18 事故：只挂了
+        # _rotate_once，生产多端口 slot 路径没接，短禁零触发、trap 线 10 连杀。
+        # _cool_egress_after_recheck 复测 OK 会放行「小探针过、大请求挂」的
+        # 坏线，靠这个兜住。
+        if reason == "transport":
+            _transport_strike_account(egress_ip or cur_ip, t0)
         h = _slot_health(name)
         switched_at = float(h.get("switched_at") or 0.0)
         retired = bool(request_started_at and request_started_at > 0

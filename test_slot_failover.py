@@ -572,6 +572,29 @@ def test_slot_rotate_writes_ban_after_into_ledger(isolated, monkeypatch):
     assert marks[0][1].get("ban_after") == 43200.0
 
 
+def test_slot_rotate_transport_strikes_wire_to_trap_ban(isolated, monkeypatch):
+    # 接线回归锁（2026-11-18 事故复盘）：trap 短禁最初只挂在 _rotate_once，
+    # 生产多端口 slot 路径（_rotate_slot_once）没接 → 短禁零触发、trap 线
+    # 10 连杀（LHR-83）。走真实 _rotate_slot_once 入口，不 mock 接线本身。
+    marks = []
+    monkeypatch.setattr(daemon, "_mark_warp_ip_used",
+                        lambda *a, **k: marks.append((a, k)))
+    monkeypatch.setattr(daemon, "_probe_verdict_for_ip", lambda ip, now=None: None)
+    monkeypatch.setattr(daemon, "_TRANSPORT_STRIKES", {})
+    monkeypatch.setattr(daemon, "_cool_egress_after_recheck", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_warp_line_invalidate", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "log", lambda *a, **k: None)
+    for i in range(2):
+        try:
+            daemon._rotate_slot_once(SLOTS[0], "transport", None,
+                                     "2001:db8::bad", f"req-t{i}", None)
+        except Exception:
+            pass
+    banned = [m for m in marks if m[1].get("kind") == "transport"]
+    assert banned, \
+        "slot 路径的 transport 双击必须接 trap 短禁（2 击 → kind=transport）"
+
+
 # ── 选槽优先级：新鲜度第一，延迟第二 ────────────────────────────────
 
 def _set_probe(name, sec, age=0.0):
