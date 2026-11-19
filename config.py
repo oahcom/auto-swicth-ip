@@ -345,8 +345,9 @@ CFG = {
         # 容量不再需要靠 usque 数量堆，多留的 17 条只是多 17 份注册身份和
         # 17 个待探测端口（2026-10-28 已全部 stop + disable，单元文件留着好回滚）。
         "members": [
-            # 2026-11-13 00:10（主人定）：9 条 CF 线**全部走 h2**，其中 5 条入口 v4、
-            # 4 条入口 v6。理由链：
+            # 2026-11-20：在原 9 条基础上新增 14 条直连 CF H2 隧道（新增 10 条 v6、4 条 v4），
+            # 总计 23 条：入口 v4 共 9 条、入口 v6 共 14 条。每条隧道独立 WARP 注册身份；
+            # 增加的是可并发使用的独立出口池，不代表 14 个不同 CF anycast POP。理由链：
             #   1. 本机到 CF 的 UDP 443 被运营商 ACL 拦（ICMP type 3 code 13），
             #      QUIC 版 v4 端点根本起不来 → 必须走 TCP+TLS 的 --http2。
             #   2. `--http2` 与 `-6` 可以叠加，v6 侧同样能走 TCP 443（实测
@@ -385,6 +386,50 @@ CFG = {
              "transport": "h2v6", "entry": "v6", "family": "v6",
              "h2_endpoint": "2606:4700:103::2"},
             {"tag": "WARP-CF6-D", "port": 1088, "service": "usque-warp-i.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            # 2026-11-20 扩容：新增 10 条入口 v6 + 4 条入口 v4。
+            # 端口 1090-1103 映射 usque11-usque24；每条独立注册设备，出口仍为 WARP IPv6。
+            {"tag": "WARP-CF6-E", "port": 1090, "service": "usque-warp-11.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF4-F", "port": 1091, "service": "usque-warp-12.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.3"},
+            {"tag": "WARP-CF4-G", "port": 1092, "service": "usque-warp-13.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.4"},
+            {"tag": "WARP-CF4-H", "port": 1093, "service": "usque-warp-14.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.8"},
+            {"tag": "WARP-CF4-I", "port": 1094, "service": "usque-warp-15.service",
+             "transport": "h2", "entry": "v4", "family": "v6",
+             "h2_endpoint": "162.159.198.9"},
+            {"tag": "WARP-CF6-F", "port": 1095, "service": "usque-warp-16.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-G", "port": 1096, "service": "usque-warp-17.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-H", "port": 1097, "service": "usque-warp-18.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-I", "port": 1098, "service": "usque-warp-19.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-J", "port": 1099, "service": "usque-warp-20.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-K", "port": 1100, "service": "usque-warp-21.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-L", "port": 1101, "service": "usque-warp-22.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-M", "port": 1102, "service": "usque-warp-23.service",
+             "transport": "h2v6", "entry": "v6", "family": "v6",
+             "h2_endpoint": "2606:4700:103::2"},
+            {"tag": "WARP-CF6-N", "port": 1103, "service": "usque-warp-24.service",
              "transport": "h2v6", "entry": "v6", "family": "v6",
              "h2_endpoint": "2606:4700:103::2"},
             # WARP-WG-13 不再写死在这里：块模型把渠道数从 12 扩到 20 之后，
