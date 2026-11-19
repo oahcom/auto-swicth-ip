@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """把 config.py 的 warp.members 渲染成 shell 可读的行：tag port service dir flag。
 
-dir 由端口推导：1080 → usque，1081 → usque2 … 1099 → usque20（与现有部署一致）。
+dir 由端口推导：1080 → usque，1081 → usque2 … 1103 → usque24（覆盖扩容后的直连 CF 池）。
 这样新增隧道只改 config.py 一处，单元与注册目录自动跟上。
 flag 是 usque 的地址族开关（-6 = IPv6 MASQUE，否则空）。
 """
