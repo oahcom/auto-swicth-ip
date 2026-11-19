@@ -919,7 +919,7 @@ CFG = {
                 # 不重叠的段、单线唯一 IP 576/天 —— 池子质量差 10 倍。
                 # 缺设备由 render_h2_lines.py 自动注册（用户规则），不要靠砍条数。
                 {"colo": "NRT", "loc": "东京",     "carrier": "proxy",  "ban_rate": 1.0,
-                 "channels": 13},
+                 "channels": 1},
                 {"colo": "PHX", "loc": "凤凰城",   "carrier": "proxy",  "ban_rate": 0.792,
                  "channels": 6},
                 {"colo": "LAX", "loc": "洛杉矶",   "carrier": "both",   "ban_rate": 0.266,
@@ -927,7 +927,7 @@ CFG = {
                 {"colo": "SJC", "loc": "圣何塞",   "carrier": "both",   "ban_rate": 0.25,
                  "channels": 3},
                 {"colo": "SIN", "loc": "新加坡",   "carrier": "both",   "ban_rate": 0.152,
-                 "channels": 21},
+                 "channels": 2},
                 {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None,
                  "channels": 8},
                 {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None,
@@ -942,7 +942,7 @@ CFG = {
                  "channels": 4},
                 {"colo": "SLC", "loc": "盐湖城",   "carrier": "proxy",  "ban_rate": None,
                  "channels": 3},
-                {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None,
+                {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None, "channels": 0,
                  # PIT 没有自己的节点：唯一落到过 PIT 的是 ORD 那条
                  # `us.bing.com:443~6-any`（5 轮里 ORD 7 / PIT 3 / SIN 1）。
                  # 按众数它归 ORD，于是 PIT 块永远空着。想拿到 PIT 的样本只能
