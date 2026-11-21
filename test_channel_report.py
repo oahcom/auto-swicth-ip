@@ -157,6 +157,25 @@ def test_only_registered_channels_are_listed(mod, monkeypatch):
     assert chans["WARP-CF"]["carrier"] == "usque"
 
 
+def test_cf_colo_uses_per_line_egress_observation(mod, monkeypatch):
+    """CF direct tunnels have no upstream node; use the per-line WARP trace."""
+    monkeypatch.setitem(mod.CFG["warp"], "members", [
+        {"tag": "WARP-CF4-F", "port": 1090, "entry": "v4", "family": "v6"}
+    ])
+    def fake_read(path, default=None):
+        if Path(path).name == ".warp_line_state.json":
+            return {"lines": {"WARP-CF4-F": {
+                "egress_colo": "LAX", "egress_loc": "CN",
+                "entry_family": "v4", "ip": "2001:db8::1"
+            }}}
+        return default
+    monkeypatch.setattr(mod, "_read_json", fake_read)
+    row = mod.load_channels()["WARP-CF4-F"]
+    assert row["colo"] == "LAX"
+    assert row["entry_family"] == "v4"
+    assert row["ip"] == "2001:db8::1"
+
+
 def test_tag_drift_falls_back_to_hostport(mod, tmp_path):
     """同名节点刷新后 tag 会加 `~N`，台账里还是旧 tag —— 按 host:port 也要认。"""
     (tmp_path / "hist.jsonl").write_text("")
@@ -415,3 +434,78 @@ def test_disabled_unit_is_primary_reason(mod, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "单元停用" in out, "主因必须是「单元停用」"
     assert "配额至" not in out, "单元没跑时不能再印配额原因"
+
+
+def test_cf_direct_has_entry_latency_target_and_node_name(mod, monkeypatch):
+    monkeypatch.setitem(mod.CFG['warp'], 'members', [
+        {'tag': 'WARP-CF6-I', 'port': 1099, 'entry': 'v6', 'family': 'v6',
+         'transport': 'h2v6', 'h2_endpoint': '2606:4700:103::2'}
+    ])
+    monkeypatch.setattr(mod, '_read_json', lambda p, default=None:
+                        {'lines': {}} if Path(p).name == '.warp_line_state.json' else default)
+    row = mod.load_channels()['WARP-CF6-I']
+    assert row['entry_target'] == '2606:4700:103::2:443'
+    assert 'CF H2 v6' in row['node_name']
+    assert row['source'] == 'CF直连'
+    monkeypatch.setattr(mod, '_read_json', lambda p, default=None: default)
+    assert mod._load_sock_ports()['WARP-CF6-I'] == 1099
+
+
+def test_cf_summarize_does_not_reuse_old_entry_egress(mod, monkeypatch, tmp_path):
+    now = 1_800_000_000.0
+    (tmp_path / "hist.jsonl").write_text("")
+    monkeypatch.setattr(mod, "_unit_states", lambda services: {})
+    monkeypatch.setattr(mod, "_singbox_outbound_tags", lambda: set())
+    monkeypatch.setattr(mod, "colo_ban_rates", lambda start, end: {})
+    chans = {"WARP-CF6-I": {"node": None, "colo": None, "carrier": "usque",
+             "family": "v6", "entry_family": "v6", "node_name": "CF H2 v6",
+             "entry_target": "2606:4700:103::2:443", "ip": None}}
+    state = {"WARP-CF6-I": {"entry_family": "v4", "last_ok_ip": "2a09:bac5:1efe:1173::1bd:f6",
+             "egress_colo": "LAX", "ban_probes": []}}
+    row = mod.summarize(state, chans, {}, 6, now)[0]
+    assert row["colo"] == "?"
+    assert row["egress_ip"] == "-"
+
+
+def test_cf_node_name_uses_live_usque_config_endpoint(mod, monkeypatch):
+    monkeypatch.setitem(mod.CFG['warp'], 'members', [
+        {'tag': 'WARP-CF4-B', 'port': 1081, 'entry': 'v4', 'family': 'v6',
+         'transport': 'h2', 'h2_endpoint': '162.159.198.4'}
+    ])
+    def read_json(path, default=None):
+        if Path(path).name == 'config.json':
+            return {'endpoint_h2_v4': '162.159.198.2'}
+        if Path(path).name == '.warp_line_state.json':
+            return {'lines': {}}
+        return default
+    monkeypatch.setattr(mod, '_read_json', read_json)
+    row = mod.load_channels()['WARP-CF4-B']
+    assert row['entry_target'] == '162.159.198.2:443'
+    assert '162.159.198.2:443' in row['node_name']
+
+
+def test_cf_generic_placeholder_is_not_reported_as_egress_colo(mod, monkeypatch):
+    monkeypatch.setitem(mod.CFG['warp'], 'members', [
+        {'tag': 'WARP-CF6-I', 'port': 1099, 'entry': 'v6', 'family': 'v6', 'colo': 'CF'}
+    ])
+    monkeypatch.setattr(mod, '_read_json', lambda p, default=None:
+                        {'lines': {}} if Path(p).name == '.warp_line_state.json' else default)
+    assert mod.load_channels()['WARP-CF6-I']['colo'] is None
+
+
+def test_cli_table_prints_window_restart_count(mod, monkeypatch, tmp_path, capsys):
+    """asip chan 文本表必须展示窗口内重启数，而不是只在 summarize 内计算。"""
+    (tmp_path / "hist.jsonl").write_text("")
+    now = time.time()
+    row = mod.summarize(
+        {"WARP-WG-1": {"restart_hist": [now - 60, now - 30, now - 3 * 86400]}},
+        _chans(), {}, 2, now)[0]
+    monkeypatch.setattr(mod, "_measure_latency_batch", lambda nodes: {})
+    monkeypatch.setattr(mod, "_load_sock_ports", lambda: {})
+    monkeypatch.setattr(mod, "_measure_tunnel_latency_batch", lambda ports: {})
+    monkeypatch.setattr(mod, "_load_slot_health", lambda: {})
+    monkeypatch.setattr(mod, "_tier_disabled", lambda: set())
+    mod.print_table([row], 2)
+    out = capsys.readouterr().out
+    assert "重启" in out
+    assert "   2 " in out

@@ -614,6 +614,15 @@ def test_slot_note_probe_records_and_expires(isolated):
     assert "probe_sec" not in daemon._slot_health("slot-3")
 
 
+def test_cached_probe_does_not_refresh_latency_sample_age(isolated):
+    daemon._slot_note_probe("slot-2", {"sec": 1.25})
+    old_ts = time.time() - 10 ** 6
+    daemon._slot_health("slot-2")["probe_ts"] = old_ts
+    daemon._slot_note_probe("slot-2", {"sec": 1.25, "cached": True})
+    assert daemon._slot_health("slot-2")["probe_ts"] == old_ts
+    assert daemon._slot_probe_sec("slot-2") is None
+
+
 def test_pick_prefers_fresh_rank_over_low_latency(isolated, monkeypatch):
     """新鲜度是主判据：刚验过 OK 的慢线，压过撑过生产流量的快线。"""
     ranks = {"2606:b::2": (2, 0, 0.0), "2606:c::3": (1, 0, 5.0)}

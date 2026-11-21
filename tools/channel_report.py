@@ -403,6 +403,7 @@ def load_channels() -> dict[str, dict]:
     """**在册**渠道 tag → 元信息。状态表里的历史残留不出现。"""
     live = {m["tag"] for m in CFG["warp"]["members"]}
     blockmap = (_read_json(PROJECT / ".warp/block-map.json") or {}).get("nodes") or {}
+    line_state = (_read_json(PROJECT / ".warp_line_state.json") or {}).get("lines") or {}
     out: dict[str, dict] = {}
 
     for tag, line in ((_read_json(PROJECT / ".warp/warp_wg_state.json") or {})
@@ -432,12 +433,40 @@ def load_channels() -> dict[str, dict]:
         tag = m.get("tag")
         if not tag or tag in out:
             continue
-        out[tag] = {"node": None, "colo": m.get("colo"),
-                    "carrier": {"wg": "WG", "h2": "H2"}.get(
-                        m.get("kind") or "usque", "usque"),
-                    "family": m.get("family") or
-                    ("v6" if m.get("ipv6") else "v4"),
-                    "ip": None}
+        st = line_state.get(tag) or {}
+        carrier = {'wg': 'WG', 'h2': 'H2'}.get(m.get('kind') or 'usque', 'usque')
+        endpoint = m.get('h2_endpoint')
+        entry_family = m.get('entry') or st.get('entry_family')
+        is_cf_direct = tag.startswith('WARP-CF') and bool(endpoint)
+        if is_cf_direct:
+            line_no = int(m.get('port') or 0) - 1079
+            line_dir = 'usque' if line_no == 1 else f'usque{line_no}'
+            line_cfg = _read_json(PROJECT / '.warp' / line_dir / 'config.json') or {}
+            endpoint_key = 'endpoint_h2_v6' if entry_family == 'v6' else 'endpoint_h2_v4'
+            fallback_key = 'endpoint_v6' if entry_family == 'v6' else 'endpoint_v4'
+            endpoint = line_cfg.get(endpoint_key) or line_cfg.get(fallback_key) or endpoint
+        state_matches_entry = (not is_cf_direct or st.get('entry_family') == entry_family)
+        if is_cf_direct:
+            endpoint_host = f'[{endpoint}]' if ':' in endpoint else endpoint
+            entry_label = entry_family or 'unknown'
+            node_name = f'CF H2 {entry_label} · {endpoint_host}:443'
+        else:
+            node_name = '-'
+        colo = st.get('egress_colo') if state_matches_entry else None
+        if str(colo or '').upper() in PSEUDO_COLO:
+            colo = None
+        if not colo and carrier != 'usque':
+            colo = m.get('colo')
+        out[tag] = {'node': None,
+                    'colo': colo,
+                    'carrier': carrier,
+                    'family': m.get('family') or ('v6' if m.get('ipv6') else 'v4'),
+                    'entry_family': entry_family,
+                    'entry_target': f'{endpoint}:443' if is_cf_direct else None,
+                    'node_name': node_name,
+                    'source': 'CF直连' if is_cf_direct else '-',
+                    'source_label': 'Cloudflare WARP' if is_cf_direct else '-',
+                    'ip': (st.get('last_ok_ip') or st.get('ip')) if state_matches_entry else None}
     return out
 
 
@@ -587,7 +616,14 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
         total = len(samples)
         node = meta.get("node")
         # 无绑定的 usque 直连线：落点从最近一次成功出口反推。
-        colo = meta.get("colo") or _colo_of_ip(st.get("last_ok_ip"))
+        # Entry-family changes invalidate older egress observations.
+        state_matches_entry = (not meta.get("entry_family") or
+                               st.get("entry_family") == meta.get("entry_family"))
+        observed_ip = ((st.get("last_ok_ip") or st.get("ip") or meta.get("ip"))
+                       if state_matches_entry else None)
+        colo = meta.get("colo") or _colo_of_ip(observed_ip)
+        if colo in PSEUDO_COLO:
+            colo = None
         cn, cb = colos.get(colo or "", (0, 0))
         if not node:
             src = {"sub": "-", "label": "-", "name": "-"}
@@ -605,14 +641,17 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
             "tag": tag,
             "carrier": meta.get("carrier"),
             "family": meta.get("family"),
+            "entry_family": meta.get("entry_family"),
+            "entry_target": meta.get("entry_target"),
             "colo": colo or "?",
             "loc": colo_name(colo),
             "node": node or "-",
-            "node_name": src["name"] or "-",
-            "source": src["sub"] or "-",
-            "source_label": src["label"] or "-",
+            "node_name": meta.get("node_name") or src["name"] or "-",
+            "source": meta.get("source") or src["sub"] or "-",
+            "source_label": meta.get("source_label") or src["label"] or "-",
             "source_url": urls.get(src["label"], "-"),
-            "egress_ip": st.get("last_ok_ip") or meta.get("ip") or "-",
+            "egress_ip": (st.get("last_ok_ip") or meta.get("ip") or "-")
+                         if state_matches_entry else (meta.get("ip") or "-"),
             "samples": total,
             "ok": ok,
             "ban": ban,
@@ -1197,6 +1236,12 @@ def _load_sock_ports() -> dict[str, int]:
                 out[tag] = int(sp)
     except Exception:
         pass
+    # CF direct usque lines are declared in config.members, not channels.json.
+    # Include them so the table measures their SOCKS tunnel latency as well.
+    for member in CFG.get("warp", {}).get("members", []):
+        tag, sp = member.get("tag"), member.get("port")
+        if tag and tag.startswith('WARP-CF') and sp:
+            out[tag] = int(sp)
     return out
 
 
@@ -1279,7 +1324,7 @@ def print_table(rows: list[dict], hours: float) -> None:
         print(f"注：渠道样本只保留当天，实际窗口从 {_fmt_ts(window_from)} 起"
               f"（< {hours:g}h）\n")
     # 入口延迟：测机场节点 TCP（所有线都测）
-    latency_map = _measure_latency_batch([r.get("node", "-") for r in rows])
+    latency_map = _measure_latency_batch([r.get("entry_target") or r.get("node", "-") for r in rows])
     # 隧道出口延迟：通过 SOCKS 代理测（隧道不通 -> 不可达）
     _sock_ports = _load_sock_ports()
     tunnel_map = _measure_tunnel_latency_batch(list(_sock_ports.values()))
@@ -1292,12 +1337,12 @@ def print_table(rows: list[dict], hours: float) -> None:
         _lat_bad = 1 if tunnel_map.get(_sp, "不可达") == "不可达" else 0
         return (_pri, _lat_bad, -(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or "")
     rows.sort(key=_sort_key)
-    head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('colo', 4)} "
+    head = (f"{_pad('渠道', 18)} {_pad('承载', 5)} {_pad('entry', 4)} {_pad('colo', 4)} "
             f"{_pad('机房', 8)} {_pad('成功率', 6, False)} "
-            f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} "
+            f"{_pad('ban', 5, False)} {_pad('成/败', 7, False)} {_pad('重启', 4, False)} "
             f"{_pad('/32,/48,/64,/128', _SEG_W, False)} "
             f"{_pad('单ip服务', 12, False)} "
-            f"{_pad('订阅', 8)} {_pad('节点名', 30)} {_pad('入口延迟', 7, False)} {_pad('隧道延迟', 7, False)} 状态")
+            f"{_pad('订阅', 8)} {_pad('节点名', 42)} {_pad('入口延迟', 7, False)} {_pad('隧道延迟', 7, False)} 状态")
     print(head)
     print("-" * (_w(head) + 40))
     tier_off = _tier_disabled()
@@ -1306,7 +1351,7 @@ def print_table(rows: list[dict], hours: float) -> None:
         state = "-"
         notes = []
         _sp = _sock_ports.get(r["tag"])
-        _lat_entry = latency_map.get(r.get("node", "-"), "—")
+        _lat_entry = latency_map.get(r.get("entry_target") or r.get("node", "-"), "—")
         _lat_tunnel = tunnel_map.get(_sp, "—") if _sp else "—"
         if r["tag"] in tier_off:
             notes.append("档位停用")
@@ -1401,13 +1446,15 @@ def print_table(rows: list[dict], hours: float) -> None:
         _lat_tunnel_style = "不可达" if _lat_tunnel == "不可达" else _lat_tunnel
         _note = (' ' + ' '.join(notes)) if notes else ''
         print(f"{_pad(r['tag'], 18)} {_pad(r['carrier'], 5)} "
+              f"{_pad(r.get('entry_family') or '-', 4)} "
               f"{_pad(r['colo'], 4)} {_pad(r['loc'], 8)} "
               f"{_pad(_pct(r['success_rate']), 6, False)} "
               f"{_pad(_pct(r['ban_rate']), 5, False)} "
               f"{_pad(okfail, 7, False)} "
+              f"{_pad(r.get('restarts', 0), 4, False)} "
               f"{_pad(_seg_label(r), _SEG_W, False)} "
               f"{_pad(_ip_svc_label(r), 12, False)} "
-              f"{_pad(r['source'], 8)} {_pad(r['node_name'], 30)} "
+              f"{_pad(r['source'], 8)} {_pad(r['node_name'], 42)} "
               f"{_pad(_lat_entry_style, 7, False)} {_pad(_lat_tunnel_style, 7, False)} "
               f"{state}{_note}")
     print("-" * (_w(head) + 40))

@@ -181,8 +181,13 @@ def main():
         fmt_table(flat[-10:], ["channel", "colo", "tls_ms", "ttfb_ms", "egress_ip"])
         print(f"失败 {len(bad)} 条（详见 JSON）")
 
-    with open(OUT, "w") as f:
+    # 原子替换：daemon 读取时不会撞上半截 JSON。
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)
+        f.flush()
+        _os.fsync(f.fileno())
+    _os.replace(tmp, OUT)
     print(f"\n结果已写入 {OUT}")
 
 

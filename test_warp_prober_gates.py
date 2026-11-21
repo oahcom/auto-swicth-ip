@@ -210,6 +210,7 @@ def test_restart_fuses_when_ip_never_changes(monkeypatch):
     之间来回跳（CF 共享 IPv4），每次重启都掐断在途连接 —— 9router 侧就是每
     8~10 秒一批 aborted/503。重启是为了换 IP，换不到就不该继续重启。
     """
+    monkeypatch.setitem(daemon.CFG["warp"], "restart_ip_stuck_fuse", 3)
     _stub_restart(monkeypatch)
     m = _member()
     for _ in range(3):

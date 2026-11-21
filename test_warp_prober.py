@@ -358,8 +358,8 @@ def test_dirty_ip_is_never_probed(monkeypatch):
     assert daemon._PROBE_LAST_VERDICT["W2"] == "blocked"
 
 
-def test_restart_to_another_banned_ip_parks_until_unban(monkeypatch):
-    """重启换到的地址若也在惩罚期，照样停探到解禁——判据是台账，不是「同址」。"""
+def test_restart_to_another_banned_ip_does_not_wait_for_unban(monkeypatch):
+    """A blocked IP is rechecked from the local ledger without waiting for ban expiry."""
     _stub_restart(monkeypatch, "2.2.2.2")
     now = time.time()
     with daemon._WARP_LINE_CV:
@@ -371,7 +371,7 @@ def test_restart_to_another_banned_ip_parks_until_unban(monkeypatch):
     assert daemon._warp_line_restart(_member(), "test") is True
     st = daemon._warp_line_state("W2")
     assert st["ip"] == "2.2.2.2"
-    assert st["next_probe_ts"] >= now + 3500
+    assert st["next_probe_ts"] < now + 10
 
 
 def test_stale_verdict_after_line_restart_is_dropped():
@@ -465,6 +465,9 @@ def test_successful_probe_records_node_colo(monkeypatch, tmp_path):
     daemon._probe_one_line(_member())
     got = json.loads(ledger.read_text())["nodes"]["n.nrt:443-any"]
     assert got["colo"] == "NRT" and got["ok"] is True, got
+    line = daemon._warp_line_state(_member()["tag"])
+    assert line.get("egress_colo") == "NRT"
+    assert line.get("egress_loc") == "JP"
 
 
 def test_penalty_restart_skipped_when_line_never_got_egress(monkeypatch):

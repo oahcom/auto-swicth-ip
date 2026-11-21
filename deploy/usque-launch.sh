@@ -47,12 +47,20 @@ case $want in
         fi
         ;;
 esac
+# usque selects endpoint_h2_v6 for --http2 -6; endpoint_v6 alone is not enough.
+# Freshly registered devices may leave endpoint_h2_v6 empty, so derive it from
+# the device's already-provisioned IPv6 endpoint before starting the tunnel.
+# Keep the v4 H2 endpoint untouched: it remains the route fallback when IPv6
+# source addressing is unavailable.
+if [ "$want" = h2v6 ]; then
+    python3 -c 'import ipaddress,json,os,tempfile; p="config.json"; d=json.load(open(p,encoding="utf-8")); v=d.get("endpoint_h2_v6") or d.get("endpoint_v6"); ipaddress.IPv6Address(v); d["endpoint_h2_v6"]=v; fd,t=tempfile.mkstemp(prefix=".config.",dir="."); f=os.fdopen(fd,"w",encoding="utf-8"); json.dump(d,f,indent=2); f.write("\n"); f.close(); os.chmod(t,os.stat(p).st_mode); os.replace(t,p)'
+fi
 # 一行写进 journal：事后要判断"这条线当时走的是哪种承载"，只看这个。
 echo "usque-launch :$port 期望=${2:-default} 实走=$want" >&2
 
 case $want in
-    h2)    exec ./usque -c config.json socks --http2      -s '' -P 443 -b 127.0.0.1 -p "$port" ;;
-    h2v6)  exec ./usque -c config.json socks --http2 -6   -s '' -P 443 -b 127.0.0.1 -p "$port" ;;
-    quic6) exec ./usque -c config.json socks -6           -b 127.0.0.1 -p "$port" ;;
-    *)     exec ./usque -c config.json socks              -b 127.0.0.1 -p "$port" ;;
+    h2)    exec ./usque -c config.json socks --http2 --local-dns --system-dns -s '' -P 443 -b 127.0.0.1 -p "$port" ;;
+    h2v6)  exec ./usque -c config.json socks --http2 -6 --local-dns --system-dns -s '' -P 443 -b 127.0.0.1 -p "$port" ;;
+    quic6) exec ./usque -c config.json socks -6 --local-dns --system-dns -b 127.0.0.1 -p "$port" ;;
+    *)     exec ./usque -c config.json socks --local-dns --system-dns -b 127.0.0.1 -p "$port" ;;
 esac

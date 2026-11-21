@@ -545,3 +545,29 @@ def test_asip_cli_systemctl_scope_follows_settings(tmp_path):
     assert system_args, "system 作用域下没调用 systemctl"
     assert "--user" not in system_args, \
         f"system 作用域下仍用 --user（会静默操作不存在的单元）：{system_args[:200]}"
+
+
+
+def test_launch_h2v6_populates_h2_endpoint_from_device_v6(tmp_path):
+    import json
+    import subprocess
+
+    script = tmp_path / "launch.sh"
+    script.write_text((PROJECT / "deploy/usque-launch.sh").read_text())
+    script.chmod(0o755)
+    (tmp_path / "usque").write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+    (tmp_path / "usque").chmod(0o755)
+    (tmp_path / "ip").write_text(
+        "#!/bin/sh\necho '2606:4700:103::2 from :: via fe80::1 dev eth1 src 2001:db8::5'\n")
+    (tmp_path / "ip").chmod(0o755)
+    cfg = {"endpoint_v6": "2606:4700:103::2",
+           "endpoint_h2_v4": "162.159.198.2", "endpoint_h2_v6": ""}
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(cfg))
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    out = subprocess.run([str(script), "1085", "h2v6"], cwd=tmp_path, env=env,
+                         capture_output=True, text=True, check=True).stdout
+    updated = json.loads(p.read_text())
+    assert "--http2" in out and "-6" in out
+    assert updated["endpoint_h2_v6"] == cfg["endpoint_v6"]
+    assert updated["endpoint_h2_v4"] == cfg["endpoint_h2_v4"]

@@ -417,7 +417,6 @@ CFG = {
             {"tag": "WARP-CF6-I", "port": 1099, "service": "usque-warp-20.service",
              "transport": "h2v6", "entry": "v6", "family": "v6",
              "h2_endpoint": "2606:4700:103::2"},
-            # 2026-11-20: add 6 IPv6-entry + 4 IPv4-entry CF devices (usque21-30).
             {"tag": "WARP-CF6-J", "port": 1100, "service": "usque-warp-21.service",
              "transport": "h2v6", "entry": "v6", "family": "v6",
              "h2_endpoint": "2606:4700:103::2"},
@@ -789,7 +788,7 @@ CFG = {
         # 重启被「不是失败」的原因挡下时（在途连接没排空、拿不到重启槽、
         # 这条线正在被别处处理）的重排间隔：不是惩罚，只是别原地空转，
         # 所以固定 5s，不随 fail_streak 涨。
-        "restart_cooldown_sec": 5,
+        "restart_cooldown_sec": 0,
         # 2026-10-28 删除 restart_backoff_sec / restart_backoff_max_sec：
         # 这条曲线从未真正生效 —— 重启成功会把 next_restart_ts 清零，紧接着
         # 探到 quota 又立刻重启，退避表根本没被查过（实测 168 次重启/分钟、
@@ -807,7 +806,7 @@ CFG = {
         # 2026-11-09 夜里配额普遍耗尽时把一条条线全熔断，池子被打空，
         # 主人定性「非常愚蠢」。设 ASIP_RESTART_IP_STUCK_FUSE=0 表示禁用
         # （代码用 max(2,...)，0 仍会变 2，故用极大值 999999 禁用）。
-        "restart_ip_stuck_fuse": _env_int("ASIP_RESTART_IP_STUCK_FUSE", 3),
+        "restart_ip_stuck_fuse": _env_int("ASIP_RESTART_IP_STUCK_FUSE", 999999),
         "restart_ip_stuck_hold_sec": _env_int("ASIP_RESTART_IP_STUCK_HOLD_SEC", 900),
         # 「重启没换出地址」的踩刹车阈值 —— 与上面的配额熔断是**两回事**：
         # 上面判的是地址好不好（上游配额结论，2026-11-09 已按主人裁定禁用，
@@ -817,7 +816,7 @@ CFG = {
         # 刹车只推迟下次重启，不写 ip_stuck_until、不碰 stop_probe ——
         # 线路照旧参与探测与选线。实测 2026-11-10 08:30 前后 12 分钟：263 次
         # 重启里 194 次以「到点无响应」收场，47 条扫描线 fail_streak 涨到 188。
-        "restart_futile_limit": _env_int("ASIP_RESTART_FUTILE_LIMIT", 6),
+        "restart_futile_limit": _env_int("ASIP_RESTART_FUTILE_LIMIT", 999999),
         "restart_futile_hold_sec": _env_int("ASIP_RESTART_FUTILE_HOLD_SEC", 900),
         # 同时在飞的重启数。每条 quota/blocked 线都要「重启换地址 → 等就绪 →
         # 重探」，这个闸才是现在的真正吞吐瓶颈：4 槽 × 一次 3~5s ≈ 20~40 条/分钟。
@@ -831,7 +830,7 @@ CFG = {
         # 旧口径（1h 窗口 100% 封禁 + 铺满半窗）实测会把能出 OK 的线锁一整天：
         # WG-21 锁在 11-03 08:00 后，10:52~13:37 期间换两个新 IP 出了 7 次 OK，
         # 但锁不解除；到期时窗口里的旧样本又把它续到次日。
-        "channel_ban_hold_enabled": True,
+        "channel_ban_hold_enabled": False,
         "channel_ban_min_samples": 1000,
         # 转义给了 `ipv6_segments.colo_ban_rates`（重定位挑 colo 用），与本锁无关。
         "channel_ban_window_sec": 3600,
@@ -984,15 +983,15 @@ CFG = {
                 {"colo": "PHX", "loc": "凤凰城",   "carrier": "proxy",  "ban_rate": 0.792,
                  "channels": 6},
                 {"colo": "LAX", "loc": "洛杉矶",   "carrier": "both",   "ban_rate": 0.266,
-                 "channels": 8},
+                 "channels": 1},
                 {"colo": "SJC", "loc": "圣何塞",   "carrier": "both",   "ban_rate": 0.25,
                  "channels": 3},
                 {"colo": "SIN", "loc": "新加坡",   "carrier": "both",   "ban_rate": 0.152,
                  "channels": 2},
                 {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None,
-                 "channels": 8},
+                 "channels": 1},
                 {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None,
-                 "channels": 18},
+                 "channels": 1},
                 {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None,
                  "channels": 1},
                 # 2026-11-02 H2 实测新增（dormant 65 节点里首次出现）。

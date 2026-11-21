@@ -1566,6 +1566,8 @@ _WARP_PROBING: set[str] = set()
 # 只用来把落点顺手记进 `wg_colo_map.json`；带上 port 是为了让调用方确认
 # 「这条结果确实是我这次探测的」，并发探测时不会记到别人的 colo。
 _LAST_EGRESS_TRACE: dict = {}
+_LAST_EGRESS_TRACE_LOCK = threading.Lock()
+_LAST_EGRESS_TRACE_BY_PORT: dict[int, dict] = {}
 # 本轮因「仍在传数据」让出的线 → 冷却截止时刻。没有它守护每 5s 就会重派一次
 # 探测线程（每次 2 次出口探测 ≈ 2~14s），把活线当靶子反复打；冷却让节奏回到
 # 一条线最多每 refresh_delay_sec 被探一次。
@@ -4001,10 +4003,14 @@ def warp_egress_ip(port: int, timeout_sec: float = 20.0) -> str | None:
     # recv_fail = 隧道建立后被打断、timeout = 到点没响应、warp_off = 通了但
     # 没走 WARP。不记它的话，日志里只剩「探测失败」四个字，四种完全不同的
     # 故障在报表上长得一模一样。
-    _LAST_EGRESS_TRACE = {"port": int(port), "ip": res.ip,
-                          "colo": getattr(res, "colo", None),
-                          "loc": getattr(res, "loc", None),
-                          "error": getattr(res, "error", None)}
+    trace = {"port": int(port), "ip": res.ip,
+             "colo": getattr(res, "colo", None),
+             "loc": getattr(res, "loc", None),
+             "error": getattr(res, "error", None),
+             "observed_at": time.time()}
+    with _LAST_EGRESS_TRACE_LOCK:
+        _LAST_EGRESS_TRACE = trace
+        _LAST_EGRESS_TRACE_BY_PORT[int(port)] = trace
     return res.ip
 
 
@@ -6728,7 +6734,6 @@ def _warp_line_restart(member: dict, reason: str,
         stuck_until_new = 0.0
         # 重启后的地址若在台账里仍处惩罚期，停探到确切解禁：这条地址已经
         # 被判脏，再探只是把同一结论再买一次。
-        block_left = _line_block_remaining(ip, now) if ip else 0.0
         with _WARP_LINE_CV:
             st = _warp_line_state_locked(tag)
             st["warming"] = False
@@ -6743,22 +6748,8 @@ def _warp_line_restart(member: dict, reason: str,
             # 重启的目的是换一个能用地址，所以必须马上知道新地址的结果。
             # 停探只保留「同一地址刚从台账读到惩罚期」这一种：那不是猜测，
             # 是台账里的确定事实，探它等于把同一结论再买一次。
-            if block_left > 0:
-                st["next_probe_ts"] = max(
-                    float(st.get("next_probe_ts") or 0.0), now + block_left)
-            else:
-                # **不许在这里写 `last_verdict`**（a377b4b 引入、2cd6845 留下的
-                # 老写法 `st["last_verdict"] = "unknown"`）。`unknown` 的语义是
-                # 「探测跑完了但没拿到出口 IP」，而这条路径刚刚拿到了地址，只是
-                # 还没做模型层探测 —— 用探测失败的词覆盖真实结论是错的词。
-                # 后果是实质性的：重启是 5~15s 一次的高频动作，字段被反复刷成
-                # `unknown`，`asip chan` 把它当「当前状态」印出来，于是 33/78 条
-                # 线看起来全是 unknown，读起来像「根本没在探测」。实测 2026-11-05
-                # 16:40：20 秒内 42 条线的 `last_probe_ts` 全在推进，30 分钟
-                # 1459 条模型层结论 —— 探测一直在跑，坏的是这个字段。
-                # 保留上一条真实结论；「地址是新的、还没探过」由 `last_ok_ts == 0`
-                # 加 `ip_ts > last_probe_ts` 表达，报表那边已有 `无地址` 口径。
-                st["next_probe_ts"] = now + _line_unknown_retry()
+            # Blocked is checked against the local ledger; do not defer probing until ban_until.
+            st["next_probe_ts"] = now + _line_unknown_retry()
             old_ip = st.get("ip")
             if ip:
                 st["ip"] = ip
@@ -6863,16 +6854,25 @@ def _probe_one_line(member: dict) -> None:
         return
     ip = warp_egress_ip(member["port"])
     if ip:
-        # 落点台账跟着生产流量自更新：这条线绑的是哪个落地节点、它实际出口
-        # 在哪个 colo —— 一次成功探测就够了，不需要单独的 survey。
-        # 台账的键是**落地节点**（`wg_colo_map.json` 的 nodes 表按节点 tag
-        # 索引，与 `survey()` / `load_colo_map()` 同一口径），不是线路 tag。
-        # trace 由 `warp_egress_ip` 顺手存在 `_LAST_EGRESS_TRACE` 里；
-        # 端口对不上说明那次结果不是本次探测的，宁可不记。
-        tr = _LAST_EGRESS_TRACE or {}
-        node = _line_node(tag) if tr.get("port") == int(member["port"]) else None
-        if node:
-            _record_line_colo(str(node), tr.get("colo"), tr.get("loc"), ip)
+        port = int(member["port"])
+        with _LAST_EGRESS_TRACE_LOCK:
+            tr = dict(_LAST_EGRESS_TRACE_BY_PORT.get(port) or {})
+            if not tr and _LAST_EGRESS_TRACE.get("port") == port:
+                tr = dict(_LAST_EGRESS_TRACE)
+        if tr.get("port") == port:
+            fields = {
+                "egress_colo": tr.get("colo"),
+                "egress_loc": tr.get("loc"),
+                "egress_colo_ts": tr.get("observed_at") or time.time(),
+                "egress_family": "v6" if ":" in ip else "v4",
+            }
+            if member.get("entry"):
+                fields["entry_family"] = member["entry"]
+            _warp_line_update(tag, **fields)
+            _save_warp_line_state()
+            node = _line_node(tag)
+            if node:
+                _record_line_colo(str(node), tr.get("colo"), tr.get("loc"), ip)
     if not ip:
         _channel_noaddr_note(tag, False, time.time())
         _warp_line_record_observation(tag, None, "unknown", time.time(), started_at)
@@ -14306,6 +14306,9 @@ def _slot_note_probe(name, probed):
     同一条代理路径，比 ping 更接近用户看到的延迟。
     """
     if not isinstance(probed, dict):
+        return
+    # 缓存结论只复用旧耗时，不代表本次真的测了延迟；不能把旧样本时间戳刷新。
+    if probed.get("cached"):
         return
     sec = probed.get("sec")
     if not isinstance(sec, (int, float)) or sec <= 0:
