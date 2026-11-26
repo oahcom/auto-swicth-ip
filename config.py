@@ -479,6 +479,8 @@ CFG = {
         # 一起删掉，客户端看到 "upstream connection lost"，sidecar 侧 socket hang
         # up → 503 → 再次触发清理，形成正反馈。默认关闭，只保留代码与配置开关。
         "cleanup_enabled": False,
+        # P0: non-EXIT_IP domains must not dirty/retire exits (fail-closed)
+        "failure_domain_enforcement": True,
         "cleanup_old_chain_age_sec": 120,
         # 出口探测正常但仍报传输层 503 → 判为连接池僵死，清理当前链上
         # age >= 300s 的连接（30 秒节流，避免 503 风暴里反复全表扫描）。

@@ -78,9 +78,10 @@ _STATE_SHADOW = None
 # opencode 专属闸口（kind="opencode"）：rotate 与槽位产出全部委托该模块，
 # daemon 只做 /rotate-opencode-gate 的接线与「非 WARP 线槽位」分类跳过。
 from asip import opencode_gate
-
 # P0 故障域分类：影子阶段只记录，不改变任何路由决策。
 from asip.failure_domain import classify_rotate_request, FailureDomain
+from asip.rotation_policy import (rotation_policy, confirm_exit_domain,
+                                 enforcement_enabled, domain_trace_fields)
 
 # WARP 渠道模型（块 = colo）与夜间锁策略。两者都是纯函数模块，import 它们不会
 # 触发任何 IO；daemon 只在这里取策略，不再自己算窗口与白名单。
@@ -15284,7 +15285,8 @@ def _with_active_line(payload: dict, t0: float, tag: str | None = None,
 def _rotate_once(reason: str, request_started_at: float | None = None,
                  egress_ip: str | None = None,
                  egress_since: float | None = None,
-                 ban_after: float | None = None) -> dict:
+                 ban_after: float | None = None,
+                 domain: FailureDomain | None = None) -> dict:
     """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
 
     错误切换（rate429/abuse403）只做秒切：翻到一条已探通的健康备用槽。
@@ -15304,6 +15306,11 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
     已知局限：与主循环自己的换线调用没有共用一把锁。两条同时发生时结果为
     最后写入者胜，记账各自完整但可能指向不同的线。两者都罕见，代价是一次
     多余的切换。
+
+    `domain` 为 /rotate handler 已完成分类的故障域；默认 None 完全保持旧行为。
+    仅当 CFG["warp"]["failure_domain_enforcement"]=True 时启用新判据：非出口域
+    （账号/模型/请求/上下文/传输）与已分类 UNKNOWN 不标脏、不切线；未分类的
+    旧调用者仍走旧策略，绝不让 UNKNOWN 升级为出口故障。
     """
     global _last_rotate_ts
     cfg = _api_cfg()
@@ -15381,6 +15388,9 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                     f" 但早于历史首条，退回当前线")
         elif request_started_at is not None:
             log("  ⟲ 迟到回溯: request_started_at 非法，退回当前线")
+        # P0 故障域判据：必须在任何标脏 / 切线之前完成。
+        # enforcement 关闭或 domain 未分类时 allow_*=True，下方旧逻辑逐字不变。
+        _pol = rotation_policy(domain, enforcement=enforcement_enabled(CFG))
         was_blocked = False
         try:
             was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
@@ -15389,7 +15399,8 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         # transport 双杀上报（9router stall 二击）：单发只是抖动证据，换线但
         # 不记脏；同 IP 10 分钟内 ≥2 次上报 = trap 线实锤（2026-11-16 晚 LHR-83
         # 一条线反复处决 10 次仍回池，每个踩中者烧 22s）——写 transport 短禁。
-        if reason not in ("proactive", "transport") and old_ip:
+        if (_pol.allow_dirty and reason not in ("proactive", "transport")
+                and old_ip):
             _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason,
                                ban_after=ban_after)
         elif reason == "transport" and old_ip:
@@ -15419,6 +15430,19 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
             # 回包定型之后启动，避免后台换线/探新线与秒切挑线并发改同一份状态表。
             quick = None
             if reason in ("rate429", "abuse403"):
+                if not _pol.allow_switch:
+                    # enforcement 开启且已分类为非出口域：不标脏、不退役、不切线。
+                    # 沿用 9router 已知的 coalesced（重连即可），另附 domain 说明；
+                    # 不返回未知 reason，避免客户端无限重试。
+                    _api_stats["domain_suppressed"] = (
+                        _api_stats.get("domain_suppressed", 0) + 1)
+                    log("· /rotate: 故障域 %s 禁止切线/退役"
+                        % (domain.value if domain else "-"))
+                    return _with_active_line({
+                        "ok": True, "switched": False, "reason": "coalesced",
+                        "switched_at": _last_rotate_ts,
+                        **domain_trace_fields(domain, _pol),
+                    }, t0)
                 if not _SWITCH_GUARD.acquire(blocking=False):
                     # 已经有一次换闸在跑：这次的 429 多半来自同一批并发请求，
                     # 那条坏线正在被换走。不排队、不重复换，直接回 coalesced
@@ -15980,7 +16004,8 @@ def _rotate_proxy_gate_once(slot, reason, request_started_at=None,
 
 
 def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
-                      req_id=None, ban_after=None, borrowed=False):
+                      req_id=None, ban_after=None, borrowed=False,
+                      domain: FailureDomain | None = None):
     """带防重的槽位 /rotate：迟到请求只重连，不为旧证据烧掉新线。
 
     与主路径一一对应：
@@ -16000,6 +16025,8 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
             borrowed=borrowed)
     t0 = time.time()
     cfg = _api_cfg()
+    # P0 故障域判据：必须在任何标脏 / 切线之前完成。
+    _pol = rotation_policy(domain, enforcement=enforcement_enabled(CFG))
     name = slot["name"]
     with _API_LOCK:
         _api_stats["calls"] += 1
@@ -16127,8 +16154,8 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
                 _cool_egress_after_recheck(cur_ip, cur_tag, reason)
             else:
                 _mark_egress_cooling(cur_ip, t0)
-        if (reason not in ("proactive", "transport") and cur_ip
-                and not defer_verdict):
+        if (_pol.allow_dirty and reason not in ("proactive", "transport")
+                and cur_ip and not defer_verdict):
             _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason,
                                ban_after=ban_after)
             # 只观测：标脏后台账里还剩什么，留在 ⇢ 那一行做运行时证据。
@@ -16152,6 +16179,12 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
               and t0 - last_attempt < _rotate_gap()):
             _api_stats["too_frequent"] += 1
             reason_out = "too_frequent"
+        elif not _pol.allow_switch:
+            # enforcement 开启且已分类为非出口域：不认领修整、不换线。
+            # 返回 9router 已知的 coalesced，不制造未知 reason。
+            _api_stats["domain_suppressed"] = (
+                _api_stats.get("domain_suppressed", 0) + 1)
+            reason_out = "coalesced"
         elif _slot_begin_repair(name, reason):
             h["last_rotate_ts"] = t0
             # 只造线程、不启动：后台换线/探新线/放回池子和下面的
@@ -16184,6 +16217,7 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         # 事发前读数钉进回包：_rotate_trace_fields 优先沿用，不在标脏
         # （forget_probe 已清台账）之后重算成「未探」。
         out["offending_verdict"] = verdict_before
+        out.update(domain_trace_fields(domain, _pol))
         # borrowed 也打：借道不认领修整，accepted 恒 False，不加这一条就
         # 完全看不见「哪条健康线被谁借去打了一发」—— 正是不可观测的复发点。
         if accepted or h["status"] == "repairing" or borrowed:
@@ -16366,6 +16400,32 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         # 它，才能把「一条失败请求」和「哪台闸/哪条线/哪个出口」串成一条链。
         _rid = req.get("req_id")
         rid = str(_rid).strip()[:64] if _rid else None
+
+        # P0 影子分类：把 429 分成账号/模型/请求/传输/未知域，只落盘不动作。
+        # 等影子期统计出各域占比后再决定是否启用「非出口域不标脏」策略。
+        _shadow_domain = FailureDomain.UNKNOWN
+        try:
+            _shadow_domain = classify_rotate_request(req)
+            if _shadow_domain in (FailureDomain.ACCOUNT, FailureDomain.MODEL,
+                                  FailureDomain.REQUEST,
+                                  FailureDomain.CONTEXT_REJECTED,
+                                  FailureDomain.TRANSPORT):
+                _atomic_append_line(
+                    os.path.join(_PROJECT, ".warp", "failure_domain_shadow.jsonl"),
+                    {"ts": time.time(), "req_id": rid,
+                     "reason": str(req.get("reason") or "")[:64],
+                     "domain": _shadow_domain.value,
+                     "retry_after_ms": req.get("retry_after_ms"),
+                     "egress_ip": str(req.get("egress_ip") or "")[:64]})
+        except Exception as _fd_err:
+            log(f"· 故障域影子分类失败（不影响路由）: {_fd_err}")
+        # P0 强制策略：仅在 enforcement 开启时把影子分类升级为策略输入。
+        # EXIT_IP 必须带 9router 透传的独立证据；否则降级为 UNKNOWN（证据不足，
+        # 不标脏、不切线）——绝不让无证据的 429 被误判成出口故障。
+        _policy_domain = None
+        if enforcement_enabled(CFG):
+            _policy_domain = confirm_exit_domain(
+                _shadow_domain, req.get("exit_evidence_id"))
         # 生产 429 的封禁时长：9router 透传的真实 Retry-After 优先，
         # 缺失时不伪造精确封禁（返回 None → 60s 默认窗，见函数注释）。
         ban_after = _rotate_ban_after_from_req(req)
@@ -16383,7 +16443,8 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                     if isinstance(req.get("egress_ip"), str)
                     and req.get("egress_ip").strip() else None,
                     rid, ban_after,
-                    borrowed=bool(req.get("borrowed")))
+                    borrowed=bool(req.get("borrowed")),
+                    domain=_policy_domain)
             except Exception as e:
                 log(f"✗ 槽位 /rotate 异常: {e}")
                 self._send(500, {"ok": False, "reason": "internal_error"})
@@ -16396,6 +16457,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                     % (slot["name"], req.get("reason"), payload.get("reason"),
                        rid or "-"))
             payload.update(_rotate_trace_fields(req, payload))
+            payload.update(domain_trace_fields(_policy_domain))
             self._send(200, payload)
             return
         try:
@@ -16408,7 +16470,8 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                 _normalize_rotate_reason(req.get("reason")),
                 _as_ts(req.get("request_started_at")),
                 str(ip).strip() if isinstance(ip, str) and ip.strip() else None,
-                _as_ts(req.get("egress_since")), ban_after)
+                _as_ts(req.get("egress_since")), ban_after,
+                domain=_policy_domain)
         except Exception as e:
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})
@@ -16416,6 +16479,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         # 主路径秒切失败：回包已经表达「无可用闸口，自己重启」，这里留一行
         # 生产日志，免得只能从 9router 侧反推 asip 到底有没有发出信号。
         result.update(_rotate_trace_fields(req, result))
+        result.update(domain_trace_fields(_policy_domain))
         if result.get("restart_required"):
             log("⇢ 主路径无可用闸口[req=%s]，通知 9router 自重启" % (rid or "-"))
         # 换线与回传分成两步：换线成功但客户端已超时断开时，记账为「回传超时」
@@ -17426,7 +17490,7 @@ def main():
             # 状态：它只回答「WARP 渠道此刻是否在承载 opencode」。池该不该轮换
             # 仍取决于池自己 —— 见 `_pool_should_rotate()`，两者的判据分开写，
             # 这样 WARP 侧的改变不会静默改变池的节奏。
-            _pool_current_dead = bool(cached_current_proxy) and cached_current_proxy in _DEAD_NODES
+            _pool_current_dead = _pool_node_dead(cached_current_proxy)
             if _pool_should_rotate(opencode_out_on_warp(), _pool_current_dead) \
                     and now - last_proactive_rotate > CFG["intervals"]["proactive_rotate_sec"]:
                 last_proactive_rotate = now
@@ -17495,7 +17559,8 @@ def main():
                     cached_all_nodes and cached_current_proxy:
                 _pool_delay_last = now
                 _submit_once("pool-delay-refresh", _refresh_pool_delays,
-                             cached_all_nodes, cached_current_proxy)
+                             cached_all_nodes, cached_current_proxy,
+                             opencode_out_on_warp())
             if now - last_health_check > CFG["intervals"]["node_health_sec"]:
                 if _initial_health_done.is_set() and cached_all_nodes and cached_current_proxy:
                     with _state_lock:
