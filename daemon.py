@@ -10581,7 +10581,8 @@ def _pool_delay_bootstrapping(nodes: list[str] | None) -> bool:
                    for n in nodes)
 
 
-def _refresh_pool_delays(nodes: list[str], current: str | None) -> int:
+def _refresh_pool_delays(nodes: list[str], current: str | None,
+                         include_current: bool = False) -> int:
     """补池成员的延迟样本：每轮健康检查抽 `pool_delay_refresh` 个缺样本的节点。
 
     WHY 不是每轮全测：142 个节点串行测一轮 93s（实测 1.55s/节点），而池的
@@ -10599,8 +10600,14 @@ def _refresh_pool_delays(nodes: list[str], current: str | None) -> int:
     with _state_lock:
         stale = [n for n in nodes
                  if _is_pool_node(n) and n not in _DEAD_NODES
-                 and n != current
+                 and (n != current or include_current)
                  and now - _NODE_DELAY_TS.get(n, 0.0) > _NODE_DELAY_TTL]
+        # 当前池节点在 opencode 走 WARP 时只是通用流量的默认出口，必须像普通节点
+        # 一样补样本，否则它死了永远判不出来（_DEAD_NODES 只由被测节点写入）。
+        # 排到最前，下一拍就测到，不必等游标转一圈。
+        if include_current and current in stale:
+            stale.remove(current)
+            stale.insert(0, current)
     if not stale:
         return 0
     # 游标取模：stale 列表每轮都在变长变短，用绝对游标保证不会永远只测前 40 个。
@@ -12581,6 +12588,22 @@ def _pool_should_rotate(on_warp: bool, pool_current_dead: bool) -> bool:
     负责把 WARP 的状态喂进来，判据的演进不会牵动 WARP 换线逻辑。
     """
     return (not on_warp) or pool_current_dead
+
+
+def _pool_node_dead(node: str | None) -> bool:
+    """池节点是否判死：既看黑名单，也看「刚测过却没拿到延迟」的新鲜失败样本。
+
+    只看 `_DEAD_NODES` 不够：健康检查与延迟补刷历史上都排除当前节点，于是当前
+    节点从不会被判死。opencode 在 WARP 上时它只是通用流量的默认出口，卡在死节点
+    上就会让 :7890 的其它 provider 一直失败（见 `_pool_should_rotate` 第 2 种情况）。
+    """
+    if not node:
+        return False
+    if node in _DEAD_NODES:
+        return True
+    now = time.time()
+    return (now - _NODE_DELAY_TS.get(node, 0.0) <= _NODE_DELAY_TTL
+            and node not in _NODE_DELAYS)
 
 
 def _rotate_pool_proactive(current: str | None, nodes: list[str], now: float) -> None:
@@ -14578,6 +14601,7 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
     t0 = time.time()
     n = len(slots)
     start = int(_SLOT_REDIRECT_RR.get("index", 0)) % n
+    cooling_candidates = []
     candidates = []
     for off in range(n):
         s = slots[(start + off) % n]
@@ -14591,11 +14615,6 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
         if ip and ip in avoid_ip_set:
             log("· 秒切候选 %s 出口=%s 是这条请求刚撞过的地址，跳过"
                 % (s["name"], ip))
-            continue
-        cooling_left = _egress_cooling_left(ip, t0)
-        if cooling_left > 0:
-            log("· 秒切候选 %s 出口=%s 冷却中（剩 %.0fs：真实请求刚在它上面失败）"
-                % (s["name"], ip or "未知", cooling_left))
             continue
         if _slot_ip_is_quarantined(ip, t0):
             log("· 秒切候选 %s 出口=%s 已隔离（生产标脏/quota），跳过"
@@ -14611,7 +14630,20 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
             log("· 秒切候选 %s 渠道延迟 %.0fms 过高（>10s），跳过"
                 % (s["name"], _chan_ms))
             continue
+        cooling_left = _egress_cooling_left(ip, t0)
+        if cooling_left > 0:
+            # 2026-11-26 ruling: a gate has no cooldown. Cooling only paces
+            # rotation; it must never remove a gate from selection. Demote to
+            # fallback so an all-cooling pool still fails over inside the
+            # gates instead of falling through to the 7th (proxy) gate.
+            log("· 秒切候选 %s 出口=%s 冷却中（剩 %.0fs），降级为后备"
+                % (s["name"], ip or "未知", cooling_left))
+            cooling_candidates.append((s, tag, ip))
+            continue
         candidates.append((s, tag, ip))
+    if not candidates and cooling_candidates:
+        # all regular gates cooling: still far better than the proxy gate
+        candidates = list(cooling_candidates)
     if not candidates:
         # 六个常规闸口一个都选不出来 —— 第七闸口（代理池兜底）是最后的
         # 选择，且**只在这里**被考虑：上面常规候选存在时它永远不出场。
@@ -14651,6 +14683,16 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
                     log("· 选槽 %s 出口=%s 的 OK 证明（%.0fs 前）早于它上次被切"
                         "（%.0fs 前），期间未复验"
                         % (chosen[0]["name"], _c_ip, t0 - _ok_ts, t0 - _used_ts))
+                    # P0 影子降权：enforcement 开启时陈旧 OK 不得直接采信——
+                    # 清掉旧结论强制下一轮复验；本次已选，降权影响下一次选槽。
+                    # 默认关闭时只记录，选择逻辑逐字不变。
+                    if enforcement_enabled(CFG):
+                        _api_stats["stale_ok_downranked"] = (
+                            _api_stats.get("stale_ok_downranked", 0) + 1)
+                        try:
+                            _WARP_PROBE_SEEN.pop((_c_tag, _c_ip), None)
+                        except Exception:
+                            pass
     except Exception as _e:
         log("· 选槽证据年龄观测失败（不影响选择）：%s" % _e)
     if len(candidates) > 1:
