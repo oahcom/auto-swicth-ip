@@ -9894,7 +9894,7 @@ def _maybe_verify_transport_failures(count: int, now: float) -> None:
 # ---------------------------------------------------------------------------
 # Batch B (503 / SSE 安全) — 影子观测区块（纯新增，不改变现有路由行为）
 #
-# 本区块不被 _verify_transport_failure / _opencode_lane_alive 调用；它提供
+# 本区块由 _verify_transport_failure 在 transport_observe_enabled 开启时调用；它提供
 # 结构化 TransportEvidence、连接生命周期分类、单连接删除唯一入口与 SSE 在途
 # 记账。任何接线到生产路由的动作都必须另加默认 False 的独立开关。
 # ---------------------------------------------------------------------------
@@ -9984,41 +9984,8 @@ def classify_transport_failure(*, egress_ok, proxy_tcp_ok=None, tls_ok=None,
     return TransportErrorClass.UNKNOWN.value
 
 
-def is_model_service_available(ev: "TransportEvidence") -> bool:
-    """模型服务可用必须满足：HTTP 200 + 收到 SSE 首事件 + 无故障阶段。"""
-    if not isinstance(ev, TransportEvidence):
-        return False
-    return bool(ev.http_status == 200 and ev.first_sse_event_ms is not None
-                and ev.error_class is None)
 
 
-_TRANSPORT_CLASSES = frozenset({
-    TransportErrorClass.CONNECT_FAILED.value,
-    TransportErrorClass.TLS_FAILED.value,
-    TransportErrorClass.HTTP_503.value,
-    TransportErrorClass.FIRST_BYTE_TIMEOUT.value,
-    TransportErrorClass.FIRST_SSE_EVENT_TIMEOUT.value,
-    TransportErrorClass.SSE_INTERRUPTED.value,
-    TransportErrorClass.UPSTREAM_ERROR.value,
-    TransportErrorClass.HEADER_TIMEOUT.value,
-    TransportErrorClass.CALLER_ABORTED.value,
-    TransportErrorClass.UPSTREAM_TIMEOUT.value,
-    TransportErrorClass.EGRESS_PROBE_FAILED.value,  # 需独立复测，不直接标脏
-})
-
-
-def transport_error_domain(error_class) -> "_FailureDomain":
-    """error_class → FailureDomain。
-
-    header-timeout / caller-aborted / upstream-timeout 及全部传输/sidecar
-    阶段都归 TRANSPORT（不是 EXIT_IP）；HTTP 429 归 REQUEST；出口探测失败
-    也只归 TRANSPORT —— 必须独立复测确认后才能考虑出口退役。
-    """
-    if error_class in _TRANSPORT_CLASSES:
-        return _FailureDomain.TRANSPORT
-    if error_class == TransportErrorClass.HTTP_429.value:
-        return _FailureDomain.REQUEST
-    return _FailureDomain.UNKNOWN
 
 
 def should_dirty_exit_on_transport_error(error_class) -> bool:
@@ -10166,140 +10133,24 @@ def observe_transport_failure(tag, port, count, *, egress_probe=None,
     return ev
 
 
-class ConnectionLifecycle(str, _Enum):
-    SSE_ACTIVE = "sse_active"
-    INFLIGHT = "inflight"
-    RECENTLY_ACTIVE = "recently_active"
-    STALE_IDLE = "stale_idle"
-    UNKNOWN = "unknown"
 
 
-STALE_CLEANUP_MIN_AGE_SEC = 300.0
-RECENT_ACTIVITY_WINDOW_SEC = 60.0
 
 
-def _conn_get(conn, key, default=None):
-    if isinstance(conn, dict):
-        return conn.get(key, default)
-    return getattr(conn, key, default)
 
 
-def classify_connection_lifecycle(conn, now=None) -> "ConnectionLifecycle":
-    """连接生命周期分类：SSE 活跃 / inflight / 近期活动 / 明确僵死 / 未知。
-
-    顺序即安全优先级：sse_active 与 inflight 永远排在年龄判断之前；
-    state != "stale" 或 last_activity 不可信时一律 UNKNOWN（保留不清理）。
-    """
-    if conn is None:
-        return ConnectionLifecycle.UNKNOWN
-    now = float(now if now is not None else time.time())
-    if _conn_get(conn, "sse_active", False):
-        return ConnectionLifecycle.SSE_ACTIVE
-    inflight = _conn_get(conn, "inflight_requests", 0)
-    try:
-        if inflight is not None and int(inflight) > 0:
-            return ConnectionLifecycle.INFLIGHT
-    except (TypeError, ValueError):
-        return ConnectionLifecycle.UNKNOWN
-    state = _conn_get(conn, "state", None)
-    last = _conn_get(conn, "last_activity", None)
-    if last is None:
-        return ConnectionLifecycle.UNKNOWN
-    try:
-        age = now - float(last)
-    except (TypeError, ValueError):
-        return ConnectionLifecycle.UNKNOWN
-    if state == "stale":
-        if age >= STALE_CLEANUP_MIN_AGE_SEC:
-            return ConnectionLifecycle.STALE_IDLE
-        return ConnectionLifecycle.RECENTLY_ACTIVE
-    if 0 <= age <= RECENT_ACTIVITY_WINDOW_SEC:
-        return ConnectionLifecycle.RECENTLY_ACTIVE
-    return ConnectionLifecycle.UNKNOWN
 
 
-def is_connection_safe_to_cleanup(conn, now=None) -> bool:
-    """未知 / SSE / inflight / 近期活动一律 False；只有明确僵死候选为 True。"""
-    return classify_connection_lifecycle(
-        conn, now) is ConnectionLifecycle.STALE_IDLE
 
 
-# OUT-OF-SCOPE：9router/sidecar 单连接删除 API 尚未验证，默认不启用。
-_SINGLE_CONNECTION_DELETE_VERIFIED = False
 
 
-def _delete_single_connection(connection_id, *, http=None,
-                              method="DELETE") -> bool:
-    """唯一允许发出单连接 DELETE 的私有入口；只打 /connections/{id}。
-
-    双重闸门：cleanup_enabled 必须开 + 单连接 API 必须已验证；否则零请求。
-    任何情况下都不退化为 DELETE /connections 全量清理。
-    """
-    if not _warp().get("cleanup_enabled", False):
-        return False
-    if not _SINGLE_CONNECTION_DELETE_VERIFIED:
-        return False
-    if not connection_id:
-        return False
-    path = f"/connections/{connection_id}"
-    if http is not None:
-        status = http.delete(path)
-    else:
-        status, _ = singbox_api(path, method=method, silent=True)
-    return status in (200, 204)
 
 
-def cleanup_one_connection(connection_id, *, conn=None, now=None,
-                           http=None) -> bool:
-    """定向清理唯一公开入口：先安全判定，再过开关，再删单个连接 ID。"""
-    if not _warp().get("cleanup_enabled", False):
-        return False
-    if not connection_id:
-        return False
-    if conn is not None and not is_connection_safe_to_cleanup(conn, now):
-        return False
-    return _delete_single_connection(connection_id, http=http)
 
 
-def should_replay_request(ctx, classification=None, max_retry=1) -> bool:
-    """已开始 SSE 绝不重放；账号/模型/上下文错误不重放；仅限流允许一次。"""
-    if ctx is None:
-        return False
-    if getattr(ctx, "sse_started", False):
-        return False
-    if int(getattr(ctx, "retry_count", 0) or 0) >= max_retry:
-        return False
-    if classification in (_ProbeClass.ACCOUNT_QUOTA, _ProbeClass.MODEL_QUOTA,
-                          _ProbeClass.CONTEXT_REJECTED):
-        return False
-    return classification == _ProbeClass.RATE_LIMITED
 
 
-def sse_disconnect_failure_domain(ctx) -> "_FailureDomain":
-    """SSE 中断是请求级事件，绝不是出口 IP 故障；未开始 SSE 则不判定。"""
-    if ctx is None:
-        return _FailureDomain.UNKNOWN
-    if getattr(ctx, "sse_started", False):
-        return _FailureDomain.REQUEST
-    return _FailureDomain.UNKNOWN
-
-
-def should_mark_exit_ip_on_sse_disconnect(ctx) -> bool:
-    return False
-
-
-def connection_from_sse_view(ctx) -> dict:
-    """把 SSE 上下文映射成连接视图，供 is_connection_safe_to_cleanup 使用。"""
-    return {
-        "id": getattr(ctx, "connection_id", None),
-        "sse_active": bool(getattr(ctx, "sse_started", False)),
-        "inflight_requests": 1 if getattr(ctx, "ended_at", None) is None else 0,
-        "state": "unknown",
-        "last_activity": time.time(),
-    }
-
-
-OPENCODE_LANE_URL = "https://opencode.ai/inference/v1/chat/completions"
 
 
 def _opencode_lane_alive(port: int, timeout_sec: float = 6.0) -> bool:

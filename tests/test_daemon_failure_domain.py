@@ -17,7 +17,6 @@ from asip.rotation_policy import (
     RequestRouteContext,
     confirm_exit_domain,
     domain_trace_fields,
-    effective_rate429_max_retry,
     enforcement_enabled,
     requires_revalidation,
     resolve_failure_tag,
@@ -176,23 +175,6 @@ def test_stale_ok_candidate_downranked():
     assert enforced.note == "stale_ok_downranked"
     fresh = stale_ok_decision(99.0, 95.0, enforcement=True)
     assert not fresh.needs_recheck and not fresh.downrank
-
-
-def test_429_replay_idempotent_by_req_id():
-    """业务方确认幂等性之前，429 自动重放上限强制为 0。"""
-    cfg = {"warp": {"rate429_max_retry": 1}}
-    assert effective_rate429_max_retry(cfg) == 0
-    seen = set()
-
-    def replay(req_id):
-        if req_id in seen or effective_rate429_max_retry(cfg) == 0:
-            return False
-        seen.add(req_id)
-        return True
-
-    assert replay("req-A") is False
-    assert replay("req-B") is False
-    assert seen == set()
 
 
 def test_non_idempotent_request_never_replayed():

@@ -138,16 +138,6 @@ def retire_once(seen_req_ids, req_id, mark_dirty, domain=None,
 REPLAY_IDEMPOTENCY_CONFIRMED = False
 
 
-def effective_rate429_max_retry(cfg,
-                                replay_confirmed=REPLAY_IDEMPOTENCY_CONFIRMED) -> int:
-    """显式读取后钳制为 0；确认幂等性后才有条件放行配置值。"""
-    if not replay_confirmed:
-        return 0
-    try:
-        warp = cfg.get("warp") or {} if isinstance(cfg, dict) else {}
-        return max(0, int(warp.get("rate429_max_retry", 0)))
-    except (TypeError, ValueError):
-        return 0
 
 
 @dataclass(frozen=True)
