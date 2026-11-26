@@ -61,22 +61,6 @@ import warp_blocks  # noqa: E402
 from config import CFG, get_singbox_secret  # noqa: E402
 
 # 端口规划（与生产错开）
-# 节点分配策略（2026-11-25 用户开关，改 .env 即可，不需改代码）：
-#   unique（默认）= 一条线独占一个节点，同 colo 最多渲染 len(该 colo 节点池) 条
-#   best          = 同 colo 的线**全部**用该 colo 延迟最低的节点，线路数不受节点数限制
-NODE_POLICY = (os.environ.get("ASIP_H2_NODE_POLICY") or "unique").strip().lower()
-# 是否允许渲染器按 block-map 自动补线（默认允许；设 0 = 台账即最终配比，不增不减）
-ALLOW_EXPAND = (os.environ.get("ASIP_H2_ALLOW_EXPAND") or "1").strip() != "0"
-# topN 模式：每个 colo 按渠道数动态算用几个节点，线分摊到池内最快的 N 个。
-# N = min(池大小, ceil(渠道数 / LINES_PER_NODE))。渠道越多用的节点越多，
-# 但每个节点最多承载 LINES_PER_NODE 条线（2026-11-25 实测：1 个节点挤 24 条
-# 会打满并发，73/132 条挂 Connect EOF）。
-LINES_PER_NODE = int(os.environ.get("ASIP_H2_LINES_PER_NODE") or "6")
-# usque 隧道内的 DNS。默认的 Quad9（9.9.9.9 / 2620:fe::9）在 WARP 里解析目标域名会超时，
-# 表现为每条线「lookup www.cloudflare.com: i/o timeout」，与节点和策略无关。
-# 2026-11-25 实测：换 1.1.1.1 + CF v6 后单线 3/3 通。可用 ASIP_H2_USQUE_DNS 覆盖（逗号分隔）。
-USQUE_DNS_ARGS = "--local-dns --system-dns"
-
 BASE_INBOUND = 22700      # sing-box direct 入站（usque 直连这里，不经 relay）
 BASE_DEVICE_PORT = 1180   # usque SOCKS 出口，落入 warp.members 的 1080 段之外
 BASE_UNIT = "usque-h2"
@@ -171,9 +155,7 @@ def h2_channels() -> list[dict]:
             cand.setdefault(str(meta.get("colo") or "?"), []).append(node)
     nxt = max([c["index"] for c in out] or [-1]) + 1
     added = 0
-    # best 模式：节点由人按「同 colo 共用最低延迟节点」显式决定，台账即最终配比，
-    # 不再按 block-map 自动补线（否则每次渲染都会把台账撑大，配比无法稳定复现）。
-    for colo in (sorted(cand) if ALLOW_EXPAND else []):
+    for colo in sorted(cand):
         cap = blk_cap.get(colo, base_cap)
         for node in sorted(cand[colo]):
             if cap and per_colo.get(colo, 0) >= cap:
@@ -493,9 +475,7 @@ def render(print_only: bool = False) -> int:
                       if o.get("server") and o.get("server_port")}
     except (OSError, ValueError, KeyError):
         pass
-    # best 模式按实测 RTT 选点，不需要再跑一遍可达性扫描（214 个节点 × 6s 超时
-    # 会把渲染拖到几分钟甚至超时）。unique 模式保持原行为。
-    reach = {} if NODE_POLICY == "best" else (_alive_many(live_nodes) if live_nodes else {})
+    reach = _alive_many(live_nodes) if live_nodes else {}
 
     # **编号（=端口偏移）是既有部署的一部分，不能重算**。
     # `WARP-H2-<COLO>-<N>` ↔ SOCKS 1180+N，这套映射写进了
@@ -526,38 +506,6 @@ def render(print_only: bool = False) -> int:
     for colo in pools_by_colo:
         pools_by_colo[colo] = _reachable_order(
             pools_by_colo[colo], live_nodes, bool(live_nodes), reach)
-    # best 模式：按实测 RTT 排序（ 写表），队首即最低延迟。
-    # 只在「在主配置里」的节点里挑 —— 否则队首可能是个没出站可用的节点，
-    # 整条 colo 的线会一起被跳过。
-    if NODE_POLICY in ("best", "topN"):
-        try:
-            delays = json.loads((PROJECT / ".warp" / "h2" / "node_delay.json").read_text())["delays"]
-        except (OSError, ValueError, KeyError):
-            delays = {}
-        # 池子要按「该 colo 的全量节点」算，不是只看台账里出现过的：
-        # 否则队首只是「台账用过的最快那个」，不是该 colo 真正最快的节点。
-        try:
-            _bm = json.loads((PROJECT / ".warp" / "block-map.json").read_text()).get("nodes") or {}
-        except (OSError, ValueError):
-            _bm = {}
-        by_colo: dict[str, list[str]] = {}
-        for _t, _m in _bm.items():
-            if isinstance(_m, dict) and _m.get("carrier") == "h2":
-                by_colo.setdefault(str(_m.get("colo")), []).append(_t)
-        try:
-            _alive = set(json.loads((PROJECT / ".warp" / "h2" / "node_delay.json").read_text())["delays"])
-        except (OSError, ValueError, KeyError):
-            _alive = set()
-        for colo, pool in list(pools_by_colo.items()):
-            cands = by_colo.get(colo) or pool
-            # 只把「TCP 实测连通」的节点放进池子：node_delay.json 里没条目 = 连不上。
-            # 2026-11-25 教训：为了提速关掉可达性扫描后，NXDOMAIN/端口不通的节点混进候选，
-            # selector 换节点时跳到死节点，整池一起失败。
-            keep = [t for t in cands
-                    if ((not live_nodes) or (t in live_nodes)) and (not _alive or t in _alive)]
-            if keep:
-                keep.sort(key=lambda t: float(delays.get(t, 9e9)))
-                pools_by_colo[colo] = keep
 
     # 想渲染多少条 = 每个 colo「成员数」与「池子大小」取小后求和。
     # 不能拿「块模型渠道去重后的节点数」当上限：同一 colo 的多条线是从
@@ -566,12 +514,8 @@ def render(print_only: bool = False) -> int:
     demand: dict[str, int] = {}
     for _, colo in fixed_order:
         demand[colo] = demand.get(colo, 0) + 1
-    if NODE_POLICY == "best":
-        want_n = sum(cnt for colo, cnt in demand.items()
-                     if pools_by_colo.get(colo))
-    else:
-        want_n = sum(min(cnt, len(pools_by_colo.get(colo) or []))
-                     for colo, cnt in demand.items())
+    want_n = sum(min(cnt, len(pools_by_colo.get(colo) or []))
+                 for colo, cnt in demand.items())
     if want_n == 0:
         print(f"⚠ 没有可渲染的渠道（渠道 {len(chs)} 条，成员 {len(fixed_order)} 条）；"
               f"先跑 tools/merge_h2_blockmap.py", file=sys.stderr)
@@ -627,21 +571,11 @@ def render(print_only: bool = False) -> int:
             continue
         k = per_colo.get(colo, 0)
         per_colo[colo] = k + 1
-        if NODE_POLICY == "topN":
-            # N 按该 colo 渠道数动态算：线多就多用几个节点，每个节点最多
-            # LINES_PER_NODE 条。pool 已按 RTT 排序，取前 N 个轮转。
-            _cnt = demand.get(colo, 1)
-            _n = max(1, min(len(pool), -(-_cnt // LINES_PER_NODE)))
-            node = pool[k % _n]
-        elif NODE_POLICY == "best":
-            # 该 colo 延迟最低的节点（pool 已按可达/延迟排序，队首即最优）
-            node = pool[0]
-        else:
-            rot = pool[k % len(pool):] + pool[:k % len(pool)]
-            node = next((t for t in rot if t not in seen_node), None)
-            if node is None:
-                continue
-            seen_node.add(node)
+        rot = pool[k % len(pool):] + pool[:k % len(pool)]
+        node = next((t for t in rot if t not in seen_node), None)
+        if node is None:
+            continue
+        seen_node.add(node)
         picked.append({"tag": member, "member_tag": member, "colo": colo,
                        "node": node, "nodes": pool})
         if len(picked) == n:
@@ -801,7 +735,7 @@ WantedBy=multi-user.target
         s.write_text(
             "#!/bin/bash\n"
             f"cd {PROJECT}/.warp/{r['device']} || exit 1\n"
-            f"exec ./usque -c {conf} socks --http2 {USQUE_DNS_ARGS} -s '' -P {r['inbound_port']} "
+            f"exec ./usque -c {conf} socks --http2 -s '' -P {r['inbound_port']} "
             f"-b 127.0.0.1 -p {r['socks_port']}\n")
         s.chmod(0o755)
 

@@ -10261,79 +10261,6 @@ def cleanup_one_connection(connection_id, *, conn=None, now=None,
     return _delete_single_connection(connection_id, http=http)
 
 
-@dataclass
-class SSEStreamContext:
-    req_id: str
-    connection_id: str | None = None
-    started_at: float = _dc_field(default_factory=time.monotonic)
-    first_event_at: float | None = None
-    ended_at: float | None = None
-    end_reason: str | None = None
-    sse_started: bool = False
-    retry_count: int = 0
-
-    def mark_first_event(self, ts=None):
-        self.sse_started = True
-        if self.first_event_at is None:
-            self.first_event_at = float(ts) if ts is not None else time.monotonic()
-        return self.first_event_at
-
-    def finish(self, reason=None):
-        self.ended_at = time.monotonic()
-        if reason:
-            self.end_reason = reason
-
-
-class SSEInflightTracker:
-    """try/finally 释放 inflight：正常结束/客户端取消/异常都不滞留。"""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._counts: dict[str, int] = {}
-        self._streams: dict[str, SSEStreamContext] = {}
-
-    @_contextmanager
-    def track(self, ctx):
-        self.enter(ctx)
-        try:
-            yield ctx
-        finally:
-            exc = _sys.exc_info()[0]
-            ctx.finish("exception" if exc is not None else None)
-            self.leave(ctx)
-
-    def enter(self, ctx):
-        with self._lock:
-            cid = ctx.connection_id or ctx.req_id
-            self._counts[cid] = self._counts.get(cid, 0) + 1
-            self._streams[ctx.req_id] = ctx
-
-    def leave(self, ctx):
-        with self._lock:
-            cid = ctx.connection_id or ctx.req_id
-            if cid in self._counts:
-                self._counts[cid] -= 1
-                if self._counts[cid] <= 0:
-                    del self._counts[cid]
-            self._streams.pop(ctx.req_id, None)
-
-    def inflight(self, connection_id) -> int:
-        with self._lock:
-            return int(self._counts.get(connection_id, 0))
-
-    def is_sse_active(self, connection_id) -> bool:
-        with self._lock:
-            return any(c.connection_id == connection_id and c.sse_started
-                       for c in self._streams.values())
-
-    def stream(self, req_id):
-        with self._lock:
-            return self._streams.get(req_id)
-
-
-_SSE_TRACKER = SSEInflightTracker()
-
-
 def should_replay_request(ctx, classification=None, max_retry=1) -> bool:
     """已开始 SSE 绝不重放；账号/模型/上下文错误不重放；仅限流允许一次。"""
     if ctx is None:
@@ -10370,105 +10297,6 @@ def connection_from_sse_view(ctx) -> dict:
         "state": "unknown",
         "last_activity": time.time(),
     }
-
-
-class GracefulDrainController:
-    """SIGTERM 受控排空：先标记 draining（拒绝新 /rotate 与主动轮换），
-    再等 inflight SSE / 请求自然结束或超时后才允许进程退出。"""
-
-    def __init__(self):
-        self._lock = threading.RLock()
-        self._draining = False
-        self._inflight = 0
-
-    def begin(self):
-        with self._lock:
-            self._draining = True
-
-    def reset(self):
-        with self._lock:
-            self._draining = False
-            self._inflight = 0
-
-    @property
-    def draining(self) -> bool:
-        with self._lock:
-            return self._draining
-
-    def accepting_new(self) -> bool:
-        with self._lock:
-            return not self._draining
-
-    def enter_request(self) -> bool:
-        with self._lock:
-            if self._draining:
-                return False
-            self._inflight += 1
-            return True
-
-    @_contextmanager
-    def request(self):
-        if not self.enter_request():
-            raise RuntimeError("daemon is draining; new requests rejected")
-        try:
-            yield
-        finally:
-            self.leave_request()
-
-    def leave_request(self):
-        with self._lock:
-            self._inflight = max(0, self._inflight - 1)
-
-    def inflight(self) -> int:
-        with self._lock:
-            return self._inflight
-
-    def wait(self, timeout_sec, *, clock=None, sleep_func=None, poll=0.05,
-             max_polls=None) -> bool:
-        """返回 True=可退出（inflight 归零或超时）；False=仍需等待。
-
-        clock / sleep_func / max_polls 仅供测试注入，生产走默认实参。
-        """
-        now_fn = clock or time.monotonic
-        sleep_fn = sleep_func or time.sleep
-        deadline = now_fn() + max(0.0, float(timeout_sec))
-        polls = 0
-        while True:
-            if self.inflight() <= 0:
-                return True
-            if now_fn() >= deadline:
-                return True
-            if max_polls is not None and polls >= max_polls:
-                return False
-            sleep_fn(poll)
-            polls += 1
-
-
-_DRAIN = GracefulDrainController()
-
-
-def batchb_sigterm_handler(signum=None, frame=None, *, clock=None,
-                           sleep_func=None, max_polls=None) -> bool:
-    """受控排空 SIGTERM 处理器（默认关闭，靠独立开关启用）。
-
-    返回 False=未退出（交给现有 handler 语义）；True=排空完成并抛 SystemExit。
-    启用后先标记 draining 拒绝新 /rotate 与主动轮换，再等 inflight 结束/超时，
-    上限 graceful_drain_timeout_sec 默认保守值 30s。
-    """
-    cfg = _warp()
-    if not cfg.get("graceful_drain_enabled", False):
-        return False
-    _DRAIN.begin()
-    timeout = float(cfg.get("graceful_drain_timeout_sec", 30.0))
-    try:
-        log(f"· SIGTERM 排空开始：inflight={_DRAIN.inflight()}，上限 {timeout:.0f}s")
-    except Exception:
-        pass
-    can_exit = _DRAIN.wait(timeout, clock=clock, sleep_func=sleep_func,
-                           max_polls=max_polls)
-    if can_exit:
-        raise SystemExit(0)
-    return False
 
 
 OPENCODE_LANE_URL = "https://opencode.ai/inference/v1/chat/completions"
@@ -16708,11 +16536,6 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         if self.path != "/rotate":
             self._send(404, {"ok": False, "reason": "not_found"})
             return
-        # Batch B 接线：排空中拒绝新 /rotate 请求。
-        # 默认 graceful_drain_enabled=False 且 _DRAIN 不 draining → 零影响。
-        if _DRAIN.draining and _warp().get("graceful_drain_enabled", False):
-            self._send(503, {"ok": False, "reason": "draining"})
-            return
         if not self._authed():
             self._send(401, {"ok": False, "reason": "unauthorized"})
             return
@@ -18040,15 +17863,7 @@ if __name__ == "__main__":
             pass
         raise SystemExit(0)
 
-    def _sigterm_handler_with_drain(signum, frame):
-        # Batch B 接线：默认 graceful_drain_enabled=False → 原 handler 逐字不变。
-        # 开关开启后先受控排空；排空完成由 batchb 抛 SystemExit，
-        # 未到超时上限则继续走原落盘/退出路径。
-        if _warp().get("graceful_drain_enabled", False):
-            batchb_sigterm_handler(signum, frame)
-        _sigterm_handler(signum, frame)
-
-    signal.signal(signal.SIGTERM, _sigterm_handler_with_drain)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
     if len(sys.argv) > 1 and sys.argv[1] == "rotate":
         cli_rotate()
     elif len(sys.argv) > 1 and sys.argv[1] == "slots":
