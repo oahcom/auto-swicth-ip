@@ -85,3 +85,5 @@ deploy/daemon.py.*
 # 4a 告警事件流水（含路径/错误文本，运行态）
 .asip_events.jsonl
 .asip_events.jsonl.*
+.chan_segs_cache.json
+*.pre-restore-*

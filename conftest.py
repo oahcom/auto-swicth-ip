@@ -432,8 +432,29 @@ def pytest_collection_modifyitems(items):
         item.add_marker(getattr(pytest.mark, _group_of(name.split(".")[-1], path)))
 
 
+def _prune_stale_sys_path_entries(stale):
+    """清 sys.path 里 realpath 命中 stale 的入口；始终留一条规范化真实根。"""
+    root = _REPO_ROOT
+    new_path = []
+    kept_root = False
+    for p in list(sys.path):
+        try:
+            rp = os.path.realpath(p) if p else None
+        except Exception:
+            new_path.append(p)
+            continue
+        if rp != stale:
+            new_path.append(p)
+            continue
+        if rp == root and not kept_root:
+            new_path.append(root)
+            kept_root = True
+        # 其余命中 stale 的入口（重复插入的当前根 / 漂移副本）丢弃
+    sys.path[:] = new_path
+
+
 def pytest_collection_finish(session):
-    """收集期结束后清掉 sys.path 里的漂移副本入口。
+    """收集期结束后清掉 sys.path 里的漂移副本入口，但保留当前真实项目根。
 
     原作用：test_channel_ban_hold / test_node_rotation 在模块级
     `sys.path.insert(0, "/home/administrator/auto-swicth-ip")`（拼写错的
@@ -441,14 +462,17 @@ def pytest_collection_finish(session):
     随后生效；任何 importlib.reload / 新 import 都可能从漂移副本拿代码，
     结论随副本内容漂移。收集完成后删掉它（模块缓存已建立，运行期不受
     影响），只清已知漂移目录，不动其他路径。
+
+    2026-11-26 修复：当前真实项目根恰好也位于 `auto-swicth-ip`（拼写错的
+    目录名），旧实现按 realpath 把项目根一并清出 sys.path，导致运行期函数
+    内 `import probe_warp` 报 ModuleNotFoundError（5 条用例红）。改为：命中
+    stale 的入口只保留一条规范化、指向 `__file__` 推导真实根的绝对路径，
+    其余（模块级重复 insert / 漂移副本）照旧移除。stale 与真实根不同时
+    （项目日后迁到正确拼写路径）行为与旧实现一致——漂移副本仍被彻底清掉。
+    清理逻辑抽成 `_prune_stale_sys_path_entries()` 便于回归测试直测。
     """
-    stale = os.path.realpath("/home/administrator/auto-swicth-ip")
-    for p in list(sys.path):
-        try:
-            if p and os.path.realpath(p) == stale:
-                sys.path.remove(p)
-        except Exception:
-            continue
+    _prune_stale_sys_path_entries(
+        os.path.realpath("/home/administrator/auto-swicth-ip"))
 
 
 @pytest.fixture(autouse=True, scope="session")
