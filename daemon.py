@@ -79,6 +79,9 @@ _STATE_SHADOW = None
 # daemon 只做 /rotate-opencode-gate 的接线与「非 WARP 线槽位」分类跳过。
 from asip import opencode_gate
 
+# P0 故障域分类：影子阶段只记录，不改变任何路由决策。
+from asip.failure_domain import classify_rotate_request, FailureDomain
+
 # WARP 渠道模型（块 = colo）与夜间锁策略。两者都是纯函数模块，import 它们不会
 # 触发任何 IO；daemon 只在这里取策略，不再自己算窗口与白名单。
 import warp_blocks
