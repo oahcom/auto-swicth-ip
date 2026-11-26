@@ -5354,6 +5354,24 @@ def test_refresh_pool_delays_skips_fresh_and_dead(monkeypatch):
     assert "stale" in daemon._NODE_DELAY_TS
 
 
+def test_refresh_pool_delays_includes_current_when_asked(monkeypatch):
+    """opencode 在 WARP 上时，当前池节点应像普通节点一样补样本（否则死也判不出）。"""
+    daemon._DEAD_NODES = set()
+    daemon._NODE_DELAYS = {}
+    daemon._NODE_DELAY_TS = {}
+    tested = []
+
+    def fake(nodes):
+        tested.extend(nodes)
+        return {n: 200 for n in nodes}
+
+    monkeypatch.setattr(daemon, "_concurrent_test_delays", fake)
+    monkeypatch.setattr(daemon, "_POOL_DELAY_CURSOR", 0)
+    monkeypatch.setitem(daemon.CFG["intervals"], "pool_delay_refresh", 40)
+    daemon._refresh_pool_delays(["cur", "other"], "cur", include_current=True)
+    assert "cur" in tested, f"include_current=True 时必须补测当前节点，实际 {tested}"
+
+
 def test_is_pool_node_separates_pool_from_warp_channels(monkeypatch):
     """池节点与 WARP 渠道成员的判据必须只有一个来源，不能靠命名习惯散落各处。"""
     monkeypatch.setattr(daemon, "_warp_member",
@@ -5374,3 +5392,17 @@ def test_pool_should_rotate_only_when_pool_is_carrying_live_traffic():
         "池当前节点死了必须换（否则 :7890 的其它 provider 全失败）"
     assert not daemon._pool_should_rotate(on_warp=True, pool_current_dead=False), \
         "opencode 在 WARP、池健康时不该换：池是兜底资源，轮换只是烧配额"
+
+
+def test_pool_node_dead_uses_fresh_failed_sample(monkeypatch):
+    """当前池节点只靠 _DEAD_NODES 判不出死；有新鲜但无延迟的样本要判死。"""
+    now = time.time()
+    monkeypatch.setattr(daemon, "_DEAD_NODES", set())
+    monkeypatch.setattr(daemon, "_NODE_DELAYS", {"ok": 120})
+    monkeypatch.setattr(daemon, "_NODE_DELAY_TS", {"ok": now, "bad": now})
+    assert not daemon._pool_node_dead(None)
+    assert not daemon._pool_node_dead("ok")
+    assert daemon._pool_node_dead("bad"), "新鲜但无延迟样本 = 刚测失败，应判死"
+    assert not daemon._pool_node_dead("never"), "从没测过不算死"
+    monkeypatch.setattr(daemon, "_NODE_DELAY_TS", {"bad": 0})
+    assert not daemon._pool_node_dead("bad"), "过期样本不算死"

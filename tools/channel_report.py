@@ -561,9 +561,42 @@ def _ip_service_stats(ban_probes: list) -> dict:
     }
 
 
+# daemon.log 里的模型层实测行（）。
+# WHY 需要它： 台账从 2026-11-2x 起不再增长（daemon 只在锁渠道时写），
+# 报表的「成/败」「成功率」就恒为 0/0。日志是同一批结论，只是没进台账。
+_LOG_OK = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]\s+✓ (\S+) 出口 \S+ 模型层: OK")
+_LOG_BAD = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]\s+✗ (\S+) 出口 \S+ 模型层: (\w+)")
+
+
+def log_probe_samples(cutoff: float) -> dict[str, list[tuple[float, str]]]:
+    """从 daemon.log[.N] 扫模型层实测结论，返回 {tag: [(ts, verdict)]}（只留 cutoff 之后）。"""
+    out: dict[str, list[tuple[float, str]]] = {}
+    for f in sorted(PROJECT.glob("daemon.log*")):
+        try:
+            fh = open(f, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if "模型层" not in line:
+                    continue
+                m = _LOG_OK.match(line) or _LOG_BAD.match(line)
+                if not m:
+                    continue
+                ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+                if ts < cutoff:
+                    continue
+                verdict = "OK" if len(m.groups()) == 2 else m.group(3)
+                out.setdefault(m.group(2), []).append((ts, verdict))
+    for v in out.values():
+        v.sort()
+    return out
+
+
 def summarize(state: dict, chans: dict, sources: dict, hours: float,
               now: float | None = None, dormant: set[str] | None = None,
-              segments: dict[str, dict] | None = None) -> list[dict]:
+              segments: dict[str, dict] | None = None,
+              strict_window: bool = False) -> list[dict]:
     """每条渠道一行。`ban_probes` 只留当天，故窗口按当地零点夹一次 ——
     不夹的话「最近 24h」会把今天凌晨那几条样本当成整天的结论。
 
@@ -575,8 +608,12 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
     # 主人实测：02:45 时配额日已跑 18.75h，报表只显示 6h）。方向：窗口取
     # max(hours跨度, 配额日至今) = cutoff 取 min；外沿 24h 兜底（样本由
     # _channel_ban_trim 只留配额日当天，24h 外本来就没有）。
-    cutoff = min(now - hours * 3600, _day_start(now))
-    cutoff = max(cutoff, now - 24 * 3600)
+    if strict_window:
+        # --strict：严格按 --hours 取窗口，不再按配额日（08:00→08:00）撑大。
+        cutoff = now - hours * 3600
+    else:
+        cutoff = min(now - hours * 3600, _day_start(now))
+        cutoff = max(cutoff, now - 24 * 3600)
     urls = sub_url_map()
     idx = source_index(sources)
     colos = colo_ban_rates(now - cutoff, now)
@@ -600,10 +637,14 @@ def summarize(state: dict, chans: dict, sources: dict, hours: float,
     # 包含补位池（WG-23+）与缩容遗留，那些本来就**不该**被探测。
     online_tags = set(declared_of) | _singbox_outbound_tags()
     rows = []
+    log_samples = log_probe_samples(cutoff)
     for tag, meta in chans.items():
         st = state.get(tag) or {}
         samples = [s for s in _expand_ban_probes(st.get("ban_probes"))
                    if s[0] >= cutoff]
+        # 台账没样本时回退到 daemon.log（见 log_probe_samples 的 WHY）。
+        if not samples:
+            samples = log_samples.get(tag) or []
         # 「惩罚期短路」观测：daemon 拿到地址后发现该地址已在台账惩罚期，
         # 于是在模型层实测**之前**就 return 了。这些不是 `ban_probes` 的
         # 判据样本（混进去会让渠道永远锁不上），但它们证明这条线**确实
@@ -1083,15 +1124,29 @@ def _measure_latency(node: str) -> str:
             ipaddress.ip_address(host)
             addrs = [host]  # 已是 IP，跳过 DNS
         except ValueError:
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-            with _TPE(max_workers=1) as _dns_pool:
-                _dns_fut = _dns_pool.submit(
-                    socket.getaddrinfo, host, port,
-                    socket.AF_UNSPEC, socket.SOCK_STREAM)
+            # getaddrinfo 不吃 socket 超时，挂死时没有中断手段。
+            # 不能用 ThreadPoolExecutor + result(timeout)：超时后 with 退出
+            # 照样 shutdown(wait=True) 等那个挂死线程，2s 超时形同虚设，
+            # 整个报表跟着卡死（2026-11-25 实测挂 30s 才放行）。
+            # 守护线程 + join(2s)：到点弃线返回，挂死的解析自生自灭。
+            import threading as _th
+            _box: dict = {}
+
+            def _dns_worker():
                 try:
-                    infos = _dns_fut.result(timeout=2.0)
+                    _box["infos"] = socket.getaddrinfo(
+                        host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
                 except Exception:
-                    return "不可达"
+                    _box["infos"] = None
+
+            _dt = _th.Thread(target=_dns_worker, daemon=True)
+            _dt.start()
+            _dt.join(2.0)
+            if not _box:
+                return "不可达"
+            infos = _box["infos"]
+            if not infos:
+                return "不可达"
             seen: set[str] = set()
             addrs = []
             for ai in infos:
@@ -1165,6 +1220,18 @@ def _measure_latency_batch(nodes: list[str]) -> dict[str, str]:
     return result
 
 
+def _recv_exact(sock, n: int) -> bytes:
+    """循环读满 n 字节（TCP 不保证一次 recv 返回全部）。"""
+    data = bytearray()
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError(
+                f"incomplete SOCKS response: expected {n}, got {len(data)}")
+        data.extend(chunk)
+    return bytes(data)
+
+
 def _measure_tunnel_latency(socks_port: int) -> str:
     """通过 SOCKS5 代理测隧道出口延迟。隧道不通 -> 不可达。"""
     import socket, time as _t
@@ -1173,18 +1240,33 @@ def _measure_tunnel_latency(socks_port: int) -> str:
         s.settimeout(2.0)
         t0 = _t.monotonic()
         s.connect(("127.0.0.1", int(socks_port)))
+        # SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0 (no-auth)
         s.sendall(b"\x05\x01\x00")
-        resp = s.recv(2)
-        if len(resp) < 2 or resp[0] != 5 or resp[1] != 0:
+        resp = _recv_exact(s, 2)
+        if resp[0] != 5 or resp[1] != 0:
             s.close(); return "不可达"
+        # SOCKS5 CONNECT: VER=5, CMD=1(CONNECT), RSV=0, ATYP=1(IPv4), 1.1.1.1:443
         s.sendall(b"\x05\x01\x00\x01\x01\x01\x01\x01\x01\xbb")
-        resp = s.recv(10)
-        if len(resp) < 2 or resp[1] != 0:
+        # 响应: VER, REP, RSV, ATYP, BND.ADDR(var), BND.PORT(2)
+        hdr = _recv_exact(s, 4)
+        if hdr[0] != 5:
             s.close(); return "不可达"
+        if hdr[1] != 0:
+            s.close(); return "不可达"
+        atyp = hdr[3]
+        if atyp == 1:
+            addr_len = 4
+        elif atyp == 4:
+            addr_len = 16
+        elif atyp == 3:
+            addr_len = _recv_exact(s, 1)[0]
+        else:
+            s.close(); return "不可达"
+        _recv_exact(s, addr_len + 2)
         dt = (_t.monotonic() - t0) * 1000
         s.close()
         return f"{dt:.0f}ms"
-    except (socket.timeout, OSError, ConnectionRefusedError):
+    except (socket.timeout, OSError, ConnectionRefusedError, ConnectionError):
         return "不可达"
     except Exception:
         return "不可达"
@@ -1197,10 +1279,13 @@ def _measure_tunnel_latency_batch(ports: list[int]) -> dict[int, str]:
     valid = list(set(p for p in ports if p and p > 0))
     if not valid:
         return {}
-    with ThreadPoolExecutor(max_workers=50) as pool:
+    max_workers = min(50, len(valid))
+    waves = (len(valid) + max_workers - 1) // max_workers
+    timeout = max(8.0, waves * 4.0 + 4.0)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futs = {pool.submit(_measure_tunnel_latency, p): p for p in valid}
         try:
-            for f in as_completed(futs, timeout=6.0):
+            for f in as_completed(futs, timeout=timeout):
                 p = futs[f]
                 try:
                     result[p] = f.result(timeout=0.1)
@@ -1211,7 +1296,13 @@ def _measure_tunnel_latency_batch(ports: list[int]) -> dict[int, str]:
         finally:
             for f, p in futs.items():
                 if p not in result:
-                    result[p] = "不可达" if not f.done() else "—"
+                    if f.done() and not f.cancelled():
+                        try:
+                            result[p] = f.result()
+                        except Exception:
+                            result[p] = "不可达"
+                    else:
+                        result[p] = "—"
                     f.cancel()
     return result
 
@@ -1268,7 +1359,8 @@ def _load_slot_health() -> dict:
         return {}
 
 
-def _display_state(r: dict, slot_health: dict, latency_map: dict, tunnel_latency_map: dict = None) -> tuple:
+def _display_state(r: dict, slot_health: dict, latency_map: dict, tunnel_latency_map: dict = None,
+                   log_samples: dict | None = None) -> tuple:
     """计算显示状态 + 排序优先级。返回 (state_str, sort_pri)。
     sort_pri: OK=0, quota=1, 中间态=2, 隧道中断=3, 单元停用=4
 
@@ -1288,6 +1380,9 @@ def _display_state(r: dict, slot_health: dict, latency_map: dict, tunnel_latency
     _sh = slot_health.get(r["tag"])
     if _sh and _sh["status"] == "ok":
         _v = r['last_verdict']
+        _ls = (log_samples or {}).get(r["tag"]) or []
+        if _v in ("port_closed", "unknown", "", None) and _ls:
+            _v = _ls[-1][1]
         if _v == "blocked":
             _ban = float(r.get('quota_until', 0) or 0)
             _v = "待验" if _ban <= time.time() else "quota"
@@ -1329,10 +1424,11 @@ def print_table(rows: list[dict], hours: float) -> None:
     _sock_ports = _load_sock_ports()
     tunnel_map = _measure_tunnel_latency_batch(list(_sock_ports.values()))
     slot_health = _load_slot_health()
+    log_samples = log_probe_samples(window_from)
     # 排序：状态优先级最高 -> 成功率 -> colo -> 订阅 -> 节点名
     # 延迟不可达排最后（同组内保持原有顺序）
     def _sort_key(r):
-        _s, _pri = _display_state(r, slot_health, latency_map, tunnel_map)
+        _s, _pri = _display_state(r, slot_health, latency_map, tunnel_map, log_samples)
         _sp = _sock_ports.get(r["tag"])
         _lat_bad = 1 if tunnel_map.get(_sp, "不可达") == "不可达" else 0
         return (_pri, _lat_bad, -(r["success_rate"] or 0), r["colo"] or "", r["source"] or "", r["node_name"] or "")
@@ -1376,6 +1472,9 @@ def print_table(rows: list[dict], hours: float) -> None:
             # 槽位健康只影响是否信旧结论——slot ok + 探针判 OK = OK；
             # slot ok + 探针判 unknown/quota = 显示探针结论（不冒充 OK）。
             _v = r['last_verdict']
+            _ls_ok = log_samples.get(r["tag"]) or []
+            if _v in ("port_closed", "unknown", "", None) and _ls_ok:
+                _v = _ls_ok[-1][1]
             if _v == "blocked":
                 _ban_until = float(r.get('quota_until', 0) or 0)
                 _v = "待验" if _ban_until <= time.time() else "quota"
@@ -1392,6 +1491,12 @@ def print_table(rows: list[dict], hours: float) -> None:
         elif r.get("egress_error") and not r["samples"]:
             state = f"隧道中断:{r['egress_error']}"
         else:
+            _ls2 = log_samples.get(r["tag"]) or []
+            if _ls2 and r.get("last_verdict") in ("port_closed", "unknown", "", None):
+                _v2 = _ls2[-1][1]
+                _ts2 = _fmt_ts(_ls2[-1][0])
+                _stale2 = (time.time() - _ls2[-1][0]) > 1800
+                state = f"{_v2}（{'旧地址·' if _stale2 else ''}{_ts2}判）"
             # 窗口内一条样本都没有 → `last_verdict` 是**旧的**，不能当成
             # 现在的结论印出来。WARP-CF-C/G/H/I 的单元 2026-10-28 缩容时
             # 就删了（`is-enabled` 返回 not-found），prober 早已用
@@ -1402,7 +1507,7 @@ def print_table(rows: list[dict], hours: float) -> None:
             #   从没探过      → 查探测名单（线根本不在名单里）
             #   探过但没入账  → 入账漏记的 bug（判了 blocked 却没进 ban_probes）
             #   探过但无地址  → 隧道取不到出口
-            if r["samples"]:
+            elif r["samples"]:
                 # 实时隧道健康信号优先于历史 verdict：
                 # 入口不可达 / no_addr_since -> 隧道当前拿不到 IP -> 隧道中断
                 _lat_now = latency_map.get(r.get("node", "-"), "—")
@@ -1569,7 +1674,7 @@ footer{{color:var(--muted);font-size:11px;margin-top:14px;line-height:1.7}}
 <span><i class="dot" style="background:{warn}"></i>成功率 ≥50% / ban ≤50%</span>
 <span><i class="dot" style="background:{crit}"></i>成功率 &lt;50% / ban &gt;50%</span>
 </div>
-<footer>成功率/ban 率按该渠道窗口内的模型层实测样本计（daemon 的 ban_probes，
+<footer>成功率/ban 率按该渠道窗口内的模型层实测样本计（daemon 的 ban_probes；台账为空时回退 daemon.log 的 ✓/✗ 模型层行，
 只保留当天）。H2 线拿不到出口地址时不会产生样本，看 colo ban 列 —— 那是整个
 机房窗口内全部出口的封禁率。订阅地址已脱敏（token 显示为 ***）。</footer>
 """
@@ -1731,6 +1836,8 @@ def print_blocked_ips(s: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="渠道健康总览（只读）")
     ap.add_argument("--hours", type=float, default=6.0, help="统计窗口（小时）")
+    ap.add_argument("--strict", action="store_true",
+                    help="严格按 --hours 取窗口（默认会被配额日 08:00→08:00 撑大）")
     ap.add_argument("--html", help="输出自包含 HTML 到该路径")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--by", choices=("colo", "source", "carrier"),
@@ -1752,7 +1859,8 @@ def main() -> int:
     segs = channel_segments()
     rows = summarize(state, load_channels(),
                      _read_json(sources_path()) or {},
-                     args.hours, dormant=dormant_tags(), segments=segs)
+                     args.hours, dormant=dormant_tags(), segments=segs,
+                     strict_window=args.strict)
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=1))
     elif args.html:

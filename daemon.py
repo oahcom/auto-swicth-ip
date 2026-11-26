@@ -78,6 +78,10 @@ _STATE_SHADOW = None
 # opencode 专属闸口（kind="opencode"）：rotate 与槽位产出全部委托该模块，
 # daemon 只做 /rotate-opencode-gate 的接线与「非 WARP 线槽位」分类跳过。
 from asip import opencode_gate
+# P0 故障域分类：影子阶段只记录，不改变任何路由决策。
+from asip.failure_domain import classify_rotate_request, FailureDomain
+from asip.rotation_policy import (rotation_policy, confirm_exit_domain,
+                                 enforcement_enabled, domain_trace_fields)
 
 # WARP 渠道模型（块 = colo）与夜间锁策略。两者都是纯函数模块，import 它们不会
 # 触发任何 IO；daemon 只在这里取策略，不再自己算窗口与白名单。
@@ -9886,6 +9890,587 @@ def _maybe_verify_transport_failures(count: int, now: float) -> None:
         log(f"✗ 传输层探针线程启动失败: {e}")
 
 
+
+# ---------------------------------------------------------------------------
+# Batch B (503 / SSE 安全) — 影子观测区块（纯新增，不改变现有路由行为）
+#
+# 本区块不被 _verify_transport_failure / _opencode_lane_alive 调用；它提供
+# 结构化 TransportEvidence、连接生命周期分类、单连接删除唯一入口与 SSE 在途
+# 记账。任何接线到生产路由的动作都必须另加默认 False 的独立开关。
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass, field as _dc_field
+from contextlib import contextmanager as _contextmanager
+from enum import Enum as _Enum
+import sys as _sys
+
+from asip.failure_domain import FailureDomain as _FailureDomain
+from asip.failure_domain import ProbeClass as _ProbeClass
+
+
+class TransportErrorClass(str, _Enum):
+    EGRESS_PROBE_FAILED = "EGRESS_PROBE_FAILED"
+    CONNECT_FAILED = "CONNECT_FAILED"
+    TLS_FAILED = "TLS_FAILED"
+    HTTP_429 = "HTTP_429"
+    HTTP_503 = "HTTP_503"
+    FIRST_BYTE_TIMEOUT = "FIRST_BYTE_TIMEOUT"
+    FIRST_SSE_EVENT_TIMEOUT = "FIRST_SSE_EVENT_TIMEOUT"
+    SSE_INTERRUPTED = "SSE_INTERRUPTED"
+    UPSTREAM_ERROR = "UPSTREAM_ERROR"
+    # 9router sidecar 错误文本的三种子因（实测 59 条 error 中 52 条 503）：
+    HEADER_TIMEOUT = "HEADER_TIMEOUT"
+    CALLER_ABORTED = "CALLER_ABORTED"
+    UPSTREAM_TIMEOUT = "UPSTREAM_TIMEOUT"
+    UNKNOWN = "UNKNOWN"
+
+
+# sidecar error 子因 → 稳定 error_class（保留原始文本便于关联 9router 日志）
+SIDECAR_REASON_CLASSES = {
+    "header-timeout": TransportErrorClass.HEADER_TIMEOUT.value,
+    "header_timeout": TransportErrorClass.HEADER_TIMEOUT.value,
+    "caller-aborted": TransportErrorClass.CALLER_ABORTED.value,
+    "caller_aborted": TransportErrorClass.CALLER_ABORTED.value,
+    "upstream-timeout": TransportErrorClass.UPSTREAM_TIMEOUT.value,
+    "upstream_timeout": TransportErrorClass.UPSTREAM_TIMEOUT.value,
+}
+
+
+@dataclass(frozen=True)
+class TransportEvidence:
+    egress_ok: bool
+    proxy_tcp_ok: bool | None = None
+    tls_ok: bool | None = None
+    http_status: int | None = None
+    first_byte_ms: int | None = None
+    first_sse_event_ms: int | None = None
+    error_class: str | None = None
+    sidecar_reason: str | None = None
+    observed_at: float | None = None
+
+
+def classify_transport_failure(*, egress_ok, proxy_tcp_ok=None, tls_ok=None,
+                               http_status=None, first_byte_ms=None,
+                               first_sse_event_ms=None, sse_interrupted=False,
+                               sidecar_reason=None) -> str:
+    """分层判定失败阶段（纯函数、影子用）。
+
+    顺序反映探测链：出口 → TCP → TLS → HTTP → 首字节 → SSE 首事件。
+    9router sidecar 的子因（header-timeout / caller-aborted /
+    upstream-timeout）优先于兜底阶段，保证实测 88% 的 503 能定位到子因。
+    任何 HTTP 响应都不代表模型服务可用；200 且拿到 SSE 首事件才算无故障。
+    """
+    if sidecar_reason:
+        key = str(sidecar_reason).strip().lower()
+        if key in SIDECAR_REASON_CLASSES:
+            return SIDECAR_REASON_CLASSES[key]
+    if not egress_ok:
+        return TransportErrorClass.EGRESS_PROBE_FAILED.value
+    if proxy_tcp_ok is False:
+        return TransportErrorClass.CONNECT_FAILED.value
+    if tls_ok is False:
+        return TransportErrorClass.TLS_FAILED.value
+    if http_status == 429:
+        return TransportErrorClass.HTTP_429.value
+    if http_status == 503:
+        return TransportErrorClass.HTTP_503.value
+    if first_byte_ms is None:
+        return TransportErrorClass.FIRST_BYTE_TIMEOUT.value
+    if first_sse_event_ms is None:
+        return TransportErrorClass.FIRST_SSE_EVENT_TIMEOUT.value
+    if sse_interrupted:
+        return TransportErrorClass.SSE_INTERRUPTED.value
+    if http_status is not None and http_status != 200:
+        return TransportErrorClass.UPSTREAM_ERROR.value
+    return TransportErrorClass.UNKNOWN.value
+
+
+def is_model_service_available(ev: "TransportEvidence") -> bool:
+    """模型服务可用必须满足：HTTP 200 + 收到 SSE 首事件 + 无故障阶段。"""
+    if not isinstance(ev, TransportEvidence):
+        return False
+    return bool(ev.http_status == 200 and ev.first_sse_event_ms is not None
+                and ev.error_class is None)
+
+
+_TRANSPORT_CLASSES = frozenset({
+    TransportErrorClass.CONNECT_FAILED.value,
+    TransportErrorClass.TLS_FAILED.value,
+    TransportErrorClass.HTTP_503.value,
+    TransportErrorClass.FIRST_BYTE_TIMEOUT.value,
+    TransportErrorClass.FIRST_SSE_EVENT_TIMEOUT.value,
+    TransportErrorClass.SSE_INTERRUPTED.value,
+    TransportErrorClass.UPSTREAM_ERROR.value,
+    TransportErrorClass.HEADER_TIMEOUT.value,
+    TransportErrorClass.CALLER_ABORTED.value,
+    TransportErrorClass.UPSTREAM_TIMEOUT.value,
+    TransportErrorClass.EGRESS_PROBE_FAILED.value,  # 需独立复测，不直接标脏
+})
+
+
+def transport_error_domain(error_class) -> "_FailureDomain":
+    """error_class → FailureDomain。
+
+    header-timeout / caller-aborted / upstream-timeout 及全部传输/sidecar
+    阶段都归 TRANSPORT（不是 EXIT_IP）；HTTP 429 归 REQUEST；出口探测失败
+    也只归 TRANSPORT —— 必须独立复测确认后才能考虑出口退役。
+    """
+    if error_class in _TRANSPORT_CLASSES:
+        return _FailureDomain.TRANSPORT
+    if error_class == TransportErrorClass.HTTP_429.value:
+        return _FailureDomain.REQUEST
+    return _FailureDomain.UNKNOWN
+
+
+def should_dirty_exit_on_transport_error(error_class) -> bool:
+    """sidecar/传输层故障绝不自动标脏出口（含 header-timeout）。"""
+    return False
+
+
+def _transport_evidence_path() -> str:
+    """证据落盘路径；env 可覆盖（测试隔离/影子开关用）。"""
+    return os.environ.get(
+        "ASIP_TRANSPORT_EVIDENCE_FILE_PATH",
+        os.path.join(_PROJECT, ".warp", "transport_evidence.jsonl"),
+    )
+
+
+def append_transport_evidence(ev, *, req_id=None, slot=None, tag=None,
+                              reason=None) -> dict:
+    """结构化落盘 + 日志；任何写失败都吞掉，绝不污染主流程。"""
+    rec = {
+        "ts": ev.observed_at if ev.observed_at is not None else time.time(),
+        "req_id": req_id,
+        "slot": slot,
+        "tag": tag,
+        "reason": reason,
+        "egress_ok": ev.egress_ok,
+        "proxy_tcp_ok": ev.proxy_tcp_ok,
+        "tls_ok": ev.tls_ok,
+        "http_status": ev.http_status,
+        "first_byte_ms": ev.first_byte_ms,
+        "first_sse_event_ms": ev.first_sse_event_ms,
+        "error_class": ev.error_class,
+        "sidecar_reason": getattr(ev, "sidecar_reason", None),
+    }
+    try:
+        path = _transport_evidence_path()
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    try:
+        log("· transport-evidence " + json.dumps(
+            rec, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        pass
+    return rec
+
+
+def _default_lane_probe(port, timeout_sec=6.0) -> dict:
+    """默认影子探针：curl 采 HTTP 状态与连接各阶段耗时。
+
+    首 SSE 事件不在 curl -w 指标里，记为 None（表示「未确认」，非「超时」）；
+    需要精确首事件时用 runner 注入真实 SSE 客户端的采样。
+    """
+    payload = json.dumps({
+        "model": "deepseek-v4.1-flash-free",
+        "max_tokens": 1,
+        "stream": True,
+        "messages": [{"role": "user", "content": "1"}],
+    })
+    sid = "ses_asip_batchb_probe"
+    cmd = [
+        "curl", "-sS", "-o", "/dev/null", "-N",
+        "-w", "%{http_code}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}",
+        "--max-time", str(timeout_sec),
+        "--proxy", f"socks5h://{_warp()['socks_host']}:{port}",
+        "-X", "POST", OPENCODE_LANE_URL,
+        "-H", "content-type: application/json",
+        "-H", "authorization: Bearer public",
+        "-H", "x-opencode-client: cli",
+        "-H", f"x-opencode-session: {sid}",
+        "-H", f"x-session-affinity: {sid}",
+        "-H", "accept: text/event-stream",
+        "--data-binary", payload,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout_sec + 2)
+    except subprocess.TimeoutExpired:
+        return {"http_status": None, "first_byte_ms": None,
+                "first_sse_event_ms": None, "proxy_tcp_ok": None,
+                "tls_ok": None, "sse_interrupted": False, "timed_out": True}
+    parts = (r.stdout or "").strip().split("|")
+
+    def _ms(x):
+        try:
+            return int(round(float(x) * 1000))
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        status = int(parts[0]) if parts and parts[0].isdigit() else None
+    except (ValueError, IndexError):
+        status = None
+    if status == 0:
+        status = None
+    return {
+        "http_status": status,
+        "proxy_tcp_ok": _ms(parts[1]) is not None if len(parts) > 1 else None,
+        "tls_ok": _ms(parts[2]) is not None if len(parts) > 2 else None,
+        "first_byte_ms": _ms(parts[3]) if len(parts) > 3 else None,
+        "first_sse_event_ms": None,
+        "sse_interrupted": False,
+        "timed_out": False,
+    }
+
+
+def observe_transport_failure(tag, port, count, *, egress_probe=None,
+                              lane_probe=None, req_id=None, slot=None,
+                              sidecar_reason=None) -> "TransportEvidence":
+    """影子版 `_verify_transport_failure`：只分层观测、落盘，不换线、不清理。"""
+    probe_egress = egress_probe or (lambda p, timeout_sec: warp_egress_ip(
+        p, timeout_sec=timeout_sec))
+    try:
+        ip = probe_egress(port, 8.0)
+    except Exception:
+        ip = None
+    sample = (lane_probe or (lambda p: _default_lane_probe(p)))(port) or {}
+    reason = sidecar_reason if sidecar_reason is not None else sample.get("sidecar_reason")
+    error_class = classify_transport_failure(
+        egress_ok=bool(ip),
+        proxy_tcp_ok=sample.get("proxy_tcp_ok"),
+        tls_ok=sample.get("tls_ok"),
+        http_status=sample.get("http_status"),
+        first_byte_ms=sample.get("first_byte_ms"),
+        first_sse_event_ms=sample.get("first_sse_event_ms"),
+        sse_interrupted=bool(sample.get("sse_interrupted")),
+        sidecar_reason=reason,
+    )
+    ev = TransportEvidence(
+        egress_ok=bool(ip),
+        proxy_tcp_ok=sample.get("proxy_tcp_ok"),
+        tls_ok=sample.get("tls_ok"),
+        http_status=sample.get("http_status"),
+        first_byte_ms=sample.get("first_byte_ms"),
+        first_sse_event_ms=sample.get("first_sse_event_ms"),
+        error_class=error_class,
+        sidecar_reason=reason,
+        observed_at=time.time(),
+    )
+    append_transport_evidence(ev, req_id=req_id, slot=slot, tag=tag,
+                              reason=f"503 x{count}")
+    return ev
+
+
+class ConnectionLifecycle(str, _Enum):
+    SSE_ACTIVE = "sse_active"
+    INFLIGHT = "inflight"
+    RECENTLY_ACTIVE = "recently_active"
+    STALE_IDLE = "stale_idle"
+    UNKNOWN = "unknown"
+
+
+STALE_CLEANUP_MIN_AGE_SEC = 300.0
+RECENT_ACTIVITY_WINDOW_SEC = 60.0
+
+
+def _conn_get(conn, key, default=None):
+    if isinstance(conn, dict):
+        return conn.get(key, default)
+    return getattr(conn, key, default)
+
+
+def classify_connection_lifecycle(conn, now=None) -> "ConnectionLifecycle":
+    """连接生命周期分类：SSE 活跃 / inflight / 近期活动 / 明确僵死 / 未知。
+
+    顺序即安全优先级：sse_active 与 inflight 永远排在年龄判断之前；
+    state != "stale" 或 last_activity 不可信时一律 UNKNOWN（保留不清理）。
+    """
+    if conn is None:
+        return ConnectionLifecycle.UNKNOWN
+    now = float(now if now is not None else time.time())
+    if _conn_get(conn, "sse_active", False):
+        return ConnectionLifecycle.SSE_ACTIVE
+    inflight = _conn_get(conn, "inflight_requests", 0)
+    try:
+        if inflight is not None and int(inflight) > 0:
+            return ConnectionLifecycle.INFLIGHT
+    except (TypeError, ValueError):
+        return ConnectionLifecycle.UNKNOWN
+    state = _conn_get(conn, "state", None)
+    last = _conn_get(conn, "last_activity", None)
+    if last is None:
+        return ConnectionLifecycle.UNKNOWN
+    try:
+        age = now - float(last)
+    except (TypeError, ValueError):
+        return ConnectionLifecycle.UNKNOWN
+    if state == "stale":
+        if age >= STALE_CLEANUP_MIN_AGE_SEC:
+            return ConnectionLifecycle.STALE_IDLE
+        return ConnectionLifecycle.RECENTLY_ACTIVE
+    if 0 <= age <= RECENT_ACTIVITY_WINDOW_SEC:
+        return ConnectionLifecycle.RECENTLY_ACTIVE
+    return ConnectionLifecycle.UNKNOWN
+
+
+def is_connection_safe_to_cleanup(conn, now=None) -> bool:
+    """未知 / SSE / inflight / 近期活动一律 False；只有明确僵死候选为 True。"""
+    return classify_connection_lifecycle(
+        conn, now) is ConnectionLifecycle.STALE_IDLE
+
+
+# OUT-OF-SCOPE：9router/sidecar 单连接删除 API 尚未验证，默认不启用。
+_SINGLE_CONNECTION_DELETE_VERIFIED = False
+
+
+def _delete_single_connection(connection_id, *, http=None,
+                              method="DELETE") -> bool:
+    """唯一允许发出单连接 DELETE 的私有入口；只打 /connections/{id}。
+
+    双重闸门：cleanup_enabled 必须开 + 单连接 API 必须已验证；否则零请求。
+    任何情况下都不退化为 DELETE /connections 全量清理。
+    """
+    if not _warp().get("cleanup_enabled", False):
+        return False
+    if not _SINGLE_CONNECTION_DELETE_VERIFIED:
+        return False
+    if not connection_id:
+        return False
+    path = f"/connections/{connection_id}"
+    if http is not None:
+        status = http.delete(path)
+    else:
+        status, _ = singbox_api(path, method=method, silent=True)
+    return status in (200, 204)
+
+
+def cleanup_one_connection(connection_id, *, conn=None, now=None,
+                           http=None) -> bool:
+    """定向清理唯一公开入口：先安全判定，再过开关，再删单个连接 ID。"""
+    if not _warp().get("cleanup_enabled", False):
+        return False
+    if not connection_id:
+        return False
+    if conn is not None and not is_connection_safe_to_cleanup(conn, now):
+        return False
+    return _delete_single_connection(connection_id, http=http)
+
+
+@dataclass
+class SSEStreamContext:
+    req_id: str
+    connection_id: str | None = None
+    started_at: float = _dc_field(default_factory=time.monotonic)
+    first_event_at: float | None = None
+    ended_at: float | None = None
+    end_reason: str | None = None
+    sse_started: bool = False
+    retry_count: int = 0
+
+    def mark_first_event(self, ts=None):
+        self.sse_started = True
+        if self.first_event_at is None:
+            self.first_event_at = float(ts) if ts is not None else time.monotonic()
+        return self.first_event_at
+
+    def finish(self, reason=None):
+        self.ended_at = time.monotonic()
+        if reason:
+            self.end_reason = reason
+
+
+class SSEInflightTracker:
+    """try/finally 释放 inflight：正常结束/客户端取消/异常都不滞留。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = {}
+        self._streams: dict[str, SSEStreamContext] = {}
+
+    @_contextmanager
+    def track(self, ctx):
+        self.enter(ctx)
+        try:
+            yield ctx
+        finally:
+            exc = _sys.exc_info()[0]
+            ctx.finish("exception" if exc is not None else None)
+            self.leave(ctx)
+
+    def enter(self, ctx):
+        with self._lock:
+            cid = ctx.connection_id or ctx.req_id
+            self._counts[cid] = self._counts.get(cid, 0) + 1
+            self._streams[ctx.req_id] = ctx
+
+    def leave(self, ctx):
+        with self._lock:
+            cid = ctx.connection_id or ctx.req_id
+            if cid in self._counts:
+                self._counts[cid] -= 1
+                if self._counts[cid] <= 0:
+                    del self._counts[cid]
+            self._streams.pop(ctx.req_id, None)
+
+    def inflight(self, connection_id) -> int:
+        with self._lock:
+            return int(self._counts.get(connection_id, 0))
+
+    def is_sse_active(self, connection_id) -> bool:
+        with self._lock:
+            return any(c.connection_id == connection_id and c.sse_started
+                       for c in self._streams.values())
+
+    def stream(self, req_id):
+        with self._lock:
+            return self._streams.get(req_id)
+
+
+_SSE_TRACKER = SSEInflightTracker()
+
+
+def should_replay_request(ctx, classification=None, max_retry=1) -> bool:
+    """已开始 SSE 绝不重放；账号/模型/上下文错误不重放；仅限流允许一次。"""
+    if ctx is None:
+        return False
+    if getattr(ctx, "sse_started", False):
+        return False
+    if int(getattr(ctx, "retry_count", 0) or 0) >= max_retry:
+        return False
+    if classification in (_ProbeClass.ACCOUNT_QUOTA, _ProbeClass.MODEL_QUOTA,
+                          _ProbeClass.CONTEXT_REJECTED):
+        return False
+    return classification == _ProbeClass.RATE_LIMITED
+
+
+def sse_disconnect_failure_domain(ctx) -> "_FailureDomain":
+    """SSE 中断是请求级事件，绝不是出口 IP 故障；未开始 SSE 则不判定。"""
+    if ctx is None:
+        return _FailureDomain.UNKNOWN
+    if getattr(ctx, "sse_started", False):
+        return _FailureDomain.REQUEST
+    return _FailureDomain.UNKNOWN
+
+
+def should_mark_exit_ip_on_sse_disconnect(ctx) -> bool:
+    return False
+
+
+def connection_from_sse_view(ctx) -> dict:
+    """把 SSE 上下文映射成连接视图，供 is_connection_safe_to_cleanup 使用。"""
+    return {
+        "id": getattr(ctx, "connection_id", None),
+        "sse_active": bool(getattr(ctx, "sse_started", False)),
+        "inflight_requests": 1 if getattr(ctx, "ended_at", None) is None else 0,
+        "state": "unknown",
+        "last_activity": time.time(),
+    }
+
+
+class GracefulDrainController:
+    """SIGTERM 受控排空：先标记 draining（拒绝新 /rotate 与主动轮换），
+    再等 inflight SSE / 请求自然结束或超时后才允许进程退出。"""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._draining = False
+        self._inflight = 0
+
+    def begin(self):
+        with self._lock:
+            self._draining = True
+
+    def reset(self):
+        with self._lock:
+            self._draining = False
+            self._inflight = 0
+
+    @property
+    def draining(self) -> bool:
+        with self._lock:
+            return self._draining
+
+    def accepting_new(self) -> bool:
+        with self._lock:
+            return not self._draining
+
+    def enter_request(self) -> bool:
+        with self._lock:
+            if self._draining:
+                return False
+            self._inflight += 1
+            return True
+
+    @_contextmanager
+    def request(self):
+        if not self.enter_request():
+            raise RuntimeError("daemon is draining; new requests rejected")
+        try:
+            yield
+        finally:
+            self.leave_request()
+
+    def leave_request(self):
+        with self._lock:
+            self._inflight = max(0, self._inflight - 1)
+
+    def inflight(self) -> int:
+        with self._lock:
+            return self._inflight
+
+    def wait(self, timeout_sec, *, clock=None, sleep_func=None, poll=0.05,
+             max_polls=None) -> bool:
+        """返回 True=可退出（inflight 归零或超时）；False=仍需等待。
+
+        clock / sleep_func / max_polls 仅供测试注入，生产走默认实参。
+        """
+        now_fn = clock or time.monotonic
+        sleep_fn = sleep_func or time.sleep
+        deadline = now_fn() + max(0.0, float(timeout_sec))
+        polls = 0
+        while True:
+            if self.inflight() <= 0:
+                return True
+            if now_fn() >= deadline:
+                return True
+            if max_polls is not None and polls >= max_polls:
+                return False
+            sleep_fn(poll)
+            polls += 1
+
+
+_DRAIN = GracefulDrainController()
+
+
+def batchb_sigterm_handler(signum=None, frame=None, *, clock=None,
+                           sleep_func=None, max_polls=None) -> bool:
+    """受控排空 SIGTERM 处理器（默认关闭，靠独立开关启用）。
+
+    返回 False=未退出（交给现有 handler 语义）；True=排空完成并抛 SystemExit。
+    启用后先标记 draining 拒绝新 /rotate 与主动轮换，再等 inflight 结束/超时，
+    上限 graceful_drain_timeout_sec 默认保守值 30s。
+    """
+    cfg = _warp()
+    if not cfg.get("graceful_drain_enabled", False):
+        return False
+    _DRAIN.begin()
+    timeout = float(cfg.get("graceful_drain_timeout_sec", 30.0))
+    try:
+        log(f"· SIGTERM 排空开始：inflight={_DRAIN.inflight()}，上限 {timeout:.0f}s")
+    except Exception:
+        pass
+    can_exit = _DRAIN.wait(timeout, clock=clock, sleep_func=sleep_func,
+                           max_polls=max_polls)
+    if can_exit:
+        raise SystemExit(0)
+    return False
+
+
 OPENCODE_LANE_URL = "https://opencode.ai/inference/v1/chat/completions"
 
 
@@ -9957,6 +10542,17 @@ def _verify_transport_failure(tag: str, port: int, count: int) -> None:
     global _LAST_STALE_SWEEP_TS, _LAST_TRANSPORT_PROBE_SIG
     global _LANE_FAIL_STREAK, _LANE_FAIL_TS
     ip = warp_egress_ip(port, timeout_sec=8.0)
+    # Batch B 接线：默认 transport_observe_enabled=False，现有路径逐字不变。
+    # 影子观测复用刚完成的出口探测，只追加结构化证据；不换线/不清理/不标脏。
+    if _warp().get("transport_observe_enabled", False):
+        try:
+            observe_transport_failure(
+                tag, port, count,
+                egress_probe=lambda p, timeout_sec: ip,
+                slot=tag,
+            )
+        except Exception as _obs_err:
+            log(f"· transport-observe 影子记录失败（不影响路由）: {_obs_err}")
     if not ip:
         log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
         # respect_evidence=False：**这条证据比 requestDetails 强得多**。
@@ -10581,7 +11177,8 @@ def _pool_delay_bootstrapping(nodes: list[str] | None) -> bool:
                    for n in nodes)
 
 
-def _refresh_pool_delays(nodes: list[str], current: str | None) -> int:
+def _refresh_pool_delays(nodes: list[str], current: str | None,
+                         include_current: bool = False) -> int:
     """补池成员的延迟样本：每轮健康检查抽 `pool_delay_refresh` 个缺样本的节点。
 
     WHY 不是每轮全测：142 个节点串行测一轮 93s（实测 1.55s/节点），而池的
@@ -10599,8 +11196,14 @@ def _refresh_pool_delays(nodes: list[str], current: str | None) -> int:
     with _state_lock:
         stale = [n for n in nodes
                  if _is_pool_node(n) and n not in _DEAD_NODES
-                 and n != current
+                 and (n != current or include_current)
                  and now - _NODE_DELAY_TS.get(n, 0.0) > _NODE_DELAY_TTL]
+        # 当前池节点在 opencode 走 WARP 时只是通用流量的默认出口，必须像普通节点
+        # 一样补样本，否则它死了永远判不出来（_DEAD_NODES 只由被测节点写入）。
+        # 排到最前，下一拍就测到，不必等游标转一圈。
+        if include_current and current in stale:
+            stale.remove(current)
+            stale.insert(0, current)
     if not stale:
         return 0
     # 游标取模：stale 列表每轮都在变长变短，用绝对游标保证不会永远只测前 40 个。
@@ -12581,6 +13184,22 @@ def _pool_should_rotate(on_warp: bool, pool_current_dead: bool) -> bool:
     负责把 WARP 的状态喂进来，判据的演进不会牵动 WARP 换线逻辑。
     """
     return (not on_warp) or pool_current_dead
+
+
+def _pool_node_dead(node: str | None) -> bool:
+    """池节点是否判死：既看黑名单，也看「刚测过却没拿到延迟」的新鲜失败样本。
+
+    只看 `_DEAD_NODES` 不够：健康检查与延迟补刷历史上都排除当前节点，于是当前
+    节点从不会被判死。opencode 在 WARP 上时它只是通用流量的默认出口，卡在死节点
+    上就会让 :7890 的其它 provider 一直失败（见 `_pool_should_rotate` 第 2 种情况）。
+    """
+    if not node:
+        return False
+    if node in _DEAD_NODES:
+        return True
+    now = time.time()
+    return (now - _NODE_DELAY_TS.get(node, 0.0) <= _NODE_DELAY_TTL
+            and node not in _NODE_DELAYS)
 
 
 def _rotate_pool_proactive(current: str | None, nodes: list[str], now: float) -> None:
@@ -14578,6 +15197,7 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
     t0 = time.time()
     n = len(slots)
     start = int(_SLOT_REDIRECT_RR.get("index", 0)) % n
+    cooling_candidates = []
     candidates = []
     for off in range(n):
         s = slots[(start + off) % n]
@@ -14591,11 +15211,6 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
         if ip and ip in avoid_ip_set:
             log("· 秒切候选 %s 出口=%s 是这条请求刚撞过的地址，跳过"
                 % (s["name"], ip))
-            continue
-        cooling_left = _egress_cooling_left(ip, t0)
-        if cooling_left > 0:
-            log("· 秒切候选 %s 出口=%s 冷却中（剩 %.0fs：真实请求刚在它上面失败）"
-                % (s["name"], ip or "未知", cooling_left))
             continue
         if _slot_ip_is_quarantined(ip, t0):
             log("· 秒切候选 %s 出口=%s 已隔离（生产标脏/quota），跳过"
@@ -14611,7 +15226,20 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
             log("· 秒切候选 %s 渠道延迟 %.0fms 过高（>10s），跳过"
                 % (s["name"], _chan_ms))
             continue
+        cooling_left = _egress_cooling_left(ip, t0)
+        if cooling_left > 0:
+            # 2026-11-26 ruling: a gate has no cooldown. Cooling only paces
+            # rotation; it must never remove a gate from selection. Demote to
+            # fallback so an all-cooling pool still fails over inside the
+            # gates instead of falling through to the 7th (proxy) gate.
+            log("· 秒切候选 %s 出口=%s 冷却中（剩 %.0fs），降级为后备"
+                % (s["name"], ip or "未知", cooling_left))
+            cooling_candidates.append((s, tag, ip))
+            continue
         candidates.append((s, tag, ip))
+    if not candidates and cooling_candidates:
+        # all regular gates cooling: still far better than the proxy gate
+        candidates = list(cooling_candidates)
     if not candidates:
         # 六个常规闸口一个都选不出来 —— 第七闸口（代理池兜底）是最后的
         # 选择，且**只在这里**被考虑：上面常规候选存在时它永远不出场。
@@ -14651,6 +15279,16 @@ def _pick_healthy_slot(name, avoid_tags=None, avoid_ips=None):
                     log("· 选槽 %s 出口=%s 的 OK 证明（%.0fs 前）早于它上次被切"
                         "（%.0fs 前），期间未复验"
                         % (chosen[0]["name"], _c_ip, t0 - _ok_ts, t0 - _used_ts))
+                    # P0 影子降权：enforcement 开启时陈旧 OK 不得直接采信——
+                    # 清掉旧结论强制下一轮复验；本次已选，降权影响下一次选槽。
+                    # 默认关闭时只记录，选择逻辑逐字不变。
+                    if enforcement_enabled(CFG):
+                        _api_stats["stale_ok_downranked"] = (
+                            _api_stats.get("stale_ok_downranked", 0) + 1)
+                        try:
+                            _WARP_PROBE_SEEN.pop((_c_tag, _c_ip), None)
+                        except Exception:
+                            pass
     except Exception as _e:
         log("· 选槽证据年龄观测失败（不影响选择）：%s" % _e)
     if len(candidates) > 1:
@@ -14968,7 +15606,8 @@ def _with_active_line(payload: dict, t0: float, tag: str | None = None,
 def _rotate_once(reason: str, request_started_at: float | None = None,
                  egress_ip: str | None = None,
                  egress_since: float | None = None,
-                 ban_after: float | None = None) -> dict:
+                 ban_after: float | None = None,
+                 domain: FailureDomain | None = None) -> dict:
     """执行一次轮换。全程持锁 → 天然单飞，并发调用只会合并或被限速。
 
     错误切换（rate429/abuse403）只做秒切：翻到一条已探通的健康备用槽。
@@ -14988,6 +15627,11 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
     已知局限：与主循环自己的换线调用没有共用一把锁。两条同时发生时结果为
     最后写入者胜，记账各自完整但可能指向不同的线。两者都罕见，代价是一次
     多余的切换。
+
+    `domain` 为 /rotate handler 已完成分类的故障域；默认 None 完全保持旧行为。
+    仅当 CFG["warp"]["failure_domain_enforcement"]=True 时启用新判据：非出口域
+    （账号/模型/请求/上下文/传输）与已分类 UNKNOWN 不标脏、不切线；未分类的
+    旧调用者仍走旧策略，绝不让 UNKNOWN 升级为出口故障。
     """
     global _last_rotate_ts
     cfg = _api_cfg()
@@ -15065,6 +15709,9 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
                     f" 但早于历史首条，退回当前线")
         elif request_started_at is not None:
             log("  ⟲ 迟到回溯: request_started_at 非法，退回当前线")
+        # P0 故障域判据：必须在任何标脏 / 切线之前完成。
+        # enforcement 关闭或 domain 未分类时 allow_*=True，下方旧逻辑逐字不变。
+        _pol = rotation_policy(domain, enforcement=enforcement_enabled(CFG))
         was_blocked = False
         try:
             was_blocked = bool(cur_ip) and _warp_ip_is_blocked(cur_ip, t0)
@@ -15073,7 +15720,8 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
         # transport 双杀上报（9router stall 二击）：单发只是抖动证据，换线但
         # 不记脏；同 IP 10 分钟内 ≥2 次上报 = trap 线实锤（2026-11-16 晚 LHR-83
         # 一条线反复处决 10 次仍回池，每个踩中者烧 22s）——写 transport 短禁。
-        if reason not in ("proactive", "transport") and old_ip:
+        if (_pol.allow_dirty and reason not in ("proactive", "transport")
+                and old_ip):
             _mark_warp_ip_used(old_ip, t0, blocked=True, kind=reason,
                                ban_after=ban_after)
         elif reason == "transport" and old_ip:
@@ -15103,6 +15751,19 @@ def _rotate_once(reason: str, request_started_at: float | None = None,
             # 回包定型之后启动，避免后台换线/探新线与秒切挑线并发改同一份状态表。
             quick = None
             if reason in ("rate429", "abuse403"):
+                if not _pol.allow_switch:
+                    # enforcement 开启且已分类为非出口域：不标脏、不退役、不切线。
+                    # 沿用 9router 已知的 coalesced（重连即可），另附 domain 说明；
+                    # 不返回未知 reason，避免客户端无限重试。
+                    _api_stats["domain_suppressed"] = (
+                        _api_stats.get("domain_suppressed", 0) + 1)
+                    log("· /rotate: 故障域 %s 禁止切线/退役"
+                        % (domain.value if domain else "-"))
+                    return _with_active_line({
+                        "ok": True, "switched": False, "reason": "coalesced",
+                        "switched_at": _last_rotate_ts,
+                        **domain_trace_fields(domain, _pol),
+                    }, t0)
                 if not _SWITCH_GUARD.acquire(blocking=False):
                     # 已经有一次换闸在跑：这次的 429 多半来自同一批并发请求，
                     # 那条坏线正在被换走。不排队、不重复换，直接回 coalesced
@@ -15664,7 +16325,8 @@ def _rotate_proxy_gate_once(slot, reason, request_started_at=None,
 
 
 def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
-                      req_id=None, ban_after=None, borrowed=False):
+                      req_id=None, ban_after=None, borrowed=False,
+                      domain: FailureDomain | None = None):
     """带防重的槽位 /rotate：迟到请求只重连，不为旧证据烧掉新线。
 
     与主路径一一对应：
@@ -15684,6 +16346,8 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
             borrowed=borrowed)
     t0 = time.time()
     cfg = _api_cfg()
+    # P0 故障域判据：必须在任何标脏 / 切线之前完成。
+    _pol = rotation_policy(domain, enforcement=enforcement_enabled(CFG))
     name = slot["name"]
     with _API_LOCK:
         _api_stats["calls"] += 1
@@ -15811,8 +16475,8 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
                 _cool_egress_after_recheck(cur_ip, cur_tag, reason)
             else:
                 _mark_egress_cooling(cur_ip, t0)
-        if (reason not in ("proactive", "transport") and cur_ip
-                and not defer_verdict):
+        if (_pol.allow_dirty and reason not in ("proactive", "transport")
+                and cur_ip and not defer_verdict):
             _mark_warp_ip_used(cur_ip, t0, blocked=True, kind=reason,
                                ban_after=ban_after)
             # 只观测：标脏后台账里还剩什么，留在 ⇢ 那一行做运行时证据。
@@ -15836,6 +16500,12 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
               and t0 - last_attempt < _rotate_gap()):
             _api_stats["too_frequent"] += 1
             reason_out = "too_frequent"
+        elif not _pol.allow_switch:
+            # enforcement 开启且已分类为非出口域：不认领修整、不换线。
+            # 返回 9router 已知的 coalesced，不制造未知 reason。
+            _api_stats["domain_suppressed"] = (
+                _api_stats.get("domain_suppressed", 0) + 1)
+            reason_out = "coalesced"
         elif _slot_begin_repair(name, reason):
             h["last_rotate_ts"] = t0
             # 只造线程、不启动：后台换线/探新线/放回池子和下面的
@@ -15868,6 +16538,7 @@ def _rotate_slot_once(slot, reason, request_started_at=None, egress_ip=None,
         # 事发前读数钉进回包：_rotate_trace_fields 优先沿用，不在标脏
         # （forget_probe 已清台账）之后重算成「未探」。
         out["offending_verdict"] = verdict_before
+        out.update(domain_trace_fields(domain, _pol))
         # borrowed 也打：借道不认领修整，accepted 恒 False，不加这一条就
         # 完全看不见「哪条健康线被谁借去打了一发」—— 正是不可观测的复发点。
         if accepted or h["status"] == "repairing" or borrowed:
@@ -16037,6 +16708,11 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         if self.path != "/rotate":
             self._send(404, {"ok": False, "reason": "not_found"})
             return
+        # Batch B 接线：排空中拒绝新 /rotate 请求。
+        # 默认 graceful_drain_enabled=False 且 _DRAIN 不 draining → 零影响。
+        if _DRAIN.draining and _warp().get("graceful_drain_enabled", False):
+            self._send(503, {"ok": False, "reason": "draining"})
+            return
         if not self._authed():
             self._send(401, {"ok": False, "reason": "unauthorized"})
             return
@@ -16050,6 +16726,32 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         # 它，才能把「一条失败请求」和「哪台闸/哪条线/哪个出口」串成一条链。
         _rid = req.get("req_id")
         rid = str(_rid).strip()[:64] if _rid else None
+
+        # P0 影子分类：把 429 分成账号/模型/请求/传输/未知域，只落盘不动作。
+        # 等影子期统计出各域占比后再决定是否启用「非出口域不标脏」策略。
+        _shadow_domain = FailureDomain.UNKNOWN
+        try:
+            _shadow_domain = classify_rotate_request(req)
+            if _shadow_domain in (FailureDomain.ACCOUNT, FailureDomain.MODEL,
+                                  FailureDomain.REQUEST,
+                                  FailureDomain.CONTEXT_REJECTED,
+                                  FailureDomain.TRANSPORT):
+                _atomic_append_line(
+                    os.path.join(_PROJECT, ".warp", "failure_domain_shadow.jsonl"),
+                    {"ts": time.time(), "req_id": rid,
+                     "reason": str(req.get("reason") or "")[:64],
+                     "domain": _shadow_domain.value,
+                     "retry_after_ms": req.get("retry_after_ms"),
+                     "egress_ip": str(req.get("egress_ip") or "")[:64]})
+        except Exception as _fd_err:
+            log(f"· 故障域影子分类失败（不影响路由）: {_fd_err}")
+        # P0 强制策略：仅在 enforcement 开启时把影子分类升级为策略输入。
+        # EXIT_IP 必须带 9router 透传的独立证据；否则降级为 UNKNOWN（证据不足，
+        # 不标脏、不切线）——绝不让无证据的 429 被误判成出口故障。
+        _policy_domain = None
+        if enforcement_enabled(CFG):
+            _policy_domain = confirm_exit_domain(
+                _shadow_domain, req.get("exit_evidence_id"))
         # 生产 429 的封禁时长：9router 透传的真实 Retry-After 优先，
         # 缺失时不伪造精确封禁（返回 None → 60s 默认窗，见函数注释）。
         ban_after = _rotate_ban_after_from_req(req)
@@ -16067,7 +16769,8 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                     if isinstance(req.get("egress_ip"), str)
                     and req.get("egress_ip").strip() else None,
                     rid, ban_after,
-                    borrowed=bool(req.get("borrowed")))
+                    borrowed=bool(req.get("borrowed")),
+                    domain=_policy_domain)
             except Exception as e:
                 log(f"✗ 槽位 /rotate 异常: {e}")
                 self._send(500, {"ok": False, "reason": "internal_error"})
@@ -16080,6 +16783,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                     % (slot["name"], req.get("reason"), payload.get("reason"),
                        rid or "-"))
             payload.update(_rotate_trace_fields(req, payload))
+            payload.update(domain_trace_fields(_policy_domain))
             self._send(200, payload)
             return
         try:
@@ -16092,7 +16796,8 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
                 _normalize_rotate_reason(req.get("reason")),
                 _as_ts(req.get("request_started_at")),
                 str(ip).strip() if isinstance(ip, str) and ip.strip() else None,
-                _as_ts(req.get("egress_since")), ban_after)
+                _as_ts(req.get("egress_since")), ban_after,
+                domain=_policy_domain)
         except Exception as e:
             log(f"✗ /rotate 异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})
@@ -16100,6 +16805,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         # 主路径秒切失败：回包已经表达「无可用闸口，自己重启」，这里留一行
         # 生产日志，免得只能从 9router 侧反推 asip 到底有没有发出信号。
         result.update(_rotate_trace_fields(req, result))
+        result.update(domain_trace_fields(_policy_domain))
         if result.get("restart_required"):
             log("⇢ 主路径无可用闸口[req=%s]，通知 9router 自重启" % (rid or "-"))
         # 换线与回传分成两步：换线成功但客户端已超时断开时，记账为「回传超时」
@@ -17110,7 +17816,7 @@ def main():
             # 状态：它只回答「WARP 渠道此刻是否在承载 opencode」。池该不该轮换
             # 仍取决于池自己 —— 见 `_pool_should_rotate()`，两者的判据分开写，
             # 这样 WARP 侧的改变不会静默改变池的节奏。
-            _pool_current_dead = bool(cached_current_proxy) and cached_current_proxy in _DEAD_NODES
+            _pool_current_dead = _pool_node_dead(cached_current_proxy)
             if _pool_should_rotate(opencode_out_on_warp(), _pool_current_dead) \
                     and now - last_proactive_rotate > CFG["intervals"]["proactive_rotate_sec"]:
                 last_proactive_rotate = now
@@ -17179,7 +17885,8 @@ def main():
                     cached_all_nodes and cached_current_proxy:
                 _pool_delay_last = now
                 _submit_once("pool-delay-refresh", _refresh_pool_delays,
-                             cached_all_nodes, cached_current_proxy)
+                             cached_all_nodes, cached_current_proxy,
+                             opencode_out_on_warp())
             if now - last_health_check > CFG["intervals"]["node_health_sec"]:
                 if _initial_health_done.is_set() and cached_all_nodes and cached_current_proxy:
                     with _state_lock:
@@ -17333,7 +18040,15 @@ if __name__ == "__main__":
             pass
         raise SystemExit(0)
 
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+    def _sigterm_handler_with_drain(signum, frame):
+        # Batch B 接线：默认 graceful_drain_enabled=False → 原 handler 逐字不变。
+        # 开关开启后先受控排空；排空完成由 batchb 抛 SystemExit，
+        # 未到超时上限则继续走原落盘/退出路径。
+        if _warp().get("graceful_drain_enabled", False):
+            batchb_sigterm_handler(signum, frame)
+        _sigterm_handler(signum, frame)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler_with_drain)
     if len(sys.argv) > 1 and sys.argv[1] == "rotate":
         cli_rotate()
     elif len(sys.argv) > 1 and sys.argv[1] == "slots":

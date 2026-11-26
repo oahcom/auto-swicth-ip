@@ -479,11 +479,23 @@ CFG = {
         # 一起删掉，客户端看到 "upstream connection lost"，sidecar 侧 socket hang
         # up → 503 → 再次触发清理，形成正反馈。默认关闭，只保留代码与配置开关。
         "cleanup_enabled": False,
+        # P0 故障域策略：影子期只记录；启用后非出口域不标脏、不退役出口。
+        "failure_domain_enforcement": True,
+        "rate429_request_backoff_sec": 15,
+        "rate429_max_retry": 0,  # 幂等确认前禁止自动重放；代码侧亦有钳制
+        "rate429_ip_retire_enabled": False,
         "cleanup_old_chain_age_sec": 120,
         # 出口探测正常但仍报传输层 503 → 判为连接池僵死，清理当前链上
         # age >= 300s 的连接（30 秒节流，避免 503 风暴里反复全表扫描）。
         "transport_stale_age_sec": 300,
         "transport_stale_gap_sec": 30,
+        # Batch B（默认全关）：503 影子观测 / SIGTERM 受控排空。
+        # transport_observe_enabled=True 仅在 503 路径追加结构化证据。
+        # graceful_drain_enabled=True 才启用 SIGTERM 排空与 /rotate 拒绝；
+        # Owner 决定以 runbook 预排空替代时保持 False，接线已就位。
+        "transport_observe_enabled": True,
+        "graceful_drain_enabled": False,
+        "graceful_drain_timeout_sec": 30,
         # 主动轮换判据二选一（互斥，只有选中的那个生效）：
         #   fixed    — 无论流量快慢，每 proactive_fixed_sec 秒换一次；
         #   requests — 当前出口上成功的 dsv4 调用累计满 proactive_after_dsv4_ok
@@ -959,12 +971,12 @@ CFG = {
             "enabled": _env_bool("ASIP_WARP_BLOCKS", False),
             # 每块每类几条渠道。2 是「同 colo 一主一备」：同块两条线共用一个段池，
             # 再多只会互相抢地址，不会多出可用地址。
-            "channels_per_block": _env_int("ASIP_WARP_BLOCK_CHANNELS", 2) or 2,
+            "channels_per_block": _env_int("ASIP_WARP_BLOCK_CHANNELS", 1) or 2,
             # 结构性不可用的块：封禁率 100% 的 colo 每条 /128 都在限额里，
             # 挂上去等于占着设备不产出。**第一阶段默认空**（2026-11-01 主人定：
             # 全部块都开、一起测），只在明确要放弃某个块时才往里加。
             # 当天实测参考：NRT 4 条线夜里 0 次模型层 OK，PHX/SJC/SIN/TPE 有。
-            "exclude_colos": [],
+            "exclude_colos": ["GIG", "SYD", "AMS", "DME", "EZE"],
             "table": [
                 # ban_rate 是 2026-11-01 实测的**段封禁率**，只用于夜间取舍：
                 # 1.0 的块夜里重启动只会换到另一个同样被封的 /128。
@@ -979,29 +991,36 @@ CFG = {
                 # 不重叠的段、单线唯一 IP 576/天 —— 池子质量差 10 倍。
                 # 缺设备由 render_h2_lines.py 自动注册（用户规则），不要靠砍条数。
                 {"colo": "NRT", "loc": "东京",     "carrier": "proxy",  "ban_rate": 1.0,
-                 "channels": 1},
+                 "channels": 4},
                 {"colo": "PHX", "loc": "凤凰城",   "carrier": "proxy",  "ban_rate": 0.792,
                  "channels": 6},
                 {"colo": "LAX", "loc": "洛杉矶",   "carrier": "both",   "ban_rate": 0.266,
-                 "channels": 1},
+                 "channels": 18},
                 {"colo": "SJC", "loc": "圣何塞",   "carrier": "both",   "ban_rate": 0.25,
-                 "channels": 3},
+                 "channels": 13},
                 {"colo": "SIN", "loc": "新加坡",   "carrier": "both",   "ban_rate": 0.152,
-                 "channels": 2},
+                 "channels": 8},
                 {"colo": "TPE", "loc": "台北",     "carrier": "proxy",  "ban_rate": None,
-                 "channels": 1},
+                 "channels": 19},
                 {"colo": "HKG", "loc": "香港",     "carrier": "proxy",  "ban_rate": None,
-                 "channels": 1},
+                 "channels": 16},
                 {"colo": "ORD", "loc": "芝加哥",   "carrier": "proxy",  "ban_rate": None,
-                 "channels": 1},
+                 "channels": 2},
                 # 2026-11-02 H2 实测新增（dormant 65 节点里首次出现）。
                 # carrier=proxy：H2 与 WG-over-UDP 同属「代理承载」，区别只在
                 # 传输层（TCP/HTTP2 vs UDP/WireGuard），不改变块的归类。
                 # ban_rate=None：段池从没在生产台账里出现过，夜间必须保留。
                 {"colo": "ICN", "loc": "首尔",     "carrier": "proxy",  "ban_rate": None,
-                 "channels": 4},
+                 "channels": 2},
                 {"colo": "SLC", "loc": "盐湖城",   "carrier": "proxy",  "ban_rate": None,
                  "channels": 3},
+                {"colo": "FRA", "loc": "法兰克福", "carrier": "proxy", "channels": 1},
+                {"colo": "LHR", "loc": "伦敦",     "carrier": "proxy", "channels": 2},
+                {"colo": "BOM", "loc": "孟买",     "carrier": "proxy", "channels": 1},
+                {"colo": "DUB", "loc": "都柏林",   "carrier": "proxy", "channels": 1},
+                {"colo": "IAD", "loc": "华盛顿",   "carrier": "proxy", "channels": 1},
+                {"colo": "IST", "loc": "伊斯坦布尔", "carrier": "proxy", "channels": 1},
+                {"colo": "JNB", "loc": "约翰内斯堡", "carrier": "proxy", "channels": 1},
                 {"colo": "PIT", "loc": "匹兹堡",   "carrier": "proxy",  "ban_rate": None, "channels": 0,
                  # PIT 没有自己的节点：唯一落到过 PIT 的是 ORD 那条
                  # `us.bing.com:443~6-any`（5 轮里 ORD 7 / PIT 3 / SIN 1）。
