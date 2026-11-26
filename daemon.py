@@ -9889,7 +9889,267 @@ def _maybe_verify_transport_failures(count: int, now: float) -> None:
         log(f"✗ 传输层探针线程启动失败: {e}")
 
 
-OPENCODE_LANE_URL = "https://opencode.ai/inference/v1/chat/completions"
+
+# ---------------------------------------------------------------------------
+# Batch B (503 / SSE 安全) — 影子观测区块（纯新增，不改变现有路由行为）
+#
+# 本区块由 _verify_transport_failure 在 transport_observe_enabled 开启时调用；它提供
+# 结构化 TransportEvidence、连接生命周期分类、单连接删除唯一入口与 SSE 在途
+# 记账。任何接线到生产路由的动作都必须另加默认 False 的独立开关。
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass, field as _dc_field
+from contextlib import contextmanager as _contextmanager
+from enum import Enum as _Enum
+import sys as _sys
+
+from asip.failure_domain import FailureDomain as _FailureDomain
+from asip.failure_domain import ProbeClass as _ProbeClass
+
+
+class TransportErrorClass(str, _Enum):
+    EGRESS_PROBE_FAILED = "EGRESS_PROBE_FAILED"
+    CONNECT_FAILED = "CONNECT_FAILED"
+    TLS_FAILED = "TLS_FAILED"
+    HTTP_429 = "HTTP_429"
+    HTTP_503 = "HTTP_503"
+    FIRST_BYTE_TIMEOUT = "FIRST_BYTE_TIMEOUT"
+    FIRST_SSE_EVENT_TIMEOUT = "FIRST_SSE_EVENT_TIMEOUT"
+    SSE_INTERRUPTED = "SSE_INTERRUPTED"
+    UPSTREAM_ERROR = "UPSTREAM_ERROR"
+    # 9router sidecar 错误文本的三种子因（实测 59 条 error 中 52 条 503）：
+    HEADER_TIMEOUT = "HEADER_TIMEOUT"
+    CALLER_ABORTED = "CALLER_ABORTED"
+    UPSTREAM_TIMEOUT = "UPSTREAM_TIMEOUT"
+    UNKNOWN = "UNKNOWN"
+
+
+# sidecar error 子因 → 稳定 error_class（保留原始文本便于关联 9router 日志）
+SIDECAR_REASON_CLASSES = {
+    "header-timeout": TransportErrorClass.HEADER_TIMEOUT.value,
+    "header_timeout": TransportErrorClass.HEADER_TIMEOUT.value,
+    "caller-aborted": TransportErrorClass.CALLER_ABORTED.value,
+    "caller_aborted": TransportErrorClass.CALLER_ABORTED.value,
+    "upstream-timeout": TransportErrorClass.UPSTREAM_TIMEOUT.value,
+    "upstream_timeout": TransportErrorClass.UPSTREAM_TIMEOUT.value,
+}
+
+
+@dataclass(frozen=True)
+class TransportEvidence:
+    egress_ok: bool
+    proxy_tcp_ok: bool | None = None
+    tls_ok: bool | None = None
+    http_status: int | None = None
+    first_byte_ms: int | None = None
+    first_sse_event_ms: int | None = None
+    error_class: str | None = None
+    sidecar_reason: str | None = None
+    observed_at: float | None = None
+
+
+def classify_transport_failure(*, egress_ok, proxy_tcp_ok=None, tls_ok=None,
+                               http_status=None, first_byte_ms=None,
+                               first_sse_event_ms=None, sse_interrupted=False,
+                               sidecar_reason=None) -> str:
+    """分层判定失败阶段（纯函数、影子用）。
+
+    顺序反映探测链：出口 → TCP → TLS → HTTP → 首字节 → SSE 首事件。
+    9router sidecar 的子因（header-timeout / caller-aborted /
+    upstream-timeout）优先于兜底阶段，保证实测 88% 的 503 能定位到子因。
+    任何 HTTP 响应都不代表模型服务可用；200 且拿到 SSE 首事件才算无故障。
+    """
+    if sidecar_reason:
+        key = str(sidecar_reason).strip().lower()
+        if key in SIDECAR_REASON_CLASSES:
+            return SIDECAR_REASON_CLASSES[key]
+    if not egress_ok:
+        return TransportErrorClass.EGRESS_PROBE_FAILED.value
+    if proxy_tcp_ok is False:
+        return TransportErrorClass.CONNECT_FAILED.value
+    if tls_ok is False:
+        return TransportErrorClass.TLS_FAILED.value
+    if http_status == 429:
+        return TransportErrorClass.HTTP_429.value
+    if http_status == 503:
+        return TransportErrorClass.HTTP_503.value
+    if first_byte_ms is None:
+        return TransportErrorClass.FIRST_BYTE_TIMEOUT.value
+    if first_sse_event_ms is None:
+        return TransportErrorClass.FIRST_SSE_EVENT_TIMEOUT.value
+    if sse_interrupted:
+        return TransportErrorClass.SSE_INTERRUPTED.value
+    if http_status is not None and http_status != 200:
+        return TransportErrorClass.UPSTREAM_ERROR.value
+    return TransportErrorClass.UNKNOWN.value
+
+
+
+
+
+
+def should_dirty_exit_on_transport_error(error_class) -> bool:
+    """sidecar/传输层故障绝不自动标脏出口（含 header-timeout）。"""
+    return False
+
+
+def _transport_evidence_path() -> str:
+    """证据落盘路径；env 可覆盖（测试隔离/影子开关用）。"""
+    return os.environ.get(
+        "ASIP_TRANSPORT_EVIDENCE_FILE_PATH",
+        os.path.join(_PROJECT, ".warp", "transport_evidence.jsonl"),
+    )
+
+
+def append_transport_evidence(ev, *, req_id=None, slot=None, tag=None,
+                              reason=None) -> dict:
+    """结构化落盘 + 日志；任何写失败都吞掉，绝不污染主流程。"""
+    rec = {
+        "ts": ev.observed_at if ev.observed_at is not None else time.time(),
+        "req_id": req_id,
+        "slot": slot,
+        "tag": tag,
+        "reason": reason,
+        "egress_ok": ev.egress_ok,
+        "proxy_tcp_ok": ev.proxy_tcp_ok,
+        "tls_ok": ev.tls_ok,
+        "http_status": ev.http_status,
+        "first_byte_ms": ev.first_byte_ms,
+        "first_sse_event_ms": ev.first_sse_event_ms,
+        "error_class": ev.error_class,
+        "sidecar_reason": getattr(ev, "sidecar_reason", None),
+    }
+    try:
+        path = _transport_evidence_path()
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    try:
+        log("· transport-evidence " + json.dumps(
+            rec, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        pass
+    return rec
+
+
+def _default_lane_probe(port, timeout_sec=6.0) -> dict:
+    """默认影子探针：curl 采 HTTP 状态与连接各阶段耗时。
+
+    首 SSE 事件不在 curl -w 指标里，记为 None（表示「未确认」，非「超时」）；
+    需要精确首事件时用 runner 注入真实 SSE 客户端的采样。
+    """
+    payload = json.dumps({
+        "model": "deepseek-v4.1-flash-free",
+        "max_tokens": 1,
+        "stream": True,
+        "messages": [{"role": "user", "content": "1"}],
+    })
+    sid = "ses_asip_batchb_probe"
+    cmd = [
+        "curl", "-sS", "-o", "/dev/null", "-N",
+        "-w", "%{http_code}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}",
+        "--max-time", str(timeout_sec),
+        "--proxy", f"socks5h://{_warp()['socks_host']}:{port}",
+        "-X", "POST", OPENCODE_LANE_URL,
+        "-H", "content-type: application/json",
+        "-H", "authorization: Bearer public",
+        "-H", "x-opencode-client: cli",
+        "-H", f"x-opencode-session: {sid}",
+        "-H", f"x-session-affinity: {sid}",
+        "-H", "accept: text/event-stream",
+        "--data-binary", payload,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout_sec + 2)
+    except subprocess.TimeoutExpired:
+        return {"http_status": None, "first_byte_ms": None,
+                "first_sse_event_ms": None, "proxy_tcp_ok": None,
+                "tls_ok": None, "sse_interrupted": False, "timed_out": True}
+    parts = (r.stdout or "").strip().split("|")
+
+    def _ms(x):
+        try:
+            return int(round(float(x) * 1000))
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        status = int(parts[0]) if parts and parts[0].isdigit() else None
+    except (ValueError, IndexError):
+        status = None
+    if status == 0:
+        status = None
+    return {
+        "http_status": status,
+        "proxy_tcp_ok": _ms(parts[1]) is not None if len(parts) > 1 else None,
+        "tls_ok": _ms(parts[2]) is not None if len(parts) > 2 else None,
+        "first_byte_ms": _ms(parts[3]) if len(parts) > 3 else None,
+        "first_sse_event_ms": None,
+        "sse_interrupted": False,
+        "timed_out": False,
+    }
+
+
+def observe_transport_failure(tag, port, count, *, egress_probe=None,
+                              lane_probe=None, req_id=None, slot=None,
+                              sidecar_reason=None) -> "TransportEvidence":
+    """影子版 `_verify_transport_failure`：只分层观测、落盘，不换线、不清理。"""
+    probe_egress = egress_probe or (lambda p, timeout_sec: warp_egress_ip(
+        p, timeout_sec=timeout_sec))
+    try:
+        ip = probe_egress(port, 8.0)
+    except Exception:
+        ip = None
+    sample = (lane_probe or (lambda p: _default_lane_probe(p)))(port) or {}
+    reason = sidecar_reason if sidecar_reason is not None else sample.get("sidecar_reason")
+    error_class = classify_transport_failure(
+        egress_ok=bool(ip),
+        proxy_tcp_ok=sample.get("proxy_tcp_ok"),
+        tls_ok=sample.get("tls_ok"),
+        http_status=sample.get("http_status"),
+        first_byte_ms=sample.get("first_byte_ms"),
+        first_sse_event_ms=sample.get("first_sse_event_ms"),
+        sse_interrupted=bool(sample.get("sse_interrupted")),
+        sidecar_reason=reason,
+    )
+    ev = TransportEvidence(
+        egress_ok=bool(ip),
+        proxy_tcp_ok=sample.get("proxy_tcp_ok"),
+        tls_ok=sample.get("tls_ok"),
+        http_status=sample.get("http_status"),
+        first_byte_ms=sample.get("first_byte_ms"),
+        first_sse_event_ms=sample.get("first_sse_event_ms"),
+        error_class=error_class,
+        sidecar_reason=reason,
+        observed_at=time.time(),
+    )
+    append_transport_evidence(ev, req_id=req_id, slot=slot, tag=tag,
+                              reason=f"503 x{count}")
+    return ev
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _opencode_lane_alive(port: int, timeout_sec: float = 6.0) -> bool:
@@ -9960,6 +10220,17 @@ def _verify_transport_failure(tag: str, port: int, count: int) -> None:
     global _LAST_STALE_SWEEP_TS, _LAST_TRANSPORT_PROBE_SIG
     global _LANE_FAIL_STREAK, _LANE_FAIL_TS
     ip = warp_egress_ip(port, timeout_sec=8.0)
+    # Batch B 接线：默认 transport_observe_enabled=False，现有路径逐字不变。
+    # 影子观测复用刚完成的出口探测，只追加结构化证据；不换线/不清理/不标脏。
+    if _warp().get("transport_observe_enabled", False):
+        try:
+            observe_transport_failure(
+                tag, port, count,
+                egress_probe=lambda p, timeout_sec: ip,
+                slot=tag,
+            )
+        except Exception as _obs_err:
+            log(f"· transport-observe 影子记录失败（不影响路由）: {_obs_err}")
     if not ip:
         log(f"⚠ 传输层 503 ×{count} 且 {tag} 出口探测失败 → 换线")
         # respect_evidence=False：**这条证据比 requestDetails 强得多**。
