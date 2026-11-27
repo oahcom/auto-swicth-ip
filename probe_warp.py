@@ -601,14 +601,23 @@ def _bun_probe(bun: str, proxy_url: str, sid: str,
 
 
 def classify(status: int | None, head: str) -> str:
-    if "abusive traffic" in head or "FreeTierError" in head:
-        return "flagged"     # 出口 IP 信誉被拉黑 → 换线有效
-    if "FreeUsageLimitError" in head:
-        return "quota"       # 出口 IP 配额用尽 → 换线有效
-    # 200 但没读到 data: ——本质是可用线，只是首个 chunk 比 read 窗口慢
-    if status == 200 or head.startswith("data:"):
-        return "OK"
-    return "err"
+    """统一分类入口：判据来自 asip.failure_domain.classify_response。
+
+    对外仍返回既有字符串 OK / quota / flagged / err —— 9router 与探测台账
+    沿用这套语义。本次改动只聚合判据来源，不改变任何字符串的下游含义。
+    """
+    from asip.failure_domain import classify_response
+    _pc = classify_response(status, head or "")
+    return {
+        "ok": "OK",
+        "account_quota": "quota",
+        "ip_blocked": "flagged",
+        "context_rejected": "err",
+        "model_quota": "err",
+        "rate_limited": "err",
+        "transport_error": "err",
+        "unknown": "err",
+    }.get(_pc.value, "err")
 
 
 def probe(port: int, timeout: float, ip: str | None = None) -> tuple[str, float, str, int | None]:
