@@ -14,8 +14,8 @@ remote-deploy.sh `git reset --hard` + restart），无版本、无回滚。16k �
 版本域（什么进快照）：git 跟踪的文本文件（代码 + deploy/ + tools/ + docs/）。
 二进制（sing-box 等 >1MB 或非文本）只记校验和不入树（体积与部署语义都不同，
 fetch-binaries.sh 负责补齐）。**不进版本域**：.env、.warp/、密钥、运行时状态
-文件（.bad_nodes.json / *_ip_used 等）——回滚代码绝不连带回滚状态，状态的
-回退走「库导出 JSON 投影→冻结→回读」（deploy/state-projection.py，P3 接线）。
+文件（.bad_nodes.json / *_ip_used 等）——回滚代码绝不连带回滚状态。WAL 模式下先停止 writer、compact JSON 快照，再走
+「导出投影→冻结→回读」（deploy/state-projection.py）；回滚闸门拒绝忽略 pending WAL。
 
 快照存放：$ASIP_RELEASE_ROOT（默认 ~/.asip/releases）。放工作区之外是有意的：
 工作区会被 git clean / reset / 重建卷掉，跟工作区同生共死的快照不叫回滚点。
@@ -35,6 +35,7 @@ fetch-binaries.sh 负责补齐）。**不进版本域**：.env、.warp/、密钥
 退出码：0 成功；1 校验/回滚失败或有漂移；2 用法/输入错误。
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -358,6 +359,46 @@ def cmd_rollback(args):
             print("  " + p, file=sys.stderr)
         return 1
     root = Path(manifest["project_dir"])
+    wal = root / ".warp_ip_used.json.wal"
+    wal_lock = root / ".warp_ip_used.json.wal.lock"
+    wal_bytes = wal.stat().st_size if wal.exists() else 0
+    if wal_lock.exists() or wal_bytes:
+        if args.dry_run:
+            print("✗ 演练发现 WAL 模式已启用；真实回滚前必须停 daemon 并确认快照已 compact。")
+            return 1
+        active = subprocess.run(["systemctl", "is-active", "--quiet",
+                                 "auto-switch-ip.service"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL).returncode == 0
+        daemon_lock = root / ".daemon.lock"
+        if daemon_lock.exists():
+            lock_fd = os.open(daemon_lock, os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    active = True
+                else:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        if active:
+            print("✗ 拒绝回滚：daemon writer 仍活动且 WAL 模式已启用。\n"
+                  "  请先停止服务，再运行 python3 deploy/ledger-wal.py compact；\n"
+                  "  验证 status 的 wal_bytes=0 后重试。工作区未修改。",
+                  file=sys.stderr)
+            return 1
+        if wal_bytes:
+            try:
+                sys.path.insert(0, str(root))
+                from asip import ledger_wal
+                out = ledger_wal.compact_from_disk(root / ".warp_ip_used.json")
+                print("  ✓ 回滚前已将 %d 条 WAL delta compact 到 JSON 快照"
+                      % out["records_replayed"])
+            except Exception as exc:
+                print("✗ 回滚前 WAL compact 失败，工作区未修改：%s" % exc,
+                      file=sys.stderr)
+                return 1
     restored, failed, skipped = [], [], []
     for rel, meta in sorted(manifest["files"].items()):
         if not meta.get("stored"):

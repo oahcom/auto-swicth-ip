@@ -63,9 +63,11 @@ from asip.redact import redact_secrets as _redact_secrets
 from asip import alerting as _alerting
 from asip import health as _health
 # `.bad_nodes.json` 的唯一写口（daemon 与 cron 两侧语义是参数，不是两份代码）
+from asip import ledger_wal as _ledger_wal
 from asip.state_store import writers as _state_writers
 # 状态库双写/对账/管理面（影子阶段只搬运，不含判据）
 from asip.state_store import bridge as _state_bridge
+from asip.state_store import shadow as _state_shadow
 from asip.state_store import schema as _state_schema
 from asip.state_store import mgmt as _state_mgmt
 
@@ -445,6 +447,7 @@ _warp_cooldown_until: float = 0     # 冷却截止，防重连风暴
 _WARP_IP_USED: dict[str, dict] = {}
 _WARP_IP_LOCK = threading.Lock()   # _WARP_IP_USED 跨线程读写（换线线程 + 主循环）
 _WARP_IP_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".warp_ip_used.json")
+_WARP_IP_WAL_RECORDS = 0  # 已追加、尚未 compact 到 JSON 快照的 delta 数
 # 槽位健康状态持久化：daemon 重启后恢复 status/verdict/switched_at/tag/egress。
 # 不持久化 repairing（没有后台线程在修，恢复了就永远卡住），load 时降级为 unknown。
 _SLOT_HEALTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".slot_health.json")
@@ -545,6 +548,26 @@ def _warp_ip_used_path() -> str:
     return os.environ.get("WARP_IP_USED_FILE_PATH") or _WARP_IP_USED_FILE
 
 
+def _warp_ip_wal_enabled() -> bool:
+    """默认生产路径启用 WAL；禁用前必须确认没有待回放 delta。"""
+    override = os.environ.get("ASIP_WARP_IP_WAL")
+    if override is not None:
+        enabled = override.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        enabled = bool(_warp().get("ip_used_wal_enabled", True))
+    if not enabled:
+        try:
+            pending = os.path.getsize(_ledger_wal.wal_path(_warp_ip_used_path()))
+        except FileNotFoundError:
+            pending = 0
+        except OSError as exc:
+            raise RuntimeError("cannot verify IP ledger WAL before disabling it") from exc
+        if pending:
+            raise RuntimeError(
+                "cannot disable IP ledger WAL while pending deltas exist; stop daemon and compact first")
+    return enabled
+
+
 def _load_warp_ip_used() -> None:
     """启动时加载落盘的 IP 使用记录（旧版文件里的 `seen` 键直接忽略）。
 
@@ -553,11 +576,25 @@ def _load_warp_ip_used() -> None:
     ban_until 类型非 rate429 或数值非法 → 置空并按默认窗口重算。
     归一化条数记入启动日志。
     """
+    global _WARP_IP_WAL_RECORDS
+    loaded = None
     try:
-        with open(_warp_ip_used_path(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # 兼容两种格式：{ip: {...}} 或 {"used": {...}}
-        used = data.get("used", data) if isinstance(data, dict) else {}
+        if _warp_ip_wal_enabled():
+            try:
+                loaded = _ledger_wal.load(_warp_ip_used_path())
+            except Exception as wal_error:
+                log(f"✗ IP 台账 WAL 无法读取，拒绝降级到旧快照: {wal_error}")
+                raise RuntimeError("IP ledger WAL load failed; fail closed") from wal_error
+            used = loaded["used"]
+            _WARP_IP_WAL_RECORDS = int(loaded.get("records") or 0)
+            if loaded.get("partial_tail_repaired"):
+                log("  ⚠ IP 台账 WAL 尾部存在未完成记录，已截断到最后一条完整 fsync 记录")
+        else:
+            _WARP_IP_WAL_RECORDS = 0
+            with open(_warp_ip_used_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 兼容两种格式：{ip: {...}} 或 {"used": {...}}
+            used = data.get("used", data) if isinstance(data, dict) else {}
         w = _warp()
         retention = float(w.get("ledger_retention_sec", 86400))
         ttl = ledger_policy.make_ttl(w)
@@ -591,10 +628,47 @@ def _load_warp_ip_used() -> None:
                 f"（清理将跳过并计数）")
             s = _ledger_shadow_reset_missing()
             s["unmigrated"] = unmigratable
+        # 影子库首次启用时只做一次全量 seed；之后每次记账走 apply_delta，
+        # 避免把 replace_rows 的全表 upsert 带回热路径。
+        if _STATE_STORE is not None:
+            try:
+                db_rows = _STATE_STORE.read_rows(_state_schema.KIND_IP_USED)
+                if _WARP_IP_USED:
+                    drift = _state_shadow.diff_rows(
+                        _state_schema.KIND_IP_USED, _WARP_IP_USED, db_rows)["diffs"]
+                    if drift:
+                        # 仅在启动时做一次可归因的影子重同步；热路径始终 apply_delta。
+                        # replace_rows 的 shrink/empty 护栏仍生效，不能因影子落后而删 ban。
+                        _state_bridge.mirror_rows(
+                            _STATE_STORE, _state_schema.KIND_IP_USED, _WARP_IP_USED,
+                            alert=_alerting)
+                elif db_rows:
+                    # 空内存不能证明是有意清空；保留影子行并告警，不做反向覆盖。
+                    log("⚠ IP 台账内存为空但 SQLite shadow 非空；拒绝自动清空影子")
+            except Exception as mirror_error:
+                # SQLite 是可重建影子，不得因影子库故障回退/丢弃权威 WAL。
+                log(f"⚠ IP 台账 SQLite 启动对账失败（JSON+WAL 仍是权威）: {mirror_error}")
+        if loaded is not None:
+            compact_records = max(1, int(w.get("ip_used_wal_compact_records", _ledger_wal.DEFAULT_COMPACT_RECORDS)))
+            compact_bytes = max(4096, int(w.get("ip_used_wal_compact_bytes", _ledger_wal.DEFAULT_COMPACT_BYTES)))
+            if (int(loaded.get("records") or 0) >= compact_records
+                    or int(loaded.get("wal_bytes") or 0) >= compact_bytes):
+                try:
+                    out = _ledger_wal.compact(_warp_ip_used_path(), _WARP_IP_USED)
+                    _WARP_IP_WAL_RECORDS = 0
+                    log("  · 启动时 compact IP 台账 WAL：%d 条 / %d bytes"
+                        % (out["rows"], out["snapshot_bytes"]))
+                except Exception as compact_error:
+                    log(f"⚠ 启动时 IP 台账 WAL compact 延后（原 WAL 可回放）: {compact_error}")
+    except _ledger_wal.LedgerWalError as e:
+        log(f"✗ IP 台账 WAL 损坏，拒绝以旧快照继续启动（防止烧毁地址回池）: {e}")
+        raise
     except FileNotFoundError:
         pass
     except Exception as e:
         log(f"✗ 加载 .warp_ip_used.json 失败: {e}")
+        if _warp_ip_wal_enabled():
+            raise RuntimeError("IP ledger load failed; fail closed") from e
 
 
 def _normalize_ledger_entry(entry: dict, retention: float, ttl: dict) -> bool:
@@ -654,34 +728,88 @@ def _record_udp_bad_node(node: str, now: float) -> None:
         log(f"✗ 写 udp_bad_nodes 失败: {e}")
 
 
-def _save_warp_ip_used() -> None:
-    """把 IP 使用记录落盘。
+def _save_warp_ip_used(upserts: dict | None = None, deletes=()) -> None:
+    """持久化 IP 台账变更。生产热路径只 fsync 一条 delta，不重写全量快照。
 
-    进程内为空但盘上已有台账时拒绝写入：并发跑的测试进程/误启动的实例
-    用空内存覆盖会把 16h 的 ban_until 全抹掉（已实际发生过）。
-    `_LEDGER_ALLOW_EMPTY_WRITE` 供清理逻辑显式放行一次写空（R-6/D-3）。
+    `upserts=None` 是兼容/运维入口：显式 compact 当前内存态到旧 JSON 封套。
+    普通记账调用方必须传本次变化的 upserts/deletes。WAL append 成功才算
+    持久化成功；append/fsync 失败向调用方抛出，不能把未落盘的 ban 当已确认。
     """
-    global _LEDGER_ALLOW_EMPTY_WRITE
+    global _LEDGER_ALLOW_EMPTY_WRITE, _WARP_IP_WAL_RECORDS
     allow_empty = bool(_LEDGER_ALLOW_EMPTY_WRITE)
     path = _warp_ip_used_path()
-    if not _WARP_IP_USED and not _LEDGER_ALLOW_EMPTY_WRITE:
+    if not _WARP_IP_USED and not allow_empty:
+        snapshot_size = wal_size = 0
         try:
-            if os.path.getsize(path) > 2:
-                log(f"  · 跳过空台账覆盖 {path}（盘上已有记录）")
-                return
-        except OSError:
+            snapshot_size = os.path.getsize(path)
+        except FileNotFoundError:
             pass
-    if not _WARP_IP_USED and _LEDGER_ALLOW_EMPTY_WRITE:
         try:
-            if os.path.getsize(path) > 2:
-                log(f"  · 清理到空表，显式放行写空 {path}")
-        except OSError:
+            wal_size = os.path.getsize(_ledger_wal.wal_path(path))
+        except FileNotFoundError:
             pass
+        if snapshot_size > 2 or wal_size > 0:
+            log(f"  · 跳过空台账覆盖 {path}（盘上已有快照/WAL 记录）")
+            return
+
+    if _warp_ip_wal_enabled():
+        try:
+            if upserts is None and not _WARP_IP_USED and allow_empty:
+                # 显式清空必须带精确 delete keys；不能用一个空内存快照 compact
+                # 覆盖快照+WAL，否则会绕过逐条删除和 ban 保护。
+                snapshot_size = wal_size = 0
+                try:
+                    snapshot_size = os.path.getsize(path)
+                except FileNotFoundError:
+                    pass
+                try:
+                    wal_size = os.path.getsize(_ledger_wal.wal_path(path))
+                except FileNotFoundError:
+                    pass
+                if snapshot_size > 2 or wal_size > 0:
+                    log("  · 拒绝未带 delete keys 的空台账 WAL compact")
+                    return
+            if upserts is None:
+                # 显式全量写仅作为兼容/运维操作，不走每请求热路径。
+                out = _ledger_wal.compact(path, _WARP_IP_USED)
+                _WARP_IP_WAL_RECORDS = 0
+                _state_bridge.mirror_rows(
+                    _STATE_STORE, _state_schema.KIND_IP_USED, _WARP_IP_USED,
+                    allow_empty=allow_empty, alert=_alerting)
+            else:
+                out = _ledger_wal.append_delta(
+                    path, upserts=upserts, deletes=deletes)
+                if out.get("written"):
+                    _WARP_IP_WAL_RECORDS += 1
+                    _state_bridge.mirror_delta(
+                        _STATE_STORE, _state_schema.KIND_IP_USED, upserts, deletes,
+                        allow_empty=allow_empty, alert=_alerting)
+                compact_records = max(1, int(_warp().get(
+                    "ip_used_wal_compact_records", 1024)))
+                compact_bytes = max(4096, int(_warp().get(
+                    "ip_used_wal_compact_bytes", 4 * 1024 * 1024)))
+                if (_WARP_IP_WAL_RECORDS >= compact_records
+                        or int(out.get("wal_bytes") or 0) >= compact_bytes):
+                    try:
+                        compacted = _ledger_wal.compact(path, _WARP_IP_USED)
+                        _WARP_IP_WAL_RECORDS = 0
+                        log("  · IP 台账 WAL 已 compact：%d 条 / %d bytes"
+                            % (compacted["rows"], compacted["snapshot_bytes"]))
+                    except Exception as compact_error:
+                        # WAL 已 fsync，compact 失败不会丢本次变更；保留 WAL，
+                        # 下一次记账继续重试，不把可恢复状态误报为持久化失败。
+                        log(f"⚠ IP 台账 WAL compact 延后（delta 已 fsync）: {compact_error}")
+            _LEDGER_ALLOW_EMPTY_WRITE = False
+            return
+        except Exception as e:
+            log(f"✗ IP 台账 WAL 写入失败（拒绝确认本次记账）: {e}")
+            _alerting.notify_write_failure(path, e,
+                                           source="daemon._save_warp_ip_used.wal")
+            raise
+
+    # 兼容旧 JSON 路径（显式关闭 WAL 或测试自定义路径）。
     _LEDGER_ALLOW_EMPTY_WRITE = False
     _write_json_atomic(path, {"used": _WARP_IP_USED})
-    # 影子双写（T2b）：JSON 成功后尽力镜像；库拒写只上报不改变上面的落盘。
-    # allow_empty 必须跟着原标志走 —— 清理路径显式放行的「写空」，库侧也要
-    # 放行，否则清理永远只清 JSON、库越积越多，差异恒非零。
     _state_bridge.mirror_rows(
         _STATE_STORE, _state_schema.KIND_IP_USED, _WARP_IP_USED,
         allow_empty=allow_empty, alert=_alerting)
@@ -7804,10 +7932,11 @@ def _record_active_ip_success(total: int, errors: int) -> None:
     if not fresh:
         return
     with _WARP_IP_LOCK:
+        cleanup_delta = {"upserts": [], "deletes": []}
         if not isinstance(_WARP_IP_USED.get(ip), dict):
-            # 重启后隧道换出的新地址此前没有记录（只有被选为出口时才写），
-            # 不补一条的话成功流量永远打不上点，选线日志恒为「有成功记录 0 条」。
-            _warp_ip_used_locked(ip, now, False)
+            # 新地址建账与本次成功打点合成一个 WAL delta，避免同一请求先后
+            # 对同一 IP 追加两条记录。
+            cleanup_delta = _warp_ip_used_locked(ip, now, False, persist=False)
         entry = _WARP_IP_USED[ip]
         # first_ok_ts 是本段「可用寿命」的起点。比 ts 还旧说明是上一个 stint
         # 留下的（同址在出窗口后被再次选中），必须重置，否则跨度跨段串算。
@@ -7819,7 +7948,12 @@ def _record_active_ip_success(total: int, errors: int) -> None:
         # 锚点 = 最近一次成功时刻（last_ok_ts），不是 time.time()
         _ledger_apply_event_locked(entry, ledger_policy.EVENT_SUCCESS,
                                    float(entry["last_ok_ts"]))
-        _save_warp_ip_used()
+        changed = {ip: dict(entry)}
+        for key in cleanup_delta.get("upserts", []):
+            if key in _WARP_IP_USED:
+                changed[key] = dict(_WARP_IP_USED[key])
+        _save_warp_ip_used(upserts=changed,
+                           deletes=cleanup_delta.get("deletes", []))
     tag = active_warp_tag()
     if tag:
         _warp_line_note_ok(tag, ip, max(fresh))
@@ -8061,7 +8195,7 @@ def _ledger_mark_probe_ok(ip: str, now: float) -> None:
             entry = _WARP_IP_USED[ip] = _ledger_new_entry(now)
         entry["probe_ok_ts"] = max(float(entry.get("probe_ok_ts") or 0), now)
         _ledger_apply_event_locked(entry, ledger_policy.EVENT_PROBE, now)
-        _save_warp_ip_used()
+        _save_warp_ip_used(upserts={ip: dict(entry)})
 
 
 def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
@@ -8102,7 +8236,8 @@ def _mark_warp_ip_used(ip: str | None, now: float, blocked: bool = False,
 
 def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
                          kind: str | None = None,
-                         ban_after: float | None = None) -> None:
+                         ban_after: float | None = None,
+                         persist: bool = True) -> dict:
     """持锁版本的写入主体（调用方必须已持有 _WARP_IP_LOCK）。
 
     记录 `first_seen` / `blocked_ts` / `served_sec`：只存"最后一次使用时刻"
@@ -8188,14 +8323,23 @@ def _warp_ip_used_locked(ip: str, now: float, blocked: bool,
     _ledger_apply_event_locked(entry, event, now)
     # ---- 清理（P2 起由 ledger_cleanup_mode 控制判据） ----
     w = _warp()
-    _ledger_cleanup_locked(now, w)
+    cleanup_delta = _ledger_cleanup_locked(now, w)
     global _LEDGER_ALLOW_EMPTY_WRITE
     if not _WARP_IP_USED:
         _LEDGER_ALLOW_EMPTY_WRITE = True
-    _save_warp_ip_used()
+    if persist:
+        changed = ({ip: dict(_WARP_IP_USED[ip])}
+                   if ip in _WARP_IP_USED and isinstance(_WARP_IP_USED[ip], dict)
+                   else {})
+        for key in cleanup_delta.get("upserts", []):
+            if key in _WARP_IP_USED:
+                changed[key] = dict(_WARP_IP_USED[key])
+        _save_warp_ip_used(upserts=changed,
+                           deletes=cleanup_delta.get("deletes", []))
+    return cleanup_delta
 
 
-def _ledger_cleanup_locked(now: float, w: dict) -> None:
+def _ledger_cleanup_locked(now: float, w: dict) -> dict:
     """全表清理（调用方持锁，并在本函数后落盘）。
 
     `legacy`：`ts` + 窗口口径，行为与改造前逐字节一致（保留 24h 内被碰过的
@@ -8208,6 +8352,8 @@ def _ledger_cleanup_locked(now: float, w: dict) -> None:
     last_ok_ts）随之丢失，而影子对无字段条目不计数、根本看不见。
     """
     mode = w.get("ledger_cleanup_mode", "legacy")
+    changed: set[str] = set()
+    deleted: list[str] = []
     if mode == "expires_at":
         retention = float(w.get("ledger_retention_sec", 86400))
         ttl = ledger_policy.make_ttl(w)
@@ -8219,6 +8365,7 @@ def _ledger_cleanup_locked(now: float, w: dict) -> None:
                 # 旧 float 格式残留（载入已转 dict，这里只防御运行期外部注入）。
                 # 保留原值当 ts；坏值走 unmigrated 分支保留而不是删。
                 v = _WARP_IP_USED[k] = {"ts": _as_ts(v), "blocked": False}
+                changed.add(k)
             delete, why = ledger_policy.cleanup_verdict(v, now, retention, ttl)
             if why == "unmigrated":
                 unmigrated += 1
@@ -8229,13 +8376,16 @@ def _ledger_cleanup_locked(now: float, w: dict) -> None:
                 v["expires_at"] = ledger_policy.backfill_expires_at(
                     v, retention, ttl)
                 s["backfilled_total"] += 1
+                changed.add(k)
             if delete:
+                deleted.append(k)
+                changed.discard(k)
                 del _WARP_IP_USED[k]
         s["missing_expires"] = missing
         s["unmigrated"] = unmigrated
         if unmigrated:
             log(f"  ⚠ 台账 P2 清理跳过 {unmigrated} 条无时间锚点条目（无法补齐）")
-        return
+        return {"upserts": sorted(changed), "deletes": sorted(deleted)}
     cutoff = now - w["ip_reuse_guard_sec"]
     # 被标记过的 IP 保留到惩罚期结束：取两档恢复期（403 6h）与 blocked_ttl_sec
     # 的最大值兜底；解析到精确封禁的条目由下方 ban_until > now 单独保护，
@@ -8256,7 +8406,9 @@ def _ledger_cleanup_locked(now: float, w: dict) -> None:
             continue
         keep = blocked_cutoff if (isinstance(v, dict) and v.get("blocked")) else cutoff
         if ts < keep:
+            deleted.append(k)
             del _WARP_IP_USED[k]
+    return {"upserts": [], "deletes": sorted(deleted)}
 
 def _warp_model_usable(member: dict, ip: str) -> bool:
     """刷新后的模型层验收：这条线此刻能否真正服务 opencode 免费层。
@@ -12875,8 +13027,9 @@ _DAEMON_LOCK_FD: int | None = None
 def _acquire_single_instance_lock() -> None:
     """拒绝第二个 daemon 实例（PID 锁）。
 
-    WHY 必须加：两个实例各自持有内存里的 `_WARP_IP_USED`，又都整份覆写
-    `.warp_ip_used.json` —— IP 去重会互相失效。实测 2026-10-19 19:12:20 与
+    WHY 必须加：两个实例各自持有内存里的 `_WARP_IP_USED`，会基于陈旧状态
+    做出冲突的选线/惩罚决定；历史整表覆写还会互相覆盖。现在 WAL 以 delta
+    append，但仍必须单 writer。实测 2026-10-19 19:12:20 与
     19:15:01 两次启动并存期间，4 次在 2~9 秒内切回同一个刚被烧掉的 IP，
     日志里同秒重复行也集中出现在那段时间。锁文件不删除（unlink 会让后来者
     拿到新 inode，锁形同虚设），进程退出时由内核释放。
@@ -15327,9 +15480,12 @@ def _api_health_snapshot() -> dict:
     except Exception:
         rows = -1
     try:
-        size = os.path.getsize(_warp_ip_used_path())
+        snapshot_size = os.path.getsize(_warp_ip_used_path())
+        wal_size = (int(_ledger_wal.inspect(_warp_ip_used_path())["wal_bytes"])
+                    if _warp_ip_wal_enabled() else 0)
+        size = snapshot_size + wal_size
     except OSError:
-        size = -1
+        snapshot_size, wal_size, size = -1, -1, -1
     ledger_cap = 32 * 1024 * 1024
     ledger_ok = None if size < 0 else size < ledger_cap
 
@@ -15348,7 +15504,10 @@ def _api_health_snapshot() -> dict:
         _health.CHECK_LEDGER_HEADROOM: _health.Check(
             name=_health.CHECK_LEDGER_HEADROOM,
             value={"file": os.path.basename(_warp_ip_used_path()),
-                   "rows": rows, "bytes": size, "cap_bytes": ledger_cap},
+                   "rows": rows, "bytes": size,
+                   "snapshot_bytes": snapshot_size, "wal_bytes": wal_size,
+                   "wal_records_pending": _WARP_IP_WAL_RECORDS,
+                   "cap_bytes": ledger_cap},
             ok=ledger_ok, ts=now,
             detail="" if ledger_ok is not None else "ledger unreadable"),
         _health.CHECK_QUEUE_DEPTH: _health.Check(
@@ -15367,10 +15526,10 @@ def _api_state_unban(req: dict) -> dict:
     """手动解封（走 daemon 写口）。判定在 `asip.state_store.mgmt`，这里只落地。
 
     WHY 必须回到这个进程里做：`_WARP_IP_USED` 是 daemon 的内存态，运维手改
-    磁盘上的 JSON 之后，下一次 `_save_warp_ip_used()` 会拿内存旧值整表覆盖，
+    磁盘上的 JSON 之后，下一次 `_save_warp_ip_used()` 会拿内存旧值覆盖，
     白改 —— 而且没留痕，事后查不到谁在什么时候解了哪个地址。所以解封只有
-    一条合法路径：改内存（持 `_WARP_IP_LOCK`）→ 走既有落盘（含空表/缩水护栏）
-    → 写事件流水（谁/何时/为什么）。
+    一条合法路径：改内存（持 `_WARP_IP_LOCK`）→ fsync 单行 WAL delta → 写事件流水。
+    必须在同一把内存锁内 append，防止并发 quota ban 排在解封之后却先于 WAL 落盘。
     """
     ip = str(req.get("ip") or "").strip()
     if not ip:
@@ -15404,8 +15563,8 @@ def _api_state_unban(req: dict) -> dict:
                               ("blocked", "blocked_kind", "ban_until",
                                "expires_at")}}
         _WARP_IP_USED[ip] = tf["after"]
-    # 落盘在锁外：与其它写路径同序（先改内存、再整表落），避免锁序交叉。
-    _save_warp_ip_used()
+        # WAL 只追加本次解封的单行；在同一内存锁内 fsync，保持与后续 ban 的顺序。
+        _save_warp_ip_used(upserts={ip: dict(tf["after"])})
     audit = {"ip": ip, "actor": str(req.get("actor") or "unknown")[:64],
              "ts": round(now, 3),
              "reason": str(req.get("reason") or "(未填写)")[:200],

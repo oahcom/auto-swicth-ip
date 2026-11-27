@@ -32,7 +32,7 @@ _E403_BODY = '{"response": {"status": 403, "error": "abusive traffic from this I
 def _mark_isolate(monkeypatch):
     """隔离 IP 台账的三类副作用（选窗文件 / 追加历史 / 探测缓存）。"""
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_probe_cache_forget", lambda *a, **k: None)
 

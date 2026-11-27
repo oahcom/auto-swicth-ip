@@ -19,7 +19,8 @@
 | `.warp/warp-outbound.json` | `deploy/members.py` / `warp_wg.apply` | `parse_subscription.py` | WARP 出口的素材 |
 | `.warp/warp_wg_state.json` | `warp_wg.write_line` / `daemon._rehome_one` | `warp_wg` / daemon 轮回 | WG 线落地节点台账 |
 | `.warp_line_state.json` | daemon | daemon | **每线状态**（最大的那份） |
-| `.warp_ip_used.json` | daemon | daemon | 出口 IP 使用台账 |
+| `.warp_ip_used.json` | daemon（周期 compact） | daemon | 出口 IP 使用台账快照；与 `.warp_ip_used.json.wal` 合起来才是完整状态 |
+| `.warp_ip_used.json.wal` | daemon（append+fsync） | daemon replay/compact | 出口 IP 台账增量 WAL；回滚旧代码前必须 compact 回 JSON |
 | `.warp_ip_cycles.json` | daemon | 离线诊断 | 段样本（**只记错误终止的段**） |
 | `.bad_nodes.json` | daemon（独占写） | daemon | 池节点黑名单 |
 | `dormant-outbounds.json` | **手工固化**（非 gitignored） | `parse_subscription.py` | 沉睡池定义：okz 的历史快照，65 条 |
@@ -106,13 +107,16 @@ daemon 重启一次就再也撤不掉那条补位线了。
 
 ## 四、`.warp_ip_used.json`
 
-`{ip: {"ts": 最后使用时刻, "blocked": 是否被 403/429 标记}}`。
+`{ip: {"ts": 最后使用时刻, "blocked": 是否被 403/429 标记}}`。WAL 模式下，
+该 JSON 是周期快照；`.warp_ip_used.json.wal` 的 pending delta 必须一起 replay，
+不能单独复制/回滚 JSON 快照。
 
 **必须落盘**：实测 22:22 重启后旧 IP 全变"干净"，22:27 立即切回已被烧的地址，
 403 持续 144s。
 
-**写入点只有两个**：换线切过去时（`blocked=False`）与触发换线时把当前出口
-标 `blocked=True`。
+**写入事件**包括出口 IP 切换/touch、模型层 probe 成功、quota/403/429 惩罚、
+TTL 清理与人工解封。每次只把变化 IP 的 upsert/delete 追加到 WAL；JSON 快照按阈值
+compact，不能再把快照 mtime 当作每次记账的实时更新时间。
 
 `_warp_any_reachable()` 要求至少一条线出**未被标记**的 IP 才算可达 —— 否则
 "连通探测全过、403 依旧 100%"（实测 22:36 切到某地址后仍 403 10/10）。

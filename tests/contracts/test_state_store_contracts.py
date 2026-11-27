@@ -666,3 +666,45 @@ def test_unban_plan_refuses_unknown_and_unblocked(store):
     assert mgmt.unban_plan(store, "1.2.3.4")["found"] is True
     assert mgmt.unban_plan(store, "1.2.3.4")["ok"] is False
 
+
+
+def test_explicit_row_delta_updates_only_changed_keys_and_protects_bans(store):
+    """WAL 热路径只写变化行；显式删除仍受 INV-BAN 保护。"""
+    store.replace_rows(schema.KIND_IP_USED, {
+        "burned": {"ts": 1.0, "blocked": True,
+                   "ban_until": 9e9, "ban_kind": "rate429"},
+        "stale": {"ts": 1.0, "blocked": False},
+    })
+    before = store._conn.execute(
+        "SELECT updated_at FROM rows WHERE kind=? AND key=?",
+        (schema.KIND_IP_USED, "burned")).fetchone()[0]
+    out = store.apply_delta(
+        schema.KIND_IP_USED,
+        upserts={"fresh": {"ts": 2.0, "blocked": False}},
+        deletes=["burned", "stale"], now=2.0)
+    assert out["written"] is True
+    assert out["deleted"] == ["stale"]
+    assert out["blocked"] == ["burned"]
+    rows = store.read_rows(schema.KIND_IP_USED)
+    assert set(rows) == {"burned", "fresh"}
+    after = store._conn.execute(
+        "SELECT updated_at FROM rows WHERE kind=? AND key=?",
+        (schema.KIND_IP_USED, "burned")).fetchone()[0]
+    assert after == before, "未变化行不得被全表 upsert 重写"
+
+
+def test_explicit_delta_cannot_accidentally_empty_nonempty_ledger(store):
+    """delta 虽然精确列出删除 key，最后一行仍必须走 INV-EMPTY。"""
+    store.replace_rows(schema.KIND_IP_USED, {"only": {"ts": 1.0}})
+    out = store.apply_delta(schema.KIND_IP_USED, deletes=["only"], now=2.0)
+    assert out["written"] is False
+    assert out["refused"] == "INV-EMPTY"
+    assert set(store.read_rows(schema.KIND_IP_USED)) == {"only"}
+
+
+def test_explicit_delta_allows_intentional_empty_with_escape_hatch(store):
+    store.replace_rows(schema.KIND_IP_USED, {"only": {"ts": 1.0}})
+    out = store.apply_delta(schema.KIND_IP_USED, deletes=["only"],
+                            allow_empty=True, now=2.0)
+    assert out["written"] is True
+    assert store.read_rows(schema.KIND_IP_USED) == {}

@@ -25,6 +25,8 @@ singbox-config.json.tmp
 .bad_nodes.json.lock
 .warp/
 .warp_ip_used.json
+.warp_ip_used.json.wal
+.warp_ip_used.json.wal.lock
 .daemon.lock
 .warp_ip_cycles.json
 .warp_ip_history.jsonl

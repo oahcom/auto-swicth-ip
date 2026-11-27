@@ -3,11 +3,12 @@
 WHY 单列一层而不是把双写散进 `_save_*`：双写必须满足三条硬约束，散着写
 必然在某处漏掉一条 ——
 
-  ① **绝不改变调用链语义**：库写失败只告警，不抛、不 return、不影响落盘结果。
-     影子阶段库是观察对象，它坏了不能反过来影响生产（顺序：JSON 先成功，
-     库后尽力）。
-  ② **护栏复用，不复制**：空表/缩水由 `Store.replace_rows` 按 schema 不变量
-     判定（INV-EMPTY / INV-SHRINK），这里不写第二份阈值。
+  ① **绝不改变调用链语义**：库写失败只告警，不抛、不 return、不影响主状态结果。
+     影子阶段库是观察对象，它坏了不能反过来影响生产（顺序：JSON+WAL 的
+     主写先 fsync，库后尽力）。
+  ② **护栏复用，不复制**：全量投影由 `Store.replace_rows` 执行 INV-EMPTY /
+     INV-SHRINK；增量投影由 `Store.apply_delta` 执行 INV-EMPTY 与 INV-BAN，
+     删除必须由调用方精确列出 key，不从陈旧快照推断缩水。
   ③ **差异可归因**：只影子 daemon 单写者的 kind（见 shadow.WRITER_TYPES），
      共享写者（bad_nodes）在收编 cron 之后才可能进 diff。
 
@@ -15,9 +16,9 @@ WHY 单列一层而不是把双写散进 `_save_*`：双写必须满足三条硬
 「库的 schema 版本」变隐式（谁先启动谁定），与迁移器的存在意义直接冲突。
 所以这里只「打不开就跳过」，从不建库。
 
-阶段中间态（必须写在明处）：本模块让库与 JSON **同时**被写，写入不损坏，
-但决策仍以 JSON/内存为准 —— 切读是 T2c 的事，且以「影子差异=0 一个观察窗」
-为门槛。
+阶段中间态（必须写在明处）：本模块让库与 JSON/WAL **同时**被写，写入不损坏，
+但决策仍以 JSON+WAL/内存为准 —— SQLite 是可重建影子，不是 IP 台账主源；
+切读是 T2c 的事，且以「影子差异=0 一个观察窗」为门槛。
 """
 from __future__ import annotations
 
@@ -70,6 +71,26 @@ def mirror_rows(store: Store | None, kind: str, mapping: dict, *,
               "库拒写 %s（%s）：%s" % (kind, out.get("refused"),
                                       out.get("detail")),
               kind=kind, invariant=out.get("refused"), ctx=out.get("ctx"))
+    return out
+
+
+def mirror_delta(store: Store | None, kind: str, upserts: dict | None = None,
+                 deletes=(), *, allow_empty: bool = False, alert=None) -> dict:
+    """增量镜像 daemon 已持久化的行变更；失败只告警，不回滚主写入。"""
+    if store is None:
+        return {"skipped": True}
+    try:
+        out = store.apply_delta(kind, upserts, deletes, allow_empty=allow_empty)
+    except Exception as exc:
+        _emit(alert, _alerting.CATEGORY_STATE_WRITE_FAILED,
+              "增量镜像 %s 失败: %s" % (kind, exc), kind=kind)
+        return {"error": str(exc)}
+    if out.get("refused") or out.get("blocked"):
+        _emit(alert, _alerting.CATEGORY_LEDGER_ANOMALY,
+              "增量镜像 %s 被护栏拒绝：refused=%s blocked=%s" %
+              (kind, out.get("refused"), out.get("blocked")),
+              kind=kind, invariant=out.get("refused"),
+              blocked=out.get("blocked", []))
     return out
 
 

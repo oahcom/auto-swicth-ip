@@ -58,3 +58,47 @@ python3 deploy/state-shadow-drill.py      # 载入器 vs 库 逐行对账
 - `run/` 700、`run/state.sqlite3` 600（库里有出口地址与封禁证据，与台账同密级）。
 - 台账保留/归档以库为准：热工作集留表内，冷归档走后台低优先车道，不得与
   `/rotate` 抢 IO，不得排进换线时间线。
+
+## 6. IP 台账增量 WAL（2026-11-27）
+
+`.warp_ip_used.json` 的热路径不再整表替换。权威状态由旧格式 JSON 快照与
+`.warp_ip_used.json.wal` 组成：每次 upsert/delete 追加一条 JSONL delta，文件
+`fsync` 成功后才返回；启动先读快照再按顺序 replay。完整损坏行 fail-closed，
+仅允许截断未完成的最后一行。
+
+默认每 1024 条 delta 或 WAL 达 4 MiB 时 compact：写临时快照 → fsync 文件 →
+rename → fsync 目录 → truncate+fsync WAL。若在 rename 后、truncate 前崩溃，旧 WAL
+会被再次 replay；upsert/delete 幂等，因此不会丢失或复活烧毁地址。
+
+- `deploy/ledger-wal.py status`：只读查看快照/WAL 大小与 pending 行数；
+- `deploy/ledger-wal.py compact`：要求 `auto-switch-ip.service` 已停止，将快照+WAL
+  合并为旧代码可读的 JSON；
+- `state-projection export` 在 WAL 非空或 daemon 仍可能追加时拒绝导出；
+- 回滚到不支持 WAL 的代码前必须停止 daemon、compact 并确认 `wal_bytes=0`。
+  `asip-release.py rollback` 和 `remote-deploy.sh` 都有 fail-closed 检查。
+
+SQLite shadow（若显式开启）首次启动时全量 seed，后续使用 `apply_delta` 只镜像变化行；
+`replace_rows` 不再位于每次 IP 记账热路径。WAL+JSON 是当前 IP 台账 source of truth，
+SQLite 仅是可重建影子；它的短暂落后不会覆盖 WAL 中已 fsync 的变更。
+
+### 6.1 10 分钟等频基准（2026-11-27）
+
+使用 `benchmarks/bench_ledger_wal.py` 在 `/tmp` 临时目录跑合成 47,665 行台账，
+按 4 updates/sec 连续 600 秒，共 2,400 次单行更新；full-rewrite 基线按现场
+快照 16,912,942 bytes/次计算。基准结束前先 replay 比对内存态，再执行一次最终
+compact 验证旧 JSON 回滚投影；最终临时目录已删除。
+
+| 指标 | 结果 |
+|---|---:|
+| full JSON rewrite 基线 | 40,591,060,800 bytes（约 40.59 GB） |
+| WAL delta append 总量 | 872,302 bytes |
+| 周期 compact | 2 次，共 29,301,020 bytes |
+| 稳态逻辑写入（delta + 周期 compact） | 30,173,322 bytes，较基线减少 **99.9257%** |
+| 加上最终回滚投影 compact | 44,824,493 bytes，较基线减少 **99.8896%** |
+| append 延迟 | p50 0.194 ms / p95 0.339 ms |
+| 周期 compact 延迟 | p50 397.3 ms / p95 405.0 ms（2 次样本） |
+| 最终 replay / JSON projection | 均通过；compact 后 WAL=0 |
+
+基准窗口底层设备总写入约 5.12 GiB，但该值包含同时运行的生产服务和其他主机负载，
+不能归因给基准进程；性能比较使用 WAL/快照文件的精确逻辑写入字节数。基准脚本
+保留为可复现工具，正式验收仍需在生产变更窗口观察真实 WAL 与设备写入趋势。

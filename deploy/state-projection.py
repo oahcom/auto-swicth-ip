@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""状态导出投影工具 —— 「导出投影 → 冻结 → 回读」三步的最小实现（T5/W1，供 P3 接线）。
+"""状态导出投影工具 —— 「导出投影 → 冻结 → 回读」三步的最小实现。
 
-WHY：阶段 2「状态权威切读」是不可逆点（停读 JSON），回滚路径 = 库导出 JSON
-投影 → 冻结 → 回读。本工具先把**契约形状**钉死：投影文件的封套、校验语义、
-三步的调用约定。P3 落地 SQLite 后在本工具加 `--source sqlite:<db>` 数据源，
-封套形状不变——这就是「接口先行、接线后至」的预留方式。
+IP 台账的 JSON 文件是周期快照；`.warp_ip_used.json.wal` 可能含已确认 delta。
+导出前必须证明 writer 已停且 WAL 已 compact，否则 JSON 投影会漏掉已确认记录。
 
 三步语义：
   导出投影 export   把状态文件（JSON/JSONL）读出 → 单个 JSON 投影文件，
@@ -30,11 +28,13 @@ glob 按**路径段**匹配（.warp/*.json 只命中直接子级）——设备�
 退出码：0 成功；1 校验失败/缺文件；2 用法错误。
 """
 import argparse
+import fcntl
 import fnmatch
 import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -88,6 +88,39 @@ def cmd_export(args):
     if not os.path.isdir(args.state_root):
         print(f"✗ 状态根不存在：{args.state_root}", file=sys.stderr)
         return 2
+    wal = os.path.join(args.state_root, ".warp_ip_used.json.wal")
+    wal_lock = wal + ".lock"
+    try:
+        wal_bytes = os.path.getsize(wal)
+    except FileNotFoundError:
+        wal_bytes = 0
+    active = False
+    if os.path.exists(wal_lock):
+        try:
+            active = subprocess.run(
+                ["systemctl", "is-active", "--quiet", "auto-switch-ip.service"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        except OSError:
+            active = True  # 无法确认 writer 已停，按 fail-closed 处理
+    daemon_lock = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        ".daemon.lock")
+    if os.path.exists(daemon_lock):
+        lock_fd = os.open(daemon_lock, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                active = True
+            else:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+    if wal_bytes or active:
+        print("✗ IP 台账 WAL 尚未成为纯 JSON 回滚点（有 pending delta 或 daemon 仍可追加）。\n"
+              "  请先停止 daemon writer（systemd service 或手工进程），运行 deploy/ledger-wal.py compact，\n"
+              "  确认 wal_bytes=0 后再导出投影。", file=sys.stderr)
+        return 1
     includes = ([] if args.no_default else list(DEFAULT_INCLUDES)) + list(args.include or [])
     if not includes:
         print("✗ 没有任何包含模式（--no-default 且未给 --include）", file=sys.stderr)

@@ -740,7 +740,7 @@ def test_model_quota_verdict_marks_ip_blocked(monkeypatch):
     monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history",
                         lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
@@ -762,7 +762,7 @@ def test_model_flagged_verdict_maps_to_abuse403(monkeypatch):
     monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
@@ -778,7 +778,7 @@ def test_model_ok_verdict_does_not_mark_blocked(monkeypatch):
     monkeypatch.setattr(daemon, "_probe_blind_until", 0.0)
     monkeypatch.setattr(daemon, "_WARP_PROBE_SEEN", {})
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG["warp"], "refresh_model_check", True)
     monkeypatch.setattr(probe_warp, "probe",
                         lambda port, timeout, ip=None: ("OK", 0.1, "", None))

@@ -144,6 +144,9 @@ with open(_EMPTY_LEDGER, "w", encoding="utf-8") as _f:
     _f.write("[]")
 os.environ["ASIP_BACKFILL_FILE_PATH"] = _EMPTY_LEDGER
 os.environ["ASIP_H2_CHANNELS_PATH"] = _EMPTY_LEDGER
+# WAL 专项用例显式 opt-in；其余测试继续覆盖旧 JSON 行为，避免后台线程
+# 因测试环境偶然配置而创建 WAL 或触发 compact。生产默认值仍在 config.py 开启。
+os.environ["ASIP_WARP_IP_WAL"] = "0"
 
 import daemon  # noqa: E402  —— 必须在上面的环境变量之后
 

@@ -1,16 +1,20 @@
-# 状态投影工具接口约定（T5/W1 预留，P3 接线用）
+# 状态投影工具接口约定（JSONL WAL + JSON 兼容投影）
 
-> 2026-11-14 | 工具：`deploy/state-projection.py`；配套：`deploy/asip-release.py`（版本/迁移骨架）
-> 性质：**接口先行、接线后至**——W1 把回滚契约的「形状」钉死并真实演练，P3 落地 SQLite
-> 后在此加数据源，封套不变。对应《实施方案规划》阶段 2 验收：「回滚演练通过（导出投影→
-> 冻结→回读一致）」。
+> 2026-11-27 | 工具：`deploy/state-projection.py`、`deploy/ledger-wal.py`；配套：`deploy/asip-release.py`
+> `.warp_ip_used.json` 的权威状态是 **JSON 快照 + `.warp_ip_used.json.wal`**。快照可能落后于
+> WAL；每条已确认变更先 append+fsync，达到阈值再原子 compact。SQLite 仍是可选影子镜像，
+> 不作为当前 IP 台账唯一真相。回滚到不认识 WAL 的旧代码前，必须停 daemon 并 compact。
 
 ---
 
 ## 一、逻辑链（为何是这个形状）
 
-阶段 2「状态权威切读」的不可逆点是**停止读 JSON**。回退路径=「库导出 JSON 投影→冻结→
-回读」：切读出问题时，把库的内容投影成 JSON（旧代码读得懂的形态）、**冻结**成不可变
+状态回滚的不可逆点是**停止读当前状态格式**。IP 台账在 WAL 模式下的回退路径是先停写者、
+将快照 + WAL compact 成旧 daemon 可读的 JSON，再导出投影→冻结→回读；不得只复制
+`.warp_ip_used.json` 而忽略非空 WAL。
+
+回退路径=「完整状态源导出 JSON 投影→冻结→
+回读」：切读出问题时，把完整状态投影成 JSON（旧代码读得懂的形态）、**冻结**成不可变
 回滚点、再**回读**校验一致性。三步各自防一种事故：
 
 - **导出投影**防「切读后旧形态丢失」：投影是库在某时刻的完整自证快照（逐条 sha256）；
@@ -19,7 +23,9 @@
 - **回读**防「回了个坏的」：还原前先验侧车与逐条哈希，目标已存在拒写（防覆盖活数据），
   条目名防路径穿越。
 
-W1 用现有 JSON 状态文件当数据源把三步走通；P3 的 SQLite 是**新数据源**，不是新契约。
+`state-projection export` 在 WAL 非空，或 WAL lock 存在且 daemon 仍 active 时 fail-closed，
+防止检查后又追加 delta 的竞态。必须先停止 `auto-switch-ip.service`，执行
+`python3 deploy/ledger-wal.py compact`，确认 `status` 的 `wal_bytes=0`。
 
 ## 二、调用约定（CLI）
 
@@ -74,8 +80,9 @@ python3 deploy/state-projection.py readback <投影.json> --verify-only   # 只�
 **已知边界（P3 接线时可收窄）**：
 1. `.warp/h2/singbox.json` 是派生产物且内嵌 Clash secret，被 `.warp/h2/*.json` 命中——
    投影文件以 0600 落盘、冻结后去写位；P3 可改为白名单只留 `.warp/h2/channels.json`；
-2. 大台账不裁剪（.warp_ip_used.json ~14.9MB、.warp_line_state.json ~2.9MB、
-   .warp_ip_history.jsonl ~3.8MB）——投影体积 ~22MB 属预期，回滚点完整性优先于体积；
+2. 大台账不裁剪（.warp_ip_used.json 当前约 17MB、.warp_line_state.json ~2.9MB、
+   .warp_ip_history.jsonl ~3.8MB）。WAL 未 compact 时 JSON 快照不完整，导出工具会拒绝；
+   compact 后投影仍包含完整旧格式台账；
 3. 设备凭据（`.warp/*/config.json`、`wglines/*/singbox.json`）**不进投影**（glob 路径段
    匹配已排除）；密钥域不归状态回滚管。
 
@@ -87,8 +94,9 @@ python3 deploy/state-projection.py readback <投影.json> --verify-only   # 只�
 - `asip-release.py rollback --with-migrations`：代码回滚时连同迁移态回退到该发布时刻
   （manifest 记录 `migrations_applied`）；状态内容的回退走本投影工具，两者职责分开：
   **版本域（代码）归 asip-release，状态域（数据）归 state-projection**，互不覆盖；
-- 顺序建议（P3 切读前）：`export`（切读前状态）→`freeze`（回滚点）→ 切读 → 出问题
-  `readback --into` 到隔离目录核对 → 人工确认后替换状态根（先停写者）。
+- WAL 回滚顺序：停止 daemon → `python3 deploy/ledger-wal.py status` → `compact` →
+  再 `status` 确认 `wal_bytes=0` → `state-projection export` → freeze/readback →
+  还原旧代码。`asip-release rollback` 与 `remote-deploy.sh` 对不支持 WAL 的目标有硬闸。
 
 ## 六、演练记录（2026-11-14 真实执行，只读真实状态根 + 回读落演练目录）
 

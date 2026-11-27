@@ -344,6 +344,72 @@ class Store:
                 raise
         return {"written": True, "count": len(merged)}
 
+    def apply_delta(self, kind: str, upserts: dict | None = None, deletes=(), *,
+                    allow_empty: bool = False, now: float | None = None) -> dict:
+        """Apply an explicit row delta in one WAL transaction.
+
+        Unlike ``replace_rows`` this touches only changed keys; deletions are an
+        explicit caller intent (normally the ledger TTL cleaner), not an inferred
+        shrink from a stale full snapshot. Active ban rows remain protected.
+        """
+        upserts = {str(k): v for k, v in (upserts or {}).items()}
+        delete_keys = sorted({str(k) for k in (deletes or ())})
+        if set(upserts) & set(delete_keys):
+            raise StoreError("同一 key 不能同时 upsert 和 delete")
+        if any(not isinstance(v, dict) for v in upserts.values()):
+            raise StoreError("row delta upsert body 必须是 dict")
+        now = time.time() if now is None else float(now)
+        blocked: list[str] = []
+        removed: list[str] = []
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                old_count = int(self._conn.execute(
+                    "SELECT COUNT(*) FROM rows WHERE kind=?", (kind,)).fetchone()[0])
+                existing = {}
+                for key in delete_keys:
+                    row = self._conn.execute(
+                        "SELECT body FROM rows WHERE kind=? AND key=?",
+                        (kind, key)).fetchone()
+                    if row is None:
+                        continue
+                    try:
+                        body = json.loads(row["body"])
+                    except ValueError:
+                        body = {}
+                    if schema.protected_by_ban(body, now):
+                        blocked.append(key)
+                    else:
+                        existing[key] = True
+                upsert_new = sum(1 for key in upserts if self._conn.execute(
+                    "SELECT 1 FROM rows WHERE kind=? AND key=?",
+                    (kind, key)).fetchone() is None)
+                new_count = old_count - len(existing) + upsert_new
+                try:
+                    schema.check_empty_write(new_count, old_count,
+                                             allow_empty=allow_empty)
+                except schema.GuardRefused as exc:
+                    self._conn.execute("ROLLBACK")
+                    return {"written": False, "refused": exc.invariant,
+                            "detail": exc.detail, "ctx": exc.ctx}
+                for key in existing:
+                    self._conn.execute(
+                        "DELETE FROM rows WHERE kind=? AND key=?", (kind, key))
+                    removed.append(key)
+                for key, body in upserts.items():
+                    self._conn.execute(
+                        "INSERT INTO rows(kind,key,body,updated_at) VALUES(?,?,?,?) "
+                        "ON CONFLICT(kind,key) DO UPDATE SET body=excluded.body, "
+                        "updated_at=excluded.updated_at",
+                        (kind, key, json.dumps(body, ensure_ascii=False), now))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return {"written": True, "count": new_count,
+                "upserted": len(upserts), "deleted": removed,
+                "blocked": blocked}
+
     def delete_rows(self, kind: str, keys, *, now: float | None = None) -> dict:
         """按 key 删除，但 INV-BAN 保护精确封禁中的行（删不掉就留在库里）。"""
         now = time.time() if now is None else now

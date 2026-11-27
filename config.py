@@ -511,6 +511,11 @@ CFG = {
         # expires_at 的保留窗口，条目到期后才允许清理。默认与
         # ip_reuse_guard_sec 同值，独立配置便于灰度期单独调。
         "ledger_retention_sec": 86400,
+        # IP 台账采用 fsync JSONL delta WAL + 周期原子快照；每次记账只追加变更行，
+        # 不再对 17MB/数万行 JSON 做全量替换。回滚前必须先 compact WAL。
+        "ip_used_wal_enabled": _env_bool("ASIP_WARP_IP_WAL", True),
+        "ip_used_wal_compact_records": _env_int("ASIP_WARP_IP_WAL_COMPACT_RECORDS", 1024),
+        "ip_used_wal_compact_bytes": _env_int("ASIP_WARP_IP_WAL_COMPACT_BYTES", 4194304),
         # 清理判据模式："legacy" 走旧规则（ts cutoff + ban_until 豁免），
         # "expires_at" 只看 expires_at < now（INV-4）。P2 切换，回滚只需改配置。
         # expires_at 模式下「缺 expires_at」= 未迁移，先按最近事件补齐再判；

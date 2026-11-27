@@ -11,7 +11,7 @@ from asip import ledger_policy
 def _mark_isolate(monkeypatch):
     """隔离 IP 台账副作用 + trap 计数 + 日志（与 test_429_cooldown 同款）。"""
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_probe_cache_forget", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_TRANSPORT_STRIKES", {})

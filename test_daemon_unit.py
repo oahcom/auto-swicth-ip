@@ -2912,7 +2912,7 @@ def test_warp_ip_records_served_sec_on_first_block(monkeypatch):
     真正要收集的是每次使用的寿命。
     """
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setitem(daemon.CFG, "warp", {**daemon.CFG["warp"], "ip_reuse_guard_sec": 86400})
     ip = "2a09:bac5:1efa:1173::1bd:e7"
     daemon._mark_warp_ip_used(ip, 1_000.0)
@@ -3642,7 +3642,7 @@ def test_blocked_ip_recovers_after_6h_for_403_and_60s_for_429(monkeypatch):
     回池（长恢复由 ban_until 精确值承载）。kind 缺失的旧记录按 24h 保守处理。
     """
     now = 1_000_000.0
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     monkeypatch.setattr(daemon, "_append_warp_ip_history",
                         lambda *a, **k: None)
@@ -3677,7 +3677,7 @@ def test_403_then_429_blocks_until_later_expiry(monkeypatch):
     """
     now = 1_000_000.0
     h = 3600
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     daemon._mark_warp_ip_used("ip-y", now, blocked=True, kind="abuse403")
@@ -3705,7 +3705,7 @@ def test_reburned_after_recovery_starts_new_penalty(monkeypatch):
     """
     now = 1_000_000.0
     h = 3600
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     daemon._mark_warp_ip_used("ip-x", now, blocked=True, kind="abuse403")
@@ -3727,7 +3727,7 @@ def test_retry_after_sets_exact_ban_until(monkeypatch):
     """
     now = 1_000_000.0
     h = 3600
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     daemon._mark_warp_ip_used("ip-ban", now, blocked=True, kind="rate429",
@@ -3743,7 +3743,7 @@ def test_ban_until_does_not_shorten_parallel_403(monkeypatch):
     """Retry-After 只替换同类型窗口；并行 403 的 6h 仍按「按多的来」。"""
     now = 1_000_000.0
     h = 3600
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     daemon._mark_warp_ip_used("ip-mix", now, blocked=True, kind="abuse403")
@@ -3859,7 +3859,7 @@ def test_record_active_ip_success_uses_window_delta(monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_IP_USED",
                         {"ip-a": {"ts": now - 100, "blocked": False, "last_ok_ts": None}})
     monkeypatch.setattr(daemon, "_last_success_probe", None)
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon.time, "time", lambda: now)
     # 成功时刻取自请求自己的 timestamp（r 新→旧），不是读库时刻
     monkeypatch.setattr(daemon, "recent_success_ts", lambda n: [now - 4.0, now - 9.0][:n])
@@ -3899,7 +3899,7 @@ def test_record_active_ip_success_uses_request_timestamps(monkeypatch):
     monkeypatch.setattr(daemon, "_WARP_IP_USED",
                         {"ip-a": {"ts": now - 100, "blocked": False}})
     monkeypatch.setattr(daemon, "_last_success_probe", ("ip-a", 6))
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon.time, "time", lambda: now)
     # 一批落库的 3 条成功，请求时刻相隔 4s —— 同一 tick 被看到，但时刻不同
     monkeypatch.setattr(daemon, "recent_success_ts", lambda n: [now - 2.0, now - 4.0, now - 6.0])
@@ -4712,7 +4712,7 @@ def test_flagged_retry_after_does_not_shorten_403(monkeypatch):
     """403（flagged）不应用 Retry-After：6h 窗口不能被响应头缩成几十秒。"""
     now = 1_000_000.0
     h = 3600
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     daemon._mark_warp_ip_used("ip-403", now, blocked=True, kind="abuse403",
@@ -4748,7 +4748,7 @@ def test_expired_exact_ban_does_not_swallow_new_429(monkeypatch):
     """
     now = 1_000_000.0
     h = 3600
-    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda: None)
+    monkeypatch.setattr(daemon, "_save_warp_ip_used", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_append_warp_ip_history", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
     daemon._mark_warp_ip_used("ip-re", now, blocked=True, kind="rate429",

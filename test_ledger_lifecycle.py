@@ -548,3 +548,172 @@ def test_w6_shadow_buckets_do_not_pollute(monkeypatch):
     assert shadow["checked_blocked"] == 2
     assert shadow["deviation_max"] == pytest.approx(t_ok - (now + 10 + 60))
     assert shadow["violations"] == 0
+
+
+# ---- 增量 WAL：每次记账只追加 delta，快照只在阈值触发时 compact ----
+
+def test_wal_mode_appends_one_row_without_rewriting_snapshot(monkeypatch, tmp_path):
+    from asip import ledger_wal
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "1")
+    monkeypatch.setattr(daemon, "_WARP_IP_WAL_RECORDS", 0)
+    now = 2_000_000.0
+    with daemon._WARP_IP_LOCK:
+        daemon._warp_ip_used_locked("wal-ip", now, True, "rate429")
+    path = tmp_path / "warp_ip_used.json"
+    assert json.loads(path.read_text()) == {"used": {}}, \
+        "首次 delta 只建立空基线快照，不应生成全量台账快照"
+    replay = ledger_wal.load(path)
+    assert replay["records"] == 1
+    assert replay["used"]["wal-ip"]["blocked"] is True
+
+
+def test_wal_compacts_only_after_record_threshold(monkeypatch, tmp_path):
+    from asip import ledger_wal
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "1")
+    original_warp = daemon._warp
+    monkeypatch.setattr(daemon, "_warp", lambda: {
+        **original_warp(), "ip_used_wal_compact_records": 2,
+        "ip_used_wal_compact_bytes": 4 * 1024 * 1024,
+    })
+    monkeypatch.setattr(daemon, "_WARP_IP_WAL_RECORDS", 0)
+    with daemon._WARP_IP_LOCK:
+        daemon._warp_ip_used_locked("wal-a", 2_000_000.0, True, "rate429")
+        assert (tmp_path / "warp_ip_used.json.wal").stat().st_size > 0
+        daemon._warp_ip_used_locked("wal-b", 2_000_001.0, True, "rate429")
+    path = tmp_path / "warp_ip_used.json"
+    assert json.loads(path.read_text())["used"].keys() == {"wal-a", "wal-b"}
+    assert (tmp_path / "warp_ip_used.json.wal").stat().st_size == 0
+    assert ledger_wal.load(path)["used"].keys() == {"wal-a", "wal-b"}
+    assert daemon._WARP_IP_WAL_RECORDS == 0
+
+
+def test_wal_cleanup_records_explicit_deletes(monkeypatch, tmp_path):
+    from asip import ledger_wal
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "1")
+    monkeypatch.setattr(daemon, "_WARP_IP_WAL_RECORDS", 0)
+    daemon._WARP_IP_USED["expired-ip"] = {"ts": 1.0, "blocked": False}
+    with daemon._WARP_IP_LOCK:
+        daemon._warp_ip_used_locked("new-ip", 2_000_000.0, False)
+    path = tmp_path / "warp_ip_used.json"
+    replay = ledger_wal.load(path)
+    assert "expired-ip" not in replay["used"]
+    assert "new-ip" in replay["used"]
+    assert replay["records"] == 1
+
+
+def test_wal_append_failure_is_not_acknowledged(monkeypatch, tmp_path):
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "1")
+    monkeypatch.setattr(daemon._alerting, "notify_write_failure", lambda *a, **k: None)
+    monkeypatch.setattr(daemon._ledger_wal, "append_delta",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        with daemon._WARP_IP_LOCK:
+            daemon._warp_ip_used_locked("not-durable", 2_000_000.0,
+                                        True, "rate429")
+    # 内存态仍保守阻断；调用方收到失败，不会把这次记账当成已持久化确认。
+    assert daemon._WARP_IP_USED["not-durable"]["blocked"] is True
+
+
+def test_wal_load_replays_delta_after_restart(monkeypatch, tmp_path):
+    from asip import ledger_wal
+    path = tmp_path / "warp_ip_used.json"
+    path.write_text(json.dumps({"used": {"old-ip": {"ts": 1.0}}}))
+    ledger_wal.append_delta(path, upserts={
+        "burned-ip": {"ts": 2.0, "blocked": True,
+                      "ban_until": 9_000_000_000, "ban_kind": "rate429"}
+    })
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "1")
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    daemon._load_warp_ip_used()
+    assert "burned-ip" in daemon._WARP_IP_USED
+    assert daemon._WARP_IP_USED["burned-ip"]["blocked"] is True
+
+
+def test_wal_delta_keeps_optional_sqlite_shadow_in_parity(monkeypatch, tmp_path):
+    from asip.state_store import schema
+    from asip.state_store.store import Store
+    from asip import ledger_wal
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "1")
+    path = tmp_path / "warp_ip_used.json"
+    path.write_text(json.dumps({"used": {
+        "seed-ip": {"ts": 1_999_999.0, "blocked": False}
+    }}))
+    store = Store(str(tmp_path / "state.sqlite3"))
+    store.replace_rows(schema.KIND_IP_USED, {
+        "stale-shadow-ip": {"ts": 1_999_000.0, "blocked": False}
+    })
+    monkeypatch.setattr(daemon, "_STATE_STORE", store)
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    monkeypatch.setattr(daemon, "_WARP_IP_WAL_RECORDS", 0)
+
+    daemon._load_warp_ip_used()  # 一次性全量 seed
+    assert set(store.read_rows(schema.KIND_IP_USED)) == {"seed-ip"}
+    before = store._conn.execute(
+        "SELECT updated_at FROM rows WHERE kind=? AND key=?",
+        (schema.KIND_IP_USED, "seed-ip")).fetchone()[0]
+
+    with daemon._WARP_IP_LOCK:
+        daemon._warp_ip_used_locked("delta-ip", 2_000_000.0, True, "rate429")
+    rows = store.read_rows(schema.KIND_IP_USED)
+    assert set(rows) == {"seed-ip", "delta-ip"}
+    after = store._conn.execute(
+        "SELECT updated_at FROM rows WHERE kind=? AND key=?",
+        (schema.KIND_IP_USED, "seed-ip")).fetchone()[0]
+    assert before == after
+    assert ledger_wal.load(path)["used"].keys() == {"seed-ip", "delta-ip"}
+    store.close()
+
+
+def test_wal_refuses_untracked_empty_compaction(monkeypatch, tmp_path):
+    from asip import ledger_wal
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "1")
+    path = tmp_path / "warp_ip_used.json"
+    path.write_text(json.dumps({"used": {"burned": {"ts": 1.0,
+                                                       "blocked": True}}}))
+    ledger_wal.append_delta(path, upserts={"new-burn": {"blocked": True}})
+    monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(path))
+    monkeypatch.setattr(daemon, "_WARP_IP_USED", {})
+    monkeypatch.setattr(daemon, "_LEDGER_ALLOW_EMPTY_WRITE", True)
+
+    daemon._save_warp_ip_used()  # 缺少精确 deletes，不允许空内存 compact
+
+    replay = ledger_wal.load(path)
+    assert set(replay["used"]) == {"burned", "new-burn"}
+    assert replay["records"] == 1
+
+
+def test_new_active_ip_success_is_one_wal_transaction(monkeypatch, tmp_path):
+    from asip import ledger_wal
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "1")
+    monkeypatch.setattr(daemon, "_WARP_IP_WAL_RECORDS", 0)
+    monkeypatch.setattr(daemon, "_ACTIVE_WARP_IP", "success-ip")
+    monkeypatch.setattr(daemon, "_last_success_probe", ("success-ip", 0))
+    monkeypatch.setattr(daemon, "recent_success_ts", lambda limit: [2_000_000.0])
+
+    daemon._record_active_ip_success(1, 0)
+
+    loaded = ledger_wal.load(tmp_path / "warp_ip_used.json")
+    assert loaded["records"] == 1, "新 IP 初始化 + 成功打点应合并为一条 delta"
+    entry = loaded["used"]["success-ip"]
+    assert entry["last_ok_ts"] == 2_000_000.0
+
+
+def test_disabling_wal_with_pending_deltas_fails_closed(monkeypatch, tmp_path):
+    from asip import ledger_wal
+    path = tmp_path / "warp_ip_used.json"
+    path.write_text(json.dumps({"used": {"old": {"ts": 1.0}}}))
+    ledger_wal.append_delta(path, upserts={"burned": {"blocked": True}})
+    monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(path))
+    monkeypatch.setenv("ASIP_WARP_IP_WAL", "0")
+    with pytest.raises(RuntimeError, match="pending deltas"):
+        daemon._warp_ip_wal_enabled()
+
+
+def test_custom_ledger_path_does_not_implicitly_disable_wal(monkeypatch, tmp_path):
+    monkeypatch.delenv("ASIP_WARP_IP_WAL", raising=False)
+    monkeypatch.setenv("WARP_IP_USED_FILE_PATH", str(tmp_path / "custom.json"))
+    original_warp = daemon._warp
+    monkeypatch.setattr(daemon, "_warp", lambda: {
+        **original_warp(), "ip_used_wal_enabled": True,
+    })
+    assert daemon._warp_ip_wal_enabled() is True

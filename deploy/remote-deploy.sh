@@ -93,13 +93,29 @@ if ! git remote get-url origin >/dev/null 2>&1; then
     echo '✗ 远端仓库没有 origin —— 先接上 GitHub（见 docs/runbook/troubleshoot.md）' >&2
     exit 1
 fi
+git fetch --depth=1 origin main
+if { [ -e .warp_ip_used.json.wal.lock ] || [ -s .warp_ip_used.json.wal ]; } && {
+    ! git cat-file -e origin/main:asip/ledger_wal.py 2>/dev/null ||
+    ! git grep -q '_ledger_wal.load' origin/main -- daemon.py ||
+    ! git grep -q '_ledger_wal.append_delta' origin/main -- daemon.py ||
+    ! git grep -q 'ASIP_WARP_IP_WAL.*True' origin/main -- config.py;
+}; then
+    if systemctl is-active --quiet auto-switch-ip.service; then
+        echo '✗ 目标 origin/main 不支持 IP 台账 WAL，且 daemon 仍运行；拒绝 reset。' >&2
+        echo '  请先停止 auto-switch-ip.service，再运行 python3 deploy/ledger-wal.py compact。' >&2
+        exit 1
+    fi
+    python3 deploy/ledger-wal.py compact
+    python3 deploy/ledger-wal.py status | grep -q '\"wal_bytes\": 0' || {
+        echo '✗ WAL compact 后仍有数据，拒绝 reset。' >&2; exit 1;
+    }
+fi
 if [ -n \"\$(git status --porcelain)\" ]; then
     echo '  ⚠ 远端工作区有未提交改动，先备份再 pull：' >&2
     git status --short | sed 's/^/    /' >&2
     git stash push -u -m \"deploy-autostash-\$(date +%s)\" >/dev/null
     echo '  （已 stash；git stash list 可查）' >&2
 fi
-git fetch --depth=1 origin main
 git reset --hard origin/main
 chmod +x deploy/*.sh tools/*.sh 2>/dev/null || true
 python3 -m py_compile config.py daemon.py warp_wg.py warp_blocks.py
