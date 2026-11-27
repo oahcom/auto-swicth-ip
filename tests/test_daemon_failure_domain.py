@@ -66,12 +66,12 @@ def test_rate_limit_does_not_switch_slot():
     assert mark.call_count == 0
 
 
-def test_unknown_failure_does_not_switch_slot():
+def test_unknown_failure_keeps_legacy_switch_behavior():
     mark = Mock()
     switch = Mock()
-    _run_policy(mark, switch, FailureDomain.UNKNOWN)
-    assert switch.call_count == 0
-    assert mark.call_count == 0
+    _run_policy(mark, switch, FailureDomain.UNKNOWN, enforcement=True)
+    assert switch.call_count == 1
+    assert mark.call_count == 1
 
 
 def test_confirmed_ip_block_can_retire_exit():
@@ -118,12 +118,18 @@ def test_request_failure_does_not_poison_slot_health():
 
 
 def test_slot_switch_requires_exit_domain():
-    for domain in (FailureDomain.ACCOUNT, FailureDomain.MODEL,
-                   FailureDomain.REQUEST, FailureDomain.CONTEXT_REJECTED,
-                   FailureDomain.TRANSPORT, FailureDomain.UNKNOWN):
+    for domain in (
+        FailureDomain.ACCOUNT,
+        FailureDomain.MODEL,
+        FailureDomain.REQUEST,
+        FailureDomain.CONTEXT_REJECTED,
+        FailureDomain.TRANSPORT,
+    ):
+        mark = Mock()
         switch = Mock()
-        _run_policy(Mock(), switch, domain)
+        _run_policy(mark, switch, domain, enforcement=True)
         assert switch.call_count == 0, domain
+        assert mark.call_count == 0, domain
 
 
 def test_rotate_once_classification_before_dirty():
@@ -151,12 +157,12 @@ def test_enforcement_off_keeps_legacy_behavior():
     assert switch.call_count == 1
 
 
-def test_unclassified_domain_is_blocked_under_enforcement():
+def test_unclassified_domain_keeps_legacy_behavior_under_enforcement():
     mark = Mock()
     switch = Mock()
     _run_policy(mark, switch, None, enforcement=True)
-    assert mark.call_count == 0
-    assert switch.call_count == 0
+    assert mark.call_count == 1
+    assert switch.call_count == 1
 
 
 def test_invalid_domain_string_is_blocked_under_enforcement():

@@ -3,10 +3,9 @@
 
 设计约束：
 - 默认 failure_domain_enforcement=False：判据返回「允许旧行为」，线上零变化。
-- 开启后只有「带独立证据的 EXIT_IP」允许标脏 / 退役出口 / 切线。
-- ACCOUNT / MODEL / REQUEST / CONTEXT_REJECTED / TRANSPORT 一律禁止。
-- 已分类的 UNKNOWN 因证据不足一并禁止；enforcement 开启时未分类（domain=None
-  或非法值）同样禁止，不回落到旧行为。
+- 开启后，只有明确分类的非出口故障域才禁止出口级动作。
+- domain=None / UNKNOWN 表示缺少分类证据，保持 legacy 行为。
+- 非法、无法识别的 domain 值仍按 unclassified 处理并禁止出口级动作。
 - 本模块是纯判据，不执行任何路由动作，也不读取运行时状态。
 """
 from __future__ import annotations
@@ -53,18 +52,32 @@ def _coerce_domain(domain):
 def rotation_policy(domain=None, enforcement=False) -> RotationPolicy:
     """统一判据：daemon 标脏点与切线点共用这一处实现。
 
-    enforcement 关闭 → 旧行为（含 domain=None 与非法值）。
-    enforcement 开启时 domain=None 或非法值 → _UNCLASSIFIED，禁止出口级动作。
-    enforcement=False（默认）→ 旧行为。
-    已分类的 UNKNOWN → 证据不足，禁止出口级动作（不会误判成出口故障）。
+    enforcement 关闭 → 旧行为。
+    enforcement 开启时：
+      - None / UNKNOWN：没有足够分类信息，保持旧行为；
+      - EXIT_IP：允许旧逻辑继续执行；
+      - 明确分类的非出口域：禁止标脏与切线；
+      - 非法、无法识别的值：保守禁止出口级动作。
     """
     if not enforcement:
         return _LEGACY
+
+    # 未分类不等于已确认的账号/模型/请求故障。
+    # 尤其 confirm_exit_domain() 会把缺少独立证据的 EXIT_IP 降级为 UNKNOWN。
+    if domain is None:
+        return _LEGACY
+
     d = _coerce_domain(domain)
     if d is None:
         return _UNCLASSIFIED
+
+    # UNKNOWN 是分类器明确表达的「证据不足/无法归类」，不是非出口域证据。
+    if d is FailureDomain.UNKNOWN:
+        return _LEGACY
+
     if d is FailureDomain.EXIT_IP:
         return _CONFIRMED
+
     return _NON_EXIT
 
 

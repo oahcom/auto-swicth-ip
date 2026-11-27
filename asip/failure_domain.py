@@ -38,7 +38,6 @@ NON_EXIT_DOMAINS = frozenset({
     FailureDomain.MODEL,
     FailureDomain.CONTEXT_REJECTED,
     FailureDomain.TRANSPORT,  # 必须先独立确认
-    FailureDomain.UNKNOWN,
 })
 
 
