@@ -77,6 +77,7 @@ def test_rejection_paths_never_leave_warming(restart_env, monkeypatch):
     assert d._warp_line_state(MEMBER["tag"]).get("warming") is False
     # 渠道锁拒绝（排在排空闸之前，附件 B4；排空不被触发）
     monkeypatch.setattr(d, "_drain_gate", lambda *a, **k: (True, "ok"))
+    monkeypatch.setitem(d.CFG["warp"], "channel_ban_hold_enabled", True)
     d._warp_line_update(MEMBER["tag"], ban_hold_until=time.time() + 600)
     assert d._warp_line_restart(MEMBER, "probe") is False
     assert restart_env["restart_calls"] == 0

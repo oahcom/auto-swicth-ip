@@ -4282,7 +4282,11 @@ def _warp_line_state_locked(tag: str) -> dict:
     if not isinstance(st, dict):
         st = _WARP_LINE_STATE[tag] = {}
     for k, v in _LINE_DEFAULTS.items():
-        st.setdefault(k, v)
+        if k in st:
+            continue
+        # _LINE_DEFAULTS 是共享对象：直接 setdefault 会让所有线共用同一个
+        # list（一条线 append，所有线都多一条）。可变默认值必须逐线复制。
+        st[k] = list(v) if isinstance(v, list) else v
     return st
 
 
@@ -4615,16 +4619,19 @@ def _channel_ban_note(tag: str, verdict: str, now: float) -> None:
             _warp_line_update(tag, ban_hold_until=0.0, stop_probe=False)
             _save_warp_line_state()
     if not _warp().get("channel_ban_hold_enabled", True):
-        # 总闸关掉后把锁解除：留着等于「关了还在锁」。但**不能清 ban_hold_home**
-        # —— 那是有线在临时 colo 上的唯一记录，清了这条线就永远回不去了。
-        # 到期分支会看到 until<=now 且 home 还在，下一轮把它还原。
-        st = _warp_line_state(tag)
-        if st.get("ban_hold_until") or st.get("ban_probes") or st.get("stop_probe"):
-            # stop_probe 必须一起清：只在关闸时解 ban_hold_until 的话，CF/H2 线
-            # （没有 home、走不到还原分支）会永久停在「不再探测」。
-            _warp_line_update(tag, ban_hold_until=0.0, ban_probes=[],
-                              stop_probe=False, ban_noaddr_since=0.0)
-            _save_warp_line_state()
+        # 总闸关掉只关「写锁」，不关「记样本」：ban_probes 是报表唯一的样本
+        # 来源，关闸期间不记就等于观测失明。但**不能动 ban_hold_home**
+        # ——那是有线在临时 colo 上的唯一记录，清了这条线就永远回不去了。
+        with _WARP_LINE_CV:
+            st = _warp_line_state_locked(tag)
+            samples = st.get("ban_probes")
+            if not isinstance(samples, list):
+                samples = st["ban_probes"] = []
+            samples.append([now, now, 1, str(verdict)])
+            _channel_ban_trim(samples, now)
+            st["ban_hold_until"] = 0.0
+            st["stop_probe"] = False
+            st["ban_noaddr_since"] = 0.0
         return
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)

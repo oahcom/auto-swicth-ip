@@ -129,7 +129,10 @@ def test_cf_lines_never_locked_but_sampled():
     assert not st.get("stop_probe")
 
 
-def test_lock_sets_stop_probe_until_reset_hour():
+def test_lock_sets_stop_probe_until_reset_hour(monkeypatch):
+    # 本用例验证锁机制本身，必须显式打开总闸；生产把
+    # channel_ban_hold_enabled 关掉是用户裁定，不代表锁机制失效。
+    monkeypatch.setitem(d.CFG["warp"], "channel_ban_hold_enabled", True)
     """全 quota 满样本 → 锁到次日 reset_hour，置 stop_probe（锁定期间不探测）。
     """
     now = time.time()
