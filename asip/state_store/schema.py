@@ -108,7 +108,8 @@ LINE_STATE_FIELDS = frozenset({
     "sel", "ban_probes", "blocked_notes", "ban_noaddr_since",
     "ban_hold_until", "stop_probe", "ban_hold_home", "ban_hold_node",
     "ban_hold_ready", "ban_backfill_tag", "ban_backfill_node",
-    "penalty_restart_streak", "ip_stuck_until", "restart_ip_hist",
+    "penalty_restart_streak", "penalty_restart_latched",
+    "ip_stuck_until", "restart_ip_hist",
     "futile_restart_streak",
 })
 

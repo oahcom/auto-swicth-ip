@@ -4257,6 +4257,8 @@ _LINE_DEFAULTS = {
     # 就把闸门复位，等于没有闸门。实测 2026-11-10 06:48~06:58 连做 16 次部署
     # 重启，152 条线的 streak 全被打回 0，10 分钟 1225 次重启、0 条熔断。
     "penalty_restart_streak": 0,
+    # 惩罚期重启闩锁：当前出口仍在惩罚期时，这条线只允许重启一次
+    "penalty_restart_latched": False,
     # 熔断截止时刻（epoch）。过期由时间比较自然失效，不需要额外的清理步骤。
     "ip_stuck_until": 0.0,
     # 最近几次重启换回来的出口地址。默认 None 不用 []：`_LINE_DEFAULTS` 是
@@ -4447,6 +4449,44 @@ def _load_warp_line_state() -> None:
             _channel_ban_trim(st["ban_probes"], now)
         _WARP_LINE_CV.notify_all()
     log(f"✓ 已恢复 {len(lines)} 条 WARP 线路状态")
+
+
+def _clear_penalty_restart_latch_if_unblocked(
+        tag: str, ip: str | None, now: float | None = None,
+        *, known_unblocked: bool = False) -> bool:
+    """只有指定 IP 明确不再处于惩罚期、且仍是该线当前 IP，才清除重启闩锁。
+
+    `known_unblocked=True` 只允许在调用方**刚刚**用同一个 ip 调过
+    `_warp_ip_is_blocked()` 并得到明确的 False 时传入；不能由 verdict、
+    超时或探测失败推断。
+    """
+    if not isinstance(ip, str) or not ip.strip():
+        return False
+
+    if now is None:
+        now = time.time()
+
+    if not known_unblocked:
+        try:
+            if _warp_ip_is_blocked(ip, now):
+                return False
+        except Exception as e:
+            log(f"  ⚠ {tag} 惩罚状态检查异常，保持重启闩锁: {e}")
+            return False
+
+    changed = False
+    with _WARP_LINE_CV:
+        st = _warp_line_state_locked(tag)
+        if st.get("ip") != ip:
+            return False
+        if st.get("penalty_restart_latched"):
+            st["penalty_restart_latched"] = False
+            changed = True
+
+    if changed:
+        _save_warp_line_state()
+
+    return changed
 
 
 def _line_fresh_sec() -> float:
@@ -6666,6 +6706,34 @@ def _warp_line_restart(member: dict, reason: str,
                 _NIGHT_LOG_TS["tier:" + tag] = now
                 log(f"  · {tag} 档位停用中，跳过重启（{reason}）")
             return False
+    # 惩罚期重启闩锁（阶段一）：同一条线在当前出口仍处于惩罚期时只允许重启
+    # 一次。rebound 表示调用方刚换了节点（旧 IP 已过期，不能用旧 IP 阻断这次
+    # 必要重启）；tunnel_dead 表示没有可判定的出口 IP。两种情况都不碰闩锁。
+    if not rebound and not tunnel_dead:
+        with _WARP_LINE_CV:
+            _st = _warp_line_state_locked(tag)
+            penalty_latched = bool(_st.get("penalty_restart_latched"))
+            penalty_ip = _st.get("ip")
+
+        if penalty_latched:
+            # 已闩锁但没有当前 IP 属于未知状态：保持闩锁并拒绝，
+            # 不能把「没有证据」当作「惩罚已经解除」。
+            if not isinstance(penalty_ip, str) or not penalty_ip.strip():
+                return False
+            try:
+                penalty_blocked = _warp_ip_is_blocked(penalty_ip, time.time())
+            except Exception as e:
+                log(f"  ⚠ {tag} 惩罚状态检查异常，保持重启闩锁: {e}")
+                return False
+            if penalty_blocked:
+                return False
+            # 只有同一个当前 IP 被明确判定 unblocked 才清闩
+            with _WARP_LINE_CV:
+                _st = _warp_line_state_locked(tag)
+                if _st.get("ip") != penalty_ip:
+                    return False
+                _st["penalty_restart_latched"] = False
+
     # 排空闸（2026-11-11）：刚被换下的线必须按字节流事实判空才允许回收。
     # 放在策略层（夜间/渠道锁/额度/档位）之后 —— 策略拒绝优先于排空，被策略
     # 拒掉的线不该先走一遍排空：那会清掉 `_RETIRED_AT`/`_DRAIN_PENDING`，留下
@@ -6685,10 +6753,52 @@ def _warp_line_restart(member: dict, reason: str,
         return False
     # warming 置位必须在全部闸门放行之后（附件 A9/B3）：排空闸要按字节流事实
     # 判空，可能跨秒；期间另一线程可能已认领这条线。锁内复核一次再置位。
+    # 最终认领重启资格：惩罚判定不持 _WARP_LINE_CV（避免与 _WARP_IP_LOCK
+    # 反向锁序），随后重新取 CV 核对 IP 未变，再原子置位
+    # penalty_restart_latched + warming。
+    penalty_ip = None
+    penalty_blocked = None
+
+    if not rebound and not tunnel_dead:
+        with _WARP_LINE_CV:
+            _st = _warp_line_state_locked(tag)
+            penalty_ip = _st.get("ip")
+        if isinstance(penalty_ip, str) and penalty_ip.strip():
+            try:
+                penalty_blocked = _warp_ip_is_blocked(penalty_ip, time.time())
+            except Exception as e:
+                log(f"  ⚠ {tag} 惩罚状态检查异常: {e}")
+                penalty_blocked = None
+
     with _WARP_LINE_CV:
         st = _warp_line_state_locked(tag)
+
         if st.get("warming") or now < float(st.get("next_restart_ts") or 0.0):
             return False
+
+        if not rebound and not tunnel_dead:
+            current_ip = st.get("ip")
+            current_latched = bool(st.get("penalty_restart_latched"))
+
+            if current_ip != penalty_ip:
+                # 检查期间 IP 变了：检查结果不适用于当前 IP，本轮放弃
+                return False
+
+            if not isinstance(current_ip, str) or not current_ip.strip():
+                if current_latched:
+                    return False
+            elif penalty_blocked is None:
+                if current_latched:
+                    return False
+            elif current_latched and penalty_blocked:
+                # 同一 IP 仍处于惩罚期，之前已经为它重启过
+                return False
+            elif current_latched and not penalty_blocked:
+                st["penalty_restart_latched"] = False
+            elif not current_latched and penalty_blocked:
+                # 当前惩罚期内允许的第一次重启；失败也保留闩锁
+                st["penalty_restart_latched"] = True
+
         st["warming"] = True
     got_slot = False
     try:
@@ -6945,9 +7055,21 @@ def _probe_one_line(member: dict) -> None:
         _H2_TRIED.pop(_h2_pool_key(member), None)
         _H2_POOL_DEAD.pop(tag, None)
     cur = _warp_line_state(tag)
-    if tag != active and _warp_line_ok_fresh(tag, now) and cur.get("ip") == ip:
+
+    # 必须先判定当前出口是否仍处于惩罚期，再考虑 freshness 早退：
+    # 否则新鲜的 last_ok_ts 会让 blocked IP 永远绕过惩罚处理。
+    blocked = _warp_ip_is_blocked(ip, now)
+
+    if not blocked:
+        _clear_penalty_restart_latch_if_unblocked(
+            tag, ip, now, known_unblocked=True)
+
+    if (not blocked and tag != active
+            and _warp_line_ok_fresh(tag, now)
+            and cur.get("ip") == ip):
         return
-    if _warp_ip_is_blocked(ip, now):
+
+    if blocked:
         _warp_line_record_observation(tag, ip, "blocked", time.time(), started_at)
         # 这条路径**不写** `ban_probes`（那是渠道锁的判据样本，blocked 混进去
         # 会让线永远锁不上），但必须留下痕迹：早退分支根本走不到模型层实测，
@@ -15912,6 +16034,18 @@ def _api_state_unban(req: dict) -> dict:
         _WARP_IP_USED[ip] = tf["after"]
     # 落盘在锁外：与其它写路径同序（先改内存、再整表落），避免锁序交叉。
     _save_warp_ip_used()
+
+    # 同一出口 IP 可能被多条线共用。解封是按 IP 的操作，因此要清掉所有
+    # 当前指向该 IP 的线的惩罚重启闩锁。只在 CV 锁内取快照，锁外逐条判定。
+    with _WARP_LINE_CV:
+        matching_tags = [
+            tag for tag, st in _WARP_LINE_STATE.items()
+            if isinstance(st, dict) and st.get("ip") == ip
+        ]
+
+    for tag in matching_tags:
+        _clear_penalty_restart_latch_if_unblocked(tag, ip, now)
+
     audit = {"ip": ip, "actor": str(req.get("actor") or "unknown")[:64],
              "ts": round(now, 3),
              "reason": str(req.get("reason") or "(未填写)")[:200],
