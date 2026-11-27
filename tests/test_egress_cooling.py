@@ -32,6 +32,7 @@ def _patch(monkeypatch):
     monkeypatch.setattr(d, "_slot_serving_name", lambda: None)
     monkeypatch.setattr(d, "_slot_pick_key", lambda s, tag, ip, t0, serving: (0, 0))
     d._EGRESS_COOLING.clear()
+    d._SLOT_REDIRECT_RR["index"] = 0
 
 
 def test_cooling_takes_an_address_out_of_the_pool(monkeypatch):
@@ -53,12 +54,18 @@ def test_cooling_expires_after_the_configured_window(monkeypatch):
     assert d._egress_cooling_left("2a09::c", now) == 0.0
 
 
-def test_all_standbys_cooling_returns_no_standby(monkeypatch):
+def test_all_standbys_cooling_still_fails_over_inside_gates(monkeypatch):
+    # 2026-11-26 ruling: gate selection has no cooldown. If every regular
+    # gate is cooling, the picker must still return one of them instead of
+    # handing traffic to the 7th gate (which is how failover got stuck).
     _patch(monkeypatch)
     now = d.time.time()
     d._mark_egress_cooling("2a09::b", now)
     d._mark_egress_cooling("2a09::c", now)
-    assert d._pick_healthy_slot("slot-1") == (None, None, None)
+    slot, tag, ip = d._pick_healthy_slot("slot-1")
+    assert slot is not None
+    assert ip in ("2a09::b", "2a09::c"), "cooling gates stay eligible as fallback"
+
 
 
 def test_cooling_can_be_disabled_by_config(monkeypatch):
