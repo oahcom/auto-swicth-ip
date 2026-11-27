@@ -1687,6 +1687,27 @@ _rotate_pool = _BoundedPool(
     queue=16,
 )
 
+# /rotate 客户端超时 2s。实测单次换线 p50 1090 / p90 1314 / max 1374 ms。
+# 不接纳必须排队的请求：排队时间 + 执行时间一旦越过客户端超时，asip 这边
+# 还在换线、客户端已经销毁请求并在旧隧道上重试，出口却变了——正是这种错位。
+# _BoundedPool.stats()["depth"] 是「排队 + 在跑」的总数，所以阈值取 worker 数。
+_ROTATE_ADMISSION_MAX_INFLIGHT = 8
+_ROTATE_ADMISSION_LOCK = threading.Lock()
+
+
+def _submit_rotate_with_budget(req):
+    """只接纳能立刻进入 worker 的 /rotate，不把请求排进等待队列。
+
+    stats 与 submit 必须在同一把锁内：否则两个并发请求可能同时读到
+    depth==7 并都通过准入，配额就形同虚设。池自身 16 的硬上限保持不变，
+    接入层 32 个线程槽位也不变。
+    """
+    with _ROTATE_ADMISSION_LOCK:
+        depth = int(_rotate_pool.stats()["depth"])
+        if depth >= _ROTATE_ADMISSION_MAX_INFLIGHT:
+            return None
+        return _rotate_pool.submit(_execute_rotate_request, req)
+
 # WARP 探测硬上限，配置只能进一步降低
 _WARP_PROBE_CONCURRENCY_MAX = 4
 _warp_probe_pool = _BoundedPool(
@@ -16751,7 +16772,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             req = {}
 
         try:
-            future = _rotate_pool.submit(_execute_rotate_request, req)
+            future = _submit_rotate_with_budget(req)
         except Exception as e:
             log(f"❌ /rotate 提交任务异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})

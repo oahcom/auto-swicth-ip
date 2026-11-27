@@ -260,6 +260,12 @@ def test_srv_rejects_thirty_third_connection_and_releases_slots(
     release = threading.Event()
 
     class BlockingPool:
+        def stats(self):
+            with submitted_lock:
+                depth = len(submitted)
+            return {"capacity": 32, "depth": depth,
+                    "available": 32 - depth}
+
         def submit(self, fn, /, *args, **kwargs):
             future = concurrent.futures.Future()
             with submitted_lock:
@@ -277,6 +283,11 @@ def test_srv_rejects_thirty_third_connection_and_releases_slots(
             return future
 
     monkeypatch.setattr(daemon, "_rotate_pool", BlockingPool())
+    # 本用例验证的是接入层 32 槽位，不是 /rotate 的预算准入：
+    # 把预算阈值放到 32，让 32 个请求都能真正提交并阻塞。
+    monkeypatch.setattr(
+        daemon, "_ROTATE_ADMISSION_MAX_INFLIGHT", 32
+    )
     monkeypatch.setattr(
         daemon,
         "_rotate_trace_fields",
@@ -517,3 +528,76 @@ def test_memory_observation_proc_read_failures_do_not_raise(monkeypatch):
     assert "anon=0kB" in logs[0]
     assert "cgroup=-1kB" in logs[0]
     assert "threads=0" in logs[0]
+
+
+def test_rotate_budget_rejects_when_all_workers_are_inflight(
+    monkeypatch,
+):
+    calls = {"main": 0, "slot": 0}
+
+    def fake_rotate_once(*args, **kwargs):
+        calls["main"] += 1
+        return {}
+
+    def fake_rotate_slot_once(*args, **kwargs):
+        calls["slot"] += 1
+        return {}
+
+    monkeypatch.setattr(daemon, "_rotate_once", fake_rotate_once)
+    monkeypatch.setattr(daemon, "_rotate_slot_once", fake_rotate_slot_once)
+
+    pool = _FakePool()
+    # depth = 排队 + 在跑；8 表示 8 个 worker 都已有任务，再提交就要排队。
+    pool.submitted = [(None, (), {}) for _ in range(8)]
+
+    handler = _make_handler(monkeypatch, {"reason": "test"}, pool=pool)
+
+    daemon._RotateHandler.do_POST(handler)
+
+    assert len(handler.sent) == 1
+    code, payload = handler.sent[0]
+    assert code == 503
+    assert payload == {
+        "ok": False,
+        "reason": "overloaded",
+        "retry_after_ms": 3000,
+    }
+
+    # 预算拒绝必须发生在 submit 之前。
+    assert len(pool.submitted) == 8
+    assert calls == {"main": 0, "slot": 0}
+
+
+def test_rotate_budget_serializes_depth_check_and_submit(monkeypatch):
+    pool = _FakePool()
+    pool.submitted = [(None, (), {}) for _ in range(7)]
+    monkeypatch.setattr(daemon, "_rotate_pool", pool)
+
+    results = []
+    results_lock = threading.Lock()
+    barrier = threading.Barrier(3)
+
+    def submit_one():
+        barrier.wait(timeout=2)
+        result = daemon._submit_rotate_with_budget({})
+        with results_lock:
+            results.append(result)
+
+    threads = [
+        threading.Thread(target=submit_one),
+        threading.Thread(target=submit_one),
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    barrier.wait(timeout=2)
+
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    # depth=7 只剩一个名额：两个并发调用只能有一个提交成功。
+    assert len(pool.submitted) == 8
+    assert sum(result is not None for result in results) == 1
+    assert sum(result is None for result in results) == 1
