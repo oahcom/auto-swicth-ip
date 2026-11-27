@@ -1640,13 +1640,17 @@ class _BoundedPool:
         self._sem = threading.Semaphore(self._capacity)
         self._name = name_prefix
     def submit(self, fn, /, *args, **kwargs):
-        # 非阻塞获取：队列满时返回 None 而非阻塞事件循环
         if not self._sem.acquire(blocking=False):
-            log(f"⚠ {self._name} 线程池队列已满，丢弃任务 {fn.__name__}")
+            log(f"⚠ {self._name} 线程池队列已满，拒绝任务 {fn.__name__}")
             return None
-        f = self._executor.submit(fn, *args, **kwargs)
+        try:
+            f = self._executor.submit(fn, *args, **kwargs)
+        except Exception:
+            self._sem.release()
+            raise
         f.add_done_callback(lambda _: self._sem.release())
         return f
+
     def stats(self) -> dict:
         """健康端点用的队列快照。depth = 已占用名额（排队 + 在跑）。
 
@@ -1664,8 +1668,24 @@ class _BoundedPool:
 # 增加 worker 数和队列深度：支持并发测试 90+ 节点不丢任务
 # 队列给到 4×worker：首轮会把订阅里的**全部**节点一次性提交，队列深度必须
 # 覆盖节点数而不是 worker 数的倍数。256 对当前 160 条订阅节点留了余量。
-_health_pool = _BoundedPool(max_workers=60, name_prefix="health", queue=256)
+_health_pool = _BoundedPool(max_workers=16, name_prefix="health", queue=256)
 _io_pool = _BoundedPool(max_workers=8, name_prefix="io")
+
+# /rotate 最多 8 个并行换线任务，最多 16 个在途任务
+_rotate_pool = _BoundedPool(
+    max_workers=8,
+    name_prefix="rotate",
+    queue=16,
+)
+
+# WARP 探测硬上限，配置只能进一步降低
+_WARP_PROBE_CONCURRENCY_MAX = 4
+_warp_probe_pool = _BoundedPool(
+    max_workers=_WARP_PROBE_CONCURRENCY_MAX,
+    name_prefix="warp-probe",
+    queue=_WARP_PROBE_CONCURRENCY_MAX,
+)
+
 
 _BG_BUSY: set[str] = set()
 _BG_LOCK = threading.Lock()
@@ -7118,15 +7138,84 @@ def _probe_targets(now: float) -> list[dict]:
     return list(out.values())
 
 
+_MEMORY_OBS_LAST = 0.0
+
+
+def _log_memory_observation() -> None:
+    global _MEMORY_OBS_LAST
+
+    now = time.monotonic()
+    if now - _MEMORY_OBS_LAST < 60:
+        return
+    _MEMORY_OBS_LAST = now
+
+    rss_kb = 0
+    anon_kb = 0
+    threads = 0
+    try:
+        with open("/proc/self/smaps_rollup", "r") as f:
+            for line in f:
+                if line.startswith("Rss:"):
+                    rss_kb = int(line.split()[1])
+                elif line.startswith("Anonymous:"):
+                    anon_kb = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("Threads:"):
+                    threads = int(line.split()[1])
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+
+    cgroup_kb = -1
+    try:
+        with open("/proc/self/cgroup", "r") as f:
+            entries = f.read().splitlines()
+
+        for entry in entries:
+            parts = entry.split(":", 2)
+            if len(parts) != 3:
+                continue
+
+            if parts[0] == "0" and parts[1] == "":
+                path = "/sys/fs/cgroup" + parts[2]
+                with open(path + "/memory.current", "r") as f:
+                    cgroup_kb = int(f.read().strip()) // 1024
+                break
+
+            if "memory" in parts[1].split(","):
+                path = "/sys/fs/cgroup/memory" + parts[2]
+                with open(path + "/memory.usage_in_bytes", "r") as f:
+                    cgroup_kb = int(f.read().strip()) // 1024
+                break
+    except (OSError, ValueError):
+        pass
+
+    try:
+        rotate_depth = _rotate_pool.stats()["depth"]
+    except Exception:
+        rotate_depth = -1
+
+    log(
+        "📊 memory rss=%dkB anon=%dkB cgroup=%dkB "
+        "threads=%d rotate_inflight=%d"
+        % (rss_kb, anon_kb, cgroup_kb, threads, rotate_depth)
+    )
+
+
 def _warp_prober_loop() -> None:
     while True:
         now = time.time()
+        _log_memory_observation()
         active = active_warp_tag()
         due: list[tuple[float, dict]] = []
+
         for m in _probe_targets(now):
             tag = m["tag"]
-            # 档位外的线不探：单元可能还在跑（改档位没重启、reconcile 漏停），
-            # 单元判据看不出来；用档位判据兜一道，别让停用线继续烧探测与日志。
             if not _line_enabled(m):
                 continue
             if not _warp_member_unit_running(m, now):
@@ -7137,9 +7226,18 @@ def _warp_prober_loop() -> None:
             needs, due_ts = _warp_line_needs_probe(tag, now)
             if needs:
                 due.append((due_ts, m))
-        free = int(_warp().get("probe_concurrency", 4)) - len(_WARP_PROBING)
+
+        configured = int(_warp().get("probe_concurrency", 4))
+        limit = min(
+            _WARP_PROBE_CONCURRENCY_MAX,
+            max(1, configured),
+        )
+        free = limit - len(_WARP_PROBING)
+
         if due and free > 0:
             due.sort(key=lambda p: p[0])
+            pool_full = False
+
             for _, m in due[:free]:
                 tag = m["tag"]
                 with _WARP_LINE_CV:
@@ -7147,29 +7245,45 @@ def _warp_prober_loop() -> None:
                         continue
                     _WARP_PROBING.add(tag)
 
-                def _run(member: dict = m, tag: str = tag) -> None:
+                def _run(member: dict = m, probe_tag: str = tag) -> None:
                     try:
                         _probe_one_line(member)
                     except Exception as e:
-                        log(f"  ✗ 探测 {tag} 异常: {e}")
+                        log(f"  ⚠ 探测 {probe_tag} 异常: {e}")
                     finally:
                         with _WARP_LINE_CV:
-                            _WARP_PROBING.discard(tag)
+                            _WARP_PROBING.discard(probe_tag)
                             _WARP_LINE_CV.notify_all()
 
-                threading.Thread(target=_run, daemon=True,
-                                 name=f"warp-probe-{tag}").start()
+                future = _warp_probe_pool.submit(_run)
+                if future is None:
+                    with _WARP_LINE_CV:
+                        _WARP_PROBING.discard(tag)
+                        _WARP_LINE_CV.notify_all()
+                    pool_full = True
+
+            if pool_full:
+                # 池满时不得空转：有界等待后再重试该线
+                with _WARP_LINE_CV:
+                    _WARP_LINE_CV.wait(timeout=1.0)
             continue
+
         if free <= 0:
             time.sleep(0.2)
             continue
+
         next_due = now + float(_warp().get("prober_idle_wait_sec", 30))
         with _WARP_LINE_CV:
             for tag, st in _WARP_LINE_STATE.items():
-                next_due = min(next_due,
-                               float(st.get("next_probe_ts") or 0.0) or next_due)
+                next_due = min(
+                    next_due,
+                    float(st.get("next_probe_ts") or 0.0) or next_due,
+                )
         with _WARP_LINE_CV:
-            _WARP_LINE_CV.wait(timeout=max(0.1, next_due - time.time()))
+            _WARP_LINE_CV.wait(
+                timeout=max(0.1, next_due - time.time())
+            )
+
 
 
 def _start_warp_prober() -> None:
@@ -16274,6 +16388,50 @@ def _rotate_trace_fields(req: dict, payload: dict) -> dict:
             "offending_verdict": verdict, "reported_egress": reported}
 
 
+def _execute_rotate_request(req: dict) -> dict:
+    _rid = req.get("req_id")
+    rid = str(_rid).strip()[:64] if _rid else None
+    ban_after = _rotate_ban_after_from_req(req)
+    slot = _slot_by_proxy_url(req.get("egress_proxy_url"))
+
+    if slot is not None:
+        payload = _rotate_slot_once(
+            slot,
+            _normalize_rotate_reason(req.get("reason")),
+            _as_ts(req.get("request_started_at")),
+            str(req.get("egress_ip")).strip()
+            if isinstance(req.get("egress_ip"), str)
+            and req.get("egress_ip").strip() else None,
+            rid, ban_after,
+            borrowed=bool(req.get("borrowed")),
+        )
+        if payload.get("restart_required"):
+            log(
+                "⚠ %s 换 %s（%ss）[req=%s] 无健康备槽，通知 9router 自重连"
+                % (
+                    slot["name"], req.get("reason"),
+                    payload.get("reason"), rid or "-",
+                )
+            )
+        return payload
+
+    ip = req.get("egress_ip")
+    result = _rotate_once(
+        _normalize_rotate_reason(req.get("reason")),
+        _as_ts(req.get("request_started_at")),
+        str(ip).strip() if isinstance(ip, str) and ip.strip() else None,
+        _as_ts(req.get("egress_since")),
+        ban_after,
+    )
+    if result.get("restart_required"):
+        log(
+            "⚠ 主路径无可用闸口[req=%s]，通知 9router 自重连"
+            % (rid or "-")
+        )
+    return result
+
+
+
 class _RotateHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "asip/1"
@@ -16284,15 +16442,16 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
             return True
         except (BrokenPipeError, ConnectionResetError,
                 ConnectionAbortedError, OSError):
-            # 对端已关闭（超时销毁 / 客户端重启）。写不出去就是写不出去，
-            # 交给调用方决定记账方式，这里不再重试、不再补写。
             self.close_connection = True
             return False
+
 
     def _authed(self) -> bool:
         return self.headers.get("X-Asip-Token") == _API_TOKEN
@@ -16390,100 +16549,47 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
         if not self._authed():
             self._send(401, {"ok": False, "reason": "unauthorized"})
             return
+
+        self.close_connection = True
+
         try:
             n = int(self.headers.get("Content-Length") or 0)
+            if n < 0 or n > 1024 * 1024:
+                self._send(413, {"ok": False, "reason": "payload_too_large"})
+                return
             raw = self.rfile.read(n) if n > 0 else b"{}"
             req = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(req, dict):
+                req = {}
         except Exception:
             req = {}
-        # 排查通道：9router 把本次请求 id 透传过来，下面所有 /rotate 日志带上
-        # 它，才能把「一条失败请求」和「哪台闸/哪条线/哪个出口」串成一条链。
-        _rid = req.get("req_id")
-        rid = str(_rid).strip()[:64] if _rid else None
 
-        # P0 影子分类：把 429 分成账号/模型/请求/传输/未知域，只落盘不动作。
-        # 等影子期统计出各域占比后再决定是否启用「非出口域不标脏」策略。
-        _shadow_domain = FailureDomain.UNKNOWN
         try:
-            _shadow_domain = classify_rotate_request(req)
-            if _shadow_domain in (FailureDomain.ACCOUNT, FailureDomain.MODEL,
-                                  FailureDomain.REQUEST,
-                                  FailureDomain.CONTEXT_REJECTED,
-                                  FailureDomain.TRANSPORT):
-                _atomic_append_line(
-                    os.path.join(_PROJECT, ".warp", "failure_domain_shadow.jsonl"),
-                    {"ts": time.time(), "req_id": rid,
-                     "reason": str(req.get("reason") or "")[:64],
-                     "domain": _shadow_domain.value,
-                     "retry_after_ms": req.get("retry_after_ms"),
-                     "egress_ip": str(req.get("egress_ip") or "")[:64]})
-        except Exception as _fd_err:
-            log(f"· 故障域影子分类失败（不影响路由）: {_fd_err}")
-        # P0 强制策略：仅在 enforcement 开启时把影子分类升级为策略输入。
-        # EXIT_IP 必须带 9router 透传的独立证据；否则降级为 UNKNOWN（证据不足，
-        # 不标脏、不切线）——绝不让无证据的 429 被误判成出口故障。
-        _policy_domain = None
-        if enforcement_enabled(CFG):
-            _policy_domain = confirm_exit_domain(
-                _shadow_domain, req.get("exit_evidence_id"))
-        # 生产 429 的封禁时长：9router 透传的真实 Retry-After 优先，
-        # 缺失时不伪造精确封禁（返回 None → 60s 默认窗，见函数注释）。
-        ban_after = _rotate_ban_after_from_req(req)
-        # 多端口：带 egress_proxy_url 的请求按端口定位槽位，走独立 sing-box 路径。
-        # 每台 sing-box 独立连接池，9router 轮询，429 时后台修那台，立即返回
-        # 让 9router 重连到别的端口。不走下面的单主出口逻辑。
-        slot = _slot_by_proxy_url(req.get("egress_proxy_url"))
-        if slot is not None:
-            try:
-                payload = _rotate_slot_once(
-                    slot,
-                    _normalize_rotate_reason(req.get("reason")),
-                    _as_ts(req.get("request_started_at")),
-                    str(req.get("egress_ip")).strip()
-                    if isinstance(req.get("egress_ip"), str)
-                    and req.get("egress_ip").strip() else None,
-                    rid, ban_after,
-                    borrowed=bool(req.get("borrowed")),
-                    domain=_policy_domain)
-            except Exception as e:
-                log(f"✗ 槽位 /rotate 异常: {e}")
-                self._send(500, {"ok": False, "reason": "internal_error"})
-                return
-            # 信号由 _slot_redirect_payload 给：无健康备槽 -> restart_required，
-            # 9router 收到后自行重启重建连接池，等后台把被报槽修好。主链路
-            # 不做同步兜底，也不把空出口身份写回调用方。
-            if payload.get("restart_required"):
-                log("⇢ %s 报 %s（%s）[req=%s] 无健康备槽，通知 9router 自重启"
-                    % (slot["name"], req.get("reason"), payload.get("reason"),
-                       rid or "-"))
-            payload.update(_rotate_trace_fields(req, payload))
-            payload.update(domain_trace_fields(_policy_domain))
-            self._send(200, payload)
-            return
-        try:
-            ip = req.get("egress_ip")
-            # 必须先拿结果再回传。写成 _send(200, _rotate_once(...)) 时，下面
-            # 那次 _send(200, result) 会踩未定义的 result —— 每调一次 /rotate
-            # 就抛一次 NameError，栈打满日志，client_gone 也永远记不上账。
-            # 换线本身是成功的，坏的只是回传这一步。
-            result = _rotate_once(
-                _normalize_rotate_reason(req.get("reason")),
-                _as_ts(req.get("request_started_at")),
-                str(ip).strip() if isinstance(ip, str) and ip.strip() else None,
-                _as_ts(req.get("egress_since")), ban_after,
-                domain=_policy_domain)
+            future = _rotate_pool.submit(_execute_rotate_request, req)
         except Exception as e:
-            log(f"✗ /rotate 异常: {e}")
+            log(f"❌ /rotate 提交任务异常: {e}")
             self._send(500, {"ok": False, "reason": "internal_error"})
             return
-        # 主路径秒切失败：回包已经表达「无可用闸口，自己重启」，这里留一行
-        # 生产日志，免得只能从 9router 侧反推 asip 到底有没有发出信号。
+
+        if future is None:
+            self._send(
+                503,
+                {
+                    "ok": False,
+                    "reason": "overloaded",
+                    "retry_after_ms": 3000,
+                },
+            )
+            return
+
+        try:
+            result = future.result()
+        except Exception as e:
+            log(f"❌ /rotate 异常: {e}")
+            self._send(500, {"ok": False, "reason": "internal_error"})
+            return
+
         result.update(_rotate_trace_fields(req, result))
-        result.update(domain_trace_fields(_policy_domain))
-        if result.get("restart_required"):
-            log("⇢ 主路径无可用闸口[req=%s]，通知 9router 自重启" % (rid or "-"))
-        # 换线与回传分成两步：换线成功但客户端已超时断开时，记账为「回传超时」
-        # 而不是异常。否则 except 里再补写一次 500 必然二次 Broken pipe。
         if not self._send(200, result):
             _note_client_gone(result)
 
@@ -16636,6 +16742,51 @@ def _proxy_gate_keeper() -> None:
             log("⚠ 第七闸口维护异常: %s" % e)
 
 
+class _Srv(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    request_queue_size = 32
+
+    def __init__(self, *args, **kwargs):
+        self._request_slots = threading.BoundedSemaphore(32)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                body = json.dumps({
+                    "ok": False,
+                    "reason": "overloaded",
+                    "retry_after_ms": 3000,
+                }).encode("utf-8")
+                response = (
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Connection: close\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                    + b"\r\n"
+                    + body
+                )
+                request.sendall(response)
+            except Exception:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
+
 def _start_rotate_server() -> None:
     """启动 UDS 接口线程。失败不影响主循环 —— 接口是增强，不是命脉。"""
     global _API_TOKEN
@@ -16655,9 +16806,6 @@ def _start_rotate_server() -> None:
         log(f"✗ 清理残留 socket 失败: {e}")
         return
     _API_TOKEN = _ensure_api_token()
-
-    class _Srv(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-        daemon_threads = True
 
     try:
         srv = _Srv(path, _RotateHandler)
