@@ -1192,7 +1192,7 @@ CFG["state_store"] = {
     # 影子对账（双写 + 周期 diff + 差异告警）。默认关闭：上线即零行为变化，
     # 要开必须显式打开并观察一个窗口 —— 差异=0 是切读门槛（T2c），不是默认态。
     "shadow": _env_bool("ASIP_STATE_SHADOW", False),
-    "shadow_interval_sec": 300,
+    "shadow_interval_sec": 900,
     # 事件流水进库（alerting.configure(journal=<Store>)）。关闭时仍走 JSONL，
     # 即 p6a 已交付的 EventJournal —— 关这个键不会丢告警。
     "journal_enabled": _env_bool("ASIP_STATE_JOURNAL", True),

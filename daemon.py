@@ -448,7 +448,7 @@ _warp_cooldown_until: float = 0     # 冷却截止，防重连风暴
 # 切回一个刚被 429/403 标记的地址等于没换。
 # 落盘 .warp_ip_used.json，daemon 重启后保留污染记录。
 _WARP_IP_USED: dict[str, dict] = {}
-_WARP_IP_LOCK = threading.Lock()   # _WARP_IP_USED 跨线程读写（换线线程 + 主循环）
+_WARP_IP_LOCK = threading.RLock()  # _WARP_IP_USED 跨线程读写（换线线程 + 主循环）
 _WARP_IP_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".warp_ip_used.json")
 # 槽位健康状态持久化：daemon 重启后恢复 status/verdict/switched_at/tag/egress。
 # 不持久化 repairing（没有后台线程在修，恢复了就永远卡住），load 时降级为 unknown。
@@ -660,35 +660,43 @@ def _record_udp_bad_node(node: str, now: float) -> None:
 
 
 def _save_warp_ip_used() -> None:
-    """把 IP 使用记录落盘。
+    """把 IP 使用台账落盘。
 
-    进程内为空但盘上已有台账时拒绝写入：并发跑的测试进程/误启动的实例
-    用空内存覆盖会把 16h 的 ban_until 全抹掉（已实际发生过）。
-    `_LEDGER_ALLOW_EMPTY_WRITE` 供清理逻辑显式放行一次写空（R-6/D-3）。
+    锁内只做「一致性快照」，序列化、写盘、桥接一律锁外：
+    `write_json` 现在是流式写，若在不持锁时遍历 `_WARP_IP_USED`，
+    并发写会让 `json.dump` 撞上 "dictionary changed size during iteration"，
+    或者写出撕裂的 JSON。
     """
     global _LEDGER_ALLOW_EMPTY_WRITE
-    allow_empty = bool(_LEDGER_ALLOW_EMPTY_WRITE)
+
+    with _WARP_IP_LOCK:
+        allow_empty = bool(_LEDGER_ALLOW_EMPTY_WRITE)
+        used_snapshot = {
+            str(k): dict(v) if isinstance(v, dict) else v
+            for k, v in _WARP_IP_USED.items()
+        }
+        _LEDGER_ALLOW_EMPTY_WRITE = False
+
     path = _warp_ip_used_path()
-    if not _WARP_IP_USED and not _LEDGER_ALLOW_EMPTY_WRITE:
+
+    if not used_snapshot and not allow_empty:
         try:
             if os.path.getsize(path) > 2:
                 log(f"  · 跳过空台账覆盖 {path}（盘上已有记录）")
                 return
         except OSError:
             pass
-    if not _WARP_IP_USED and _LEDGER_ALLOW_EMPTY_WRITE:
+
+    if not used_snapshot and allow_empty:
         try:
             if os.path.getsize(path) > 2:
                 log(f"  · 清理到空表，显式放行写空 {path}")
         except OSError:
             pass
-    _LEDGER_ALLOW_EMPTY_WRITE = False
-    _write_json_atomic(path, {"used": _WARP_IP_USED})
-    # 影子双写（T2b）：JSON 成功后尽力镜像；库拒写只上报不改变上面的落盘。
-    # allow_empty 必须跟着原标志走 —— 清理路径显式放行的「写空」，库侧也要
-    # 放行，否则清理永远只清 JSON、库越积越多，差异恒非零。
+
+    _write_json_atomic(path, {"used": used_snapshot})
     _state_bridge.mirror_rows(
-        _STATE_STORE, _state_schema.KIND_IP_USED, _WARP_IP_USED,
+        _STATE_STORE, _state_schema.KIND_IP_USED, used_snapshot,
         allow_empty=allow_empty, alert=_alerting)
 
 
@@ -4298,16 +4306,24 @@ def _warp_line_state(tag: str) -> dict:
 
 def _save_warp_line_state(force: bool = False) -> None:
     global _WARP_LINE_LAST_SAVE
+
     now = time.time()
     with _WARP_LINE_SAVE_LOCK:
         if not force and now - _WARP_LINE_LAST_SAVE < 5.0:
             return
         _WARP_LINE_LAST_SAVE = now
+
+    # 锁内只复制：每条线自己的 dict 也是可变的，浅拷贝不够
     with _WARP_LINE_CV:
-        payload = {"version": 1,
-                   "lines": {t: dict(s) for t, s in _WARP_LINE_STATE.items()}}
+        lines_snapshot = {
+            str(t): dict(s) if isinstance(s, dict) else s
+            for t, s in _WARP_LINE_STATE.items()
+        }
+
+    payload = {"version": 1, "lines": lines_snapshot}
     path = _warp_line_state_path()
-    if not payload["lines"]:
+
+    if not lines_snapshot:
         try:
             if os.path.getsize(path) > 2:
                 log(f"  · 跳过空状态表覆盖 {path}（盘上已有记录）")
@@ -4315,43 +4331,34 @@ def _save_warp_line_state(force: bool = False) -> None:
         except OSError:
             pass
     else:
-        # **条数保护**：盘上已有 N 条、这次要写 M 条且 M < N —— 拒绝覆盖。
-        # WHY 需要：`_save_warp_line_state` 落的是整个内存状态表。如果此刻
-        # 内存里的表还没加载盘上数据（例如启动早期、或某个清理函数在
-        # `_load_warp_line_state()` 之前被调用），落盘的就是"只剩被清理的
-        # 那一条" —— 实测 2026-11-11：3 条假数据被覆盖成 1 条，其余整条
-        # 丢失，且没有任何日志。
-        # 这条保护是**兜底**：它挡的不是某一个具体调用点，而是"整表覆盖"
-        # 这类危险写法的**所有**未来变体。
+        # 条数保护：盘上比内存多就拒绝覆盖（状态表未加载就落盘的兜底）
         try:
             if os.path.getsize(path) > 2:
                 with open(path, "r", encoding="utf-8") as f:
                     old = json.load(f)
                 old_lines = old.get("lines", old) if isinstance(old, dict) else {}
-                if isinstance(old_lines, dict) and len(old_lines) > len(payload["lines"]):
+                if (isinstance(old_lines, dict)
+                        and len(old_lines) > len(lines_snapshot)):
                     log(f"  ⚠ 拒绝覆盖状态表 {path}：盘上 {len(old_lines)} 条 > "
-                        f"内存 {len(payload['lines'])} 条（疑似状态表未加载就落盘）")
-                    # 4a：拒绝覆盖是「脏值/未加载就落盘」的实证。以前只有一行
-                    # 日志，滚掉后没人知道这台机器的台账当时差点被抹平。
+                        f"内存 {len(lines_snapshot)} 条（疑似状态表未加载就落盘）")
                     _alerting.emit(
                         _alerting.CATEGORY_LEDGER_ANOMALY,
                         f"拒绝覆盖状态表 {os.path.basename(path)}："
-                        f"盘上 {len(old_lines)} 条 > 内存 {len(payload['lines'])} 条",
+                        f"盘上 {len(old_lines)} 条 > 内存 {len(lines_snapshot)} 条",
                         severity=_alerting.SEVERITY_ERROR,
                         key=f"ledger_shrink:{path}",
                         source="daemon._save_warp_line_state",
                         path=path, on_disk=len(old_lines),
-                        in_memory=len(payload["lines"]))
+                        in_memory=len(lines_snapshot))
                     return
         except FileNotFoundError:
             pass
         except (OSError, ValueError):
             pass
+
     _write_json_atomic(path, payload)
-    # 影子双写：payload["lines"] 与 JSON 同一份快照。库侧同样过缩水护栏
-    # （INV-SHRINK），所以这里不会出现「JSON 拒写、库却写进去」的劈叉。
     _state_bridge.mirror_rows(
-        _STATE_STORE, _state_schema.KIND_LINE_STATE, payload["lines"],
+        _STATE_STORE, _state_schema.KIND_LINE_STATE, lines_snapshot,
         alert=_alerting)
 
 

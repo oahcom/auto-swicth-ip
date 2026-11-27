@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -29,6 +30,12 @@ from .redact import redact_secrets
 # Grace period for reaping after the process group has been signalled. The
 # direct child is normally already dead; this only bounds a wedged descendant.
 _REAP_GRACE_SEC = 5.0
+
+# 单个子进程单条流最多保留的字节数：超过就丢弃后续内容，但**继续 drain 到 EOF**，
+# 否则子进程写满 pipe 会永久阻塞，超时语义也随之失效。
+MAX_CAPTURE_BYTES = 256 * 1024
+_CAPTURE_READ_SIZE = 64 * 1024
+_CAPTURE_TRUNCATION_MARKER = b"\n...[truncated]"
 
 
 @dataclass(frozen=True)
@@ -86,15 +93,29 @@ def _kill_process_group(child: subprocess.Popen) -> None:
             pass
 
 
+def _kill_process_group_id(pgid: int) -> None:
+    """杀掉一个进程组，即使组长已经退出。
+
+    ``start_new_session=True`` 让 ``child.pid`` 就是 pgid；直接子进程退出后
+    组里可能还有继承 pipe 的后代，必须按 pgid 杀，不能用 ``child.returncode``
+    判断组是否还存在。
+    """
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        pass
+
+
+
 def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
         env: Mapping[str, str] | None = None, redact: bool = True) -> ProcResult:
     """Run ``argv`` and return a result instead of raising.
 
-    Both streams are captured as text, which is what
-    ``subprocess.run(capture_output=True, text=True)`` does; ``Popen`` is used
-    directly only so a timeout can kill the whole process group. ``stdout`` is
-    never redacted — callers need the raw payload even when it happens to
-    contain a token-shaped string.
+    stdout/stderr 各自由一条读取线程持续 drain，只保留前 ``MAX_CAPTURE_BYTES``；
+    超限后继续读并丢弃，保证子进程不会因为 pipe 写满而卡死。超时仍先杀进程组
+    再回收，``ProcResult`` 的字段语义不变。
     """
     _require_positive_timeout(timeout)
     argv = list(argv)
@@ -105,8 +126,7 @@ def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
+            text=False,
             cwd=cwd,
             env=dict(env) if env is not None else None,
             start_new_session=True,
@@ -117,57 +137,99 @@ def run(argv: Sequence[str], *, timeout: float, cwd: str | None = None,
             error=_mask(f"binary not found: {argv0}", redact),
         )
     except OSError as exc:
-        # Every start failure is reported with the documented prefix; the
-        # underlying OSError keeps its detail for diagnosis.
         return ProcResult(
             code=None,
             error=_mask(f"binary not found: {argv0}: {exc}", redact),
         )
 
+    captures = {"stdout": bytearray(), "stderr": bytearray()}
+    truncated = {"stdout": False, "stderr": False}
+    reader_errors: list[BaseException] = []
+
+    def drain(name, stream):
+        try:
+            while True:
+                chunk = stream.read(_CAPTURE_READ_SIZE)
+                if not chunk:
+                    break
+                captured = captures[name]
+                remaining = MAX_CAPTURE_BYTES - len(captured)
+                if remaining > 0:
+                    captured.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncated[name] = True
+        except (OSError, ValueError) as exc:
+            reader_errors.append(exc)
+
+    readers = [
+        threading.Thread(target=drain, args=("stdout", child.stdout),
+                         name="proc-stdout-drain", daemon=True),
+        threading.Thread(target=drain, args=("stderr", child.stderr),
+                         name="proc-stderr-drain", daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    def captured_text(name) -> str:
+        data = bytes(captures[name])
+        if truncated[name]:
+            data += _CAPTURE_TRUNCATION_MARKER
+        return data.decode("utf-8", errors="replace")
+
+    def join_readers(timeout_sec: float) -> None:
+        for reader in readers:
+            reader.join(timeout_sec)
+
+    def close_streams() -> None:
+        for stream in (child.stdout, child.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
     try:
-        stdout, stderr = child.communicate(timeout=timeout)
+        child.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_process_group(child)
         try:
-            stdout, stderr = child.communicate(timeout=_REAP_GRACE_SEC)
+            child.wait(timeout=_REAP_GRACE_SEC)
         except subprocess.TimeoutExpired:
-            # A descendant escaped the group and still holds the pipe. Close our
-            # ends so the caller cannot block forever, then reap the direct
-            # child best-effort.
-            for stream in (getattr(child, "stdout", None),
-                           getattr(child, "stderr", None)):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
-            try:
-                child.wait(timeout=1)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            stdout, stderr = "", ""
+            pass
+        join_readers(_REAP_GRACE_SEC)
+        if any(reader.is_alive() for reader in readers):
+            # 后代逃出进程组仍握着 pipe：关掉我们这端，别让 reader 永久挂住
+            close_streams()
+            join_readers(1.0)
         return ProcResult(
             code=None,
-            stdout=_as_text(stdout),
-            stderr=_mask(_as_text(stderr), redact),
+            stdout=_as_text(captured_text("stdout")),
+            stderr=_mask(_as_text(captured_text("stderr")), redact),
             timed_out=True,
             error=_mask(f"timeout after {timeout}s", redact),
         )
     except BaseException:
-        # communicate() can fail for reasons other than timeout (closed pipe,
-        # broken decoder). Reap the group before propagating so a failing wait
-        # does not leak the child; the exception still belongs to the caller.
         _kill_process_group(child)
         try:
-            child.communicate(timeout=_REAP_GRACE_SEC)
+            child.wait(timeout=_REAP_GRACE_SEC)
         except Exception:
             pass
+        join_readers(_REAP_GRACE_SEC)
+        close_streams()
         raise
+
+    # 直接子进程已退出；后代可能仍握着继承来的 pipe 写端，reader 看不到 EOF。
+    join_readers(0.2)
+
+    if any(reader.is_alive() for reader in readers):
+        # start_new_session=True 使 child.pid 就是 pgid；组长退出不代表组没了。
+        _kill_process_group_id(child.pid)
+        join_readers(1.0)
 
     return ProcResult(
         code=child.returncode,
-        stdout=_as_text(stdout),
-        stderr=_mask(_as_text(stderr), redact),
+        stdout=_as_text(captured_text("stdout")),
+        stderr=_mask(_as_text(captured_text("stderr")), redact),
     )
 
 
