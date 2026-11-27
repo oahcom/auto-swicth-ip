@@ -266,28 +266,59 @@ def _normalize_reason(raw) -> str:
 # 挂死 40s+，所有换节点请求全卡在死节点上。
 _PICKER_TIMEOUT_SEC = 4.0
 
+# 全进程最多一个 picker worker。超时但仍存活的 worker 继续占用名额：
+# 不能把仍在跑的 picker 当作已释放，再启动第二条可能同样泄漏的线程。
+_PICKER_INFLIGHT = 0
+_PICKER_INFLIGHT_LOCK = threading.Lock()
+
 
 def _pick_with_timeout(picker, cur, pool, cooled):
     """带超时的选点调用 → (值, 是否按时答)。
 
-    超时/异常 → (None, False)，调用方回退均匀随机。被弃线程只做只读
-    探测、daemon=True 随进程退场，无害。超时 ≠ 「不换」：报障轮换场景
-    里留在原节点是最差结果；但 picker 正常答 None（判无可用）仍尊重
-    其判断、不换。
+    全进程最多一个 worker：已有 worker 未退出（含已超时但卡住的）时立即
+    返回 (None, False)，由调用方回退均匀随机。名额由 worker 自己在 finally
+    里归还；start 失败由调用线程归还。
     """
+    global _PICKER_INFLIGHT
+
+    with _PICKER_INFLIGHT_LOCK:
+        if _PICKER_INFLIGHT >= 1:
+            return None, False
+        _PICKER_INFLIGHT = 1
+
     box: dict = {}
 
     def _run():
+        global _PICKER_INFLIGHT
         try:
-            box["v"] = picker(cur, pool, cooled)
-        except Exception:  # noqa: BLE001 — 选点异常不掀翻整个 rotate
-            box["errored"] = True
+            try:
+                box["v"] = picker(cur, pool, cooled)
+            except Exception:
+                box["errored"] = True
+        finally:
+            # 必须由 worker 自己释放：超时返回不代表 worker 已结束。
+            with _PICKER_INFLIGHT_LOCK:
+                _PICKER_INFLIGHT = 0
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+    t = threading.Thread(
+        target=_run,
+        name="opencode-gate-picker",
+        daemon=True,
+    )
+
+    try:
+        t.start()
+    except Exception:
+        # start 失败时 worker 不会执行 finally，由当前线程归还名额。
+        with _PICKER_INFLIGHT_LOCK:
+            _PICKER_INFLIGHT = 0
+        return None, False
+
     t.join(_PICKER_TIMEOUT_SEC)
+
     if t.is_alive() or box.get("errored"):
         return None, False
+
     return box.get("v"), True
 
 
