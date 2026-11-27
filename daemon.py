@@ -15,6 +15,7 @@ auto-switch-ip daemon v2 - 加固版
 import fcntl
 import bisect
 import json
+from collections import OrderedDict
 import os
 import sys
 import time
@@ -13605,7 +13606,43 @@ def _ledger_shadow_tick() -> None:
 
 # 换线前实测台账：tag|ip -> 结论。9router 一次 429 风暴会连着打几十个 /rotate，
 # 每个都实测会把换线拖到几分钟，而同一地址同一时刻的结论不会变。
-_PROBE_BEFORE_ROTATE = {}
+_PROBE_BEFORE_ROTATE = OrderedDict()
+_PROBE_BEFORE_ROTATE_LOCK = threading.Lock()
+_PROBE_BEFORE_ROTATE_MAX = 8192
+_PROBE_BEFORE_ROTATE_SWEEP_INTERVAL = 60.0
+_PROBE_BEFORE_ROTATE_LAST_SWEEP = 0.0
+
+
+def _probe_before_rotate_get(key, *, now, ttl, fresh):
+    with _PROBE_BEFORE_ROTATE_LOCK:
+        hit = _PROBE_BEFORE_ROTATE.get(key)
+        if hit is None or fresh or now - hit.get("ts", 0) >= ttl:
+            return None
+        out = dict(hit)
+        out["cached"] = True
+        return out
+
+
+def _probe_before_rotate_put(key, out, *, now, ttl):
+    global _PROBE_BEFORE_ROTATE_LAST_SWEEP
+
+    with _PROBE_BEFORE_ROTATE_LOCK:
+        _PROBE_BEFORE_ROTATE[key] = out
+        _PROBE_BEFORE_ROTATE.move_to_end(key)
+
+        if now - _PROBE_BEFORE_ROTATE_LAST_SWEEP >= (
+                _PROBE_BEFORE_ROTATE_SWEEP_INTERVAL):
+            cutoff = now - 6 * ttl
+            while _PROBE_BEFORE_ROTATE:
+                oldest_key = next(iter(_PROBE_BEFORE_ROTATE))
+                oldest = _PROBE_BEFORE_ROTATE[oldest_key]
+                if oldest.get("ts", 0) >= cutoff:
+                    break
+                _PROBE_BEFORE_ROTATE.popitem(last=False)
+            _PROBE_BEFORE_ROTATE_LAST_SWEEP = now
+
+        while len(_PROBE_BEFORE_ROTATE) > _PROBE_BEFORE_ROTATE_MAX:
+            _PROBE_BEFORE_ROTATE.popitem(last=False)
 
 # 探测分歧台账：9router 说这条线不行、asip 实测却 OK 的每一次。这是「差异在
 # 请求体/上游口径、不在出口」的直接证据，只靠日志 grep 不方便复盘。
@@ -13630,13 +13667,11 @@ def _probe_line_before_rotate(tag, ip, fresh=False):
     ttl = float(cfg.get("pre_rotate_probe_ttl_sec", 30))
     key = tag + "|" + ip
     now = time.time()
-    hit = _PROBE_BEFORE_ROTATE.get(key)
+    hit = _probe_before_rotate_get(key, now=now, ttl=ttl, fresh=fresh)
     # fresh=True：连缓存都不看，真打一次。补线/修整后要确认「这条线到底是不是
     # 真的 quota」，复用 30s 前的 OK 等于拿旧结论给新线盖章。
-    if hit and not fresh and now - hit["ts"] < ttl:
-        out = dict(hit)
-        out["cached"] = True
-        return out
+    if hit is not None:
+        return hit
     started = time.time()
     retry_after = None
     try:
@@ -13648,7 +13683,7 @@ def _probe_line_before_rotate(tag, ip, fresh=False):
     out = {"tag": tag, "ip": ip, "verdict": verdict, "sec": sec,
            "detail": detail, "retry_after": retry_after,
            "elapsed": round(time.time() - started, 1), "ts": time.time()}
-    _PROBE_BEFORE_ROTATE[key] = out
+    _probe_before_rotate_put(key, out, now=now, ttl=ttl)
     log("换线前实测 %s 出口=%s: %s %ss" % (tag, ip, verdict, sec))
     return out
 
@@ -16488,6 +16523,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             if not self._authed():
                 self._send(401, {"ok": False, "reason": "unauthorized"})
                 return
+            self.close_connection = True
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n > 0 else b"{}"
@@ -16507,6 +16543,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             if not self._authed():
                 self._send(401, {"ok": False, "reason": "unauthorized"})
                 return
+            self.close_connection = True
             # 不在这里判「是否已在刷新」：refresh_subscription 自己拿非阻塞锁，
             # 重复调用只会打一行「已有订阅刷新在进行」。预判一次反而多一个竞态。
             threading.Thread(target=refresh_subscription,
@@ -16520,6 +16557,7 @@ class _RotateHandler(http.server.BaseHTTPRequestHandler):
             if not self._authed():
                 self._send(401, {"ok": False, "reason": "unauthorized"})
                 return
+            self.close_connection = True
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n > 0 else b"{}"

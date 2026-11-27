@@ -55,11 +55,38 @@ def _atomic_write(path: str, text: str, mode: int) -> None:
 
 def write_json(path: str, payload: Any, *, mode: int = 0o600,
                indent: int | None = None) -> None:
-    """Serialize ``payload`` and replace ``path`` atomically."""
-    text = json.dumps(payload, ensure_ascii=False, indent=indent,
-                      separators=None if indent else (",", ":"))
-    _atomic_write(path, text, mode)
+    """Serialize ``payload`` into ``path`` atomically, without building the
+    whole document as one string.
 
+    ``json.dumps`` on a 20MB ledger allocates a second 20MB string on top of the
+    object graph; with 60+ workers doing that concurrently glibc keeps the
+    arenas. Streaming straight into the temp file keeps the peak at the file
+    size instead of twice it.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    prefix = os.path.basename(path) + "."
+    fd, tmp = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump(payload, f, ensure_ascii=False, indent=indent,
+                      separators=None if indent else (",", ":"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 def write_text(path: str, text: str, *, mode: int = 0o600) -> None:
     """Replace ``path`` with ``text`` atomically."""
