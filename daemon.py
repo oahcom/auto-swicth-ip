@@ -4389,6 +4389,33 @@ def _save_warp_line_state(force: bool = False) -> None:
         alert=_alerting)
 
 
+# IP-stuck 判定只需要「最近 fuse 次重启拿回的地址」，而存储上限必须与判定
+# 阈值分离：fuse 被设成 999999（等于禁用）时 hist[-fuse:] 就是「永不裁剪」，
+# 实测 412 条线攒出 12.86 MB / 每条约 5,500 个地址，状态表每 5s 全量重写
+# 一次（安静期也 ~0.65 MB/s）。超过存储上限的 fuse 一律解释为「该判定禁用」，
+# 配置值本身不动，历史只留上限条供排查。
+_RESTART_IP_HIST_MAX = 64
+
+
+def _restart_ip_fuse_policy() -> tuple[bool, int, int]:
+    """→ (判定是否启用, 生效 fuse, 历史存储上限)。
+
+    fuse <= 上限：原判定完整保留，只留 fuse 条。
+    fuse >  上限：判定禁用（不宣称能执行该阈值），只留上限条。
+    """
+    configured = max(2, int(_warp().get("restart_ip_stuck_fuse", 3)))
+    if configured <= _RESTART_IP_HIST_MAX:
+        return True, configured, configured
+    return False, 0, _RESTART_IP_HIST_MAX
+
+
+def _clamp_restart_ip_hist(st: dict, cap: int) -> None:
+    """把一条线的重启地址历史裁到 cap 条（只保留字符串元素）。"""
+    hist = [x for x in (st.get("restart_ip_hist") or [])]
+    hist = [x for x in hist if isinstance(x, str)]
+    st["restart_ip_hist"] = hist[-cap:] if cap > 0 else []
+
+
 def _load_warp_line_state() -> None:
     """恢复状态表；过期 OK 在启动时直接作废，避免拿重启前的证据选线。"""
     try:
@@ -4452,6 +4479,11 @@ def _load_warp_line_state() -> None:
             # （`_channel_blocked_note`）自己会判 isinstance 再重建。
             if not isinstance(st.get("blocked_notes"), list):
                 st["blocked_notes"] = None
+            # 存量裁剪：盘上可能已经攒了几千条（实测 5,700 条/线 / 12.86 MB）。
+            # 只裁内存，不主动写盘 —— 下一次正常 _save_warp_line_state 自然
+            # 落盘。保存前的「盘上条数 > 内存条数」保护比的是**线数**不是
+            # 每线历史条数，所以这次合法收缩不会被误判成数据回退。
+            _clamp_restart_ip_hist(st, _restart_ip_fuse_policy()[2])
             if (st.get("last_ok_ip") != st.get("ip")
                     or now - float(st.get("last_ok_ts") or 0) > fresh):
                 st["last_ok_ts"] = 0.0
@@ -6929,12 +6961,13 @@ def _warp_line_restart(member: dict, reason: str,
                 # 记「每次重启换回来的地址」。连续拿回同一个地址 = 这条线的
                 # 落地节点只发这一个出口，重启换 IP 对它无效，必须熔断 ——
                 # 否则就是每 8~10 秒重启一次、每次掐断在途连接的死循环。
-                fuse = max(2, int(_warp().get("restart_ip_stuck_fuse", 3)))
+                fuse_enabled, fuse, hist_cap = _restart_ip_fuse_policy()
                 hist = [x for x in (st.get("restart_ip_hist") or [])
                         if isinstance(x, str)]
                 hist.append(ip)
-                st["restart_ip_hist"] = hist[-fuse:]
-                if (len(st["restart_ip_hist"]) >= fuse
+                st["restart_ip_hist"] = hist[-hist_cap:]
+                if (fuse_enabled
+                        and len(st["restart_ip_hist"]) >= fuse
                         and len(set(st["restart_ip_hist"])) == 1):
                     stuck_until_new = now + float(
                         _warp().get("restart_ip_stuck_hold_sec", 900))
@@ -6943,8 +6976,8 @@ def _warp_line_restart(member: dict, reason: str,
                 # 取不到地址时不推进历史：那不是「换地址失败」，是隧道坏了。
                 hist = [x for x in (st.get("restart_ip_hist") or [])
                         if isinstance(x, str)]
-                st["restart_ip_hist"] = hist[-(max(2, int(_warp().get(
-                    "restart_ip_stuck_fuse", 3))) - 1):] or []
+                # 不推进历史（这次没拿到地址），但仍要受同一存储上限约束。
+                st["restart_ip_hist"] = hist[-_restart_ip_fuse_policy()[2]:] or []
                 # 落盘失败原因，让 `asip chan` 能显示「为什么拿不到出口」，
                 # 而不是只印一个 `无地址`。值是人话，已过 `_EGRESS_HINT`。
                 st["egress_error"] = _egress_error_hint(member["port"]) or "unknown"
